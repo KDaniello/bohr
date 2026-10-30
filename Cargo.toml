@@ -51,7 +51,7 @@ toml = "0.8"
 thiserror = "1"
 
 proptest = "1"
-cucumber = { version = "0.21", default-features = false, features = ["macros"] }
+cucumber = { version = "0.23", default-features = false, features = ["macros"] }
 futures = "0.3"
 
 [workspace.package]
