@@ -16,7 +16,7 @@ jobs:
   compat:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -32,20 +32,20 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: x86_64-unknown-linux-musl }
       - uses: ./.github/actions/deterministic-build-env
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl --bin bohr
       - run: sha256sum target/x86_64-unknown-linux-musl/release/bohr | tee hash-${{ matrix.runner }}.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: "hash-${{ matrix.runner }}", path: hash-*.txt }
 
   compare-hashes:
     needs: reproducible
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: hashes/ }
       - name: Two runners must produce the same binary
         run: |
@@ -60,7 +60,7 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: "${{ matrix.target }}" }
       # The same environment the hash gate above verified. Building the published artefact any
@@ -76,7 +76,7 @@ jobs:
             -cf - -C target/${{ matrix.target }}/release bohr \
             | gzip -n -9 > bohr-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           sha256sum bohr-*.tar.gz > SHA256SUMS-${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: "dist-${{ matrix.target }}"
           path: |
@@ -87,11 +87,11 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with: { path: dist/, merge-multiple: true }
       - run: cat dist/SHA256SUMS-* > dist/SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/bohr-*.tar.gz

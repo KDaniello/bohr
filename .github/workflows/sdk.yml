@@ -26,13 +26,13 @@ jobs:
   conformance:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with: { dotnet-version: "8.0" }
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with: { go-version: "1.22" }
       - run: make test-sdk
         env:
@@ -42,16 +42,16 @@ jobs:
   go-lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with: { go-version: "1.22" }
       - run: make lint-go
 
   python-lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
       - run: pip install ruff mypy
       - run: make lint-python
@@ -59,7 +59,7 @@ jobs:
   schema:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: The committed schema must equal the one generated from the Rust types
         run: |
@@ -70,7 +70,7 @@ jobs:
   antithesis-interop:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -83,7 +83,7 @@ jobs:
   other-widths:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # `rust-toolchain.toml` pins the toolchain the workspace builds with, so the target is added to
       # that one and not to the `stable` the step above installed.
@@ -94,6 +94,6 @@ jobs:
   no-dependencies:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: SDKs are linked into other people's builds and carry no third-party deps
         run: ./scripts/check-sdk-deps.sh

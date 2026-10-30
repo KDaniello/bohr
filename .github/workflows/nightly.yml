@@ -18,7 +18,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, self-hosted-amd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -26,7 +26,7 @@ jobs:
       - run: make guests
       - name: Produce bundles
         run: cargo nextest run --test portability -- produce
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: "bundles-${{ matrix.runner }}", path: target/bohr-out/portability/ }
 
   replay-cross:
@@ -37,9 +37,9 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, self-hosted-amd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: bundles/ }
       - run: make guests
       - uses: taiki-e/install-action@v2
@@ -55,18 +55,18 @@ jobs:
   hunting:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: make guests
       - run: make test-hunting
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with: { name: hunting-findings, path: /tmp/bohr-hunt-*/findings/ }
 
   perf:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: make guests
       - name: Which scheduler reaches the seeded defects
@@ -81,12 +81,12 @@ jobs:
       matrix:
         target: [bundle, tape, sdk_record, event_log, syscall_args]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - run: make fuzz T=${{ matrix.target }} S=14400
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with: { name: "fuzz-crash-${{ matrix.target }}", path: fuzz/artifacts/ }
