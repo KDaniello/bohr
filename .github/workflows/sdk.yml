@@ -10,6 +10,7 @@ on:
   # a change to how records are digested reached main without the conformance suite running at all
   # -- and a contract checked on one side only is a contract nobody is holding.
   push:
+    branches: [main]
     paths: &sdk_paths
       - "sdk/**"
       - "crates/bohr-sdk-proto/**"
