@@ -397,26 +397,6 @@ pub(crate) fn run_config_for(
     config
 }
 
-/// One guest specification per node, from a command line and the configuration.
-///
-/// A single-node `[cluster]` may still shape the run: its environment is presented, and `{node}` in
-/// its argv is substituted, so a scenario file and the command line agree on what node zero is.
-/// Without a `[cluster]`, the command line is node zero and there is nothing else.
-///
-/// **`standing_in` is one execution of a comparison, and it replaces exactly one node.** A cluster
-/// of unlike nodes is how a real client is driven at all — one node is the client, another is the
-/// caller that makes it do anything — so replacing the whole cluster would replace the caller too,
-/// and every implementation would then run the identical scenario and agree with itself. That was
-/// the behaviour here until this parameter existed: a cluster's own programs won, silently, and a
-/// comparison of two clients reported agreement having compared one.
-///
-/// **One function, and it matters.** A run and its replay build their guests from different
-/// starting points — a command line here, a stored configuration there — and for a while they did
-/// so through different code. The environment they produced differed by two variables, which moved
-/// the guest's stack by sixty-four bytes, and any guest that read a stack address replayed to a
-/// different digest than it recorded. A divergence in the one thing the tool exists to guarantee,
-/// caused by nothing more than two spellings of one rule.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 /// Writes a copy of a program with its processor questions made to fault, and names the copy.
 ///
 /// A copy and never the file itself: rewriting what somebody handed us is the one thing
@@ -444,6 +424,26 @@ fn trapped_copy(program: &str) -> Result<String, CliError> {
     Ok(into.to_string_lossy().into_owned())
 }
 
+/// One guest specification per node, from a command line and the configuration.
+///
+/// A single-node `[cluster]` may still shape the run: its environment is presented, and `{node}` in
+/// its argv is substituted, so a scenario file and the command line agree on what node zero is.
+/// Without a `[cluster]`, the command line is node zero and there is nothing else.
+///
+/// **`standing_in` is one execution of a comparison, and it replaces exactly one node.** A cluster
+/// of unlike nodes is how a real client is driven at all — one node is the client, another is the
+/// caller that makes it do anything — so replacing the whole cluster would replace the caller too,
+/// and every implementation would then run the identical scenario and agree with itself. That was
+/// the behaviour here until this parameter existed: a cluster's own programs won, silently, and a
+/// comparison of two clients reported agreement having compared one.
+///
+/// **One function, and it matters.** A run and its replay build their guests from different
+/// starting points — a command line here, a stored configuration there — and for a while they did
+/// so through different code. The environment they produced differed by two variables, which moved
+/// the guest's stack by sixty-four bytes, and any guest that read a stack address replayed to a
+/// different digest than it recorded. A divergence in the one thing the tool exists to guarantee,
+/// caused by nothing more than two spellings of one rule.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn specs_for(
     argv: Vec<String>,
     loaded: Option<&bohr_world::LoadedConfig>,

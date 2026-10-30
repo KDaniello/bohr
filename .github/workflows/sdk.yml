@@ -71,6 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - run: cargo nextest run -p bohr-sdk-proto --test antithesis_fixtures
 
   # An SDK is linked into somebody else's build, and theirs is compiled for more targets than a
@@ -81,8 +84,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: i686-unknown-linux-gnu
+      # `rust-toolchain.toml` pins the toolchain the workspace builds with, so the target is added to
+      # that one and not to the `stable` the step above installed.
+      - run: rustup target add i686-unknown-linux-gnu
       - run: cargo check -p bohr-sdk --target i686-unknown-linux-gnu
       - run: cargo check -p bohr-sdk-proto --target i686-unknown-linux-gnu
 

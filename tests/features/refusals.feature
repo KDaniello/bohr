@@ -13,8 +13,8 @@ Feature: Refusals
     And the message names error code "BOHR-2001"
 
   @linux
-  Scenario: An asynchronous ring is refused under its own name
-    Given the program "testdata/guests/build/uses_io_uring"
+  Scenario: Entering an asynchronous ring is refused under its own name
+    Given the program "testdata/guests/build/enters_io_uring"
     When I run the program once with seed 1
     Then the exit code is 3
     And the message names error code "BOHR-2004"
