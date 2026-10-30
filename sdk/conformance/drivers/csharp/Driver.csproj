@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>conformance-driver</AssemblyName>
+    <RootNamespace>Bohr.Conformance</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- A record carries the line it was written on, so a driver built without symbols would
+         report a location the checker is right to reject. -->
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../csharp/src/Bohr.Sdk/Bohr.Sdk.csproj" />
+  </ItemGroup>
+
+</Project>

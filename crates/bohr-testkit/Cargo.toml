@@ -1,0 +1,45 @@
+[package]
+name = "bohr-testkit"
+description = "Fixtures and the determinism harness the rest of the workspace is tested with."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bohr-backend.workspace = true
+bohr-backend-null.workspace = true
+bohr-explorer.workspace = true
+bohr-kernel.workspace = true
+bohr-reducer.workspace = true
+bohr-tape.workspace = true
+bohr-trace.workspace = true
+bohr-types.workspace = true
+bohr-world.workspace = true
+
+[dev-dependencies]
+bohr-tape.workspace = true
+
+[features]
+# One name per deliberate defect, each forwarded to the crate that owns the site it breaks. The
+# mutation harness enables them one at a time and requires the determinism suite to go red.
+chaos-ambient-rng = ["bohr-tape/chaos-ambient-rng"]
+chaos-hash-iteration = ["bohr-kernel/chaos-hash-iteration"]
+chaos-delivery-tie = ["bohr-kernel/chaos-delivery-tie"]
+chaos-wall-clock-digest = ["bohr-trace/chaos-wall-clock-digest"]
+chaos-syscall-passthru = ["bohr-world/chaos-syscall-passthru"]
+chaos-futex-order = ["bohr-world/chaos-futex-order"]
+chaos-node-clock-shared = ["bohr-world/chaos-node-clock-shared"]
+chaos-deadline-tie = ["bohr-world/chaos-deadline-tie"]
+chaos-fault-moment-drift = ["bohr-world/chaos-fault-moment-drift"]
+chaos-unknown-descriptor = ["bohr-world/chaos-unknown-descriptor"]
+chaos-proc-on-the-disk = ["bohr-world/chaos-proc-on-the-disk"]
+chaos-coverage-ambient = ["bohr-backend-null/chaos-coverage-ambient"]
+chaos-worker-order = ["bohr-explorer/chaos-worker-order"]
+
+[lints]
+workspace = true

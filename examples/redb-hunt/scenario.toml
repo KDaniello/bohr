@@ -1,0 +1,40 @@
+# A store killed between an acknowledgement and its sync, and a client that asks for the data back.
+#
+# Nothing here knows anything about `redb`. The scenario says only that node zero dies at one
+# moment and comes back at another, and that its disk is the kind of disk a real machine has: a
+# sync that sometimes stalls, and a crash that keeps only what a completed sync promised.
+#
+# The verdict comes from the client, and the claim it makes is the one every client makes: a write
+# the store acknowledged is a write the store still has. A record that the store never
+# acknowledged is nobody's fault and is never asked about.
+
+[run]
+horizon_ticks = 400_000_000       # 400 ms: the writes, the kill, the restart and the read-back
+
+[cluster]
+nodes = 2
+argv = ["examples/redb-hunt/build/redb-hunt", "{node}"]
+
+# A service and its client on one machine, so the network is fast and reliable: what is under test
+# is the disk, and packets going missing would only hide it.
+[network]
+topology = "full"
+latency_mean_ticks = 50_000       # 0.05 ms
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"
+stall_probability = "1/16"
+stall_mean_ticks = 2_000_000
+
+# The kill lands inside the writes rather than after them, which is the only place it can catch a
+# commit that has been answered for and not yet made durable.
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 40_000_000              # 40 ms
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 60_000_000              # 60 ms

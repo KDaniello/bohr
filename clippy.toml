@@ -1,0 +1,19 @@
+msrv = "1.85"
+
+# Nondeterminism sources banned by docs/ARCHITECTURE.md 8, rules 1, 9 and 10.
+# The grep in scripts/lint-rules.sh catches the rest; these catch it at compile time.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "use the logical clock; see docs/ARCHITECTURE.md D5" },
+  { path = "std::time::SystemTime::now", reason = "use the logical clock; see docs/ARCHITECTURE.md D5" },
+  { path = "rand::random", reason = "draw from the tape; see docs/ARCHITECTURE.md D1" },
+  { path = "rand::thread_rng", reason = "draw from the tape; see docs/ARCHITECTURE.md D1" },
+]
+
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "iteration order is unstable; use BTreeMap or IndexMap in decision paths. See docs/ARCHITECTURE.md 8 rule 10" },
+  { path = "std::collections::HashSet", reason = "iteration order is unstable; use BTreeSet or IndexSet in decision paths. See docs/ARCHITECTURE.md 8 rule 10" },
+]
+
+# A trace holds tens of millions of events; a fat enum variant is memory we do not have.
+enum-variant-size-threshold = 256
+too-many-arguments-threshold = 8

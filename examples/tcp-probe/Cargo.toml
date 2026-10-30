@@ -1,0 +1,21 @@
+# Deliberately outside the tool's workspace: this guest exists to be surveyed, and the tool's own
+# dependency graph stays narrow (docs/ARCHITECTURE.md §5.11).
+[workspace]
+
+[package]
+name = "tcp-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The runtime every OP Stack component in Rust is built on. Pinned, because what a survey reports
+# is a fact about a version.
+tokio = { version = "=1.53.1", features = ["rt", "net", "io-util", "macros"] }
+
+[[bin]]
+name = "tcp-probe"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

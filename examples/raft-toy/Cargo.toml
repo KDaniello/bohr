@@ -1,0 +1,26 @@
+# Deliberately outside the tool's workspace: this scenario depends on a third-party consensus
+# library, and the tool's own dependency graph stays narrow (docs/ARCHITECTURE.md §11).
+#
+# A seeded-bug program (testdata/bugs/raft_toy) rather than a demonstration: the defect in it is
+# deliberate, documented, and the search is measured on whether it reaches it.
+[workspace]
+
+[package]
+name = "raft-toy"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The synchronous, runtime-free Raft: the caller drives `tick` and `step`, so nothing here reads a
+# host clock or needs an executor. That is what makes it a guest rather than a port of one.
+raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
+prost = "0.11"
+slog = "2"
+
+[[bin]]
+name = "raft-toy-node"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

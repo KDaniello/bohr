@@ -1,0 +1,26 @@
+# The classic split-brain-and-heal, described by hand so it replays as a regression test.
+#
+# A five-node cluster elects a leader, then a one-directional cut isolates nodes 3 and 4 from the
+# rest for long enough to force an election on the minority side. The heal puts the cluster back
+# together, and every node checks that no term ever had two leaders and that no committed entry
+# went missing.
+
+[cluster]
+nodes = 5
+argv = ["examples/split-brain/build/split-brain-node", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 2_000_000      # 2 ms
+latency_jitter_ticks = 1_000_000
+drop_probability = "1/200"
+
+[disk]
+sync_semantics = "strict"
+
+# The cut: nodes 0, 1 and 2 stop reaching 3 and 4 while 3 and 4 still reach them, which is the
+# asymmetry a symmetric partition test never produces.
+[[partition]]
+at_tick = 1_000_000_000             # 1 s, past the first election
+heal_at_tick = 3_000_000_000        # 3 s
+cut = { from = [0, 1, 2], to = [3, 4], directional = true }

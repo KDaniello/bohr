@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- No package references, by rule: this is linked into somebody else's program, and a
+       dependency of ours would become a dependency of theirs. See docs/ARCHITECTURE.md 9, S3. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Bohr.Sdk</AssemblyName>
+    <RootNamespace>Bohr</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Line numbers reach a record's location only if the symbols are there to read. A guest
+         built without them is reported as having no location rather than a wrong one. -->
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+</Project>

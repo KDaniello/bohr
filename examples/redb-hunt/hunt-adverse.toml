@@ -1,0 +1,51 @@
+# The same store and the same client, with every kind of node fault a campaign can draw.
+#
+# `hunt.toml` beside this one draws the kill and nothing else, which is what a campaign could draw
+# at all until this file had anything to name: the freeze, the cut and the link that stops being
+# good stood where somebody had written a tick down, so a search covered one entry of the catalogue
+# and reached the rest only where a person had already guessed the moment.
+#
+# What is under test is unchanged — a write the store acknowledged is a write the store still has —
+# and the point of naming four kinds is that the guest is asked it under four different kinds of
+# adversity rather than one. A cut and a degradation cost the store nothing by themselves; what
+# they cost is the client's ability to reach it, which is where a store that acknowledges over a
+# network and a store that acknowledges to itself stop being the same thing.
+
+[run]
+horizon_ticks = 10_000_000_000
+
+[cluster]
+nodes = 2
+argv = ["examples/redb-hunt/build/redb-hunt", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"
+stall_probability = "1/16"
+stall_mean_ticks = 2_000_000
+
+[durability]
+ack = "send_while_dirty"
+
+# Every kind, and a ceiling on how many of them one run gets.
+#
+# **The ceiling is what makes a run about the first fault rather than about the fourth.** Odds say
+# when a fault fires and never how many: at odds short enough to be reached at all, a guest making
+# millions of eligible calls meets them over and over, and a run that was killed, frozen, cut off
+# and killed again reports on the recovery path rather than on whatever it was asked. Four is loose
+# for this guest, which draws about one and a half fires a run on its own; it is a bound and not a
+# target.
+#
+# `restart_after_ticks` is what every kind here comes back after — a killed node restarts, a frozen
+# one thaws, a cut heals and a bad link becomes good again — so one number says how long a run
+# spends under adversity whatever the adversity turned out to be.
+[faults]
+kill_probability = "1/300"
+targeting = "guided"
+restart_after_ticks = 20_000_000
+draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade"]
+budget_per_run = 4

@@ -1,0 +1,11 @@
+# Flags this guest is built with, on top of what `scripts/build-example.sh` sets for every one.
+#
+# A guest that is searched rather than merely run is instrumented, because a search with no
+# coverage to steer by is random sampling with extra steps (`docs/ARCHITECTURE.md` §5.10). The
+# runtime that answers the instrumentation is linked by `build.rs` beside this file.
+#
+# Level 3 is edges and not merely blocks: a block reached from two callers is two edges, and
+# collapsing them is what makes a map stop distinguishing paths.
+-Cpasses=sancov-module
+-Cllvm-args=-sanitizer-coverage-level=3
+-Cllvm-args=-sanitizer-coverage-trace-pc-guard

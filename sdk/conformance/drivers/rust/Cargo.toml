@@ -1,0 +1,22 @@
+[package]
+name = "conformance-driver"
+description = "Makes the calls a conformance case asks for, in Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bohr-sdk = { path = "../../../rust", version = "0.0.0" }
+bohr-sdk-proto.workspace = true
+
+[[bin]]
+name = "conformance-driver"
+path = "src/main.rs"
+
+[lints]
+workspace = true

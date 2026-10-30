@@ -1,0 +1,11 @@
+# minimal/1 digest goldens: fixture seed digest
+# Regenerate with: cargo test -p bohr-testkit --test goldens -- --ignored bless
+clock-and-random 0 blake3:6668c950a4d35d8d8ec188dfe032999ed0fdecb6ee5d7c4b3cbc057a6e6e266a
+clock-and-random 1 blake3:1466df47f93f778a367c18a613cdc063b551478aba0cd2db5f27847917f3aa7f
+clock-and-random 42 blake3:dfb5c1b6f25b090167bf6d58b276798f0a307956ac0fff03bc5bbd70963ffbe6
+two-tasks 0 blake3:38dc71b2561e59efb9b4879a21a0e4544d3ae861679dfb0de86deefb16f9d8eb
+two-tasks 1 blake3:6c58262e90f2a5ed982f5e7ae15727c72fcfc666c269bc1d6aee8046a59a13c9
+two-tasks 42 blake3:d6f7169732a0be03fec3abd397fd4ff060a286dfde69d917b73d8db9384b11f4
+large-random 0 blake3:44e7b2923e83aab8163688a6d395147f3b31b874af8d62ab188823614d66b634
+large-random 1 blake3:d0d84fa2b309eac0b8eee869ce09969027415f07cca6aacce660fd272cb15f61
+large-random 42 blake3:6548649b30d50cacd6d232faf306a2f2645d6d1737ec08712525380b2985e187

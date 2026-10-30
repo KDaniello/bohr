@@ -1,0 +1,41 @@
+# The same hunt, from a database that already holds something.
+#
+# Every run until this one began with an empty store, and an empty store never reaches the code a
+# full one lives in: a file grown past its first pages, pages freed and reused, a meta page that has
+# already been rewritten more than once. Recovery from a large database is not the path recovery
+# from a small one takes.
+#
+# The state is a directory on the host, produced once by `mdbx-hunt prepare` and recorded in the
+# bundle by digest — never carried in it. A replay against a changed directory is refused.
+#
+# The client adds a claim here that the other scenarios cannot make: **records that were durable
+# before the run began are still there afterwards.** Nothing this run does is about them, so a store
+# that lost one lost data no crash had any business touching.
+
+[run]
+horizon_ticks = 10_000_000_000
+
+[cluster]
+nodes = 2
+argv = ["examples/mdbx-hunt/build/mdbx-hunt", "{node}"]
+
+[state]
+dir = "examples/mdbx-hunt/state"
+
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"
+stall_probability = "1/16"
+stall_mean_ticks = 2_000_000
+
+[durability]
+ack = "send_while_dirty"
+
+[faults]
+kill_probability = "1/300"
+targeting = "guided"
+restart_after_ticks = 20_000_000

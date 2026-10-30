@@ -1,0 +1,25 @@
+* text=auto eol=lf
+
+*.rs      text diff=rust
+*.md      text diff=markdown
+*.toml    text
+*.feature text
+
+# A prepared state is bytes a guest reads, not source: a line-ending normalisation must not touch it.
+examples/*/state/** binary
+
+# Binary fixtures: never normalize, never diff. A mangled tape is an unreproducible run.
+*.tape    binary
+*.bohr    binary
+testdata/** binary
+
+# Guests are the exception: they are committed as source and built with pinned flags, so they need
+# the same normalisation as any other source file.
+testdata/guests/*.c  text diff=cpp
+testdata/guests/Makefile text
+
+# The report page is assembled from these as they are written, and a golden comparison of the
+# result would differ between checkouts if a line ending did.
+*.css text
+*.js text
+*.tsv text

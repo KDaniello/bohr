@@ -1,0 +1,34 @@
+[package]
+name = "bohr-trace"
+description = "The event log, the trace digest and the .bohr scenario bundle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-sdk-proto.workspace = true
+bohr-types.workspace = true
+blake3.workspace = true
+ciborium.workspace = true
+zstd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Redaction proves what it removed: the scanner takes the lines out, and the parser is asked
+# whether anything it was supposed to remove is still there.
+toml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+# Deliberate defects, each breaking determinism at one named site. Off in every build that is
+# not the mutation harness, which asserts the determinism suite goes red for each in turn.
+chaos-wall-clock-digest = []
+
+[lints]
+workspace = true

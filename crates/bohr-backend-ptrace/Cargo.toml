@@ -1,0 +1,25 @@
+[package]
+name = "bohr-backend-ptrace"
+description = "Syscall-level interception on Linux x86-64."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-backend.workspace = true
+bohr-types.workspace = true
+
+[dev-dependencies]
+bohr-backend.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+libc.workspace = true
+seccompiler.workspace = true
+
+[lints]
+workspace = true

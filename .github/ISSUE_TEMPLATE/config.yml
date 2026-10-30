@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/KDaniello/bohr/discussions
+    about: Anything that is not a bug report or a concrete proposal.
+  - name: Security or false-assurance report
+    url: https://github.com/KDaniello/bohr/security/policy
+    about: Do not open a public issue. A run reported as deterministic when it was not counts here.
+  - name: Design disagreement
+    url: https://github.com/KDaniello/bohr/issues/new?labels=S-needs-decision
+    about: Name the section of docs/ARCHITECTURE.md you are arguing with.

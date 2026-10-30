@@ -1,0 +1,62 @@
+# An execution client and the thing that drives it, on two nodes of one cluster.
+#
+# A client does nothing on its own: it opens its store, stands up its engine API and waits to be
+# told what the chain is. Node zero is the client and node one is the caller, which is what
+# `programs` is for — a cluster of unlike nodes has as many command lines as it has nodes.
+#
+# The path to the client is written here and the client is not in this repository: build it from
+# `ethereum-optimism/op-reth` and put its path in the first program. `benches/baseline.toml` records
+# the version and the flags the numbers were taken with.
+#
+# The shared secret is in the state every node starts from, which is how both come to have it: the
+# client is told to use it rather than writing one of its own, and the caller reads the same file on
+# its own filesystem. Neither is told about the other, which is what makes the exchange between them
+# an exchange rather than an arrangement.
+#
+# `--db.growth-step` is named rather than left to the client: by default it reserves four gibibytes
+# at a stroke and every file in this world is bytes in the supervisor's memory.
+
+# The exchange is over by 0.22 s of virtual time, and what follows is a node polling for work
+# nobody is there to give it — a million clock reads and half a million waits per three million
+# events. The horizon is what stops paying for that, and it is five times the span the exchange
+# needs rather than the twenty-five hours a run defaults to.
+[run]
+horizon_ticks = 1_000_000_000
+ends_with_node = 1
+
+[cluster]
+nodes = 2
+programs = [
+  [
+    "/path/to/op-reth-target/x86_64-unknown-linux-gnu/release/op-reth",
+    "node",
+    "--datadir", "/data",
+    "--chain", "base-sepolia",
+    "--disable-discovery",
+    "--ipcdisable",
+    "--http",
+    "--http.addr", "10.66.0.1",
+    "--authrpc.addr", "10.66.0.1",
+    "--authrpc.jwtsecret", "/jwt.hex",
+    "--db.max-size", "32MB",
+    "--db.growth-step", "4MB",
+    "--db.exclusive", "true",
+  ],
+  ["examples/engine-driver/build/engine-driver"],
+]
+
+[cluster.env]
+HOME = "/root"
+
+[state]
+dir = "examples/engine-driver/state"
+
+# A service and its caller on one machine, so the network is fast and reliable: what is under test
+# is the exchange, and packets going missing would only hide it.
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"

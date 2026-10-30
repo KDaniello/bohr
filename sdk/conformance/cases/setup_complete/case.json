@@ -1,0 +1,12 @@
+{
+  "calls": [
+    {
+      "fn": "setup_complete",
+      "args": [
+        {
+          "nodes": 5
+        }
+      ]
+    }
+  ]
+}

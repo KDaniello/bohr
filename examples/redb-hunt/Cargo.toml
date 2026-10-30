@@ -1,0 +1,21 @@
+# Deliberately outside the tool's workspace: this guest depends on the store it hunts, and the
+# tool's own dependency graph stays narrow (docs/ARCHITECTURE.md §5.11).
+[workspace]
+
+[package]
+name = "redb-hunt"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The store under test. Pinned, because a finding names a version and a bundle that replays under
+# a different one is a bundle that proves nothing.
+redb = "=2.6.3"
+
+[[bin]]
+name = "redb-hunt"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

@@ -1,0 +1,64 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local run artifacts: corpora, tapes, traces, reports.
+/out
+/corpus
+/artifacts
+*.tape
+*.bohr
+# ...except the golden bundles the replay, reduce, report and handover tests read.
+# They are 2 KB each and a clean clone without them fails 184 tests.
+!/testdata/bundles/*.bohr
+*.profraw
+
+# Editors
+/.idea
+/.vscode/*
+!/.vscode/extensions.json
+!/.vscode/settings.json
+
+# Guest binaries: built from the committed source with pinned flags, never committed themselves.
+/testdata/guests/build
+
+# SDK build outputs
+/sdk/**/bin
+/sdk/**/obj
+/sdk/**/__pycache__
+/sdk/**/*.egg-info
+/sdk/**/dist
+
+# Product specification: internal, deliberately not published in this repository.
+deterministic-simulator-spec.md
+
+# Roadmap: internal planning document, deliberately not published in this repository.
+/docs/ROADMAP.md
+/docs/ru/ROADMAP.md
+/docs/ROADMAP.agents.md
+/docs/ru/ROADMAP.agents.md
+/docs/ROADMAP.improves.md
+/docs/ROADMAP.targets.md
+
+# Product ideas: internal, and about products other than this one.
+/ideas
+
+# Example guests: built from committed source, never committed as binaries.
+examples/*/build/
+examples/*/target/
+
+# Fuzzing: the seeds are committed, the corpus a fuzzer grows from them is not.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+
+# Built .NET output: the SDK and its driver are sources, the assemblies are not.
+sdk/**/bin/
+sdk/**/obj/
+sdk/conformance/drivers/csharp/out/
+
+# The Go driver's binary, for the same reason.
+sdk/conformance/drivers/go/out/
+
+# The prepared database a hunt starts from: built by `redb-hunt prepare`, identified by digest.
+/examples/redb-hunt/state

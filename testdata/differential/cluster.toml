@@ -1,0 +1,26 @@
+# The same comparison, in the shape a real client is driven in: a cluster of unlike nodes, one of
+# which is the implementation and the rest of which are the conditions it runs under.
+#
+# **This is the shape that used to report agreement having compared nothing.** The cluster names a
+# program per node, so both implementations ran `programs[0]` and produced the same answer whatever
+# they were. An implementation says which node it stands in for, and only that node is replaced.
+
+[cluster]
+nodes = 2
+programs = [
+  ["testdata/guests/build/answers_from_draw"],
+  ["testdata/guests/build/answers_from_draw"],
+]
+
+[differential]
+projections = [{ label = "answer", source = "file:/answer" }]
+
+[[differential.implementation]]
+name = "reference"
+node = 0
+argv = ["testdata/guests/build/answers_from_draw"]
+
+[[differential.implementation]]
+name = "second"
+node = 0
+argv = ["testdata/guests/build/answers_from_draw_wrong"]

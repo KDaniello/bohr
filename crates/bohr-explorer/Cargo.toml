@@ -1,0 +1,25 @@
+[package]
+name = "bohr-explorer"
+description = "The search: a corpus of tapes, the mutations that grow it, and the campaign that folds the results."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bohr-backend.workspace = true
+bohr-tape.workspace = true
+bohr-trace.workspace = true
+bohr-types.workspace = true
+
+[features]
+# A campaign that folds results in the order they arrived. The mutation harness enables it alone
+# and requires the determinism suite to go red.
+chaos-worker-order = []
+
+[lints]
+workspace = true

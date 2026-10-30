@@ -1,0 +1,45 @@
+name: Unsupported syscall
+description: A program you want to test hit BOHR-2001 or BOHR-2002
+labels: ["C-syscall", "S-needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An unsupported syscall is a deliberate loud failure, not a defect — we never pass an
+        unmodelled syscall to the host (`docs/ARCHITECTURE.md` D7). The support table grows
+        from real targets, so this report is exactly how it grows.
+
+  - type: input
+    id: syscall
+    attributes:
+      label: Syscall
+      placeholder: io_uring_setup
+    validations: { required: true }
+
+  - type: input
+    id: program
+    attributes:
+      label: Program that needs it
+      description: Name and version, and a link if it is public. This is what sets the priority.
+    validations: { required: true }
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Full error output
+      render: text
+    validations: { required: true }
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `bohr doctor --target <program>`
+      description: It lists every unsupported syscall the binary references, not just the first hit.
+      render: text
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to write the handler and its test

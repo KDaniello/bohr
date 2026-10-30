@@ -1,0 +1,26 @@
+[package]
+name = "bohr-kernel"
+description = "Logical time, scheduling, the run loop, and the ports it drives."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-backend.workspace = true
+bohr-tape.workspace = true
+bohr-trace.workspace = true
+bohr-types.workspace = true
+thiserror.workspace = true
+
+[features]
+# Deliberate defects, each breaking determinism at one named site. Off in every build that is
+# not the mutation harness, which asserts the determinism suite goes red for each in turn.
+chaos-hash-iteration = []
+chaos-delivery-tie = []
+
+[lints]
+workspace = true

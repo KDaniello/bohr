@@ -1,0 +1,21 @@
+# Deliberately outside the tool's workspace: this guest exists to be surveyed, and the tool's own
+# dependency graph stays narrow (docs/ARCHITECTURE.md §5.11).
+[workspace]
+
+[package]
+name = "mdbx-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The store an OP Stack execution client keeps its chain in, through the same binding that client
+# uses. Pinned, because what a survey reports is a fact about a version.
+libmdbx = { package = "signet-libmdbx", version = "=0.8.3" }
+
+[[bin]]
+name = "mdbx-probe"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

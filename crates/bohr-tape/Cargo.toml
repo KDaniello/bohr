@@ -1,0 +1,28 @@
+[package]
+name = "bohr-tape"
+description = "The entropy tape: the single source of nondeterminism in a run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-types.workspace = true
+blake3.workspace = true
+chacha20.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+# Deliberate defects, each breaking determinism at one named site. Off in every build that is
+# not the mutation harness, which asserts the determinism suite goes red for each in turn.
+chaos-ambient-rng = []
+
+[lints]
+workspace = true

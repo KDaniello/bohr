@@ -1,0 +1,63 @@
+name: Bug report
+description: Something is wrong with Bohr itself
+labels: ["C-bug", "S-needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A finding **in your own program** is not a bug in Bohr — that is the tool working.
+        This form is for Bohr misbehaving.
+
+        **Attach the seed or the bundle.** This is a tool whose whole purpose is reproduction;
+        a report without one is one we cannot act on. If the bundle holds data you cannot
+        publish, `bohr report --redact` strips it while keeping the run structure — see
+        `docs/API.md` §4.6 for exactly what a bundle contains.
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `bohr version --verbose` — all four numbers.
+      render: text
+    validations: { required: true }
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Host
+      description: Output of `bohr doctor`.
+      render: text
+    validations: { required: true }
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The exact command, and the seed or the attached bundle.
+      placeholder: bohr run --seed 12345 -- ./my-service
+    validations: { required: true }
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected and what happened
+    validations: { required: true }
+
+  - type: dropdown
+    id: class
+    attributes:
+      label: Class
+      options:
+        - Divergence — the same seed produced different runs
+        - False reproduction — a bundle did not replay, or replayed when it should not have
+        - Crash or hang in Bohr itself
+        - Wrong output — report, trace or reduction is incorrect
+        - Performance — much slower than documented
+        - Other
+    validations: { required: true }
+
+  - type: markdown
+    attributes:
+      value: |
+        A **divergence** or a **false reproduction** is `C-determinism` / `P-critical` and we
+        will pick it up immediately. Say so plainly if that is what you have.

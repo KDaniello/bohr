@@ -1,0 +1,43 @@
+# The same store and the same client, with the moment of the crash drawn instead of written down.
+#
+# `scenario.toml` beside this one kills at a fixed tick, which makes it a regression test: it
+# reproduces one execution and says nothing about any other. This one is the search. The kill is
+# drawn at every syscall and, under guided targeting, can only fire where the node has written
+# something no `fsync` has promised yet — the window where a crash costs an acknowledgement and
+# nowhere else. Every seed therefore lands the crash somewhere different in the write stream.
+#
+# What is under test is unchanged: a write the store acknowledged is a write the store still has.
+
+# Well past what the client needs even when every question it asks is put to a dead store: the
+# store bounds its own life, so what ends the run is the guests ending rather than this.
+[run]
+horizon_ticks = 10_000_000_000    # 10 s of virtual time, which costs the run nothing real
+
+[cluster]
+nodes = 2
+argv = ["examples/redb-hunt/build/redb-hunt", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"
+stall_probability = "1/16"
+stall_mean_ticks = 2_000_000
+
+# Not for its verdict, which cannot see a store that commits by rewriting a header rather than by
+# growing a file (`docs/API.md` §5.6). For the number it puts on the timeline at every crash: what
+# the node had answered for and not yet made durable. Without it a clean campaign cannot be told
+# from a campaign whose crashes all landed where nothing was at stake.
+[durability]
+ack = "send_while_dirty"
+
+# Guided, so the draw is offered only where a crash would cost the guest something. Uniform
+# targeting spends nearly every draw on a moment where the disk is clean and a crash proves
+# nothing, which is a search that measures its own patience.
+[faults]
+kill_probability = "1/300"
+targeting = "guided"
+restart_after_ticks = 20_000_000  # 20 ms before the node is started again

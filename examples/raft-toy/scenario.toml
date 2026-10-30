@@ -1,0 +1,29 @@
+# The seeded consensus defect, hunted rather than staged.
+#
+# Nothing here names a moment. The scenario says only that a node may die at any syscall and comes
+# back a little later; which node, and when, is drawn from the tape — so finding the defect is the
+# search's work and not the author's. A hand-written `[[fault]] at_tick` would prove the guest
+# checks itself and nothing about whether the search can reach it.
+#
+# The probability is the corpus-wide one (docs/TESTING.md §8): tuning it for this target would make
+# the measurement about the number rather than about the search.
+
+[cluster]
+nodes = 3
+argv = ["examples/raft-toy/build/raft-toy-node", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 2_000_000       # 2 ms
+latency_jitter_ticks = 1_000_000
+drop_probability = "1/200"
+
+[disk]
+sync_semantics = "strict"
+
+[faults]
+kill_probability = "1/400"
+targeting = "uniform"
+# Long enough for the survivors to notice and elect somebody, short enough that the restarted node
+# rejoins while the run still has ticks left to catch it out.
+restart_after_ticks = 300_000_000    # 300 ms

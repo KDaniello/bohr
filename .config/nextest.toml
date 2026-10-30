@@ -1,0 +1,25 @@
+[profile.default]
+# Per-test process isolation matters here: a test that drives ptrace can leak a traced
+# process, and a leaked tracee must not poison the tests that follow.
+retries = 0
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5 }
+status-level = "fail"
+final-status-level = "slow"
+
+[profile.ci]
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "retry"
+
+# Determinism gates run alone: they measure repeatability, and a loaded machine
+# is a different machine.
+[[profile.ci.overrides]]
+filter = "test(/^determinism::/)"
+threads-required = "num-cpus"
+slow-timeout = { period = "600s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = "test(/^system::/)"
+slow-timeout = { period = "300s", terminate-after = 3 }

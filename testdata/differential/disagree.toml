@@ -1,0 +1,17 @@
+# The same comparison, against an implementation that answers differently.
+#
+# Nothing here knows what the answer means. What it says is that these two implement one thing and
+# that their answers must match — which is the only claim a differential run makes, and the only
+# one it can make about a client that will never adopt an SDK.
+
+
+[differential]
+projections = [{ label = "answer", source = "file:/answer" }]
+
+[[differential.implementation]]
+name = "reference"
+argv = ["testdata/guests/build/answers_from_draw"]
+
+[[differential.implementation]]
+name = "second"
+argv = ["testdata/guests/build/answers_from_draw_wrong"]

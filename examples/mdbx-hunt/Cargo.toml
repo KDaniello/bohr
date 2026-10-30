@@ -1,0 +1,22 @@
+# Deliberately outside the tool's workspace: this guest depends on the store it hunts, and the
+# tool's own dependency graph stays narrow (docs/ARCHITECTURE.md §5.11).
+[workspace]
+
+[package]
+name = "mdbx-hunt"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The store an OP Stack execution client keeps its chain in, through the binding that client uses.
+# Pinned, because a finding names a version and a bundle that replays under a different one is a
+# bundle that proves nothing.
+libmdbx = { package = "signet-libmdbx", version = "=0.8.3" }
+
+[[bin]]
+name = "mdbx-hunt"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

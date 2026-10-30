@@ -1,0 +1,27 @@
+name: docs
+
+on:
+  # On both events, for the reason given in sdk.yml: gated on a path, never on an event.
+  push:
+    paths: &docs_paths ["docs/**", "*.md", "scripts/check-docs.sh"]
+  pull_request:
+    paths: *docs_paths
+
+jobs:
+  # Links resolve, and docs/ru mirrors docs/ section for section. A translation that has
+  # silently fallen behind is worse than none, because a reader trusts it.
+  structure:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-docs.sh
+
+  rustdoc:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --all-features --no-deps

@@ -1,0 +1,10 @@
+{
+  "calls": [
+    {
+      "fn": "random_bytes",
+      "args": [
+        16
+      ]
+    }
+  ]
+}

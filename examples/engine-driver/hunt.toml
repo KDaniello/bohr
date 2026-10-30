@@ -1,0 +1,115 @@
+# The chain, with the moment of the crash drawn instead of written down.
+#
+# `scenario.toml` beside this one builds the same blocks and kills nothing, which makes it a
+# regression test: it reproduces one execution and says nothing about any other. This one is the
+# hunt. The kill is drawn at every syscall and, under guided targeting, can only fire where the node
+# has written something no sync has promised yet — the window where a crash costs the client a
+# promise and nowhere else.
+#
+# What is under test is the strongest promise the engine API lets a client make: a block it called
+# `VALID` and was then told is final is a block it still has after it comes back. Nothing about
+# op-reth is instrumented and nothing here knows what a block is — every hash in the question came
+# from the client itself.
+#
+# The horizon is three seconds because a crash costs the run a second startup, and a client that
+# never came back would leave the questions unasked rather than unanswered.
+
+[run]
+horizon_ticks = 3_000_000_000
+# And the run is over when the caller is, which is what it was for. The horizon stays as the
+# ceiling for a run whose caller never finishes because the client never answered it.
+ends_with_node = 1
+
+[cluster]
+nodes = 2
+programs = [
+  [
+    "/path/to/op-reth-target/x86_64-unknown-linux-gnu/release/op-reth",
+    "node",
+    "--datadir", "/data",
+    "--chain", "base-sepolia",
+    "--disable-discovery",
+    "--ipcdisable",
+    "--http",
+    "--http.addr", "10.66.0.1",
+    "--authrpc.addr", "10.66.0.1",
+    "--authrpc.jwtsecret", "/jwt.hex",
+    "--db.max-size", "32MB",
+    "--db.growth-step", "4MB",
+    "--db.exclusive", "true",
+  ],
+  ["examples/engine-driver/build/engine-driver"],
+]
+
+[cluster.env]
+HOME = "/root"
+
+# A datadir that has already reached the disk, which is what a node that has been up for a minute
+# has. A hunt starts from there so its budget goes to what is not known yet.
+[state]
+dir = "examples/engine-driver/state-initialised"
+
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"
+
+# Not for its verdict, which cannot see a store that commits by rewriting a header rather than by
+# growing a file (`docs/API.md` §5.6) — and the store an execution client keeps its chain in is
+# exactly that. For the number it puts on the timeline at every crash: what the node had answered
+# for and not yet made durable. Without it a clean campaign cannot be told from a campaign whose
+# crashes all landed where nothing was at stake.
+[durability]
+ack = "send_while_dirty"
+
+# **The verdict this campaign was missing, and the eight runs it was missing it on.** Twelve runs of
+# twenty left the client printing that it could not open its own store; the panel called four of
+# them findings. In the other eight the client does not exit — it prints, unwinds into a futex
+# nothing will wake, and the run reaches its horizon with every task blocked. Nothing exited badly,
+# so nothing was judged badly, and a campaign that trusted the verdict alone reported eight clean
+# runs containing the worst outcome this target has.
+#
+# Half a second, and what it sits between: a running client polls constantly, and virtual time
+# barely advances between calls anyway, so no live guest approaches this — while the caller spends
+# two seconds retrying before it gives up, which is the window the check has to fire in. A node the
+# world killed is not watched at all until it comes back, so the restart gap is not a bound here.
+[liveness]
+quiet_ticks = 500_000_000
+
+# Guided, so the draw is offered only where a crash would cost the client something.
+#
+# **Every number here is against when this run actually ends, and that is the correction.** The run
+# ends with its caller, at forty-four milliseconds of virtual time — `run.ends_with_node` decides
+# that and the three-second horizon never bounds it. The moments written here used to be three
+# hundred milliseconds to arm and fifty to come back, from a startup that cost a hundred and thirty
+# thousand calls before the scenario was given a prepared store. Both were past the end of the run:
+# twenty seeds fired nothing at all, built their four blocks, and reported twenty clean runs having
+# never once pressed on the client. `BOHR-5006` now refuses a campaign that lands nothing.
+#
+# **Held back until the client is up, which is what makes the campaign about the chain.** Measured
+# on this scenario: the client's first `fsync` — its store made — is at 3.2 ms, and the run has
+# forty milliseconds left after five. A kill before that asks what a crash during startup does,
+# which is a question about a path the chain never reaches.
+#
+# **The odds are as long as this ABI can express, and pressing harder makes the campaign worse.** A
+# boolean draw is granular to one part in 65536 (`docs/API.md` §5.2). At that rate, over the
+# thirty-six thousand eligible calls this run makes, twenty seeds land eleven kills: seven runs
+# crash and thirteen build all four blocks. One part in 8192 was tried and measured — twenty runs of
+# twenty pressed, and nineteen of them killed the client before it had built a single block, so the
+# campaign built four blocks in total and asked nothing at all about the chain.
+#
+# The window is why: the store exists at 3.2 ms and the blocks are not final until 42, so a crash
+# aimed anywhere in between lands on a client that has nothing to lose yet. Pressing every run means
+# pressing in that window, and what comes back is the startup path over and over.
+#
+# The ceiling stays regardless, because odds say when a fault fires and never how many: two is a
+# crash and a chance to be crashed again after coming back.
+[faults]
+kill_probability = "1/65536"
+arm_after_ticks = 5_000_000
+targeting = "guided"
+restart_after_ticks = 5_000_000
+budget_per_run = 2

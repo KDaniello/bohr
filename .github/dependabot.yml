@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    labels: ["C-refactor", "A-ci"]
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: monthly }
+    labels: ["A-ci"]
+
+  # SDKs carry no third-party dependencies by rule (docs/ARCHITECTURE.md 9 S3).
+  # These entries exist to catch a dependency being added, not to update one.
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule: { interval: monthly }
+    labels: ["A-sdk"]
+
+  - package-ecosystem: nuget
+    directory: /sdk/csharp
+    schedule: { interval: monthly }
+    labels: ["A-sdk"]
+
+  - package-ecosystem: gomod
+    directory: /sdk/go
+    schedule: { interval: monthly }
+    labels: ["A-sdk"]

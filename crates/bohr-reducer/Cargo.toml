@@ -1,0 +1,21 @@
+[package]
+name = "bohr-reducer"
+description = "Delta debugging over a scenario: the smallest world that still breaks the guest."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-kernel.workspace = true
+bohr-sdk-proto.workspace = true
+bohr-tape.workspace = true
+bohr-trace.workspace = true
+bohr-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

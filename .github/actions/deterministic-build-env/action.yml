@@ -1,0 +1,20 @@
+name: deterministic build environment
+description: >
+  Pins a release build to the commit rather than to the machine that ran it, so two runners
+  produce the same bytes and so can anybody following the recipe in docs/repo/release.md.
+
+runs:
+  using: composite
+  steps:
+    - name: Pin the build to the commit, not to the machine
+      shell: bash
+      # A timestamp and two path prefixes are the whole difference between a build that
+      # reproduces and one that does not: the first stops the clock leaking in, the second and
+      # third stop the checkout directory and the crate cache leaking in through debug info and
+      # panic messages. Zero would work for the clock, but a commit's own time is what makes the
+      # artefact and its source say the same thing.
+      run: |
+        {
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)"
+          echo "RUSTFLAGS=--remap-path-prefix=$PWD=/bohr --remap-path-prefix=$HOME/.cargo=/cargo"
+        } >> "$GITHUB_ENV"

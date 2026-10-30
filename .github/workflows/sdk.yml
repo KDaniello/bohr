@@ -1,0 +1,94 @@
+name: sdk
+
+on:
+  # Both events, not just one. The table in docs/TESTING.md 15 calls this job blocking and gates
+  # it on a path, never on an event -- but the trigger was `pull_request` alone, and a repository
+  # whose history is direct pushes to main never opened one, so the gate had not run a single time
+  # in the life of the project. A job that never runs looks exactly like a job that passed.
+  #
+  # The paths carry both halves of the contract. The supervisor's reader lives outside `sdk/`, so
+  # a change to how records are digested reached main without the conformance suite running at all
+  # -- and a contract checked on one side only is a contract nobody is holding.
+  push:
+    paths: &sdk_paths
+      - "sdk/**"
+      - "crates/bohr-sdk-proto/**"
+      - "crates/bohr-world/src/distributed/sdk.rs"
+      - "crates/bohr-trace/src/redact.rs"
+  pull_request:
+    paths: *sdk_paths
+
+jobs:
+  # Five SDKs, one contract. The suite runs for every language on every change, including
+  # the languages the change did not touch: the point of a shared contract is that it is
+  # checked as one thing. See docs/ARCHITECTURE.md 9 S4.
+  conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "8.0" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - run: make test-sdk
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+          DOTNET_NOLOGO: "1"
+
+  go-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - run: make lint-go
+
+  python-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff mypy
+      - run: make lint-python
+
+  schema:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The committed schema must equal the one generated from the Rust types
+        run: |
+          cargo run -p bohr-sdk-proto --bin export-schema > /tmp/records.schema.json
+          diff -u crates/bohr-sdk-proto/schema/records.schema.json /tmp/records.schema.json
+
+  # When the Antithesis format moves, this goes red. That is the point.
+  antithesis-interop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo nextest run -p bohr-sdk-proto --test antithesis_fixtures
+
+  # An SDK is linked into somebody else's build, and theirs is compiled for more targets than a
+  # guest of this tool ever runs on. Reading eight bytes straight into a `usize` compiled here and
+  # nowhere narrower, and nothing was watching the difference.
+  other-widths:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - run: cargo check -p bohr-sdk --target i686-unknown-linux-gnu
+      - run: cargo check -p bohr-sdk-proto --target i686-unknown-linux-gnu
+
+  no-dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: SDKs are linked into other people's builds and carry no third-party deps
+        run: ./scripts/check-sdk-deps.sh

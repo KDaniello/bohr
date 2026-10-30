@@ -1,0 +1,49 @@
+# Tool configuration for every Python file in the repository. The Python here is small — one SDK,
+# one conformance checker, two measurement scripts — and the smaller a codebase, the less excuse
+# it has to lint dirty.
+
+[tool.ruff]
+# What the SDK promises to run on; see sdk/python/pyproject.toml.
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # import order
+  "N",        # naming
+  "UP",       # not writing for interpreters older than the floor
+  "B",        # bugbear
+  "A",        # shadowed builtins
+  "C4",       # comprehensions
+  "SIM",      # simplifiable constructs
+  "PL",       # pylint
+  "RUF",
+]
+
+# The SDK's runtime floor stays 3.9 (sdk/python/pyproject.toml); 3.10 here is the oldest
+# semantics this mypy can still check against, and every annotation is deferred anyway.
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["sdk", "scripts"]
+
+# The only third-party import anywhere in this repository's Python, and it ships no stubs.
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
+# The measurement scripts are experiments: linted, type-checked where annotated, but not required
+# to annotate a throwaway loop. The SDK and the conformance checker get no such licence.
+[[tool.mypy.overrides]]
+module = "draw-abi"
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "exponential-table"
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+check_untyped_defs = true

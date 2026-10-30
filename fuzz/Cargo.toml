@@ -1,0 +1,58 @@
+# Its own workspace: the fuzzing harness needs nightly and a dependency the tool itself does not
+# carry, and neither belongs in the build every contributor runs.
+[package]
+name = "bohr-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bohr-backend = { path = "../crates/bohr-backend" }
+bohr-backend-null = { path = "../crates/bohr-backend-null" }
+bohr-kernel = { path = "../crates/bohr-kernel" }
+bohr-tape = { path = "../crates/bohr-tape" }
+bohr-types = { path = "../crates/bohr-types" }
+bohr-world = { path = "../crates/bohr-world" }
+bohr-trace = { path = "../crates/bohr-trace" }
+bohr-sdk-proto = { path = "../crates/bohr-sdk-proto" }
+
+[[bin]]
+name = "fuzz_bundle"
+path = "fuzz_targets/fuzz_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tape"
+path = "fuzz_targets/fuzz_tape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sdk_record"
+path = "fuzz_targets/fuzz_sdk_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_event_log"
+path = "fuzz_targets/fuzz_event_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_syscall_args"
+path = "fuzz_targets/fuzz_syscall_args.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

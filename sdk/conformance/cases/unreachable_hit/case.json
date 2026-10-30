@@ -1,0 +1,10 @@
+{
+  "calls": [
+    {
+      "fn": "unreachable",
+      "args": [
+        "the impossible branch"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "calls": [
+    {
+      "fn": "always",
+      "args": [
+        false,
+        "a leader was elected 🎯 and the log stayed monotonic ✓"
+      ]
+    }
+  ]
+}

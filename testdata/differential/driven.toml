@@ -1,0 +1,30 @@
+# The value under comparison is written by a node other than the one being compared.
+#
+# This is the shape of every real execution client: the client answers, and the caller that drove it
+# writes down what it answered. So the projection is on the caller's node, and the implementations
+# swapped in and out are on the client's.
+#
+# **What it proves is that the right node is read.** Both nodes here write `/answer`, and the two
+# implementations at node zero write different ones deliberately. A projection that read node zero
+# would report a disagreement — a true one, about the wrong question. The comparison this scenario
+# asks for is between the two runs of node one, which agree, and it is clean.
+
+[cluster]
+nodes = 2
+programs = [
+  ["testdata/guests/build/answers_from_draw"],
+  ["testdata/guests/build/answers_from_draw"],
+]
+
+[differential]
+projections = [{ label = "answer", source = "file:1:/answer" }]
+
+[[differential.implementation]]
+name = "reference"
+node = 0
+argv = ["testdata/guests/build/answers_from_draw"]
+
+[[differential.implementation]]
+name = "second"
+node = 0
+argv = ["testdata/guests/build/answers_from_draw_wrong"]

@@ -1,0 +1,1 @@
+{"antithesis_assert": {"assert_type": "always", "condition": false, "hit": true, "location": "a location", "message": "a leader was elected 🎯 and the log stayed monotonic ✓", "must_hit": true}, "bohr": {"node": 0, "schema": 1, "seq": 1}}

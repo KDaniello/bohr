@@ -1,0 +1,48 @@
+# The same chain, with its history rewound once and let run again.
+#
+# `scenario.toml` beside this one is the pair's other half: same seed, same client, same blocks, and
+# nothing rewound. A run with a fault and one without is what makes the fault's cost readable — a
+# single run says only that something happened.
+#
+# The rewind goes to the newest block the client was told is final and builds a sibling of the one
+# above it. Nothing final is stepped past, so the run is legal by construction and what the check
+# afterwards measures is the client rather than the caller.
+
+[run]
+horizon_ticks = 2_000_000_000
+ends_with_node = 1
+
+[cluster]
+nodes = 2
+programs = [
+  [
+    "/path/to/op-reth-target/x86_64-unknown-linux-gnu/release/op-reth",
+    "node",
+    "--datadir", "/data",
+    "--chain", "base-sepolia",
+    "--disable-discovery",
+    "--ipcdisable",
+    "--http",
+    "--http.addr", "10.66.0.1",
+    "--authrpc.addr", "10.66.0.1",
+    "--authrpc.jwtsecret", "/jwt.hex",
+    "--db.max-size", "32MB",
+    "--db.growth-step", "4MB",
+    "--db.exclusive", "true",
+  ],
+  ["examples/engine-driver/build/engine-driver", "reorg"],
+]
+
+[cluster.env]
+HOME = "/root"
+
+[state]
+dir = "examples/engine-driver/state"
+
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"

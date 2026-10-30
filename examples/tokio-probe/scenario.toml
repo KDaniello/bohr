@@ -1,0 +1,6 @@
+[cluster]
+nodes = 1
+argv = []
+
+[run]
+horizon_ticks = 2_000_000_000

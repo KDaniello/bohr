@@ -1,0 +1,10 @@
+{
+  "calls": [
+    {
+      "fn": "fault_point",
+      "args": [
+        "before_commit_ack"
+      ]
+    }
+  ]
+}

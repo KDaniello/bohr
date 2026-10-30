@@ -1,0 +1,11 @@
+{
+  "calls": [
+    {
+      "fn": "always",
+      "args": [
+        false,
+        "log is monotonic"
+      ]
+    }
+  ]
+}

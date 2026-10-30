@@ -1,0 +1,154 @@
+/* A report, read top to bottom. One column, printable, and legible in either colour scheme.
+ *
+ * No framework and no build step: this file is included in the page as it is written, so what a
+ * reviewer reads here is what a reader receives. See docs/ARCHITECTURE.md D13. */
+
+:root {
+  --ink: #14171a;
+  --dim: #5b6570;
+  --page: #fdfdfc;
+  --panel: #ffffff;
+  --edge: #dfe3e7;
+  --bad: #b3261e;
+  --bad-wash: #fdecea;
+  --good: #1c6b3f;
+  --accent: #1a4f8a;
+  --shade: #f4f6f8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e6e8ea;
+    --dim: #9aa4ae;
+    --page: #16181a;
+    --panel: #1d2022;
+    --edge: #2e3336;
+    --bad: #ff6b5e;
+    --bad-wash: #3a1b18;
+    --good: #6ed49a;
+    --accent: #79b2ef;
+    --shade: #232729;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0 0 6rem;
+  background: var(--page);
+  color: var(--ink);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+main { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem; }
+
+h1 { font-size: 1.5rem; margin: 2rem 0 0.25rem; }
+h2 { font-size: 1.05rem; margin: 2.5rem 0 0.75rem; letter-spacing: 0.02em; text-transform: uppercase; color: var(--dim); }
+p { margin: 0.5rem 0; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 0.9em; }
+
+/* The strip nobody can skip: a run whose determinism was not guaranteed says so above everything
+ * else, because every number below it is worth less than it looks. */
+.degraded {
+  background: var(--bad);
+  color: #fff;
+  padding: 0.9rem 1.5rem;
+  font-weight: 600;
+}
+.degraded ul { margin: 0.5rem 0 0; padding-left: 1.2rem; font-weight: 400; }
+
+.verdict { font-size: 1.25rem; line-height: 1.45; margin: 1.5rem 0 0.5rem; }
+.verdict .bad { color: var(--bad); font-weight: 700; }
+.verdict .good { color: var(--good); font-weight: 700; }
+
+.repro {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  background: var(--shade);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  margin: 1rem 0;
+}
+.repro code { flex: 1; overflow-x: auto; white-space: nowrap; }
+.repro button {
+  font: inherit;
+  font-size: 0.85em;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.orientation { color: var(--dim); border-left: 3px solid var(--edge); padding-left: 1rem; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+}
+.card.violation { border-color: var(--bad); }
+.card h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+
+dl.facts { display: grid; grid-template-columns: 12rem 1fr; gap: 0.35rem 1rem; margin: 0; }
+dl.facts dt { color: var(--dim); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--edge); vertical-align: top; }
+th { color: var(--dim); font-weight: 600; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; }
+
+.empty { color: var(--dim); font-style: italic; }
+
+/* The timeline. Position is order, not elapsed time — a run spends almost all of its virtual time
+ * inside one sleep, and a linear clock axis draws that as a single stripe. Every event occupies
+ * the same column in every lane, so what lines up vertically happened next to each other. */
+.lanes { display: grid; gap: 0.25rem; margin-top: 0.5rem; }
+.lane { display: grid; grid-auto-flow: column; grid-auto-columns: 14px; align-items: center; min-height: 26px; }
+.lane .name { position: sticky; left: 0; color: var(--dim); font-size: 0.75rem; padding-right: 0.5rem; background: var(--page); }
+
+.ev {
+  width: 10px; height: 10px; padding: 0; margin: 0 2px;
+  border: 0; border-radius: 2px; cursor: pointer;
+  background: var(--dim);
+}
+.ev.k-syscall { background: #8a93a0; }
+.ev.k-fault { background: var(--bad); clip-path: polygon(50% 0, 100% 100%, 0 100%); border-radius: 0; }
+.ev.k-assertion { background: var(--accent); transform: rotate(45deg); }
+.ev.k-packet { background: var(--good); border-radius: 50%; }
+.ev.k-schedule { width: 4px; background: var(--edge); }
+.ev.k-node { background: var(--bad); border-radius: 50%; }
+.ev[data-violation="1"] { outline: 2px solid var(--bad); outline-offset: 2px; }
+.ev:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.gap { color: var(--dim); font-size: 0.7rem; padding: 0 0.4rem; white-space: nowrap; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 1rem; margin: 0.75rem 0; font-size: 0.85rem; color: var(--dim); }
+.controls label { display: inline-flex; align-items: center; gap: 0.3rem; }
+
+#detail { min-height: 4rem; }
+#detail .none { color: var(--dim); }
+
+pre.config {
+  background: var(--shade);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 0.8rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+}
+
+footer { color: var(--dim); font-size: 0.85rem; margin-top: 3rem; border-top: 1px solid var(--edge); padding-top: 1rem; }
+
+@media print {
+  .controls, .repro button { display: none; }
+  body { background: #fff; color: #000; }
+}

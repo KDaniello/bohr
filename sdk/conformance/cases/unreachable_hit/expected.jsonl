@@ -1,0 +1,1 @@
+{"antithesis_assert": {"assert_type": "unreachable", "condition": false, "hit": true, "location": "a location", "message": "the impossible branch", "must_hit": false}, "bohr": {"node": 0, "schema": 1, "seq": 1}}

@@ -1,0 +1,47 @@
+# The same store and the same client, on a disk that fails the way real disks fail.
+#
+# `hunt.toml` beside this one takes the store away at a drawn moment and gives it back. This one
+# leaves it running and breaks the medium under it: a sync that reports failure, a write that
+# reports the disk full, and a sync that stalls long enough for a crash to interrupt it and tear
+# what it was appending.
+#
+# **`fsync` reporting `EIO` is the interesting one.** Linux reports a failed sync once and drops
+# the dirty pages, so the data is gone and a second `fsync` on the same descriptor reports success
+# having written nothing. A store that treats the first failure as retryable acknowledges data it
+# no longer has. That is the class `fsyncgate` named, and it is why the probability here is high
+# enough to be reached rather than realistic.
+#
+# What is under test is unchanged: a write the store acknowledged is a write the store still has.
+# A commit that returned an error was never acknowledged and is never asked about.
+
+[run]
+horizon_ticks = 10_000_000_000
+
+[cluster]
+nodes = 2
+argv = ["examples/redb-hunt/build/redb-hunt", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 50_000
+latency_jitter_ticks = 20_000
+
+[disk]
+sync_semantics = "strict"
+# Long enough that a drawn crash has somewhere to land inside a sync, which is the only way a
+# write is torn: what tears is what the crash interrupted the disk appending.
+stall_probability = "1/8"
+stall_mean_ticks = 4_000_000
+# Low enough that most commits still succeed. A disk that fails one call in forty leaves almost
+# nothing acknowledged, and a hunt with no promises to hold anyone to is a hunt that runs without
+# asking anything — what `fsyncgate` is about is one failure at a bad moment, not a broken medium.
+eio_probability = "1/400"
+enospc_probability = "1/600"
+
+[durability]
+ack = "send_while_dirty"
+
+[faults]
+kill_probability = "1/300"
+targeting = "guided"
+restart_after_ticks = 20_000_000

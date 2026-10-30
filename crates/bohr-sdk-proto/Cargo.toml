@@ -1,0 +1,18 @@
+[package]
+name = "bohr-sdk-proto"
+description = "The SDK record format, shared by the supervisor and every SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# No dependencies, by rule: this crate is linked into a customer's process through the Rust SDK,
+# and a library in that position is a version conflict waiting for them.
+# See docs/ARCHITECTURE.md 9, rule S3.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "bohr-backend-null"
+description = "An in-process backend executing a scripted guest."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-backend.workspace = true
+bohr-types.workspace = true
+
+[features]
+# Coverage gathered from something other than the guest's own execution. The mutation harness
+# enables it alone and requires the determinism suite to go red.
+chaos-coverage-ambient = []
+
+[lints]
+workspace = true

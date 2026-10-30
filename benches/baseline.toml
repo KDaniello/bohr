@@ -1,0 +1,1221 @@
+# Slowdown versus native, as measured by scripts/bench-slowdown.sh.
+#
+# `slowdown` is what the guest cost when the number was last taken, and `ceiling` is what the job
+# refuses to go past. The gap between them is deliberate: the ratio moves with the machine, and a
+# threshold tight enough to catch machine noise catches nothing else.
+#
+# `per_call_us` is the number to watch. A ratio divides by a native time that is mostly process
+# startup and swings by a quarter between runs on one machine; the cost of a single intercepted
+# syscall does not, and it is what changes when the interception path changes. One intercepted
+# syscall is three context switches and about ten supervisor syscalls, plus one recorded event.
+#
+# The two full-stop guests are startup-dominated and their ratios say little. `cat` compares
+# against a native run that reads the host's own `/dev/urandom`, which is a different amount of
+# work from drawing the same bytes off a tape, so its ratio is a smoke test rather than a measure.
+
+[measured]
+host = "x86_64, ubuntu:24.04 container on Linux 6.18, Core i5-12600KF, guest pinned to one core"
+build = "release"
+
+[guests.syscall_storm]
+args = ""
+slowdown = 500.0
+ceiling = 1000.0
+per_call_us = 57.0
+per_call_us_ceiling = 120.0
+
+# The milestone workload: an embedded database on its own test suite, 37 tests over 20 000
+# intercepted calls. Unlike the guests below it spends its time working rather than starting up, so
+# its ratio is the one the goal is stated against.
+# The one row here nothing in the tree produces. It was measured out of band, against an embedded
+# database on its own test suite, and it is the row the ≤5× claim rests on — so it is marked rather
+# than left to look like the others.
+[guests.redb]
+measured_out_of_band = true
+slowdown = 3.6
+ceiling = 5.0
+
+[guests.cat]
+args = "/dev/urandom"
+slowdown = 1.6
+ceiling = 4.0
+
+[guests.clock_and_random]
+args = ""
+slowdown = 1.5
+ceiling = 4.0
+
+# How often each scheduling policy reaches the seeded defects, out of 60 seeds, as measured by
+# scripts/policy-comparison.sh. PCT is the default because of the guarantee it carries, and this is
+# where that either shows or does not.
+#
+# `race_counter` is depth 1 and reachable from almost any ordering, so it separates nothing.
+# `race_init` needs two orderings to fall together, and there the difference appears. A corpus with
+# depth-3 defects needs a virtual network and disk, so the comparison gets sharper at M2.
+
+[policies.race_counter]
+pct = 60
+random = 60
+
+[policies.race_init]
+pct = 60
+random = 47
+
+# The cluster gate, measured on the same host as the numbers above. A five-node `raft-rs` cluster
+# driven through a one-directional partition and back, one seed, a hundred repetitions, one digest.
+#
+# `events`, `syscalls` and `draws` are recorded because they are what changes when the model gains
+# a behaviour: a gate that only says "identical" cannot tell a richer run from a shorter one.
+[cluster.split_brain]
+nodes = 5
+repeats = 100
+events = 16016
+syscalls = 6448
+draws = 7129
+
+# The same scenario with its partition removed. The gap is the evidence the cut actually fired:
+# a run that lost the schedule silently would sit at the lower numbers and still be identical.
+[cluster.split_brain_healthy]
+events = 15448
+syscalls = 6244
+draws = 6425
+
+# What the cluster milestone was measured to do, on the host named above and on a Windows
+# workstation with its Linux subsystem. Recorded rather than remembered: the next milestone's
+# claim is "no worse than this", and a claim with no number behind it cannot be checked.
+#
+# `cross_machine` is the one that needs two machines to mean anything: bundles written by a
+# Windows build, replayed by a Linux one, digest for digest.
+[m2.gates]
+cluster_repeats_identical = 100
+cross_machine_bundles = 9
+cross_machine_replayed = 9
+sdk_conformance_checks = 16
+mutation_injections = 9
+mutation_injections_caught = 9
+bdd_scenarios = 10
+fuzz_targets = 5
+
+# What each fuzz target reached in five minutes on the host above, in executions. The numbers vary
+# wildly by target because a bundle parse is thousands of times more work than a tape draw; what
+# matters is that none of them found a way to bring a reader down.
+[m2.fuzz_executions]
+bundle = 7_611_375
+tape = 108_893_335
+sdk_record = 1_333_835
+event_log = 6_054_026
+syscall_args = 1_003_615
+
+# Guided against uniform fault targeting, on `kv_fsync`: a depth-2 defect where a crash must land
+# between an acknowledgement and the `fsync` that would have made it durable. Sixty seeds each,
+# counting how many expose the defect.
+#
+# The specification claimed guided finds an order of magnitude more. It does not: it loses at every
+# probability, because its candidate moments are a subset of uniform's and on this target they are
+# most of the run. Recorded as measured, and `docs/API.md` §5.4 withdraws the claim rather than
+# softening it. The mechanism stays; the heuristic behind it is what needs the work.
+[m3.targeting.uniform]
+"1/400" = 13
+"1/100" = 33
+"1/40" = 52
+"1/10" = 60
+
+[m3.targeting.guided]
+"1/400" = 6
+"1/100" = 21
+"1/40" = 33
+"1/10" = 56
+
+[m3.targeting]
+seeds = 60
+target = "kv_fsync"
+
+# Does the search reach the seeded consensus defect? `raft_toy` is depth 3: the leader acknowledges
+# a write on its own append, dies before the entry replicates, and the term that follows elects a
+# node without it. Eight master seeds, the corpus-wide fault probability, `bohr explore`.
+#
+# `without_faults` is the measurement that keeps the rest meaningful. A defect an ordinary
+# interleaving could reach would make this a gate on the scheduler rather than on the search.
+[m3.reach]
+target = "raft_toy"
+depth = 3
+master_seeds = 8
+without_faults_reached = 0
+without_faults_runs = 256
+
+# What this measurement does not cover, stated because the number would otherwise be read as
+# covering it. `raft_toy` is not built against the coverage runtime, so every campaign here ran
+# with an empty coverage map: the corpus stayed at zero entries, nothing was ever novel, and what
+# reached the defect was the fault schedule and tape mutation with no coverage feedback at all.
+# The gate is met by less machinery than the milestone built, which is worth knowing in both
+# directions — the search is stronger than this measurement shows, and the coverage half of it is
+# still unmeasured against a real target.
+[m3.reach.unmeasured]
+coverage_edges = 0
+corpus_entries = 0
+reason = "the guest is not built with the coverage runtime"
+
+# At a 32-run budget, reproduced twice with the same four seeds. Not a majority, so the gate is not
+# met at this budget — and 32 runs is a twentieth of the budget the corpus records for this defect.
+[m3.reach.budget_32]
+reached = 4
+of = 8
+
+# At the recorded budget, every master seed reaches it. Seconds and findings are per campaign, in
+# master-seed order; the eighth took twice as long as the rest for a reason that is about the host
+# rather than the search and is recorded under [m3.kernel_ceiling] below.
+#
+# An earlier attempt at this number recorded 3 of 8 and blamed the machine for running out of
+# memory. That was wrong twice over: the failure was not memory exhaustion by the tool, and four
+# campaigns that never started were counted as not reaching. Both are corrected here.
+[m3.reach.budget_256]
+reached = 8
+of = 8
+seconds = [161, 164, 170, 132, 164, 161, 165, 322]
+findings = [5, 3, 3, 4, 5, 5, 6, 1]
+
+# What a campaign used to cost the kernel, and what removing one namespace did to it. Kept because
+# the ceiling was real and reached — consecutive campaigns slowed down and then could not place a
+# guest at all — and because a number that vanished is worth as much as one that appeared.
+#
+# Each guest had its own network namespace, held to be what stopped an untrapped network call from
+# reaching the real network. It was not: the filter traces by default and admits only calls that
+# shape the guest's own address space, signals or exec, so a network call cannot reach the host
+# whether or not there is an interface to try. The namespace guarded nothing and cost almost
+# everything — 180 KB of unreclaimable kernel slab per guest against 4 KB for the other five
+# together, freed on a lagging schedule, at 768 guests a campaign.
+#
+# `after_campaigns` is the unreclaimable slab after each of four consecutive campaigns on a host
+# that started at 59 MB, and `still_held_after_12_min_mb` is what it had returned by then.
+[m3.kernel_ceiling]
+host = "x86_64, Ubuntu 24.04 under the Windows subsystem, 8 GB cap, Core i5-12600KF"
+guests_per_campaign = 768
+network_namespace_kb = 180
+other_five_namespaces_kb = 4
+after_campaigns = [1201, 2346, 3296, 2707]
+still_held_after_12_min_mb = 1847
+per_campaign_mb_after_removal = 0
+
+# Reduction. A scripted two-node exchange that promises every ping is answered, run until a
+# scheduled kill stops the answers: forty-nine thousand events, of which the reduction leaves
+# eighteen. Measured against the null backend, so the numbers are facts about the reduction rather
+# than about the host — the same run on any machine produces them.
+#
+# What made the difference is which of the three scheduled things mattered and when it happened.
+# The grey window was removed outright; the partition and the kill were brought from tick nine
+# billion to tick one, which is what turns four thousand six hundred answered rounds into one
+# unanswered one. The budget was never the constraint: twenty replays of two thousand.
+[m4.reduction]
+target = "ping_pong"
+events_before = 49477
+events_after = 18
+draws_before = 58468
+draws_after = 17
+replays_spent = 20
+replays_budget = 2000
+reproduced_out_of = 100
+
+# What two real open-source programs asked for, measured with `bohr survey` rather than assumed.
+# The milestone's scope list named `io_uring` as the thing its targets demand. Neither of these
+# asks for one, and the wall they hit is somewhere else entirely.
+#
+# `redb` is an embedded database and runs to completion today: it needs nothing this build does not
+# have. `tokio` is the asynchronous runtime every real network client is built on — including the
+# ones this milestone exists for — and it dies at `epoll_create1`, the reactor's first call, long
+# before anything could reach a ring.
+#
+# Both numbers are lower bounds, which is what a survey can be and no more: a call answered ENOSYS
+# sends the guest down a path it would not have taken, and tokio's is to give up, so the twelve
+# events below are where it stopped rather than what it needs. What the measurement settles is the
+# ordering — `epoll` is the prerequisite, and `io_uring` is not what stands in the way.
+[m4_1.surveyed.redb]
+version = "2.6.3"
+static_linked = true
+runs_today = true
+events = 58
+syscalls = 57
+draws = 7
+unmodelled = []
+
+# Superseded by `[m5.tokio]` below: the call that stopped it is modelled now.
+[m4_1.surveyed.tokio]
+version = "1.53.1"
+static_linked = true
+runs_today = false
+events_before_giving_up = 12
+unmodelled = [[291, "epoll_create1", 1]]
+
+# The boundary oracles, measured as a pair. "Caught on a seeded defect" is half a claim on its own,
+# because an oracle that fired on every run would satisfy it — so the number that means something
+# is the twin: the same scenario, the same seeds, and a correct program it must stay silent about.
+#
+# `kv_ack_quiet` is `kv_fsync` with the self-check removed. Its neighbour exits 1 when it notices
+# it lost an acknowledged write, so the crash oracle finds it and finding it proves nothing; this
+# one serves what it has and exits 0, which is what a real client does. Nothing in the scenario
+# knows what the store promises: `[durability]` says only that a node which answered somebody with
+# unsynced writes behind it, and came back without them, is a finding.
+#
+# Measured under the real interceptor, one run per seed, scheduled kill and restart.
+[m4_1.durability]
+defect = "kv_ack_quiet"
+twin = "kv_ack_quiet_correct"
+seeds = 60
+found_on_defect = 60
+found_on_twin = 0
+lost_bytes_at_seed_1 = 64
+
+# Reorg. A two-node cluster appending to a log and syncing each record, with history rewound two
+# entries at ten milliseconds. Measured against the null backend, so the numbers are facts about
+# the fault rather than about the host.
+#
+# The pair is what the gate asks for — the same scenario with the fault and without it — and it is
+# produced by a test rather than by somebody running the tool twice and writing down what they saw.
+# The rewind costs *more* events, not fewer: both nodes die and come back, and everything they did
+# after the fork point they do again.
+[m4_1.reorg]
+target = "two-node log"
+back = 2
+events_without = 491
+events_with = 657
+draws_without = 488
+draws_with = 648
+
+# What a real client costs, measured rather than estimated. `redb` 2.6.3 — an embedded database
+# nobody wrote for this tool — doing forty write batches with a commit and a read-back each, which
+# is enough work that what the ratio measures is the work rather than `execve`.
+#
+# The number to compare against is the per-call figure above and not this ratio: 347 intercepted
+# calls against four milliseconds of native work is a heavier interception share than a database
+# test suite has, which is why `[guests.redb]` sits at 3.6× and this sits at 6.6×. Both are true
+# about different workloads, and neither is the other's contradiction.
+#
+# `campaign_runs_per_hour` is what the prepared-state gate asks for, derived from the measured run
+# cost at one worker; a campaign at `-j N` multiplies it.
+[m4_1.slowdown]
+target = "redb 2.6.3"
+host = "x86_64, Ubuntu 24.04 under the Windows subsystem, Core i5-12600KF"
+events = 348
+syscalls = 347
+native_seconds = 0.00417
+traced_seconds = 0.02747
+slowdown = 6.6
+campaign_runs_per_hour = 131_000
+
+# The first hunt. `redb` 2.6.3 behind a datagram service, with a client that holds it to what it
+# answered: a write the store acknowledged is a write the store still has. Nothing about `redb` is
+# instrumented — the client is ours, the store is not, and the scenario knows only that a node dies
+# at a drawn moment and comes back.
+#
+# **`verified` is the number that makes `findings` mean anything.** A campaign that reports clean
+# runs without saying how many acknowledgements it asked back is a campaign that cannot tell a
+# store which kept its promises from one that was never asked. The same goes for `crashes`: a run
+# whose crash never fired asked a weaker question, and `crashed_runs` says how many did.
+#
+# `acknowledged` exceeds `verified` where the store was dead or unreachable when asked. Those are
+# indeterminate and are never used to accuse, which is the distinction Jepsen draws between an
+# operation that failed and one whose outcome is unknown.
+#
+# `refused` counts commits the store reported as failed and the client then asked about anyway: a
+# refusal that is present afterwards is a store that said no and did yes. `undropped` is the same
+# question for a removal, and `prepared_lost` is the one only a prepared database can ask: a record
+# durable before the run began, which nothing the run did was about.
+#
+# The client holds the store to what it observed and to nothing else. A record it was never
+# acknowledged is never asked for, a question the store was dead for is indeterminate rather than a
+# loss, and prepared records are sampled at the start so a scenario that prepared none demands none.
+
+[m5.redb.crash]
+target = "redb 2.6.3"
+scenario = "examples/redb-hunt/hunt.toml"
+world_model = "distributed@2"
+runs = 200
+findings = 0
+acknowledged = 12_594
+verified = 12_594
+refused = 0
+resurrected = 0
+undropped = 0
+prepared_lost = 0
+crashes = 330
+crashed_runs = 158
+torn_writes = 71
+
+[m5.redb.hostile_disk]
+target = "redb 2.6.3"
+scenario = "examples/redb-hunt/hunt-disk.toml"
+world_model = "distributed@2"
+runs = 200
+findings = 0
+acknowledged = 9_503
+verified = 9_135
+refused = 2_925
+resurrected = 0
+undropped = 0
+prepared_lost = 0
+crashes = 287
+crashed_runs = 148
+torn_writes = 68
+
+# The same hunt from a database of two thousand records rather than an empty one. It crashes more
+# often and tears more often for the same fault odds, because there is more on the disk to be
+# dirty at any moment — which is the reason to start from one.
+[m5.redb.prepared]
+target = "redb 2.6.3"
+scenario = "examples/redb-hunt/hunt-prepared.toml"
+world_model = "distributed@2"
+prepared_records = 2_000
+runs = 200
+findings = 0
+acknowledged = 12_534
+verified = 12_534
+refused = 0
+resurrected = 0
+undropped = 0
+prepared_lost = 0
+crashes = 403
+crashed_runs = 171
+torn_writes = 90
+
+# The runtime every real network client in Rust is built on, and the one thing measured to stop
+# this engine dead. It runs now: a current-thread runtime, a timer, a bound socket, a datagram sent
+# to itself and received back.
+#
+# What it needed was not one call but five and a half — the readiness family, an event counter to
+# wake the poller with, and the descriptor questions asked of anything just opened. Each was found
+# by running the probe again rather than by reading a list: `epoll_create1` first, then `fcntl` on
+# a descriptor the file model had never heard of, then `F_DUPFD_CLOEXEC`, which is `mio` giving the
+# thread that wakes the poller a handle of its own.
+[m5.tokio]
+version = "1.53.1"
+runs_today = true
+events = 3_645
+syscalls = 2_032
+draws = 11
+repeats_agreeing = 100
+modelled_for_it = [
+  [291, "epoll_create1"],
+  [233, "epoll_ctl"],
+  [232, "epoll_wait"],
+  [281, "epoll_pwait"],
+  [290, "eventfd2"],
+  [72, "fcntl on a descriptor this model owns, including F_DUPFD_CLOEXEC"],
+]
+
+# Streams, and what they open. Everything an OP Stack node is made of talks over one — the engine
+# API between the consensus client and the execution client, the JSON-RPC a user calls, the
+# peer-to-peer transport, the batcher's calls to the settlement layer — and a model answering
+# datagrams and nothing else reached none of them.
+#
+# The probe is both ends of one conversation in one process, which is what an engine API is in
+# miniature: bind, listen, connect, accept, a request across and an answer back. Found the same way
+# the readiness family was, by running it again after each step rather than by reading a list —
+# `listen` first, and then `sendto` with a null address, which is what `send` on a connected stream
+# compiles to and what a model that always read the address died on.
+[m5.tcp]
+runtime = "tokio 1.53.1"
+runs_today = true
+events = 62
+syscalls = 51
+draws = 7
+repeats_agreeing = 100
+modelled_for_it = [
+  [50, "listen"],
+  [43, "accept"],
+  [288, "accept4"],
+  [52, "getpeername"],
+  [42, "connect, which was answered yes and remembered nowhere"],
+  [44, "sendto with no address, which is send on a connected stream"],
+]
+
+# The store an OP Stack execution client keeps its chain in, through the binding that client uses.
+# Measured, not run: it stops before it has opened anything.
+#
+# What stopped it is not the mapping everyone expects. `newfstatat` has a row in the table and is
+# deliberately answered "not implemented" so callers take an older kernel's path — and this one has
+# no older path to take. Behind that wall stand three more, none of them reached and all of them
+# visible in the log: the store wants a *directory* holding a data file and a lock file, and this
+# world has no directories at all; it reaches its pages through a mapping, and `mmap` on a file is
+# admitted straight to the host; and it asks the filesystem about itself, which nothing here models.
+#
+# So the storage half of an execution client is a milestone rather than a syscall. Recorded here as
+# measured so the next person costs it by reading rather than by finding out.
+[m5.mdbx]
+binding = "signet-libmdbx 0.8.3, forked from reth-libmdbx"
+runs_today = true
+events = 208
+syscalls = 154
+draws = 23
+repeats_agreeing = 50
+# Sixteen keys written in one transaction, committed, and read back through another. The store an
+# OP Stack execution client keeps its chain in, running under the engine and reproducing.
+#
+# Four walls stood in front of it and each was found by running the probe again rather than by
+# reading a list. The mapping is the one everybody expects and was the least of them: what decided
+# its design was that the first mapping a store makes is of its *lock* file, whose contents die
+# with the process, and not of the data file whose contents a crash oracle is about.
+walls_taken_down = [
+  [262, "newfstatat", "and with it directories, which this world had none of"],
+  [137, "statfs", "one device, ext4's identity, free space derived from what is held"],
+  [9, "mmap", "of a file: the call is replaced and the world fills what comes back"],
+  [26, "msync", "a durability point, drawn upon exactly as a sync is"],
+  [202, "futex", "the three operations of a lock whose word names its holder"],
+  [296, "pwritev", "which is how it writes, and so what a crash has to be able to tear"],
+]
+exclusive = "the probe opens the store exclusively, which is what one process per node is"
+
+# The first campaign against the store an OP Stack execution client keeps its chain in. Drawn
+# crashes under guided targeting, and a client that holds the store to what it answered.
+#
+# **The store kept every promise it made.** Nine thousand four hundred and eighty-one
+# acknowledgements asked for back and nine thousand four hundred and eighty-one still there, across
+# three hundred and ten crashes — forty-four of which interrupted a sync and tore what it was
+# appending. Nothing it removed came back, and nothing it refused was there anyway.
+#
+# **The forty-one verdicts are the world's own durability watcher, and the client contradicts every
+# one of them.** That watcher's approximation is that an acknowledgement is an outbound datagram
+# sent while the disk is dirty (docs/API.md 5.6). This store answers reads over the same socket it
+# answers writes on, and its first replies are to reads — sent while its file already holds the
+# layout it was created with and nothing has been committed yet. A crash there takes the file back
+# to nothing and the watcher reports a promise broken, when all that was said is "I do not have
+# that record".
+#
+# Recorded rather than tuned away: what it measures is the limit of judging a request-and-response
+# service by its packets, and the number to trust in this campaign is the client's.
+[m5.mdbx.campaign]
+seeds = 150
+scenario = "examples/mdbx-hunt/hunt.toml"
+acknowledged = 9_481
+verified = 9_481
+lost = 0
+resurrected = 0
+undropped = 0
+prepared_lost = 0
+crashes = 310
+crashed_runs = 132
+tears = 44
+watcher_verdicts = 41
+watcher_verdicts_the_client_confirmed = 0
+
+# The same store with the medium broken under it rather than taken away: a sync that reports
+# failure, a write that reports the disk full, and a stall long enough for a crash to land inside a
+# sync and tear what it was appending.
+#
+# **`verified` is well below `acknowledged` here and that is not a loss.** The gap is questions the
+# store never answered, because it was dead or unreachable when they were asked. An unanswered
+# question is indeterminate and is never used to accuse — it is counted so that a campaign cannot
+# quietly turn silence into either verdict.
+[m5.mdbx.campaign_hostile_disk]
+seeds = 100
+scenario = "examples/mdbx-hunt/hunt-disk.toml"
+acknowledged = 4_980
+verified = 3_795
+unanswered = 1_185
+lost = 0
+resurrected = 0
+undropped = 0
+crashes = 166
+crashed_runs = 80
+tears = 15
+watcher_verdicts = 0
+
+# The same hunt from a database that already holds two thousand records. An empty store never
+# reaches the code a full one lives in: a file grown past its first pages, pages freed and reused, a
+# meta page already rewritten more than once.
+#
+# `prepared_seen` is the denominator of the last claim and is why the claim can be read at all: a
+# run that found no prepared record reports none lost, which is the line a run that found them all
+# and kept them prints. Thirty-two sampled per run, and every one of them there at the end.
+[m5.mdbx.campaign_prepared]
+seeds = 100
+scenario = "examples/mdbx-hunt/hunt-prepared.toml"
+acknowledged = 6_323
+verified = 6_323
+lost = 0
+resurrected = 0
+undropped = 0
+prepared_seen_per_run = 32
+prepared_lost = 0
+crashes = 102
+crashed_runs = 65
+tears = 21
+watcher_verdicts = 0
+
+# What the sharpening cost, measured on the seeded defect the watcher exists for rather than argued
+# about. `kv_ack_quiet` is a store that answers before it syncs; the same twenty seeds catch it the
+# same number of times with the condition and without. Forty-one false verdicts gone, no true one.
+[m5.durability_watcher]
+condition = "the node wrote something since it last asked a socket for work"
+seeded_defect = "kv_ack_quiet"
+seeds = 20
+caught_before = 12
+caught_after = 12
+false_verdicts_before = 41
+false_verdicts_after = 0
+
+# op-reth 1.1.5, the execution client an OP Stack chain runs, built statically from
+# ethereum-optimism/op-reth and pointed at this engine. Not hunted yet — measured.
+#
+# It prints its version, and it starts its node. Three hundred and thirty-three thousand events and
+# a hundred and thirty-three thousand syscalls in, it has read its configuration, made its data
+# directory, opened its log directory and begun standing up a runtime. A survey of that whole path
+# names two walls, and both are calls this build declines on purpose so the caller takes a path it
+# already keeps: statx falls back to newfstatat, which is modelled, and prctl to nothing at all.
+#
+# What stops it is one descriptor question answered EBADF while the runtime is being built, three
+# calls after the poller and its wake counter were handed out. That is a defect to be found rather
+# than a capability to be added, which is what separates this row from the ones above it.
+#
+# HOME is recorded because without it the client will not start at all: it resolves its default data
+# directory from the environment, and a guest with an empty one panics before parsing its arguments.
+[m5.op_reth]
+version = "1.1.5"
+commit = "f54434b7bc73d1839a2eb3f5b26ccbd2c93f3d49"
+built = "static, rustc 1.85, features jemalloc and optimism"
+bytes = 103_292_800
+version_command_runs = true
+node_command_events = 333_485
+node_command_syscalls = 133_457
+surveyed_walls = [
+  [332, "statx", "answered ENOSYS; the caller falls back to newfstatat, which is modelled"],
+  [157, "prctl", "answered ENOSYS; naming a thread is not needed"],
+]
+needs_env = ["HOME"]
+
+# **The node runs.** It opens its database, creates its tables, takes its lock and initialises its
+# transaction pool, and then idles — polling for work no peer and no consensus client is there to
+# give it. Ten runs of one seed produce one digest.
+#
+#   INFO Starting reth version="1.1.5 (f54434b)"
+#   INFO Opening database path="/data/db"
+#   INFO Transaction pool initialized
+#
+# Four walls came down between the runtime and here, each found by running it again. Copying a
+# descriptor, which nothing could do — a socket and a counter answered EBADF, and an open file
+# answered zero, which is not a refusal but standard input. Listing a directory, which answered
+# empty, so the library that finds a process by reading /proc found none, including the one asking.
+# What the kernel says about a process, which is generated now. And what a task has spent, which
+# here is nothing.
+#
+# `db.growth_step` is the one thing the client is told rather than left to choose, and it is the
+# honest limit rather than a convenience: its default reserves four gibibytes at a stroke, and every
+# file in this world is bytes in the supervisor's memory. A sparse file model would lift it and is
+# the real answer; until then the reservation is named.
+runs_today = true
+node_command = "node --datadir /data --chain base-sepolia --disable-discovery --http"
+db_geometry = "max-size 32MB, growth-step 4MB, exclusive"
+reached = "the whole of its startup, under uniform scheduling"
+# The whole of it, in order:
+#
+#   INFO P2P networking initialized  enode=enode://2fdce0e0…@10.66.0.1:30303
+#   INFO StaticFileProducer initialized
+#   INFO Pruner initialized
+#   INFO Creating JWT auth secret file  path="/data/jwt.hex"
+#   INFO Consensus engine initialized
+#   INFO Engine API handler initialized
+#   INFO RPC HTTP server started  url=10.66.0.1:8545
+#   INFO RPC auth server started  url=10.66.0.1:8551
+#   INFO Starting consensus engine
+#
+# **The engine API is listening**, which is the door a consensus client drives an execution client
+# through, and the next thing to build is something to knock on it.
+#
+# What it took past the store was one address. A server binds the wildcard because it does not want
+# to know which of its addresses callers will use; a node here has exactly one, so the question does
+# not arise — but refusing the wildcard turned "listen anywhere" into EINVAL and stopped the network
+# builder dead. `--ipcdisable` is passed because the endpoint it wants is a Unix socket, which is
+# not modelled and is named rather than worked around.
+listens_on = ["10.66.0.1:8551 engine API", "10.66.0.1:8545 JSON-RPC", "10.66.0.1:30303 peers"]
+extra_flags = ["--ipcdisable", "--disable-discovery"]
+
+# **It came up under uniform scheduling only, and that is no longer true.** Under the default it
+# used to stop at its transaction pool four million steps in, because a thread that yielded once
+# during startup was demoted below the priced band and nothing could promote it again. A yield says
+# "let somebody else go now" and is taken to mean that and no more, so the demotion is gone; the
+# numbers below are the ones taken before it, under uniform choice, and `[m5.engine_api]` carries
+# the pair taken after.
+scheduler = "random"
+events = 600_000
+syscalls = 292_885
+draws = 360_977
+repeats_agreeing = 5
+# Where an idle node spends itself, from a run capped at three million events: it asks the time and
+# it waits for something to happen. Recorded because it is the shape of a node with nothing to do,
+# and the next thing to do about this target is to give it something.
+idle_spend = [
+  [228, "clock_gettime", 1_199_348],
+  [232, "epoll_wait", 532_906],
+  [74, "fsync", 379],
+]
+walls_taken_down = [
+  [2, "open", "the older spelling, without a descriptor to be relative to"],
+  [72, "fcntl", "duplicating a socket, a counter and an open file"],
+  [217, "getdents64", "listing a directory, which is how a process finds itself"],
+  [98, "getrusage", "what a task has spent, which here is nothing"],
+]
+generated_proc = ["/proc/self/stat", "/proc/1/stat", "/proc/uptime"]
+
+# **The execution client answers.** A caller on the second node authenticates the way a consensus
+# client does — a bearer token signed with the secret both nodes were given in the state they start
+# from — and asks the engine three questions. All three come back.
+#
+#   chainId 0x14a34
+#   capabilities 16
+#   forkchoice {"error":{"code":-38002,"message":"Invalid forkchoice state"}}
+#
+# **The refusal is the result, not a failure of one.** Zero is not a block this node has, so the
+# only correct answer is that the state is invalid — and an answer is what was under test. The
+# client's own log agrees from the other side: `Received invalid forkchoice updated message`.
+#
+# One wall stood between the connection and the answer, and it was on the way back rather than the
+# way in. The request arrived whole and the client read it; its reply never left. A server puts its
+# headers and its body on the wire in one vectored call, and `writev` on a socket was not recognised
+# as a network call at all — it fell past the network to a filesystem that had never heard of the
+# descriptor and came back EBADF. The client then closed the connection, so the caller's own read
+# returned nought, which is how the defect first showed: as a stream that ended before it began.
+#
+# `horizon_ticks` is what the numbers below rest on. The exchange is over by 0.22 s of virtual time
+# and the node then polls for work nobody is there to give it, so a horizon of a second is five
+# times what the exchange needs and sixty times cheaper than the one this scenario was written with.
+#
+# `seconds_per_run` is the number every campaign against this target will be sized by, and it is
+# what an idle node costs rather than what the exchange does: nine hundred thousand intercepted
+# calls, almost all of them a clock read or a wait.
+[m5.engine_api]
+host = "x86_64, Ubuntu 24.04 under the Windows subsystem, Core i5-12600KF"
+scenario = "examples/engine-driver/scenario.toml"
+driver = "examples/engine-driver, one command line per node"
+chain_id = "0x14a34, which is Base Sepolia"
+capabilities_offered = 16
+events = 1_667_147
+syscalls = 933_353
+draws = 3_343
+repeats_agreeing = 10
+seconds_per_run = 59
+walls_taken_down = [
+  [20, "writev on a socket, which is how a server answers"],
+]
+
+# **The default policy is the one that finishes, and the pair is what says so.** The same seed and
+# the same horizon under uniform choice reach the client and its capabilities and then run out of
+# time: the third call, the one that reaches the engine itself, never comes back.
+#
+# The draw counts are where the difference lives. Uniform choice pays the tape at every decision
+# with more than one task ready — a million of them here — while PCT draws its change points once
+# per window of a thousand steps and follows a priority order in between. That is the policy's whole
+# design, and against a client this size it is also what makes it the faster of the two.
+#
+# Recorded as a correction: `[m5.op_reth]` above says this target came up under uniform scheduling
+# only, which was true when a yield demoted the task that made it.
+[m5.engine_api.by_policy.pct]
+draws = 3_343
+answered = ["chainId", "capabilities", "forkchoice"]
+
+[m5.engine_api.by_policy.random]
+draws = 1_001_368
+answered = ["chainId", "capabilities"]
+unfinished = "the forkchoice call had not come back when the horizon arrived"
+
+# **The client builds a chain, and the caller builds none of it.** The driver runs the loop an OP
+# consensus client runs in sequencer mode — start building, take back what was built, hand it
+# straight over to be validated, name the hash the client returned as the head — and the payload
+# crosses it as text. Three fields are read out of one, and each of them is a value the client
+# produced.
+#
+# `gasLimit` is in the attributes because the client asked for it by name and not because anybody
+# looked it up: the first attempt was refused with `missing field gasLimit`, which is the whole
+# method here — the client is the authority on what a caller owes it.
+#
+# Every block has the same state root because every block is empty, which is what `noTxPool` and an
+# empty transaction list mean. It is still the value a second implementation of this specification
+# would have to match, and it is written to a file for a projection to read.
+[m5.op_reth.chain]
+scenario = "examples/engine-driver/scenario.toml"
+engine_calls = "forkchoiceUpdatedV1 with attributes, getPayloadV1, newPayloadV1, forkchoiceUpdatedV1"
+version_reason = "the genesis of this chain is stamped before the fork that brought withdrawals"
+blocks_built = 4
+head = "0xedc91d5cb74caeec19e2725a07fcf465afe5539030e238f8d14edb47c66fac10"
+finalized = "0x965f1145eec710595c0bd0451bd2374a0cec5cab53d5ff95a9d2e04420a082fc"
+state_root = "0x907f339ca16b3e45a89a7f4cc29d4430c8d4178d73b370ec9180e04a0dd7fcf3"
+promises_verified = 4
+repeats_agreeing = 5
+
+# History rewound to the newest final block and a different one built from it. The pair the gate
+# asks for is the same scenario with the fault and without: `scenario.toml` builds four blocks and
+# ends on one head, `reorg.toml` builds those four, rewinds and builds two siblings, and ends on
+# another.
+#
+# **The event count is not the measure here, and saying so is the point.** `[m4_1.reorg]` counted
+# events because its guests finished and the run ended when they did. This node never exits, so a
+# run ends at its horizon and the event count follows the horizon rather than the work: 1 665 333
+# events at a second and 3 332 344 at two, whatever the caller did in between. What the rewind
+# changed is the chain, so the chain is what is recorded.
+# The first campaign against an execution client. Drawn crashes under guided targeting, and a
+# caller that holds the client to what it answered: a block it called `VALID` and was then told is
+# final is a block that is still at that height when it comes back.
+#
+# **Every crash landed on a node with something outstanding**, which is what makes the clean part of
+# this readable. Two hundred and seventy crashes and two hundred and seventy markers: no run here
+# died where nothing was at stake, so fifty-two promises kept are fifty-two promises that were
+# actually put at risk.
+#
+# `behind` is counted and is not a failure. An execution client keeps recent blocks in memory and
+# writes them down on a schedule of its own, so a crash costs it the unpersisted ones and the
+# consensus client is expected to drive it forward again. It never happened here, which is a
+# stronger result than the oracle was built to require.
+#
+# `forked` is the fault the oracle exists for — a different block where a final one stood — and
+# there was none.
+[m5.op_reth.campaign]
+scenario = "examples/engine-driver/hunt.toml"
+seeds = 20
+blocks_built = 55
+acknowledged = 52
+verified = 52
+forked = 0
+behind = 0
+unanswered = 0
+crashes = 270
+crashed_runs = 20
+crashes_with_something_at_risk = 270
+tears = 0
+runs_that_left_the_client_unable_to_start = 12
+findings = 4
+
+# **The two numbers above disagree, and the gap is the campaign's own limit rather than a rounding.**
+# Twelve runs left the client printing that it could not open its own database; the panel called
+# four of them findings. The other eight end with the client wedged rather than exited: it prints
+# its error, unwinds into a futex nothing will wake, and the run reaches its horizon with every task
+# blocked. Nothing exited badly, so nothing is judged badly.
+#
+# Counted from the client's own output for exactly that reason. A campaign that trusted the verdict
+# alone would have reported sixteen clean runs, eight of them containing the worst outcome this
+# target has.
+#
+# The half of it that was a rule rather than a hole is fixed: a task that exits non-zero is no
+# longer overwritten by one that exits zero after it, which is what a cluster's caller does every
+# time. `crates/bohr-testkit/tests/cluster_exit.rs` holds that. What is left is a guest that never
+# reaches an exit at all, and a horizon that calls the run complete anyway.
+[m5.op_reth.campaign.unmeasured]
+verdict_missed = 8
+of_runs_the_client_died_in = 12
+reason = "the client wedges instead of exiting, and a horizon completes the run around it"
+
+# The same twenty seeds from a prepared state: the datadir is initialised and durable from the
+# first instruction, so no crash can take it away.
+#
+# **It bought no depth, and that is the measurement.** Fifty-five blocks became fifty-six. The
+# missing file was never what capped this campaign; it capped the *verdicts*, and twelve runs that
+# said nothing now say what they found. What caps the depth is arithmetic: a kill is drawn at one
+# part in 65536 of the eligible calls (`docs/API.md` §5.2 — the finest this ABI expresses), and a
+# startup of this client costs about 133 000 of them. The client is therefore killed, on average,
+# **before it has finished starting**, and a campaign of twenty runs spends itself on startups.
+#
+# So the next thing this target needs is not a longer horizon — the ratio does not improve with one
+# — but drawn faults that are not offered until the node is up.
+[m5.op_reth.campaign.after_workaround]
+state = "examples/engine-driver/state-initialised"
+blocks_built = 56
+acknowledged = 52
+verified = 52
+forked = 0
+behind = 0
+runs_that_left_the_client_unable_to_start = 0
+findings = 3
+expected_calls_per_kill = 65_536
+startup_calls = 133_457
+
+# **The three that remain are this world's, not the client's, and were nearly reported as findings.**
+# The client panics at `crates/storage/db/src/lockfile.rs:123`, which is `.expect("own process")`:
+# it asks the system for its own process and does not get it. On any real machine that cannot fail.
+#
+# It fails here because `/proc` in this world is an ordinary file in the ordinary filesystem —
+# generated on open and then snapshotted, rolled back and torn like anything else on the disk. A
+# crash takes the process's own entry away with it. `/proc` is not on the disk and must not be in
+# the image.
+#
+# Recorded as ours. A campaign that had reported this upstream would have spent the one thing a
+# hunting project cannot buy back.
+# **A finding against this target cannot be reduced, and that is the gate's own requirement.** The
+# bundle from seed 1 records `guest crashed`, carries `task exited 1` in its timeline, and `bohr
+# replay` verifies it to the digit — `ok blake3:ef0b0d08…`, the same digest a fresh run produces.
+# `bohr reduce` re-executes the same tape under the same stored configuration and is answered
+# `Clean`, so it refuses with BOHR-5003: nothing went wrong, so there is nothing to minimise.
+#
+# Same seed, same configuration, same event stream, two verdicts. Whatever the verdict is being read
+# from, it is not the run — and until it is, a finding here can be neither shrunk nor handed to
+# anybody, which is what M5 asks of every one of them.
+#
+# Ruled out on the way, so the next person does not spend the time again: `msync` does collect what
+# a guest wrote through its mappings before the sync commits, so the model is not producing an image
+# the guest never asked for; and `[m5.mdbx.campaign]` put 150 seeds through the same store with no
+# reopen failure at all.
+[m5.op_reth.campaign.after_workaround.cannot_reduce]
+bundle_outcome = "guest crashed"
+replay_verifies = "ok, and to the same digest a fresh run produces"
+reduce_says = "BOHR-5003: replayed clean, so there is nothing to reduce"
+blocks = "the gate's own words: every finding reproducible from a published bundle by a third party"
+fixed_by = "a prefix that covers what the run read, taken from the run's own draw journal"
+
+# **The reduction runs now, and it is the run cost that stops it being useful.** The baseline
+# reproduces — `reducing 1222888 events · guest crashed`, where before it was refused — and the
+# bundle it wrote replays. What it removed is almost nothing: three per cent of the events and a
+# tenth of a per cent of the draws.
+#
+# The spend says why. Twenty replays bought two to verify, two for the configuration — this
+# scenario schedules no faults, so there is nothing there to take away — sixteen for the tape, and
+# **none at all for the events**, which is the pass that does the work. `[m4.reduction]` had a
+# budget of two thousand and spent twenty of them on a scripted fixture.
+#
+# Two thousand replays here is forty-one hours, because a run against this client is seventy-five
+# seconds. So reduction against a real target is bounded by what a run costs and not by the
+# algorithm, and the throughput work that looked like a convenience is what decides whether a
+# finding can be handed to anybody in the shape the milestone asks for.
+[m5.op_reth.reduction]
+bundle = "kept outside the repository"
+events_before = 1_222_888
+events_after = 1_189_704
+draws_before = 495_591
+draws_after = 495_453
+replays_budget = 20
+replays_spent = { verifying = 2, config = 2, events = 0, tape = 16 }
+reduced_bundle_replays = true
+seconds_per_replay = 75
+budget_the_scripted_fixture_had = 2_000
+
+# What ending the run with the node it was for is worth, measured on the scenario that builds a
+# chain and nothing else. The caller finishes at 0.22 s of virtual time and the horizon was a
+# second, so nine tenths of every run was a client polling for work nobody was there to give it.
+#
+# The hunt is untouched by this and that is right: there the caller does not finish, because the
+# client it is asking has died, so the horizon is still what ends the run. The saving is on the runs
+# that go well, which is most of them.
+# **The search can see, and this is the number that says so.** `[m3.reach.unmeasured]` above records
+# coverage as zero and reads as though the machinery had never worked. It had: what it says is that
+# `raft_toy` was not built against the runtime. An example that is — `redb-hunt`, carrying its own
+# `rustflags.txt` and linking `sdk/c/bohr-cov-rt.c` from its `build.rs` — fills the map.
+#
+# The corpus growing with the budget is the part that matters. A map that filled and stopped would
+# mean the guest walks one path whatever it draws, and a corpus that stayed empty would mean nothing
+# was ever novel; neither happened. What it steers is real: two operators earned entries, and the
+# campaign at ninety-six runs reached a crash that the shorter ones did not.
+#
+# Against third-party code rather than a fixture: `redb` is somebody else's database and the eleven
+# megabytes here are mostly it.
+[m3.coverage]
+guest = "examples/redb-hunt, redb 2.6.3, instrumented with sanitizer-coverage-level=3"
+runtime = "sdk/c/bohr-cov-rt.c, linked by the example's own build.rs"
+runs = [24, 48, 96]
+edges = [4_052, 4_062, 4_155]
+corpus = [18, 29, 42]
+generations = [1, 2, 3]
+runs_per_second = 2.77
+credit = { extend = 19, interesting = 1 }
+
+# What the longest of them reached, and it is recorded as evidence that the feedback steers rather
+# than as a finding about anybody: `redb-hunt` is our own example, so a panic in it may be ours.
+# Two kills, a restart, and the guest exits 101 — a Rust panic. It reproduces from its bundle and
+# not from its seed, because the tape that reached it was mutated rather than derived.
+# The same instrumentation against a real execution client, and the number that matters is not the
+# first one.
+#
+# op-reth builds with it: `-Cpasses=sancov-module` at level 3 and the same runtime object linked
+# through `-Clink-arg`, on the toolchain the client itself pins. Two things had to give way and both
+# are worth writing down, because the next person meets them in the same order. The current
+# toolchain will not build this client at all — a lifetime rule changed under `metrics-0.24.1` — so
+# it is built with the one the client was released against. And link-time optimisation and this pass
+# do not compose: instrumented units fail to resolve generics out of an uninstrumented std, so the
+# build turns it off.
+#
+# **What it measured is a ceiling rather than a success.** Thirty-two thousand edges of a map that
+# holds sixty-five thousand, from one startup and four blocks. Twelve further runs added
+# eighty-four. Every run entered the corpus, which is what a map this full does to the feedback:
+# when almost anything is novel, novelty stops choosing, and a corpus that keeps everything is a
+# corpus that steers nothing.
+#
+# So the map is the next thing this target needs, not more campaigning. Recorded here rather than
+# discovered later, and it is a fact about a 64 KiB map against a program of this size rather than
+# about the client.
+[m3.coverage.op_reth]
+version = "op-reth 1.1.5, instrumented at sanitizer-coverage-level=3"
+built_with = "the toolchain the client pins; the current one cannot build it at all"
+lto = "off, because the pass and link-time optimisation do not compose"
+bytes = 184_823_504
+runs = [6, 18]
+edges = [32_145, 32_229]
+corpus = [6, 18]
+map_cells = 65_536
+reads = "a map half full from one path, so nearly every run is novel and the corpus keeps them all"
+
+[m3.coverage.reached]
+outcome = "GuestCrashed(exit status 101)"
+bundle = "kept outside the repository"
+attribution = "not established; the guest is ours and the panic may be too"
+
+[m5.op_reth.ends_with_node]
+scenario = "examples/engine-driver/scenario.toml"
+events_before = 1_665_335
+events_after = 375_557
+seconds_before = 59
+seconds_after = 12
+blocks_built = 4
+promises_verified = 4
+
+# What the client says after a crash once the datadir is initialised, and it is **not yet
+# attributed**. MDBX refuses to open a store it wrote itself: `failed to open the database: invalid
+# parameter specified (22)`.
+#
+# It is either the store failing to recover from a legal crash state or this world producing a state
+# no disk can leave, and today's work says be careful: two failures that looked like the client's
+# turned out to be this world's. One thing about the setup weighs against reporting it as it stands
+# — every file here is bytes in supervisor memory, so the client is run with `--db.growth-step 4MB`
+# against reth's own default of four gibibytes. That is a geometry nobody operates.
+[m5.op_reth.campaign.after_workaround.unattributed]
+client_said = "failed to open the database: invalid parameter specified (22)"
+suspect = "the geometry this world forces, which no operator runs"
+ruled_out = ["msync collects mapped writes before it commits", "150 seeds of mdbx-hunt reopen cleanly"]
+
+[m5.op_reth.campaign.after_workaround.ours_not_theirs]
+seeds = [1, 13, 16]
+client_said = "panicked at crates/storage/db/src/lockfile.rs:123, expect(\"own process\")"
+cause = "generated /proc files live on the modelled disk and a crash rolls them back"
+fix = "answer /proc from the world rather than from the filesystem a crash acts on"
+
+[m5.op_reth.reorg]
+scenario = "examples/engine-driver/reorg.toml"
+rewound_to = "0x965f1145eec710595c0bd0451bd2374a0cec5cab53d5ff95a9d2e04420a082fc"
+rewind_rule = "the newest block the client was told is final, so nothing final is stepped past"
+blocks_without = 4
+blocks_with = 6
+head_without = "0xedc91d5cb74caeec19e2725a07fcf465afe5539030e238f8d14edb47c66fac10"
+head_with = "0x3f880308d9a66e29395363308ae2f93a362452d6d9d0a4cd93d8abe282f55e82"
+promises_verified = 5
+
+# A guest that replaces itself is not fully intercepted afterwards, and one line shows it: the
+# client started by the supervisor stamps its log 1970-01-01, and the same binary reached through a
+# guest that called execve stamps it with the host's own date. Whatever the supervisor does to a
+# guest at spawn does not survive the guest doing it again for itself.
+#
+# Found while trying to put two unlike programs on two nodes of one cluster, which a cluster cannot
+# express: it substitutes an index into one argument list. The trick would have been a launcher; the
+# answer is per-node argument lists, and that is what shipped — so nothing needs the trick now, and
+# the hole is a hole in the guarantee rather than in anybody's way.
+#
+# testdata/guests/becomes_another.c is the smallest thing that does it.
+[m5.exec_hole]
+found_by = "a launcher standing in for two programs on one cluster"
+supervisor_started = "1970-01-01, which is the world's clock"
+reached_by_execve = "the host's own date"
+blocks = "nothing; per-node argument lists removed the need for a launcher"
+
+# **The whole of what this world can do to a node is now searchable, and this is the number.** A
+# campaign used to draw one kind: the kill. Everything else — the freeze, the cut, the link that
+# stops being good — stood where somebody had written a tick down, so a search covered one twelfth
+# of the catalogue and the eleven remaining entries were reachable only by a person who had already
+# guessed the moment.
+#
+# Twenty seeds of `examples/redb-hunt/hunt-adverse.toml`, counting narrated faults rather than
+# fires: an isolation is four lines — two links, raised and healed — and a degradation is two or
+# four depending on the rung it drew. Roughly twenty-nine fires across the twenty runs.
+[m2.drawn_catalogue]
+seeds = 20
+link_cut = 44
+link_slowed = 20
+packet_dropped = 16
+node_frozen = 6
+node_let_run_again = 6
+node_killed = 6
+write_torn_by_a_crash = 2
+
+# **A budget is a ceiling on fires, and the same campaign under one shows it.** Odds say when a
+# fault fires and never how many; against a guest that makes millions of eligible calls, a
+# probability short enough to be reached at all is a probability reached over and over — measured
+# against an execution client, two hundred and seventy kills across twenty runs, which is a
+# campaign reporting on the restart path rather than on anything it asked.
+#
+# The four-fire ceiling above never binds on this guest, which is the honest reading of the two
+# tables being equal: the campaign draws about one and a half fires per run on its own. At one it
+# binds, and what it takes away is the second and third fault of a run rather than the first.
+[m2.drawn_catalogue.budget_of_one]
+seeds = 20
+link_cut = 28
+link_slowed = 16
+packet_dropped = 8
+node_killed = 3
+node_frozen = 2
+node_let_run_again = 2
+write_torn_by_a_crash = 1
+
+# **What the first day of hunting a real target actually cost, and what closes most of it.** Four
+# things looked like an execution client's defects; three were this tool's, and each was disproved
+# only by reading the client's source. That does not scale, and it is the opposite of what an
+# external simulator is for: the tool that created the condition should be the one that says the
+# condition was impossible.
+#
+# Two rules, checked as a run goes and stated independently of the code that would have to be wrong
+# for them to trip. At every crash the image must be one a machine could leave; at every answer a
+# descriptor this world issued is never answered `EBADF`. A run that breaks either stops under
+# `BOHR-5005` naming the file or the descriptor, rather than being reported as a finding.
+#
+# Each rule is measured against the defect it exists for, reintroduced by an injection that names
+# it, in the harness that already holds every other determinism claim to the same standard.
+[m4.own_evidence]
+false_accusations_seen = 3
+closed_by_a_rule = 2
+still_open = "a listener that served one connection: the port table lost an accepted socket, and the answer was a refused connection rather than a state no machine could present"
+injections = ["chaos-unknown-descriptor", "chaos-proc-on-the-disk"]
+caught = 2
+
+# What the rules cost a campaign that has nothing wrong with it, which is the number that decides
+# whether they can be left on. Ten seeds of the store hunt and three of the engine-API hunt against
+# the real client: no refusals, the same chain built and finalised, the same digests a run without
+# the rules would have produced — a file no write touched is the same counted pointer the durable
+# image holds, so proving it unchanged is one comparison.
+[m4.own_evidence.against_a_clean_run]
+redb_hunt_seeds = 10
+op_reth_hunt_seeds = 3
+refusals = 0
+
+# **The number the search was missing, and it was never a number about the campaign.** A coverage
+# map holds one counter per edge, and a map with fewer counters than the guest has edges puts two
+# edges on one: two runs that differ only there are one run to the corpus, and a search whose
+# feedback has stopped discriminating looks exactly like one that has covered everything.
+#
+# The guest is the only side that knows how many edges it has, so it now says: the shared region
+# carries a header, the supervisor writes how many counters are in it, and the runtime writes what
+# the compiler's guard ranges added up to. Against the instrumented client that number is two and a
+# quarter million, against a default map of sixty-five thousand — smaller by a factor of thirty-four.
+#
+# `covered` below is one run of one seed at three map sizes. It is the same run each time; what
+# changes is how much of it the map could hold apart. At the default size a quarter of what the run
+# reached was invisible, folded onto counters that already stood for something else.
+[m3.coverage.op_reth.sized]
+guest_edges = 2_201_469
+covered_at_65536 = 31_124
+covered_at_1048576 = 41_215
+covered_at_4194304 = 41_774
+lost_to_aliasing_at_the_default = "25% of what the run reached"
+raised_by = "[coverage] shm_size, 1 KiB to 64 MiB, default unchanged at 65 536"
+
+# **A defect this measurement found in the tool, and it is not about coverage.** Under two map sizes
+# the client produces the same 36 735 events, in the same order, with the same returns — and two
+# different digests. Every differing line is an argument register of a call that does not take one:
+# `sched_yield` takes none of six, `clock_gettime` takes two. In a program this size the leftovers
+# are pointers, and a different memory footprint moves them.
+#
+# So the digest is stricter than "the same run": it fires on register values nothing reads. What it
+# costs is every future comparison between two runs that differ in something harmless. The remedy is
+# to record the arguments a call has rather than the registers it was entered with, which is a
+# change to what every stored digest is, and is not made here.
+[m3.coverage.op_reth.sized.digest_sensitivity]
+events = 36_735
+events_differing = 0
+returns_differing = 0
+lines_differing = 11_233
+all_of_them = "argument registers of calls that do not take them"
+calls = { clock_gettime = 10_792, sched_yield = 411, shutdown = 24, listen = 3, epoll_create1 = 1, eventfd2 = 1, getpid = 1 }
+remedy = "record the arguments a call has, not the registers it was entered with"
+
+# **A wall that was not there any more, and nobody had looked.** `PLATFORMS.md` §4.1 said killing a
+# node with more than one task stalls the run, and named the scenario that reproduced it on demand.
+# It does not: ten seeds, five tasks, a kill and a restart written into the scenario, every run
+# completing and answering its durability questions.
+#
+# Nothing was fixed on purpose. Whatever closed it was done for another reason, and the row outlived
+# the defect — which is the argument for re-measuring a stated limit rather than reading it. It cost
+# one command and it moved a milestone's scope: this was the largest item on the list of what stood
+# between here and hunting a real client, because every real client is thread-heavy and the kill is
+# the fault the campaigns are built on.
+#
+# What it is not: one scenario re-measured, so the honest claim is that this shape is gone rather
+# than that every shape is.
+[m4_2.multi_task_kill]
+scenario = "examples/mdbx-hunt/scenario.toml, with both of its [[fault]] tables"
+seeds = 10
+stalled = 0
+tasks_per_run = 5
+faults = ["node_kill", "node_restart"]
+was = "PLATFORMS.md 4.1: the run stalls, and a guest under search is written with one thread per node"
+
+# **The campaign against an execution client was firing nothing, and had been for as long as it had
+# had an ending.** `examples/engine-driver/hunt.toml` armed a drawn kill three hundred milliseconds
+# in. The run ends with its caller — `run.ends_with_node = 1` — at forty-four milliseconds of
+# virtual time, and the three-second horizon never bounds it. So the arm was seven times past the
+# end of every run: twenty seeds, no `FaultFired`, no `NodeState`, four blocks built each time, and
+# twenty clean runs reported by a campaign that had not once pressed on the client.
+#
+# The existing refusal compares `arm_after_ticks` against `horizon_ticks` and passes, correctly: the
+# horizon is three seconds. Nothing checkable at load could have known, because when a run ends is
+# what the runs decide. So the runs say it instead — `BOHR-5006` for a campaign that landed nothing,
+# and a line on every single run that names what reached it.
+#
+# The moments were set for a startup costing a hundred and thirty thousand calls; a prepared store
+# made the whole run thirty-six thousand. Measured on the scenario as it stands: the client's store
+# is made at 3.2 ms and the caller's blocks are not final until 42, which is the window a crash has
+# to land in to be about the chain at all.
+[m4_2.campaign_fired_nothing]
+scenario = "examples/engine-driver/hunt.toml"
+seeds = 20
+was = { arm_after_ticks = 300_000_000, restart_after_ticks = 50_000_000, faults_fired = 0, findings = 0 }
+now = { arm_after_ticks = 5_000_000, restart_after_ticks = 5_000_000, faults_fired = 11, findings = 7 }
+runs_that_met_anything = "9 of 20, from 0 of 20"
+blocks_built = 52
+client_died = 7
+verdict_agreed_with_the_client = "7 of 7, which is what the exit-status path was already for"
+run_ends_at = "t43982000, and the horizon is 3_000_000_000"
+
+# **Pressing every run makes the campaign worse, and this is the measurement that says so.** One
+# part in 8192 with a ceiling of two: twenty runs of twenty met a kill, and nineteen of them lost
+# the client before it had built a block. Four blocks across the whole campaign, against fifty-two
+# at the longer odds — the chain question went unasked in nineteen runs out of twenty.
+#
+# Not a tuning preference: the window between the store existing and the blocks being final is
+# thirty-nine milliseconds of a forty-four millisecond run, and a fault that reaches every run
+# reaches it there.
+[m4_2.campaign_fired_nothing.pressing_harder]
+kill_probability = "1/8192"
+budget_per_run = 2
+runs_that_met_anything = 20
+blocks_built = 4
+findings = 19
+
+# The quiet watch armed against the same campaign, and what it did not do: nothing. Recorded
+# because the reason is the interesting part — `ends_with_node` ends the run when the caller gives
+# up, which it does before any wedge lasts the span. The eight runs `[m5.op_reth.campaign.unmeasured]`
+# recorded as judged clean while the client was dead do not reproduce on the repaired scenario: all
+# seven deaths here exit non-zero and all seven are judged findings.
+#
+# **What arming it did cost was two false accusations, both found by arming it.** A node this world
+# killed makes no calls, and so does a node whose program ended — the first fires on every run of a
+# crash campaign, the second on every scenario with a caller that finishes. Both are held by tests.
+[m4_2.quiet_watch]
+scenario = "examples/engine-driver/hunt.toml"
+quiet_ticks = 500_000_000
+seeds = 20
+nodes_reported = 0
+why = "the run ends with the caller, before a wedged client has been silent for the span"
+false_accusations_closed = ["a node the world killed or froze", "a node whose program ended"]
+
+# **The digest now means "the same run", and this is the pair that proves it.** One execution
+# client, one seed, two coverage map sizes. The runs are identical: 43 608 events, the same order,
+# the same returns, the same 19 922 syscalls and 1 604 draws, and the trace text agrees line for
+# line. Under the old rule — six argument registers hashed whatever the call takes — they compare as
+# two different runs. Under the new one they compare as one.
+#
+# `[m3.coverage.op_reth.sized.digest_sensitivity]` above named this and did not fix it; the count it
+# recorded, 11 233 differing lines, was on a scenario whose event count was 36 735. What is measured
+# here is the property rather than that count: the difference is in registers the trace does not
+# even print, which is why the line-by-line comparison shows nothing while the digest showed
+# everything.
+#
+# BREAKING: every stored digest is invalidated. The three golden bundles and the minimal-world
+# vectors were re-blessed with this commit.
+[m4_2.digest_reads_what_a_call_takes]
+scenario = "examples/engine-driver/scenario.toml, op-reth 1.1.5"
+seed = 1
+events = 43_608
+syscalls = 19_922
+draws = 1_604
+trace_lines_differing = 0
+under_the_old_rule = { at_65536 = "blake3:4c6738cf", at_4194304 = "blake3:be86a017", verdict = "two runs" }
+under_the_new_rule = { at_65536 = "blake3:b6614802", at_4194304 = "blake3:b6614802", verdict = "one run" }
+rule = "an address is hashed as whether it is null; a scalar by value; a register the call does not read, not at all"

@@ -1,0 +1,27 @@
+# The same cluster with nothing injected, which is how the gate stays honest.
+#
+# The seeded defect needs a crash between an acknowledgement and its replication. With no faults
+# there is no crash, so a campaign here must find nothing — and the suite requires that. A defect an
+# ordinary interleaving could reach would make the gate measure the scheduler rather than the
+# search, and this file is what rules that out.
+#
+# Nothing here names a moment. The scenario says only that a node may die at any syscall and comes
+# back a little later; which node, and when, is drawn from the tape — so finding the defect is the
+# search's work and not the author's. A hand-written `[[fault]] at_tick` would prove the guest
+# checks itself and nothing about whether the search can reach it.
+#
+# The probability is the corpus-wide one (docs/TESTING.md §8): tuning it for this target would make
+# the measurement about the number rather than about the search.
+
+[cluster]
+nodes = 3
+argv = ["examples/raft-toy/build/raft-toy-node", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 2_000_000       # 2 ms
+latency_jitter_ticks = 1_000_000
+drop_probability = "1/200"
+
+[disk]
+sync_semantics = "strict"

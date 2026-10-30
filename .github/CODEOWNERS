@@ -1,0 +1,23 @@
+# Ownership follows the split in deterministic-simulator-spec.md 10:
+# one engineer inward (interception, clock, scheduler, world), one outward
+# (SDK, explorer, reducer, reports, documentation).
+
+*                           @bohr-dev/maintainers
+
+/crates/bohr-backend-ptrace/ @bohr-dev/inward
+/crates/bohr-kernel/         @bohr-dev/inward
+/crates/bohr-world/          @bohr-dev/inward
+/crates/bohr-tape/           @bohr-dev/inward
+
+/crates/bohr-explorer/       @bohr-dev/outward
+/crates/bohr-reducer/        @bohr-dev/outward
+/crates/bohr-report/         @bohr-dev/outward
+/sdk/                        @bohr-dev/outward
+/docs/                       @bohr-dev/outward
+
+# The boundary and the formats are shared: a change to either affects both halves,
+# and both should see it.
+/crates/bohr-backend/        @bohr-dev/maintainers
+/crates/bohr-trace/          @bohr-dev/maintainers
+/docs/API.md                 @bohr-dev/maintainers
+/docs/ARCHITECTURE.md        @bohr-dev/maintainers

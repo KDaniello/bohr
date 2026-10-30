@@ -1,0 +1,140 @@
+# Syscall numbers, names, and the shape of what they are called with. x86-64.
+#
+# A copy of the table the syscall backend is built from, kept because that backend exists on one
+# platform only and sits below a boundary this crate is above. scripts/lint-rules.sh compares the
+# number and the name against the original and fails on any disagreement, so the copy cannot drift.
+#
+# Every number here is one this build has an opinion about, which by the rule that an unknown
+# syscall stops a run rather than reaching the host is every number a stored trace can contain.
+#
+# **The third column is what makes a digest mean "the same run".** A syscall is entered with six
+# registers whatever it takes, and what a call does not take holds whatever was there before — in a
+# program the size of an execution client, a pointer. Two runs of one client under two memory
+# footprints produced the same 36 735 events, in the same order, with the same returns, and 11 233
+# differing lines, every one an argument register of a call that does not read it.
+#
+# One character per argument the call reads, in ABI order, and nothing for the registers after them:
+#
+#   s   a value the call reads as a value: a descriptor, a flag, a length, an offset, a signal
+#   p   an address. Where it points is behaviour; what it equals is a fact about this run's memory
+#   -   the call reads none of the six
+#
+# The classification follows each call's declared prototype rather than what a particular guest
+# passes, so it is a fact about Linux and not about a target. A number absent from this table is
+# hashed by all six registers, which is stricter than necessary and never wrong.
+
+0	read	sps
+1	write	sps
+2	open	pss
+3	close	s
+5	fstat	sp
+7	poll	pss
+8	lseek	sss
+9	mmap	psssss
+10	mprotect	pss
+11	munmap	ps
+12	brk	p
+13	rt_sigaction	spps
+14	rt_sigprocmask	spps
+15	rt_sigreturn	-
+16	ioctl	ssp
+17	pread64	spss
+18	pwrite64	spss
+20	writev	sps
+21	access	ps
+24	sched_yield	-
+25	mremap	psssp
+26	msync	pss
+28	madvise	pss
+32	dup	s
+33	dup2	ss
+35	nanosleep	pp
+39	getpid	-
+41	socket	sss
+42	connect	sps
+43	accept	spp
+44	sendto	spssps
+45	recvfrom	spsspp
+46	sendmsg	sps
+47	recvmsg	sps
+48	shutdown	ss
+49	bind	sps
+50	listen	ss
+51	getsockname	spp
+52	getpeername	spp
+53	socketpair	sssp
+54	setsockopt	sssps
+55	getsockopt	ssspp
+56	clone	sppps
+57	fork	-
+58	vfork	-
+59	execve	ppp
+60	exit	s
+62	kill	ss
+63	uname	p
+72	fcntl	sss
+73	flock	ss
+74	fsync	s
+75	fdatasync	s
+77	ftruncate	ss
+79	getcwd	ps
+82	rename	pp
+83	mkdir	ps
+84	rmdir	p
+87	unlink	p
+88	symlink	pp
+89	readlink	pps
+96	gettimeofday	pp
+97	getrlimit	sp
+98	getrusage	sp
+99	sysinfo	p
+102	getuid	-
+104	getgid	-
+107	geteuid	-
+108	getegid	-
+110	getppid	-
+111	getpgrp	-
+131	sigaltstack	pp
+137	statfs	pp
+138	fstatfs	sp
+143	sched_getparam	sp
+145	sched_getscheduler	s
+157	prctl	sssss
+158	arch_prctl	ss
+160	setrlimit	sp
+186	gettid	-
+201	time	p
+202	futex	psspps
+204	sched_getaffinity	ssp
+217	getdents64	sps
+218	set_tid_address	p
+221	fadvise64	ssss
+228	clock_gettime	sp
+230	clock_nanosleep	sspp
+231	exit_group	s
+232	epoll_wait	spss
+233	epoll_ctl	sssp
+234	tgkill	sss
+257	openat	spss
+258	mkdirat	sps
+262	newfstatat	spps
+263	unlinkat	sps
+264	renameat	spsp
+266	symlinkat	psp
+267	readlinkat	spps
+273	set_robust_list	ps
+281	epoll_pwait	spssps
+288	accept4	spps
+290	eventfd2	ss
+291	epoll_create1	s
+292	dup3	sss
+293	pipe2	ps
+296	pwritev	spsss
+302	prlimit64	sspp
+316	renameat2	spsps
+318	getrandom	pss
+332	statx	spssp
+334	rseq	psss
+425	io_uring_setup	sps
+435	clone3	ps
+439	faccessat2	spss

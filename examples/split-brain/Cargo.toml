@@ -1,0 +1,23 @@
+# Deliberately outside the tool's workspace: this scenario depends on a third-party consensus
+# library, and the tool's own dependency graph stays narrow (docs/ARCHITECTURE.md §11).
+[workspace]
+
+[package]
+name = "split-brain"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The synchronous, runtime-free Raft: the caller drives `tick` and `step`, so nothing here reads a
+# host clock or needs an executor. That is what makes it a guest rather than a port of one.
+raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
+prost = "0.11"
+slog = "2"
+
+[[bin]]
+name = "split-brain-node"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

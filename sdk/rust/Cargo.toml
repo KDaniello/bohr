@@ -1,0 +1,15 @@
+[package]
+name = "bohr-sdk"
+description = "Tell Bohr what your program promises."
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/KDaniello/bohr"
+authors = ["The Bohr contributors"]
+publish = false
+
+# The record format, and nothing else. An SDK is linked into somebody else's build, so a
+# dependency here becomes their problem to resolve. See docs/ARCHITECTURE.md 9, rule S3.
+[dependencies]
+bohr-sdk-proto = { path = "../../crates/bohr-sdk-proto", version = "0.0.0" }

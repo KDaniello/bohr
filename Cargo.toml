@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/bohr-types",
+  "crates/bohr-tape",
+  "crates/bohr-trace",
+  "crates/bohr-backend",
+  "crates/bohr-backend-null",
+  "crates/bohr-backend-ptrace",
+  "crates/bohr-kernel",
+  "crates/bohr-world",
+  "crates/bohr-explorer",
+  "crates/bohr-reducer",
+  "crates/bohr-report",
+  "crates/bohr-cli",
+  "crates/bohr-sdk-proto",
+  "crates/bohr-testkit",
+  "sdk/rust",
+  "sdk/conformance/drivers/rust",
+]
+
+# Crate layout and the dependency graph are documented in docs/ARCHITECTURE.md 3.
+
+[workspace.dependencies]
+# Internal crates carry an explicit version, not a bare path: a versionless dependency is a
+# wildcard, and `cargo deny` bans wildcards so that an external one can never slip in unnoticed.
+bohr-types = { path = "crates/bohr-types", version = "0.0.0" }
+bohr-tape = { path = "crates/bohr-tape", version = "0.0.0" }
+bohr-trace = { path = "crates/bohr-trace", version = "0.0.0" }
+bohr-backend = { path = "crates/bohr-backend", version = "0.0.0" }
+bohr-backend-null = { path = "crates/bohr-backend-null", version = "0.0.0" }
+bohr-backend-ptrace = { path = "crates/bohr-backend-ptrace", version = "0.0.0" }
+bohr-kernel = { path = "crates/bohr-kernel", version = "0.0.0" }
+bohr-world = { path = "crates/bohr-world", version = "0.0.0" }
+bohr-explorer = { path = "crates/bohr-explorer", version = "0.0.0" }
+bohr-reducer = { path = "crates/bohr-reducer", version = "0.0.0" }
+bohr-report = { path = "crates/bohr-report", version = "0.0.0" }
+bohr-sdk-proto = { path = "crates/bohr-sdk-proto", version = "0.0.0" }
+bohr-testkit = { path = "crates/bohr-testkit", version = "0.0.0" }
+
+blake3 = { version = "1.5", default-features = false, features = ["std"] }
+chacha20 = "0.9"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+seccompiler = "0.5"
+ciborium = "0.2"
+zstd = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "1"
+
+proptest = "1"
+cucumber = { version = "0.21", default-features = false, features = ["macros"] }
+futures = "0.3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/KDaniello/bohr"
+homepage = "https://github.com/KDaniello/bohr"
+authors = ["The Bohr contributors"]
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Nondeterminism in the determinism tool is the one unforgivable bug class.
+# These three are the mechanical half of docs/ARCHITECTURE.md 8, rules 1, 9 and 10.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+float_arithmetic = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rustdoc]
+all = { level = "warn", priority = -1 }
+broken_intra_doc_links = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+# The supervisor is debugged against hostile guests; a release backtrace must be readable.
+debug = 1
+panic = "unwind"
+
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true

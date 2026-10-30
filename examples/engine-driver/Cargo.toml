@@ -1,0 +1,22 @@
+# Deliberately outside the tool's workspace: this guest exists to drive somebody else's node, and
+# the tool's own dependency graph stays narrow (docs/ARCHITECTURE.md §5.11).
+[workspace]
+
+[package]
+name = "engine-driver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# What a bearer token is signed with. Pure Rust and pinned: the token this makes has to be the one
+# the node's own library verifies, and a version is part of that claim.
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+
+[[bin]]
+name = "engine-driver"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

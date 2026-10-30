@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Every stored bundle must still replay with the release build. This is the
+  # backward-compatibility gate from docs/repo/release.md and it is not skippable.
+  compat:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: make guests
+      - run: cargo nextest run --test golden_bundles
+
+  # A tool that promises reproducibility and cannot reproduce its own build has an
+  # obvious credibility problem, and the question is asked on the first release thread.
+  reproducible:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - uses: ./.github/actions/deterministic-build-env
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl --bin bohr
+      - run: sha256sum target/x86_64-unknown-linux-musl/release/bohr | tee hash-${{ matrix.runner }}.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: "hash-${{ matrix.runner }}", path: hash-*.txt }
+
+  compare-hashes:
+    needs: reproducible
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: hashes/ }
+      - name: Two runners must produce the same binary
+        run: |
+          set -e
+          cut -d' ' -f1 hashes/*/hash-*.txt | sort -u > uniq
+          test "$(wc -l < uniq)" -eq 1 || { echo "reproducible build failed"; cat hashes/*/*; exit 1; }
+
+  build:
+    needs: [compat, compare-hashes]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      # The same environment the hash gate above verified. Building the published artefact any
+      # other way would mean shipping a binary nobody proved reproducible.
+      - uses: ./.github/actions/deterministic-build-env
+      - run: cargo build --release --locked --target ${{ matrix.target }} --bin bohr
+      - name: Package
+        # The archive is pinned as hard as the binary: without a fixed time, ownership and order
+        # the tarball differs on every run and its checksum says nothing about its contents.
+        run: |
+          tar --sort=name --numeric-owner --owner=0 --group=0 \
+            --mtime="@$SOURCE_DATE_EPOCH" --format=gnu \
+            -cf - -C target/${{ matrix.target }}/release bohr \
+            | gzip -n -9 > bohr-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          sha256sum bohr-*.tar.gz > SHA256SUMS-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "dist-${{ matrix.target }}"
+          path: |
+            bohr-*.tar.gz
+            SHA256SUMS-*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist/, merge-multiple: true }
+      - run: cat dist/SHA256SUMS-* > dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/bohr-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: false
+          body_path: CHANGELOG.md

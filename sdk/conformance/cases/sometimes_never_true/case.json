@@ -1,0 +1,11 @@
+{
+  "calls": [
+    {
+      "fn": "sometimes",
+      "args": [
+        false,
+        "a leader change happened"
+      ]
+    }
+  ]
+}

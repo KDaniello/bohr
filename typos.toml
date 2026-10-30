@@ -1,0 +1,16 @@
+[files]
+extend-exclude = [
+  "LICENSE-APACHE",
+  "testdata/**",
+  "fuzz/corpus/**",
+  "fuzz/seeds/**",
+  "docs/ru/**",
+  "*.tape",
+  "*.bohr",
+]
+
+[default.extend-words]
+# Domain vocabulary that spell checkers dislike.
+ba = "ba"
+inout = "inout"
+seccomp = "seccomp"

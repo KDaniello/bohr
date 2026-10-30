@@ -1,0 +1,92 @@
+name: nightly
+
+on:
+  schedule: [{ cron: "0 3 * * *" }]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Goal T4, second half. A divergence here means something host-specific reached a
+  # decision — the class of bug that makes the tool untrustworthy. P1 on sight.
+  portability:
+    name: cross-cpu replay
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, self-hosted-amd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: make guests
+      - name: Produce bundles
+        run: cargo nextest run --test portability -- produce
+      - uses: actions/upload-artifact@v4
+        with: { name: "bundles-${{ matrix.runner }}", path: target/bohr-out/portability/ }
+
+  replay-cross:
+    needs: portability
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, self-hosted-amd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with: { path: bundles/ }
+      - run: make guests
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Replay every bundle produced on every other runner
+        env:
+          BOHR_PORTABILITY_BUNDLES: bundles
+        run: cargo nextest run --test portability -- verify
+
+  # Correctness gates say we did not break anything. This says the tool is still good at the one
+  # thing it is for: reaching what ordinary testing cannot. docs/TESTING.md 8.
+  hunting:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make guests
+      - run: make test-hunting
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: hunting-findings, path: /tmp/bohr-hunt-*/findings/ }
+
+  perf:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make guests
+      - name: Which scheduler reaches the seeded defects
+        run: make policy-comparison
+      - name: Slowdown versus native, the T3 gate
+        run: make bench-slowdown
+      - run: make bench
+
+  fuzz-long:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [bundle, tape, sdk_record, event_log, syscall_args]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: make fuzz T=${{ matrix.target }} S=14400
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: "fuzz-crash-${{ matrix.target }}", path: fuzz/artifacts/ }
