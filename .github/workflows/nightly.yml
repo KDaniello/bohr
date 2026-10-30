@@ -18,7 +18,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, self-hosted-amd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -37,7 +37,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, self-hosted-amd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with: { path: bundles/ }
@@ -55,7 +55,7 @@ jobs:
   hunting:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: make guests
       - run: make test-hunting
@@ -66,7 +66,7 @@ jobs:
   perf:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: make guests
       - name: Which scheduler reaches the seeded defects
@@ -81,7 +81,7 @@ jobs:
       matrix:
         target: [bundle, tape, sdk_record, event_log, syscall_args]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@v2
         with:

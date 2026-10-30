@@ -25,7 +25,7 @@ jobs:
   conformance:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -41,7 +41,7 @@ jobs:
   go-lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with: { go-version: "1.22" }
       - run: make lint-go
@@ -49,7 +49,7 @@ jobs:
   python-lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install ruff mypy
@@ -58,7 +58,7 @@ jobs:
   schema:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: The committed schema must equal the one generated from the Rust types
         run: |
@@ -69,7 +69,7 @@ jobs:
   antithesis-interop:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -82,7 +82,7 @@ jobs:
   other-widths:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # `rust-toolchain.toml` pins the toolchain the workspace builds with, so the target is added to
       # that one and not to the `stable` the step above installed.
@@ -93,6 +93,6 @@ jobs:
   no-dependencies:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: SDKs are linked into other people's builds and carry no third-party deps
         run: ./scripts/check-sdk-deps.sh
