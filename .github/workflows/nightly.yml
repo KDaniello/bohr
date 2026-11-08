@@ -33,7 +33,7 @@ jobs:
       - run: make guests
       - name: Produce bundles
         run: cargo nextest run --test portability -- produce
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: "bundles-${{ matrix.runner }}", path: target/bohr-out/portability/ }
 
   replay-cross:
@@ -77,7 +77,7 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: make guests
       - run: make test-hunting
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with: { name: hunting-findings, path: /tmp/bohr-hunt-*/findings/ }
 
@@ -109,6 +109,6 @@ jobs:
         with:
           tool: cargo-fuzz
       - run: make fuzz T=${{ matrix.target }} S=14400
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with: { name: "fuzz-crash-${{ matrix.target }}", path: fuzz/artifacts/ }
