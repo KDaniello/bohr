@@ -3,7 +3,7 @@
 //! An ordinary run refuses the first unmodelled syscall and ends, which is §5.7 and is the
 //! right thing for a run: a call that reached the host unnoticed is a hole nothing downstream would
 //! find. It also means that learning a real program's surface one call at a time costs a run per
-//! call, and [`docs/ARCHITECTURE.md`] §5.7 promises the opposite — the whole set, up front. This is
+//! call, and `docs/ARCHITECTURE.md` §5.7 promises the opposite — the whole set, up front. This is
 //! that promise.
 //!
 //! A survey is not a run and must never be mistaken for one, which is arranged rather than asked

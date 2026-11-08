@@ -194,7 +194,7 @@ impl<'a> TapeCursor<'a> {
     /// An exponentially distributed value with the given mean, consuming a fixed four bytes.
     ///
     /// The journal records the uniform draw, not the mapped value: the mapping is a pure function
-    /// evaluated in fixed point ([`crate::fixed`]), so a mutator edits the underlying uniform and
+    /// evaluated in fixed point (`crate::fixed`), so a mutator edits the underlying uniform and
     /// the journal stays regenerable from the tape alone.
     pub fn draw_exponential(&mut self, mean: u64, site: DrawSite) -> Result<u64, TapeError> {
         let u = self.draw_range(1 << 32, site)?;

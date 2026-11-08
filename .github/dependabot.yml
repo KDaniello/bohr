@@ -3,16 +3,25 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels: ["C-refactor", "A-ci"]
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
+      major:
+        update-types: ["major"]
+    # The tape's extension keystream (docs/API.md §2.3): its version is part of the tape ABI and
+    # moves only together with a run of every stored tape and bundle, never as a routine bump.
+    ignore:
+      - dependency-name: chacha20
 
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: monthly }
     labels: ["A-ci"]
+    groups:
+      actions:
+        patterns: ["*"]
 
   # SDKs carry no third-party dependencies by rule (docs/ARCHITECTURE.md 9 S3).
   # These entries exist to catch a dependency being added, not to update one.

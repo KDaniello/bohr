@@ -50,7 +50,7 @@ fn segment_nonce(segment: u64) -> [u8; 12] {
 ///
 /// Past the end of the prefix the tape keeps producing bytes, still as a pure function of the
 /// seed, for as far as an offset can be counted — the cipher is re-keyed per
-/// [`EXTENSION_SEGMENT_BYTES`] rather than asked for more than one keying can give.
+/// `EXTENSION_SEGMENT_BYTES` rather than asked for more than one keying can give.
 #[derive(Clone)]
 pub struct Tape {
     seed: Seed,

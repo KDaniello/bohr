@@ -10,6 +10,7 @@ on:
   # a change to how records are digested reached main without the conformance suite running at all
   # -- and a contract checked on one side only is a contract nobody is holding.
   push:
+    branches: [main]
     paths: &sdk_paths
       - "sdk/**"
       - "crates/bohr-sdk-proto/**"
@@ -71,6 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - run: cargo nextest run -p bohr-sdk-proto --test antithesis_fixtures
 
   # An SDK is linked into somebody else's build, and theirs is compiled for more targets than a
