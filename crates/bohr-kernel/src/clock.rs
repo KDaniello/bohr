@@ -28,17 +28,11 @@ impl NodeClock {
     ///
     /// # Panics
     ///
-    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`]. The bound was stated above and enforced only
-    /// by the kernel's own draw, while this constructor is handed to every world model through
-    /// `WorldCtx::set_node_clock` -- so a rate below -1 000 000 made a node's clock read *earlier*
-    /// as the world moved on, and the guest watched time run backwards. §8 rule 1: public means
-    /// constructors that validate, and an invariant in a doc comment is not one.
+    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`]. Below -1 000 000 a node's clock would read
+    /// earlier as the world moves on, so the bound is checked here rather than trusted to callers.
     #[must_use]
     pub const fn new(offset: u64, drift_ppm: i32) -> Self {
-        assert!(
-            drift_ppm >= -(MAX_DRIFT_PPM as i32) && drift_ppm <= MAX_DRIFT_PPM as i32,
-            "a node's clock may not drift further than MAX_DRIFT_PPM"
-        );
+        assert_drift_in_bounds(drift_ppm);
         Self { offset, drift_ppm }
     }
 
@@ -48,8 +42,13 @@ impl NodeClock {
     /// past: readings before `at` stay exactly what they were, which a replayed trace depends on.
     /// Where the fold would need a negative offset the clock reads the drifted value instead —
     /// forward, never back.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`], for the reason [`Self::new`] does.
     #[must_use]
     pub fn rebased(self, at: Tick, drift_ppm: i32) -> Self {
+        assert_drift_in_bounds(drift_ppm);
         let reading = i128::from(self.read(at).get());
         let elapsed = i128::from(at.get());
         let drifted = elapsed + (elapsed * i128::from(drift_ppm)) / 1_000_000;
@@ -74,6 +73,14 @@ impl NodeClock {
             Tick(shifted as u64)
         }
     }
+}
+
+/// The one check every way of making a [`NodeClock`] goes through.
+const fn assert_drift_in_bounds(drift_ppm: i32) {
+    assert!(
+        drift_ppm >= -(MAX_DRIFT_PPM as i32) && drift_ppm <= MAX_DRIFT_PPM as i32,
+        "a node's clock may not drift further than MAX_DRIFT_PPM"
+    );
 }
 
 /// Virtual time for a run.
@@ -181,6 +188,12 @@ mod tests {
         let later = Tick(20 * Tick::SECOND.get());
         assert!(rebased.read(later) < clock.read(later), "the new rate applies after the rebase");
         assert!(rebased.read(later) > rebased.read(at), "and time still moves forward");
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_DRIFT_PPM")]
+    fn a_rebase_cannot_set_a_rate_past_the_bound() {
+        let _ = NodeClock::new(0, 0).rebased(Tick::SECOND, -2_000_000);
     }
 
     #[test]

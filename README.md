@@ -15,7 +15,7 @@ Same seed, same bytes, every time.**
 [API](./docs/API.md) ·
 [Determinism map](./docs/DETERMINISM.md) ·
 [Testing](./docs/TESTING.md) ·
-[Русская документация](./docs/ru/)
+[Evidence](./docs/EVIDENCE.md)
 
 </div>
 
@@ -23,50 +23,72 @@ Same seed, same bytes, every time.**
 
 ## What is Bohr
 
-Bohr runs an unmodified Linux program inside a deterministic world. Time, randomness, thread
-scheduling, the network and the disk all come from us, and every nondeterministic decision is drawn
-from a single string of bytes — the **entropy tape**. One 64-bit seed therefore defines an entire
-execution.
+Bohr runs an unmodified Linux program in a deterministic world. Time, randomness, thread
+scheduling, the network and the disk all come from Bohr, and every nondeterministic decision is
+drawn from one string of bytes — the **entropy tape**. One 64-bit seed defines a whole execution.
 
-On top of that sits controlled hostility — network delays and partitions, process kills, torn
-writes, stalled disks, reordered threads — and a search over the schedules that break the program
-under test. A finding is a file that reproduces on another machine with a different CPU, and it is
-reduced to the smallest scenario that still fails.
+On top of that sit network delays and partitions, process kills, torn writes, stalled disks,
+reordered threads, and a search for the schedule that breaks the program. A finding is a file that
+replays on another machine, reduced to the smallest scenario that still fails.
+
+## What works today
+
+- **A cluster in one world.** Five `raft-rs` nodes driven through a one-way partition and back:
+  100 runs, 16,016 events each, one digest.
+- **Real programs, as released.** `redb` 2.6.3 under a crash campaign; `tokio` 1.53.1 and a TCP
+  service on it, 100 runs agreeing; a 103 MB Ethereum execution client through 333,485 events of
+  its node command.
+- **Runs travel.** 9 of 9 bundles written by a Windows build replay on a Linux one, digest for
+  digest.
+- **Findings shrink.** A fixture's 49,477 events reduce to 18 in 20 replays and reproduce 100 times
+  of 100.
+- **Findings in other projects.** Two, in widely deployed open-source software, are with their
+  maintainers and stay private until fixed.
+
+Every figure is in [`benches/baseline.toml`](./benches/baseline.toml) with the host it was taken on,
+a Core i5-12600KF. [EVIDENCE.md](./docs/EVIDENCE.md) gives the key and the command behind each.
+
+## Goals and where they stand
+
+| Goal | Target | Measured |
+|---|---|---|
+| Total repeatability | 1000 runs of one seed, one byte-identical trace | 100 runs of a five-node cluster, one digest; `make gate` runs 1000 per guest |
+| Zero changes to the code under test | an existing binary, one command | the programs above, as their projects release them |
+| Usable speed | no worse than 5× native | 3.6× on `redb`'s own test suite, measured outside the tree; 6.6× on the same database under the Windows subsystem for Linux; 57 µs per intercepted syscall |
+| Reproduction that travels | 100 of 100 on another machine | 9 of 9, Windows build to Linux build |
+| Minimal reproducers | 40,000 events to fewer than 20 | met on a fixture, 49,477 to 18; not met on a real client within 20 replays, 1,222,888 to 1,189,704 |
+| Stated limits | every hole recorded with its reason | the [determinism map](./docs/DETERMINISM.md) |
+
+## What it does not do
+
+- **Judge what it was not told to judge.** It finds crashes, hangs, broken SDK assertions and what a
+  scenario's oracle checks. A clean campaign is a statement about those and nothing else.
+- **Run what it does not model.** An unmodelled syscall ends the run with a named error rather than
+  reaching the host. `RDRAND` is a documented hole.
+- **Run the program under test anywhere but Linux x86-64.** The core builds and tests on macOS and
+  Windows; the guest needs Linux.
+- **Place faults better than uniform choice.** Guided targeting loses to uniform on the defect it
+  was measured against, and the claim is withdrawn ([API.md](./docs/API.md) §5.4).
+- **Contain a hostile program.** It is not a sandbox — see [Security](#security).
 
 ## Why
 
 The most expensive bugs in server software happen once in a million runs: two threads line up, a
-packet arrives out of order, a node dies exactly between the write and the acknowledgement. Ordinary
-tests do not catch them. A test that is sometimes red gets marked flaky, and a real bug is now
-behind a retry annotation.
+packet arrives out of order, a node dies between the write and the acknowledgement. Ordinary tests
+miss them, and a test that is sometimes red gets a retry annotation with a real bug behind it.
 
-Deterministic simulation testing addresses this class, and the teams that need it — TigerBeetle,
-FoundationDB, WarpStream, SurrealDB, RisingWave, Resonate — have each written their own, because
-there is nothing to take off the shelf. The one commercial product in the category is closed-source.
+The teams that need deterministic simulation testing — TigerBeetle, FoundationDB, WarpStream,
+SurrealDB, RisingWave, Resonate — have each written their own, because there is nothing to take off
+the shelf. The one commercial product in the category is closed-source.
 
 Bohr is an open implementation at the syscall level: no code changes, no rebuild, no hypervisor.
 
-## Goals
-
-1. **Total repeatability.** 1000 runs of one seed produce a byte-identical event trace.
-2. **Zero changes to the code under test.** An existing binary, one command, no rebuild.
-3. **Usable speed.** No worse than 5× native on a typical workload.
-4. **Reproduction that travels.** A scenario file replays on a different machine with a different
-   CPU, 100 out of 100.
-5. **Minimal reproducers.** 40 000 events reduced automatically to fewer than 20.
-6. **Stated limits.** Where determinism cannot be guaranteed, the run records it and names the
-   reason. See the [determinism map](./docs/DETERMINISM.md).
-
 ## Status
 
-**Pre-alpha. Not yet released.** A five-node cluster runs in one deterministic world, through a
-network that drops and reorders and a disk that tears, and a run saved on one machine replays on
-another. There is exactly one public release — v1.0 — and it ships only after the hunting phase has
-produced findings confirmed by the maintainers of real projects. Nothing here is stable yet: the
-tape ABI, the bundle format and the command line will all move before v1.0.
-
-Progress is measured by gates rather than by commit count. Every number this repository states about
-itself is measured, and the measurements live in [`benches/baseline.toml`](./benches/baseline.toml).
+**v0.1.0, the foundation — not published.** What it does and does not do is fixed in the
+[changelog](./CHANGELOG.md). There is one public release, v1.0, and it ships after findings in real
+projects are confirmed by their maintainers. Until then the tape ABI, the bundle format and the
+command line all change.
 
 ## For users
 
@@ -126,8 +148,10 @@ make pr           # exactly what CI runs on a pull request
 
 The core is sans-io: the scheduler, the virtual world, the explorer and the reducer are state
 machines with no syscalls, so most of the codebase builds and tests on macOS and Windows too. Only
-the syscall backend needs Linux.
+the syscall backend needs Linux — and there green elsewhere is not green: the Linux half is skipped,
+not passed.
 
+[AGENTS.md](./AGENTS.md) maps each area to its files and the check that covers it;
 [OVERVIEW.md](./docs/OVERVIEW.md) describes the machine end to end;
 [ARCHITECTURE.md](./docs/ARCHITECTURE.md) states the rules, and its twenty invariants in §5 govern
 the code. [CONTRIBUTING.md](./CONTRIBUTING.md) covers the workflow.

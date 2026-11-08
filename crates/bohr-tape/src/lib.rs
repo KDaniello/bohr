@@ -27,8 +27,8 @@ mod journal;
 mod tape;
 
 pub use cursor::TapeCursor;
-pub use journal::{DrawRecord, DrawSite, Journal, DRAW_RECORD_BYTES};
-pub use tape::{Tape, TapeReader, TAPE_HEADER_BYTES, TAPE_MAGIC};
+pub use journal::{DRAW_RECORD_BYTES, DrawRecord, DrawSite, Journal};
+pub use tape::{TAPE_HEADER_BYTES, TAPE_MAGIC, Tape, TapeReader};
 
 /// Version of the `.tape` container layout.
 pub const TAPE_FORMAT_VERSION: u16 = 1;
@@ -88,16 +88,16 @@ pub enum TapeError {
     },
 
     /// `BOHR-4001` — the container is shorter than a header.
-    #[error("BOHR-4001: tape truncated: {actual} bytes is shorter than the {TAPE_HEADER_BYTES}-byte header")]
+    #[error(
+        "BOHR-4001: tape truncated: {actual} bytes is shorter than the {TAPE_HEADER_BYTES}-byte header"
+    )]
     HeaderTooShort {
         /// Bytes actually present.
         actual: usize,
     },
 
     /// The container is shorter than its own header says it is.
-    #[error(
-        "BOHR-4002: tape truncated: header declares {declared} prefix bytes, {actual} present"
-    )]
+    #[error("BOHR-4002: tape truncated: header declares {declared} prefix bytes, {actual} present")]
     Truncated {
         /// Prefix length from the header.
         declared: u64,

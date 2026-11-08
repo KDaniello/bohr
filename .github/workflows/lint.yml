@@ -18,16 +18,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with: { components: rustfmt }
-      - run: cargo +nightly fmt --all --check
+      - uses: ./.github/actions/toolchain
+        with: { nightly: "true" }
+      - run: make fmt-check
 
   clippy:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy }
+      - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
       - run: make clippy
 

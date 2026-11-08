@@ -21,10 +21,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
+        os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -42,7 +42,7 @@ jobs:
           - { runner: ubuntu-22.04, label: "5.15" }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
       # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a
       # guest cannot be placed in its own namespaces without them.
@@ -84,7 +84,8 @@ jobs:
         target: [bundle, tape, sdk_record, event_log, syscall_args]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/toolchain
+        with: { nightly: "true" }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz

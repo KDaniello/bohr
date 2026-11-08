@@ -12,4 +12,6 @@ development tooling to the git history. See [`docs/ARCHITECTURE.md`](./docs/ARCH
 **Comments.** As many as it takes for the code to be understandable, and no more. A comment explains
 a block, an algorithm or a contract — never a line. Explain *why*, not *what*. Everything in
 English, and never any project meta: no milestone names, no roadmap references, no "for now" or
-"to be added later". See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §8.1.
+"to be added later". Never the history of a line either — "used to", the bug that prompted it — that
+is the commit message. A doc comment is the contract in one line and at most two more. See
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §8.1.

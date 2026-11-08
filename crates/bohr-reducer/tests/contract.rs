@@ -86,10 +86,8 @@ fn kill_at(config: &str) -> Option<u64> {
         if trimmed.starts_with('[') {
             inside_fault = trimmed == "[[fault]]";
         }
-        if inside_fault {
-            if let Some(value) = trimmed.strip_prefix("at_tick") {
-                return value.trim_start_matches([' ', '=']).replace('_', "").trim().parse().ok();
-            }
+        if inside_fault && let Some(value) = trimmed.strip_prefix("at_tick") {
+            return value.trim_start_matches([' ', '=']).replace('_', "").trim().parse().ok();
         }
     }
     None

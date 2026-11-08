@@ -142,8 +142,8 @@ bohr/
 │   ├── TESTING.md
 │   ├── DETERMINISM.md           # the nondeterminism source map — the project's checklist
 │   ├── PLATFORMS.md             # host requirements, kernel features, syscall support matrix
-│   ├── repo/                    # ci.md, labels.md, release.md
-│   └── ru/                      # identical documentation in Russian
+│   ├── EVIDENCE.md              # what the project claims, and the command that checks it
+│   └── repo/                    # ci.md, labels.md, release.md
 ├── crates/
 │   ├── bohr-types/              # Tick, Seed, NodeId, TaskId, Fd, EventId, digests.
 │   │                            # serde + zero I/O. The only crate everyone else knows.
@@ -1084,8 +1084,11 @@ shows (`try_advance`, not `advance`, when it returns `Option`).
 - no project meta in code: milestone names, roadmap references, "for now", "added later" (§8.1)
 
 **15. Public API is documented in place.** `#![warn(missing_docs)]` in `bohr-types`,
-`bohr-backend`, `bohr-tape`, `bohr-sdk-proto` and every SDK crate. Those are the crates an outsider
-reads, and the first impression is formed in an IDE, not on a website.
+`bohr-backend`, `bohr-tape`, `bohr-sdk-proto`, `bohr-kernel` and every SDK crate. Those are the
+crates an outsider reads or implements against — the kernel's ports are what a second domain
+implements (§5.16) — and the first impression is formed in an IDE, not on a website. The lint
+belongs on these crates and no others: elsewhere it demands a line on every accessor, which §8.1
+forbids.
 
 **16. Comments — English, to the point, per block.** Detailed in §8.1: it is the rule broken most
 often and it earns its own section.
@@ -1105,8 +1108,7 @@ The split is simple and hard:
 | What | Language |
 |---|---|
 | Code, comments, doc comments, identifiers, error text, log messages | **English** |
-| `docs/*.md` | **English** (the canonical version) |
-| `docs/ru/*.md` | Russian, an identical mirror |
+| `docs/*.md` | **English**, the only version |
 | Commits, PR descriptions, issues, discussions | English |
 | Gherkin `.feature` files and their step definitions | **English** — their audience is every user of the tool ([`TESTING.md`](./TESTING.md) §5) |
 
@@ -1142,9 +1144,39 @@ the one sentence a reader needs to not break it.
 // length — the kind of bug that shows up once in ten thousand runs and costs a week.
 ```
 
-Every public field carries a `///`, usually one line. Expand only where a design constraint would
-otherwise be invisible — a bound that exists for backpressure, an ordering that exists for
-determinism.
+**The shape of a doc comment.** The first line is the contract: what the item is or does, in the
+terms a caller checks. Anything after it is one of three things — the edge cases (a bound, a panic,
+what zero or empty does), the reference the code follows with the clause that says why that one, or
+the determinism constraint a cleanup would otherwise remove. **Three lines of prose is the limit.**
+A doc comment that needs more is a design argument: it moves to `docs/`, and the comment keeps the
+decision and a § link.
+
+```rust
+/// Uniform in `0..n`.
+///
+/// Modulo at a fixed width, never a rejection loop: a retry makes consumption depend on the
+/// drawn value, which the draw ABI forbids (docs/API.md §2.4).
+pub fn draw_range(&mut self, n: u64, site: DrawSite) -> Result<u64, TapeError>
+```
+
+**The shape of a module comment.** `//!` names what the module owns, in one line. Where a reader
+would assume more, a second line names what it does not do.
+
+```rust
+//! Logical time: the world clock and each node's reading of it.
+//! No host clock is read here; time moves only when the run loop advances it.
+```
+
+**A public field** outside the crates of rule 15 gets a `///` when its name and type leave something
+open — the unit, the bound, what `None` means. `max_events: u64` earns "event count after which the
+run is abandoned"; `node: NodeId` does not earn "the node". Inside those crates the lint asks for a
+line on every item, and an obvious item gets exactly one.
+
+**History is not a comment.** A comment states what holds now. The bug that prompted a line, the
+version before it, the test it replaced, the target where it was first seen — "used to", "an
+earlier draft", "on the first try" — belong to the commit message and the name of the regression
+test, where they stay true. The comment keeps the constraint the bug taught: not "the fallback used
+to file these exits under node 0", but "a task whose node is gone is filed under no node".
 
 **Where a comment is mandatory:**
 
@@ -1172,7 +1204,9 @@ determinism.
   "temporary", "to be added later". A comment describes the code as it is. The moment it describes
   the plan it dates itself and starts lying, and the reader who wants the plan is not reading source
   files to find it. Where a limitation is real, state the limitation and its consequence, never the
-  date it is expected to end.
+  date it is expected to end;
+- **the history of the line** — what it replaced, which bug prompted it, where it was observed;
+- a doc comment past three lines of prose. The argument belongs in `docs/`, the decision here.
 
 Right:
 
@@ -1181,15 +1215,6 @@ Right:
 // same tick must have a total order that does not depend on allocator addresses.
 // See docs/ARCHITECTURE.md §7.2.
 struct DeliveryQueue(BinaryHeap<Reverse<(Tick, NodeId, u64)>>);
-
-impl TapeCursor {
-    /// Draws a value in `0..n` and records the draw in the journal.
-    ///
-    /// Rejection sampling rather than modulo: modulo biases low values, and a biased scheduler
-    /// draw silently reduces the bug classes PCT can reach. The bias is invisible in tests and
-    /// only shows up as "we never find depth-3 bugs".
-    pub fn draw_range(&mut self, n: u64, site: DrawSite) -> u64 { /* ... */ }
-}
 
 // SAFETY: `addr` is a guest address validated against the task's mappings above, and `buf` is
 // owned by us for the whole call. process_vm_readv does not write outside `buf`.
@@ -1205,7 +1230,10 @@ struct DeliveryQueue {
     len: usize,              // the length    ← restates the code
 }
 // TODO: think about this                     ← no owner, no link, immortal
+// Ties used to follow insertion order        ← history: the commit message holds it
 ```
+
+A comment is right when it stays true after the bug that prompted it is forgotten.
 
 ### 8.2 Authorship in git
 

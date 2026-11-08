@@ -416,7 +416,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: network.topology has no layout named {other:?}; \
                      this build knows full, ring, star"
-                )))
+                )));
             }
         };
         network.latency_mean_ticks = net.latency_mean_ticks.unwrap_or(0);
@@ -472,7 +472,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: disk.sync_semantics {other:?} is not available; \
                      this build implements strict"
-                )))
+                )));
             }
         }
         disk.stall_probability =
@@ -497,7 +497,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
             Some(other) => {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: faults.targeting {other:?} is neither uniform nor guided"
-                )))
+                )));
             }
         };
         fault_policy.restart_after = bohr_types::Tick(raw_faults.restart_after_ticks.unwrap_or(0));
@@ -539,7 +539,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                              takes recover_from_snapshot for what a killed node comes back on. \
                              A thaw, a heal or a restart is not drawn: it is how a node comes \
                              back from the fault that took it away"
-                        )))
+                        )));
                     }
                 }
             }
@@ -583,7 +583,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
             other => {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: fault.kind has no fault named {other:?}"
-                )))
+                )));
             }
         };
         // A cluster-wide fault names no node, and a node fault must: a `node` on a reorg would be
@@ -595,7 +595,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: fault.kind {:?} acts on one node and this entry names none",
                     fault.kind
-                )))
+                )));
             }
             (true, None) => NodeId::ZERO,
             (true, Some(_)) => return Err(ConfigError::Refused(
@@ -603,10 +603,10 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     .to_owned(),
             )),
         };
-        // **A node the cluster does not have is a typo, and it used to be materialised.** The
-        // world creates a node it is asked about, so `node = 5` in a cluster of three quietly
-        // produced a fourth to kill and restart -- a scenario that ran, reported nothing and
-        // tested nothing anybody meant. §8 rule 6: refused where it is read.
+        // **A node the cluster does not have is a typo.** The world creates a node it is asked
+        // about, so `node = 5` in a cluster of three would produce a fourth to kill and restart --
+        // a scenario that runs, reports nothing and tests nothing anybody meant. §8 rule 6:
+        // refused where it is read.
         let known = network.nodes;
         let named: Vec<u32> = match &kind {
             NodeFaultKind::ChainReorg { nodes, .. } => {
@@ -661,15 +661,15 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     // A policy armed after the run is over is a policy that never fires, and a configuration that
     // is read and does nothing is a configuration that lies. Both numbers are named, because the
     // reader is about to change one of them and needs to know which.
-    if let Some(horizon) = run.horizon {
-        if fault_policy.arm_after >= horizon {
-            return Err(ConfigError::Refused(format!(
-                "BOHR-1002: faults.arm_after_ticks is {} and run.horizon_ticks is {}, so the run \
+    if let Some(horizon) = run.horizon
+        && fault_policy.arm_after >= horizon
+    {
+        return Err(ConfigError::Refused(format!(
+            "BOHR-1002: faults.arm_after_ticks is {} and run.horizon_ticks is {}, so the run \
                  would end before a drawn fault was ever offered",
-                fault_policy.arm_after.get(),
-                horizon.get()
-            )));
-        }
+            fault_policy.arm_after.get(),
+            horizon.get()
+        )));
     }
 
     Ok(LoadedConfig {
@@ -724,7 +724,7 @@ fn liveness(
                 "BOHR-1002: liveness.progress has no definition named {other:?}; this build counts \
                  a completed fsync and nothing else, because a cluster that has stopped committing \
                  still answers heartbeats"
-            )))
+            )));
         }
     }
     if raw.after_heal_ticks.is_none() && raw.quiet_ticks.is_none() {
@@ -831,7 +831,7 @@ fn differential(
                      {node}, so the comparison would be between unlike programs rather than \
                      between two of one",
                     implementation.name
-                )))
+                )));
             }
             _ => stands_in_for = Some((&implementation.name, node)),
         }
@@ -923,7 +923,7 @@ fn durability(
                 "BOHR-1002: durability.ack has no definition named {other:?}; this build counts an \
                  outbound datagram sent while the node's disk is dirty, because the world has no \
                  word for an acknowledgement and reading the guest's protocol is out of scope"
-            )))
+            )));
         }
     }
     // The finding needs a node to come back without something, so a scenario where nothing can
@@ -973,27 +973,27 @@ fn run_limits(raw: Option<&RawRun>, nodes: Option<u32>) -> Result<RunLimits, Con
     // A horizon the budget reaches first never fires, and a configuration that is read and does
     // nothing is a configuration that lies. Refused with both numbers, because the reader is about
     // to change one of them and needs to know which.
-    if let (Some(at), Some(budget)) = (horizon, max_ticks) {
-        if at >= budget {
-            return Err(ConfigError::Refused(format!(
-                "BOHR-1002: run.horizon_ticks is {} and run.max_ticks is {}, so the budget would \
+    if let (Some(at), Some(budget)) = (horizon, max_ticks)
+        && at >= budget
+    {
+        return Err(ConfigError::Refused(format!(
+            "BOHR-1002: run.horizon_ticks is {} and run.max_ticks is {}, so the budget would \
                  end the run first and the horizon would never fire",
-                at.get(),
-                budget.get()
-            )));
-        }
+            at.get(),
+            budget.get()
+        )));
     }
 
     // Refused rather than clamped, because a node that is not in the cluster never ends and the
     // run would quietly wait out its horizon instead — a key that is read and does nothing.
-    if let Some(node) = raw.ends_with_node {
-        if nodes.is_some_and(|count| node >= count) {
-            return Err(ConfigError::Refused(format!(
-                "BOHR-1002: run.ends_with_node is {node} and the cluster has {} nodes, so the run \
+    if let Some(node) = raw.ends_with_node
+        && nodes.is_some_and(|count| node >= count)
+    {
+        return Err(ConfigError::Refused(format!(
+            "BOHR-1002: run.ends_with_node is {node} and the cluster has {} nodes, so the run \
                  would wait for a node that is not there",
-                nodes.unwrap_or(0)
-            )));
-        }
+            nodes.unwrap_or(0)
+        )));
     }
 
     Ok(RunLimits { horizon, max_ticks, ends_with_node: raw.ends_with_node })

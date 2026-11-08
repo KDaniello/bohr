@@ -2,11 +2,11 @@
 
 use bohr_types::{Digest, Seed};
 use chacha20::{
-    cipher::{KeyIvInit, StreamCipher, StreamCipherSeek},
     ChaCha8,
+    cipher::{KeyIvInit, StreamCipher, StreamCipherSeek},
 };
 
-use crate::{cursor::TapeCursor, TapeError, TAPE_ABI, TAPE_FORMAT_VERSION};
+use crate::{TAPE_ABI, TAPE_FORMAT_VERSION, TapeError, cursor::TapeCursor};
 
 /// First four bytes of a `.tape` container.
 pub const TAPE_MAGIC: [u8; 4] = *b"BTP\x01";
@@ -50,7 +50,7 @@ fn segment_nonce(segment: u64) -> [u8; 12] {
 ///
 /// Past the end of the prefix the tape keeps producing bytes, still as a pure function of the
 /// seed, for as far as an offset can be counted — the cipher is re-keyed per
-/// `EXTENSION_SEGMENT_BYTES` rather than asked for more than one keying can give.
+/// [`EXTENSION_SEGMENT_BYTES`] rather than asked for more than one keying can give.
 #[derive(Clone)]
 pub struct Tape {
     seed: Seed,

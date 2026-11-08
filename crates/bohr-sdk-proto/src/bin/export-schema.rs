@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use bohr_sdk_proto::{json::Json, AssertType, SDK_SCHEMA};
+use bohr_sdk_proto::{AssertType, SDK_SCHEMA, json::Json};
 
 fn main() {
     println!("{}", schema().to_json());

@@ -6,7 +6,7 @@ use std::{
 use bohr_backend::{Resume, Stop, StopKind};
 use bohr_kernel::{Effects, FaultCatalog, KernelError, NodeOp, Wake, WorldCtx, WorldModel};
 use bohr_tape::DrawSite;
-use bohr_trace::{short_digest, EventKind};
+use bohr_trace::{EventKind, short_digest};
 use bohr_types::{GuestAddr, SyncWordId, TaskId, Tick, WorldModelId};
 
 use crate::nums::{errno, sys};
@@ -318,11 +318,7 @@ const RLIMIT_NOFILE: u64 = 7;
 /// a stock Linux gives; everything else is unlimited, which is the answer that makes a guest do the
 /// most rather than the least.
 const fn limit_for(resource: u64) -> (u64, u64) {
-    if resource == RLIMIT_NOFILE {
-        (1024, 1_048_576)
-    } else {
-        (u64::MAX, u64::MAX)
-    }
+    if resource == RLIMIT_NOFILE { (1024, 1_048_576) } else { (u64::MAX, u64::MAX) }
 }
 
 /// Size of `struct statfs` on x86-64.
@@ -530,7 +526,7 @@ pub struct MinimalWorld {
     /// What `getcwd` answers.
     ///
     /// A fact about the filesystem the guest was given, so it travels with the state rather than
-    /// with the process — which is where the backend's own never-read `cwd` field used to sit.
+    /// with the process.
     cwd: String,
     /// Whether something outside this world arms the timeout a wait carries.
     timeouts_armed: bool,
@@ -944,10 +940,10 @@ impl MinimalWorld {
             content.resize(end, 0);
         }
         content[start..end].copy_from_slice(bytes);
-        if at.is_none() {
-            if let Some(open) = self.open.get_mut(&fd) {
-                open.position += bytes.len() as u64;
-            }
+        if at.is_none()
+            && let Some(open) = self.open.get_mut(&fd)
+        {
+            open.position += bytes.len() as u64;
         }
         (bytes.len() as i64, Some(short_digest(bytes)))
     }
@@ -970,15 +966,15 @@ impl MinimalWorld {
 
         // What the kernel says about the process is made on the way in and then is a file like any
         // other to read — but never one to any disk, which is what `synthetic` marks it as.
-        if !self.names.contains_key(&path) {
-            if let Some(content) = generated(&path) {
-                self.make_parents(&path);
-                let inode = self.next_inode;
-                self.next_inode += 1;
-                self.names.insert(path.clone(), inode);
-                self.content.insert(inode, Arc::new(content));
-                self.synthetic.insert(inode);
-            }
+        if !self.names.contains_key(&path)
+            && let Some(content) = generated(&path)
+        {
+            self.make_parents(&path);
+            let inode = self.next_inode;
+            self.next_inode += 1;
+            self.names.insert(path.clone(), inode);
+            self.content.insert(inode, Arc::new(content));
+            self.synthetic.insert(inode);
         }
 
         let inode = if RANDOM_PATHS.contains(&path.as_str()) {
@@ -1512,10 +1508,10 @@ impl MinimalWorld {
         self.transfer.clear();
         self.transfer.extend_from_slice(&content[from.min(content.len())..][..take]);
         ctx.write_mem(addr, &self.transfer)?;
-        if at.is_none() {
-            if let Some(open) = self.open.get_mut(&fd) {
-                open.position += take as u64;
-            }
+        if at.is_none()
+            && let Some(open) = self.open.get_mut(&fd)
+        {
+            open.position += take as u64;
         }
         Ok((take as i64, Some(short_digest(&self.transfer))))
     }
@@ -1541,8 +1537,8 @@ impl MinimalWorld {
         ctx.read_mem(addr, &mut self.transfer)?;
 
         // Growing the file, moving the position and choosing where an appending write lands are
-        // done once, in `write_bytes`. They used to be done here as well, and two implementations
-        // of one rule diverge -- rule 7, and the appending case is where they already had.
+        // done once, in `write_bytes`: two implementations of one rule diverge (rule 7), and the
+        // appending case is where they would.
         let bytes = std::mem::take(&mut self.transfer);
         let answer = self.write_bytes(fd, &bytes, at);
         self.transfer = bytes;
@@ -2036,10 +2032,10 @@ impl MinimalWorld {
                     return Ok((Some(-errno::EAGAIN), Vec::new()));
                 }
                 // **A timeout this world cannot arm is refused, not ignored.** Timers belong to
-                // the cluster model; alone, this world has no way to make one fire, so a
-                // `pthread_cond_timedwait` that nothing wakes used to wait for ever and the kernel
-                // called it a deadlock -- a finding invented against a correct program. Refusing
-                // says which call could not be answered, which is what §5.7 asks for.
+                // the cluster model; alone, this world cannot make one fire, so a
+                // `pthread_cond_timedwait` that nothing wakes would wait for ever and be called a
+                // deadlock -- a finding invented against a correct program. Refusing says which
+                // call could not be answered, which is what §5.7 asks for.
                 if args[3] != 0 && !self.timeouts_armed {
                     let why = "a futex wait with a timeout needs a timer this world has none of";
                     return Err(ctx.refuse("BOHR-2004", why.to_owned()));
@@ -2428,10 +2424,11 @@ impl MinimalWorld {
         // Where a write is about to land, taken before it lands: the non-positional forms move the
         // descriptor, so afterwards the file no longer says where they started.
         let wrote_from = mapped.and(self.open.get(&(args[0] as i64))).map_or(0, |f| f.position);
-        if let Some(inode) = mapped {
-            if matches!(nr, sys::READ | sys::PREAD64) && self.is_mapped_writable(inode) {
-                self.collect_mappings(ctx, inode)?;
-            }
+        if let Some(inode) = mapped
+            && matches!(nr, sys::READ | sys::PREAD64)
+            && self.is_mapped_writable(inode)
+        {
+            self.collect_mappings(ctx, inode)?;
         }
 
         // Creating a task is carried out by the host, since a real thread is what the guest needs.
@@ -2745,7 +2742,7 @@ impl MinimalWorld {
                 return Err(ctx.refuse(
                     "BOHR-2004",
                     "a signal sent to another thread is not modelled here".to_owned(),
-                ))
+                ));
             }
             sys::TGKILL | sys::KILL => {
                 let signal = if nr == sys::KILL { args[1] } else { args[2] } as u32;
@@ -2834,7 +2831,7 @@ impl MinimalWorld {
                     "BOHR-2004",
                     "poll with no timeout waits on something this world cannot make ready"
                         .to_owned(),
-                ))
+                ));
             }
             sys::POLL => {
                 let ret = Self::clear_poll_results(ctx, GuestAddr(args[0]), args[1])?;

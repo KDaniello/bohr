@@ -21,7 +21,7 @@ use bohr_explorer::{Campaign, RunResult, WorkItem};
 use bohr_tape::Tape;
 use bohr_types::Seed;
 
-use crate::{execute, guests::Demo, wire, CliError};
+use crate::{CliError, execute, guests::Demo, wire};
 
 /// How many items a generation holds.
 ///
@@ -267,13 +267,13 @@ fn run_slices(
         // and a worker that dies before writing would otherwise leave the previous generation's
         // file to be read as this one's answer: the indices are the same 0..n, so results from
         // tapes nobody ran would be folded into the corpus without a word.
-        if let Err(e) = std::fs::remove_file(&results) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(CliError::Internal(format!(
-                    "BOHR-3006: cannot clear {}: {e}",
-                    results.display()
-                )));
-            }
+        if let Err(e) = std::fs::remove_file(&results)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(CliError::Internal(format!(
+                "BOHR-3006: cannot clear {}: {e}",
+                results.display()
+            )));
         }
 
         let mut command =
@@ -507,12 +507,10 @@ fn report(campaign: &Campaign, started: Instant, saved: u64) {
 
 /// The campaign as one machine-readable object.
 ///
-/// **Written through a serialiser, because the strings in it are the guest's.** It used to be
-/// assembled by hand: a finding's kind is `format!("{:?}")` of an outcome, so
-/// `PropertyViolated("log is monotonic")` put bare double quotes inside a JSON string, and a
-/// property name comes from a record the guest wrote — so a guest naming a property
-/// `x", "satisfied": 999999, "y` rewrote the machine-readable account of the campaign that ran it.
-/// The gate compares these byte for byte and the test only asked whether one substring appeared,
+/// **Written through a serialiser, because the strings in it are the guest's.** A finding's kind
+/// is `format!("{:?}")` of an outcome and a property name comes from a record the guest wrote, so
+/// hand-assembled JSON would let a guest naming a property `x", "satisfied": 999999, "y` rewrite
+/// the account of the campaign that ran it. The gate compares this file byte for byte.
 /// so an invalid file shipped as soon as anything was found.
 fn summary(request: &Request, campaign: &Campaign) -> String {
     let findings: Vec<serde_json::Value> = campaign

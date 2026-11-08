@@ -9,10 +9,10 @@
 //! the exit status reads zero, and a campaign of a million of them says a guest that aborted every
 //! time never once misbehaved.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Scenario};
+use bohr_testkit::{Scenario, judge_scenario};
 use bohr_trace::Outcome;
 use bohr_types::Seed;
 

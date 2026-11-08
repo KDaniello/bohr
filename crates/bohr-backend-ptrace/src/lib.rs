@@ -4,13 +4,11 @@
 //! carries the invariant its caller must hold. On any other target it compiles to nothing, so the
 //! layers above build and test unchanged wherever the toolchain runs.
 
-#![warn(missing_docs)]
-
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use linux::{doctor, syscall_name, syscall_table, unmodelled_syscall_name, PtraceBackend};
+pub use linux::{PtraceBackend, doctor, syscall_name, syscall_table, unmodelled_syscall_name};
 
 /// Whether this build contains a working interceptor.
 ///

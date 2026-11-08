@@ -18,10 +18,10 @@
 //! **A stream carries an answer written in pieces.** A server puts its headers and its body on the
 //! wire in one vectored call, and that is the shape of nearly every reply a real one sends.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::EventKind;
 use bohr_types::{NodeId, Seed, Tick};
 use bohr_world::{NetworkConfig, NodeFaultKind, ScheduledNodeFault, ScheduledPartition};
@@ -274,9 +274,9 @@ fn a_stream_carries_an_answer_written_in_pieces() {
 /// A listener serves more than one caller.
 ///
 /// An accepted connection is given the listening port so `getsockname` can answer on it, and
-/// closing it used to give that port up — so a server was bound to nothing the moment it finished
-/// with its first caller, and every connection after the first was refused. Found against an
-/// execution client, whose caller asks it a question, hangs up, and comes back with the next.
+/// closing it must not give that port up: a server would then be bound to nothing after its first
+/// caller, and an execution client -- asked a question, hung up on, asked the next -- refuses every
+/// connection after the first.
 ///
 /// Asserted on both connects rather than on the second alone: a pair where the first also failed
 /// would be a different defect wearing the same result.

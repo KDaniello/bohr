@@ -16,8 +16,8 @@
 
 #![cfg(any(feature = "chaos-unknown-descriptor", feature = "chaos-proc-on-the-disk"))]
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
-use bohr_testkit::{refusable_scenario, Preload, Scenario};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
+use bohr_testkit::{Preload, Scenario, refusable_scenario};
 use bohr_types::Seed;
 
 const PAYLOAD_AT: u64 = MEMORY_BASE + 0x200;

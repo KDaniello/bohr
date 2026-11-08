@@ -15,11 +15,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # Two hosted images, which differ in kernel and C library. A second CPU vendor needs a
+      # self-hosted runner this repository does not have, so that half of the claim is unchecked
+      # here: a job waiting for a runner that never comes holds the whole night for a day.
       matrix:
-        runner: [ubuntu-24.04, self-hosted-amd]
+        runner: [ubuntu-24.04, ubuntu-22.04]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
+      # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
+      # cannot be placed in its own namespaces without them.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -34,11 +41,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # Two hosted images, which differ in kernel and C library. A second CPU vendor needs a
+      # self-hosted runner this repository does not have, so that half of the claim is unchecked
+      # here: a job waiting for a runner that never comes holds the whole night for a day.
       matrix:
-        runner: [ubuntu-24.04, self-hosted-amd]
+        runner: [ubuntu-24.04, ubuntu-22.04]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
+      # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
+      # cannot be placed in its own namespaces without them.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - uses: actions/download-artifact@v4
         with: { path: bundles/ }
       - run: make guests
@@ -56,7 +70,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
+      # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
+      # cannot be placed in its own namespaces without them.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: make guests
       - run: make test-hunting
       - uses: actions/upload-artifact@v4
@@ -67,13 +85,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
+      # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
+      # cannot be placed in its own namespaces without them.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: make guests
       - name: Which scheduler reaches the seeded defects
         run: make policy-comparison
       - name: Slowdown versus native, the T3 gate
         run: make bench-slowdown
-      - run: make bench
 
   fuzz-long:
     runs-on: ubuntu-24.04
@@ -82,7 +103,8 @@ jobs:
         target: [bundle, tape, sdk_record, event_log, syscall_args]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/toolchain
+        with: { nightly: "true" }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz

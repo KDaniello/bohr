@@ -22,11 +22,7 @@ impl Probe {
     /// A probe from a boolean answer.
     #[must_use]
     pub const fn from(present: bool) -> Self {
-        if present {
-            Self::Present
-        } else {
-            Self::Absent
-        }
+        if present { Self::Present } else { Self::Absent }
     }
 }
 
@@ -126,10 +122,7 @@ pub fn can_disable_aslr() -> Probe {
 /// an instruction nothing in the run could have predicted.
 #[must_use]
 pub fn supports(leaf_one_ecx: u32, leaf_seven_ebx: u32) -> Probe {
-    // SAFETY: the instruction reads and writes nothing outside the registers it returns, and this
-    // build only reaches here on the architecture that has it.
-    let (one, seven) =
-        unsafe { (std::arch::x86_64::__cpuid(1), std::arch::x86_64::__cpuid_count(7, 0)) };
+    let (one, seven) = (std::arch::x86_64::__cpuid(1), std::arch::x86_64::__cpuid_count(7, 0));
     Probe::from(
         one.ecx & leaf_one_ecx == leaf_one_ecx && seven.ebx & leaf_seven_ebx == leaf_seven_ebx,
     )

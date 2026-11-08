@@ -61,10 +61,8 @@ pub(crate) fn decisions(journal: &Journal, prefix_len: usize, target: Target) ->
             Target::Deliveries => is_delivery && deliveries % 2 == 1,
             Target::Everything => site.is_some(),
         };
-        if wanted {
-            if let Some(site) = site {
-                found.push(Decision { site, offset: record.offset, len: record.len });
-            }
+        if wanted && let Some(site) = site {
+            found.push(Decision { site, offset: record.offset, len: record.len });
         }
     }
     found

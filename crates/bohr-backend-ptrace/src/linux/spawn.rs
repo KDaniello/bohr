@@ -133,11 +133,11 @@ pub(super) fn spawn_traced(
     // watching, and a filter that traces with no tracer attached fails the syscall instead.
     let mut report = [0; 2];
     let mut go = [0; 2];
-    // Close-on-exec, so the ends the guest does not use do not follow it through `execve`. They
-    // used to: a guest reading `/proc/self/fd` saw two descriptors whose numbers came from this
-    // process's allocation state, which is host state reaching a guest by the back door. The
-    // coverage channel two files away is handled exactly this way for exactly this reason, and
-    // the ends the guest is meant to inherit clear the flag where they are dup'd into place.
+    // Close-on-exec, so the ends the guest does not use do not follow it through `execve`: a guest
+    // reading `/proc/self/fd` would otherwise see descriptor numbers taken from this process's
+    // allocation state, which is host state reaching a guest by the back door. The ends the guest
+    // is meant to inherit clear the flag where they are dup'd into place, as the coverage channel's
+    // do.
     // SAFETY: both arrays are ours and large enough for a pipe pair.
     if unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(BackendError::CannotStart { program: program.clone(), reason: last_error() });
@@ -158,8 +158,8 @@ pub(super) fn spawn_traced(
     let intermediate = unsafe { libc::fork() };
     if intermediate < 0 {
         let reason = last_error();
-        // A campaign that starts hundreds of guests and meets a descriptor ceiling used to leak
-        // four here on every attempt after it, so the ceiling became permanent.
+        // Closed on every failure: a campaign that meets a descriptor ceiling would otherwise leak
+        // four per attempt and never get back under it.
         // SAFETY: descriptors this call opened and nothing else holds.
         unsafe {
             libc::close(report[0]);
@@ -259,29 +259,33 @@ unsafe fn intermediate_setup(
     go: libc::c_int,
     coverage: Option<libc::c_int>,
 ) -> ! {
-    // Whether this host allows it is settled before the fork, so reaching here and failing is a
-    // condition the run cannot be honest about and must not continue under.
-    if isolate && !enter_namespaces() {
-        libc::_exit(failed::NAMESPACES);
-    }
+    // SAFETY: every call below is made under this function's own contract (`# Safety` above),
+    // which its caller upholds.
+    unsafe {
+        // Whether this host allows it is settled before the fork, so reaching here and failing is a
+        // condition the run cannot be honest about and must not continue under.
+        if isolate && !enter_namespaces() {
+            libc::_exit(failed::NAMESPACES);
+        }
 
-    // The guest, and only the guest, is inside the identifier namespace created above.
-    let guest = libc::fork();
-    if guest < 0 {
-        libc::_exit(failed::HANDOVER);
-    }
-    if guest == 0 {
-        libc::close(report);
-        child_setup(path, argv, envp, filter, go, coverage)
-    }
+        // The guest, and only the guest, is inside the identifier namespace created above.
+        let guest = libc::fork();
+        if guest < 0 {
+            libc::_exit(failed::HANDOVER);
+        }
+        if guest == 0 {
+            libc::close(report);
+            child_setup(path, argv, envp, filter, go, coverage)
+        }
 
-    // The pid here is the one the supervisor can see, which is the outer numbering; inside its own
-    // namespace the guest is number one.
-    let bytes = guest.to_le_bytes();
-    if libc::write(report, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
-        libc::_exit(failed::HANDOVER);
+        // The pid here is the one the supervisor can see, which is the outer numbering; inside its
+        // own namespace the guest is number one.
+        let bytes = guest.to_le_bytes();
+        if libc::write(report, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
+            libc::_exit(failed::HANDOVER);
+        }
+        libc::_exit(0)
     }
-    libc::_exit(0)
 }
 
 /// Everything the guest must have arranged before its first instruction.
@@ -298,65 +302,74 @@ unsafe fn child_setup(
     go: libc::c_int,
     coverage: Option<libc::c_int>,
 ) -> ! {
-    // The counters, moved to the number the environment names. `dup2` is what carries them across
-    // the `execve`: it clears close-on-exec on the descriptor it creates, and the original was
-    // opened with it set so that no other spawn inherits one.
-    if let Some(fd) = coverage {
-        if libc::dup2(fd, coverage::COVERAGE_FD) < 0 {
+    // SAFETY: every call below is made under this function's own contract (`# Safety` above),
+    // which its caller upholds.
+    unsafe {
+        // The counters, moved to the number the environment names. `dup2` is what carries them
+        // across the `execve`: it clears close-on-exec on the descriptor it creates, and
+        // the original was opened with it set so that no other spawn inherits one.
+        if let Some(fd) = coverage
+            && libc::dup2(fd, coverage::COVERAGE_FD) < 0
+        {
             libc::_exit(failed::COVERAGE);
         }
-    }
-    // Address randomisation would place every mapping differently on every run.
-    if libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong) == -1 {
-        libc::_exit(failed::PERSONALITY);
-    }
+        // Address randomisation would place every mapping differently on every run.
+        if libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong) == -1 {
+            libc::_exit(failed::PERSONALITY);
+        }
 
-    // One core: migration between cores changes timing and what the processor reports.
-    let mut set: libc::cpu_set_t = std::mem::zeroed();
-    libc::CPU_SET(0, &mut set);
-    if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == -1 {
-        libc::_exit(failed::AFFINITY);
-    }
+        // One core: migration between cores changes timing and what the processor reports.
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(0, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == -1 {
+            libc::_exit(failed::AFFINITY);
+        }
 
-    // A filter may only be installed by a process that cannot gain privileges, and the guarantee
-    // must outlive the exec.
-    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
-        libc::_exit(failed::NO_NEW_PRIVS);
-    }
-    // Reading the timestamp counter becomes a fault the supervisor answers from logical time.
-    // Set before the filter, because `prctl` is itself filtered and would otherwise be refused.
-    if libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) == -1 {
-        libc::_exit(failed::TSC);
-    }
+        // A filter may only be installed by a process that cannot gain privileges, and the
+        // guarantee must outlive the exec.
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+            libc::_exit(failed::NO_NEW_PRIVS);
+        }
+        // Reading the timestamp counter becomes a fault the supervisor answers from logical time.
+        // Set before the filter, because `prctl` is itself filtered and would otherwise be refused.
+        if libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) == -1 {
+            libc::_exit(failed::TSC);
+        }
 
-    // Wait until the supervisor is watching. The order is load-bearing: a filter returning
-    // SECCOMP_RET_TRACE while no tracer is attached produces no event at all and fails the syscall
-    // with ENOSYS instead, which surfaces much later as a segfault in the loader.
-    let mut ready = [0u8; 1];
-    if libc::read(go, ready.as_mut_ptr().cast(), 1) != 1 {
-        libc::_exit(failed::HANDOVER);
+        // Wait until the supervisor is watching. The order is load-bearing: a filter returning
+        // SECCOMP_RET_TRACE while no tracer is attached produces no event at all and fails the
+        // syscall with ENOSYS instead, which surfaces much later as a segfault in the
+        // loader.
+        let mut ready = [0u8; 1];
+        if libc::read(go, ready.as_mut_ptr().cast(), 1) != 1 {
+            libc::_exit(failed::HANDOVER);
+        }
+        libc::close(go);
+
+        // Both crates describe the kernel's `struct sock_filter`, so the cast is between two
+        // spellings of one ABI type.
+        let prog = libc::sock_fprog {
+            len: u16::try_from(filter.len()).unwrap_or(u16::MAX),
+            filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+        };
+        if libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            std::ptr::from_ref(&prog),
+        ) == -1
+        {
+            libc::_exit(failed::SECCOMP);
+        }
+
+        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+
+        libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        libc::_exit(failed::EXECVE)
     }
-    libc::close(go);
-
-    // Both crates describe the kernel's `struct sock_filter`, so the cast is between two spellings
-    // of one ABI type.
-    let prog = libc::sock_fprog {
-        len: u16::try_from(filter.len()).unwrap_or(u16::MAX),
-        filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
-    };
-    if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, std::ptr::from_ref(&prog))
-        == -1
-    {
-        libc::_exit(failed::SECCOMP);
-    }
-
-    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
-    argv_ptrs.push(std::ptr::null());
-    let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
-    envp_ptrs.push(std::ptr::null());
-
-    libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
-    libc::_exit(failed::EXECVE)
 }
 
 /// Places the caller in fresh namespaces and gives it a fixed view of the machine.
@@ -365,24 +378,29 @@ unsafe fn child_setup(
 ///
 /// Must only be called between `fork` and `execve`, where the process is single-threaded.
 pub(super) unsafe fn enter_namespaces() -> bool {
-    let uid = libc::getuid();
-    let gid = libc::getgid();
-    if libc::unshare(GUEST_NAMESPACES) == -1 {
-        return false;
-    }
+    // SAFETY: every call below is made under this function's own contract (`# Safety` above),
+    // which its caller upholds.
+    unsafe {
+        let uid = libc::getuid();
+        let gid = libc::getgid();
+        if libc::unshare(GUEST_NAMESPACES) == -1 {
+            return false;
+        }
 
-    // A fresh user namespace starts with no mapping, which leaves every identifier unresolvable
-    // until one is written. Group mapping is refused outright unless `setgroups` is denied first.
-    let mut line = [0u8; 32];
-    if !write_proc(c"/proc/self/setgroups", b"deny")
-        || !write_proc(c"/proc/self/uid_map", identity_map(&mut line, uid))
-        || !write_proc(c"/proc/self/gid_map", identity_map(&mut line, gid))
-    {
-        return false;
-    }
+        // A fresh user namespace starts with no mapping, which leaves every identifier unresolvable
+        // until one is written. Group mapping is refused outright unless `setgroups` is denied
+        // first.
+        let mut line = [0u8; 32];
+        if !write_proc(c"/proc/self/setgroups", b"deny")
+            || !write_proc(c"/proc/self/uid_map", identity_map(&mut line, uid))
+            || !write_proc(c"/proc/self/gid_map", identity_map(&mut line, gid))
+        {
+            return false;
+        }
 
-    libc::sethostname(GUEST_HOSTNAME.as_ptr().cast(), GUEST_HOSTNAME.len()) == 0
-        && libc::setdomainname(GUEST_HOSTNAME.as_ptr().cast(), GUEST_HOSTNAME.len()) == 0
+        libc::sethostname(GUEST_HOSTNAME.as_ptr().cast(), GUEST_HOSTNAME.len()) == 0
+            && libc::setdomainname(GUEST_HOSTNAME.as_ptr().cast(), GUEST_HOSTNAME.len()) == 0
+    }
 }
 
 /// Formats `0 <id> 1`, the one mapping line an unprivileged process is allowed to install.
@@ -412,13 +430,17 @@ fn identity_map(buf: &mut [u8; 32], id: libc::uid_t) -> &[u8] {
 ///
 /// Must only be called between `fork` and `execve`.
 unsafe fn write_proc(path: &std::ffi::CStr, line: &[u8]) -> bool {
-    let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-    if fd < 0 {
-        return false;
+    // SAFETY: every call below is made under this function's own contract (`# Safety` above),
+    // which its caller upholds.
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return false;
+        }
+        let written = libc::write(fd, line.as_ptr().cast(), line.len());
+        libc::close(fd);
+        written == line.len() as isize
     }
-    let written = libc::write(fd, line.as_ptr().cast(), line.len());
-    libc::close(fd);
-    written == line.len() as isize
 }
 
 /// Rewrites the auxiliary vector on the guest's stack.

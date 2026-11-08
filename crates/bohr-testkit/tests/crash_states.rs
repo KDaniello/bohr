@@ -15,10 +15,10 @@
 //! disk ever passed through, and a model that restored some earlier moment would only ever produce
 //! states the store had already survived once.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::{EventKind, FaultKind, Outcome};
 use bohr_types::{NodeId, Seed, Tick};
 use bohr_world::{DurabilityConfig, NetworkConfig, NodeFaultKind, ScheduledNodeFault};
@@ -240,12 +240,10 @@ fn a_crash_can_leave_some_sectors_of_a_write_and_not_others() {
 
 /// A file cut down after a write, and then a crash.
 ///
-/// **The shape that panicked the supervisor.** A write marks its sectors as not yet durable; a
-/// later `ftruncate` takes the bytes above the new length but used to leave the marks behind. The
-/// crash image then copied a sector out of a file shorter than the mark said it was — an index past
-/// the end, in the sans-io core, from a guest doing nothing unusual and one drawn crash. A panic
-/// there destroys the run it exists to record, and the audit that names an impossible image runs
-/// after the arithmetic that panicked.
+/// **A shape that can panic the supervisor.** A write marks its sectors as not yet durable, and a
+/// later `ftruncate` must take the marks above the new length with the bytes. Otherwise the crash
+/// image copies a sector out of a file shorter than the mark says -- an index past the end, in the
+/// sans-io core, from a guest doing nothing unusual and one drawn crash.
 ///
 /// Over a spread of seeds because where a crash lands is drawn, and the sector that mattered has to
 /// be one the draw reaches.

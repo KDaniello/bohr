@@ -111,13 +111,11 @@ fn a_differential_scenario_with_one_implementation_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The shape a real client is compared in, and the one that used to compare nothing.
+/// The shape a real client is compared in: each implementation shares a cluster with its caller.
 ///
-/// An execution client does nothing until something drives it, so the implementation under
-/// comparison shares a cluster with the caller that makes it work. Every node's program then comes
-/// from `[cluster]`, and both implementations ran the same one: the run reported agreement having
-/// executed a single program twice. Nothing about it looked wrong — it was clean, it was fast, and
-/// a campaign of a million such runs would have been clean a million times.
+/// An execution client does nothing until something drives it, so every node's program comes from
+/// `[cluster]`. The danger is both implementations running the same program: the run reports
+/// agreement having executed one program twice, and nothing about it looks wrong.
 #[test]
 fn an_implementation_replaces_its_own_node_of_a_cluster() {
     let Some(config) = scenario("cluster.toml") else {

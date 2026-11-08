@@ -9,7 +9,7 @@
 //! Runs against the scripted backend, so it is checked on every machine rather than only where a
 //! guest can be intercepted. See `docs/API.md` §5.5.
 
-use bohr_testkit::{run_once_covered, Fixture};
+use bohr_testkit::{Fixture, run_once_covered};
 use bohr_types::Seed;
 
 /// The founding half: coverage is a fact about the run, and the run is a function of the seed.

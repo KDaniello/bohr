@@ -9,7 +9,7 @@ use bohr_reducer::{
     Baseline, CandidateOutcome, ConfigDoc, Limits, Reduction, Scenario, Size, Violation,
 };
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, violation::PingPong, Judged};
+use bohr_testkit::{Judged, judge_scenario, violation::PingPong};
 use bohr_types::Seed;
 use bohr_world::config::load;
 

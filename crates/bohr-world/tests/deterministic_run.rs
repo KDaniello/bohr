@@ -4,10 +4,10 @@
 //! syscalls, no privileges and no Linux are involved, which is what lets the claim these tests make
 //! be checked on any machine in milliseconds.
 
-use bohr_backend_null::{GuestOp, NullBackend, NullProgram, MEMORY_BASE};
-use bohr_kernel::{run, Oracle, RunConfig, RunInputs, RunOutcome, Verdict};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
+use bohr_kernel::{Oracle, RunConfig, RunInputs, RunOutcome, Verdict, run};
 use bohr_tape::Tape;
-use bohr_trace::{read_events, EventKind, Outcome, TraceWriter};
+use bohr_trace::{EventKind, Outcome, TraceWriter, read_events};
 use bohr_types::{Digest, OracleId, Seed};
 use bohr_world::MinimalWorld;
 

@@ -45,7 +45,7 @@ pub fn functions(bytes: &[u8]) -> Vec<Function> {
         let Some((symbols, _)) = sections.by_kind(table) else {
             continue;
         };
-        for entry in symbols.chunks_exact(24) {
+        for entry in symbols.as_chunks::<24>().0 {
             // Type is the low four bits of the info byte; two is a function.
             if entry[4] & 0xF != 2 {
                 continue;

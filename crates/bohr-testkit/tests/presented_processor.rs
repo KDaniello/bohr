@@ -10,7 +10,7 @@
 //! ones. The table has its own tests inside `bohr-world`; this is the wire between it and a guest.
 
 use bohr_backend_null::{GuestOp, NullProgram};
-use bohr_testkit::{run_scenario, Scenario};
+use bohr_testkit::{Scenario, run_scenario};
 use bohr_trace::EventKind;
 use bohr_types::Seed;
 

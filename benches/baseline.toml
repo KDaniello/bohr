@@ -871,7 +871,7 @@ fixed_by = "a prefix that covers what the run read, taken from the run's own dra
 # algorithm, and the throughput work that looked like a convenience is what decides whether a
 # finding can be handed to anybody in the shape the milestone asks for.
 [m5.op_reth.reduction]
-bundle = "kept outside the repository"
+bundle = "in findings/, which is not published"
 events_before = 1_222_888
 events_after = 1_189_704
 draws_before = 495_591
@@ -948,7 +948,7 @@ reads = "a map half full from one path, so nearly every run is novel and the cor
 
 [m3.coverage.reached]
 outcome = "GuestCrashed(exit status 101)"
-bundle = "kept outside the repository"
+bundle = "in findings/, which is not published"
 attribution = "not established; the guest is ours and the panic may be too"
 
 [m5.op_reth.ends_with_node]
@@ -1219,3 +1219,23 @@ trace_lines_differing = 0
 under_the_old_rule = { at_65536 = "blake3:4c6738cf", at_4194304 = "blake3:be86a017", verdict = "two runs" }
 under_the_new_rule = { at_65536 = "blake3:b6614802", at_4194304 = "blake3:b6614802", verdict = "one run" }
 rule = "an address is hashed as whether it is null; a scalar by value; a register the call does not read, not at all"
+
+# What v0.1.0 was measured to do, on its own commit and on the host named here. The [m2.gates]
+# section above is an earlier measurement, kept as it was taken.
+#
+# `slowdown_cat` is past the ceiling of [guests.cat], and was on the commit before under the previous
+# toolchain (4.7x): a guest that lives a millisecond is measured by its startup, and starting under
+# the supervisor costs about three milliseconds on this host. The per-call figure is the cost of
+# interception itself, and it is within its ceiling.
+[v0_1.gates]
+host = "x86_64, Ubuntu 24.04 under the Windows subsystem for Linux, Linux 6.18, Core i5-12600KF"
+toolchain = "1.99.1"
+determinism_repeats_identical = 1000
+cluster_repeats_identical = 100
+mutation_injections = 13
+mutation_injections_caught = 13
+bdd_scenarios = 12
+bdd_scenarios_passing = 12
+per_call_us = 53.2
+slowdown_cat = 4.9
+slowdown_clock_and_random = 3.5

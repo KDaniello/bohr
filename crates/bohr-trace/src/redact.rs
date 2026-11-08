@@ -85,9 +85,9 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
 ///
 /// # Errors
 ///
-/// Refuses a section it cannot read or cannot write back. Both used to pass the bytes through
-/// untouched and count nought, so the note on the bundle said "0 binary paths hashed" over a list
-/// of paths that were still there — a redaction reporting success for work it had not done.
+/// Refuses a section it cannot read or cannot write back. Passing the bytes through untouched and
+/// counting nought would note "0 binary paths hashed" over paths still there -- a redaction
+/// reporting success for work it had not done.
 fn hash_paths(binaries: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
     let mut records: Vec<crate::BinaryRecord> =
         serde_json::from_slice(binaries).map_err(|e| TraceError::RedactionIncomplete {
@@ -169,10 +169,11 @@ const REMOVED_RECORD: &str = r#"{"bohr_redacted":{}}"#;
 /// somebody wrote, and a replay reads exactly those bytes back. Removing lines can be read off a
 /// diff; re-serialising cannot, and would have to be trusted to have changed nothing else.
 ///
-/// **What it cannot prove it removed, it refuses.** Filtering by line used to mean a value spread
-/// over several lines lost only its first one — `argv = [` kept every argument under it — and a
-/// `[env]` table was not a key at all, so nothing matched and everything under it went out whole.
-/// So the scanner below understands a value's extent, and then the result is parsed and asked
+/// **What it cannot prove it removed, it refuses.** Filtering by line alone would let a value
+/// spread over several lines lose only its first one -- `argv = [` keeps every argument under it --
+/// and would match nothing in an `[env]` table, which is not a key. So the scanner below
+/// understands a value's extent, and the result is then parsed and asked whether anything it was
+/// meant to remove survived.
 /// whether anything it was meant to remove survived. A redaction that cannot answer that question
 /// is not a redaction (`TraceError::RedactionIncomplete`).
 ///

@@ -7,12 +7,12 @@
 //! what can be held is answered, never obeyed. See `docs/ARCHITECTURE.md` §5.7.
 
 use bohr_backend::{BackendError, GuestSpec};
-use bohr_backend_null::{GuestOp, NullBackend, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
 use bohr_kernel::{
-    run, KernelError, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict,
+    KernelError, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict, run,
 };
 use bohr_tape::Tape;
-use bohr_trace::{read_events, Event, EventKind, TraceWriter};
+use bohr_trace::{Event, EventKind, TraceWriter, read_events};
 use bohr_types::{GuestAddr, OracleId, Seed};
 use bohr_world::MinimalWorld;
 

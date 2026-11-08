@@ -1,7 +1,9 @@
 .DEFAULT_GOAL := help
 
 CARGO ?= cargo
-NIGHTLY ?= +nightly
+# rustfmt and cargo-fuzz need nightly; dated, because an undated one reformats untouched code the
+# day rustfmt changes. CI reads the date from this line (.github/actions/toolchain).
+NIGHTLY ?= +nightly-2026-10-16
 WORKSPACE_FLAGS := --workspace --all-features
 # Targets that execute code use these instead of WORKSPACE_FLAGS: --all-features would switch on
 # every chaos injection at once, and the determinism suite is built to go red under any one of
@@ -9,6 +11,8 @@ WORKSPACE_FLAGS := --workspace --all-features
 # Static analysis keeps --all-features so the injections themselves stay compiled and linted.
 RUN_FLAGS := --workspace
 BIN := target/release/bohr
+# The compiler the SDK crates promise to build on, read from the crate rather than restated.
+SDK_MSRV := $(shell sed -n 's/^rust-version = "\(.*\)"/\1/p' sdk/rust/Cargo.toml)
 
 # Guests are built from committed source with pinned flags, never committed as binaries.
 GUEST_SRC := $(wildcard testdata/guests/*.c testdata/guests/*.rs)
@@ -82,6 +86,10 @@ test-sdk: ## SDK conformance across every language with a driver (docs/TESTING.m
 	dotnet build -c Debug -o sdk/conformance/drivers/csharp/out sdk/conformance/drivers/csharp
 	cd sdk/conformance/drivers/go && go build -o out/conformance-driver .
 	python3 sdk/conformance/check.py --all
+
+.PHONY: msrv
+msrv: ## The SDK crates build on the oldest compiler they promise (their rust-version)
+	$(CARGO) +$(SDK_MSRV) check -p bohr-sdk -p bohr-sdk-proto --all-targets
 
 .PHONY: test-mutation
 test-mutation: ## Assert every chaos injection breaks the determinism suite (docs/TESTING.md 7.4)
@@ -173,7 +181,7 @@ docs: ## Build and open the rustdoc
 	$(CARGO) doc $(WORKSPACE_FLAGS) --no-deps --open
 
 .PHONY: docs-check
-docs-check: ## Link check and English/Russian structure parity
+docs-check: ## Every relative link in the repository resolves
 	scripts/check-docs.sh
 
 ##@ Release

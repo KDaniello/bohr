@@ -78,10 +78,10 @@ pub(crate) fn run(target: Option<&str>, list_syscalls: bool) -> Result<u8, CliEr
         println!("{:width$}  {}  {}", check.name, check.verdict.mark(), check.detail);
         // Only where something is wrong: a remedy printed under a passing check reads as an
         // instruction to follow rather than as the way to look into a problem.
-        if check.verdict != Verdict::Pass {
-            if let Some(remedy) = &check.remedy {
-                println!("{:width$}        {remedy}", "");
-            }
+        if check.verdict != Verdict::Pass
+            && let Some(remedy) = &check.remedy
+        {
+            println!("{:width$}        {remedy}", "");
         }
         if check.verdict == Verdict::Fail {
             worst = Verdict::Fail;
@@ -121,12 +121,14 @@ fn print_syscalls() -> u8 {
 /// What a build without an interceptor can say about a host: that it is not one.
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn host_checks() -> Vec<Check> {
-    vec![Check::new(
-        "syscall backend",
-        Verdict::Skip,
-        "this build has none; guests run only through `bohr selftest`",
-    )
-    .with_remedy("build on Linux x86-64 to intercept a program on disk")]
+    vec![
+        Check::new(
+            "syscall backend",
+            Verdict::Skip,
+            "this build has none; guests run only through `bohr selftest`",
+        )
+        .with_remedy("build on Linux x86-64 to intercept a program on disk"),
+    ]
 }
 
 /// Everything a host is asked about.

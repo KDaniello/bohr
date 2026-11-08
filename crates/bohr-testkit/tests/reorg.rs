@@ -8,10 +8,10 @@
 //! The gate is the pair, as it is everywhere else here: the same scenario with the fault and
 //! without it, and the difference between them is what says the fault did something.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::{EventKind, FaultKind, FaultTarget};
 use bohr_types::{NodeId, Seed, Tick};
 use bohr_world::{NetworkConfig, NodeFaultKind, ScheduledNodeFault};

@@ -11,7 +11,7 @@
 //! defect is in the plumbing rather than in the search.
 
 use bohr_explorer::{Campaign, RunResult, WorkItem};
-use bohr_testkit::{carry_out, Fixture};
+use bohr_testkit::{Fixture, carry_out};
 use bohr_types::Seed;
 
 /// How a generation's results come back when the workers are of different speeds.

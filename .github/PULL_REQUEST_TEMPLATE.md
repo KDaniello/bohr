@@ -23,4 +23,4 @@ Closes #
 
 - [ ] `make pr` is green locally
 - [ ] Tests included; a bug fix names the seed or bundle that found it in the commit message
-- [ ] `docs/` and `docs/ru/` both updated, if documentation changed
+- [ ] `docs/` updated, if the behaviour it describes changed

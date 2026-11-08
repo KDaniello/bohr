@@ -53,10 +53,9 @@ impl ConfigDoc {
         let mut open: Option<(String, usize)> = None;
 
         // Depth of the value being read, so a line inside a multi-line array is text rather than
-        // structure. A continuation beginning with `[` -- an element of an array of arrays --
-        // used to close the open entry early, and one shaped like `[[0, 1], [2, 3]]` registered an
-        // entry named `0, 1], [2, 3` whose removal would have cut arbitrary lines out of somebody
-        // else's file.
+        // structure. A continuation beginning with `[` -- an element of an array of arrays -- must
+        // not close the open entry: `[[0, 1], [2, 3]]` read that way registers an entry named
+        // `0, 1], [2, 3`, whose removal would cut arbitrary lines out of somebody else's file.
         let mut depth = 0usize;
         for (at, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -65,10 +64,10 @@ impl ConfigDoc {
             if inside_value {
                 continue;
             }
-            if trimmed.starts_with('[') {
-                if let Some((table, from)) = open.take() {
-                    entries.push(Entry { table, span: from..at });
-                }
+            if trimmed.starts_with('[')
+                && let Some((table, from)) = open.take()
+            {
+                entries.push(Entry { table, span: from..at });
             }
             if let Some(name) = trimmed.strip_prefix("[[").and_then(|rest| rest.strip_suffix("]]"))
             {

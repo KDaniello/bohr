@@ -9,10 +9,10 @@
 use bohr_backend::GuestSpec;
 use bohr_backend_null::{GuestOp, NullBackend, NullProgram};
 use bohr_kernel::{
-    run, KernelError, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict, WorldModel,
+    KernelError, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict, WorldModel, run,
 };
 use bohr_tape::Tape;
-use bohr_trace::{read_events, EventKind, TraceWriter};
+use bohr_trace::{EventKind, TraceWriter, read_events};
 use bohr_types::{OracleId, Seed};
 use bohr_world::MinimalWorld;
 

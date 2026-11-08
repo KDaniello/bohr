@@ -1,8 +1,7 @@
 //! A campaign can search more than one kind of node fault.
 //!
-//! Every kind but the kill used to exist only where somebody wrote a tick down, so a campaign
-//! searched one twelfth of the catalogue and a freeze or a restart from an older image appeared
-//! only where a person had already guessed the moment. Which is the opposite of searching.
+//! A fault that exists only where somebody wrote a tick down is a fault a campaign never searches:
+//! it appears only where a person already guessed the moment.
 //!
 //! Two claims:
 //!
@@ -17,10 +16,10 @@
 
 use std::collections::BTreeSet;
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::{EventKind, FaultKind};
 use bohr_types::{Seed, Tick};
 use bohr_world::{DiskConfig, DrawnFaults, FaultPolicy, NetworkConfig, Targeting};

@@ -1,0 +1,30 @@
+name: toolchain
+description: >
+  Installs the toolchain rust-toolchain.toml names, with the components and targets it lists, and
+  optionally the dated nightly the Makefile names for rustfmt and fuzzing. No version is written
+  here: a workflow that named its own would build with a compiler the repository never pinned.
+
+inputs:
+  nightly:
+    description: Also install the nightly named by NIGHTLY in the Makefile.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: The pinned toolchain
+      shell: bash
+      # With no argument rustup installs what rust-toolchain.toml names, components and targets
+      # included, so the file stays the one place a version is chosen.
+      run: |
+        rustup toolchain install
+        rustc --version
+    - name: The pinned nightly
+      if: inputs.nightly == 'true'
+      shell: bash
+      # An undated nightly reformats code nobody touched the day rustfmt changes its mind, and the
+      # format gate then fails on a commit that changed nothing.
+      run: |
+        nightly=$(sed -n 's/^NIGHTLY ?= +//p' Makefile)
+        rustup toolchain install "$nightly" --profile minimal -c rustfmt
+        rustc "+$nightly" --version

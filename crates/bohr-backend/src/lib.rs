@@ -46,7 +46,7 @@ pub trait DeterminismBackend {
 
     /// Copies into guest memory.
     fn write_mem(&mut self, task: TaskId, addr: GuestAddr, data: &[u8])
-        -> Result<(), BackendError>;
+    -> Result<(), BackendError>;
 
     /// Reads the register file of a stopped task.
     fn regs(&mut self, task: TaskId) -> Result<Regs, BackendError>;
@@ -346,11 +346,9 @@ pub struct Mapping {
 
 /// Failures that originate in a backend.
 ///
-/// One code to one condition. All five used to share `BOHR-3005`, which the catalogue defines as
-/// the guest dying in a way the backend cannot describe — so a caller naming a task that had
-/// already exited, a memory read off the end of a mapping and a host file descriptor running out
-/// all reported the same thing, and the one code that means "this is either our bug or a hostile
-/// guest" was the one every ordinary mistake wore.
+/// One code to one condition. `BOHR-3005` means the guest died in a way the backend cannot
+/// describe -- our bug or a hostile guest -- so an ordinary mistake (a task that already exited, a
+/// read off the end of a mapping, a host descriptor running out) never wears it.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// `BOHR-1001` — the program cannot be executed.

@@ -6,8 +6,8 @@ use bohr_trace::{Event, EventKind, FaultKind, Outcome, PacketFate};
 use bohr_types::{Digest, EventId, GuestAddr, NodeId, OracleId, TaskId, Tick, WorldModelId};
 
 use crate::{
-    clock::{Clock, NodeClock},
     KernelError,
+    clock::{Clock, NodeClock},
 };
 
 /// The environment a guest believes it is running in.
@@ -164,9 +164,9 @@ pub enum NodeOp {
     ///
     /// Not a kill and never narrated as one: `exit_group` is what a program calls when it is done,
     /// and every thread of the process goes with it whether or not it was in the middle of
-    /// something. Without this, a runtime that parks its workers on a futex and then exits leaves
-    /// them parked here for ever, and a run that finished perfectly is reported as one where every
-    /// task is waiting — which is what a Go program did, correctly, on the first try.
+    /// something. Without this, a runtime that parks its workers on a futex and then exits -- the
+    /// Go runtime does -- leaves them parked for ever, and a run that finished is reported as one
+    /// where every task is waiting.
     Ended {
         /// The node whose process is ending.
         node: NodeId,
@@ -502,7 +502,10 @@ impl<'a, 't> WorldCtx<'a, 't> {
         Ok(())
     }
 
-    /// Gives a node a clock of its own — the mechanism behind clock-step and drift faults.
+    /// Gives a node a clock of its own.
+    ///
+    /// No world re-draws a clock during a run: clocks are skewed once, before the first task runs
+    /// (`docs/ARCHITECTURE.md` §4.5).
     pub fn set_node_clock(&mut self, node: NodeId, clock: NodeClock) {
         self.clock.set_node_clock(node, clock);
     }

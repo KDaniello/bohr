@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use bohr_backend::GuestSpec;
 use bohr_backend_null::NullBackend;
-use bohr_kernel::{run, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict};
+use bohr_kernel::{Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict, run};
 use bohr_tape::Tape;
 use bohr_testkit::Fixture;
 use bohr_trace::TraceWriter;

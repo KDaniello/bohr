@@ -16,11 +16,11 @@
 //! long run and the short one a matter of *when* the world acts rather than of how much guest is
 //! left to execute.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_types::{GuestAddr, NodeId, Tick};
 use bohr_world::{NetworkConfig, NodeFaultKind, ScheduledNodeFault, ScheduledPartition};
 
-use crate::{sockaddr_for, sys, Preload, Scenario};
+use crate::{Preload, Scenario, sockaddr_for, sys};
 
 /// The node that makes the promise.
 pub const ASKER: NodeId = NodeId(0);

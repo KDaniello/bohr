@@ -373,8 +373,8 @@ fn parse_meta(value: &Json) -> Result<Option<BohrMeta>, String> {
 /// Wholly derived from the type, which is why it is not carried in [`AssertRecord::rest`]: a field
 /// this build can compute is a field it must compute the same way they write it. The guards spell
 /// out their own display names rather than falling back to the wire name, because theirs is
-/// `AlwaysGreaterThan` where the wire says `always_greater_than`, and reading one of their records
-/// and writing it back used to change that word.
+/// `AlwaysGreaterThan` where the wire says `always_greater_than`, and a record read and written
+/// back must keep that word.
 const fn display_type(kind: AssertType) -> &'static str {
     match kind {
         AssertType::Always => "Always",

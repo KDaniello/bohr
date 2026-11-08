@@ -13,6 +13,7 @@ These documents answer only "how is it built, and why exactly this way".
 | [`API.md`](./API.md) | every contract that crosses a boundary: the tape ABI, the backend trait, the bundle format, the SDK schema, the CLI, error codes |
 | [`DETERMINISM.md`](./DETERMINISM.md) | the complete map of nondeterminism sources and what we do about each one. The project's checklist |
 | [`TESTING.md`](./TESTING.md) | the test pyramid, TDD and BDD practice, the determinism gates, and how every acceptance criterion maps to a test |
+| [`EVIDENCE.md`](./EVIDENCE.md) | what the project claims about itself, the command that checks each claim, and what none of it proves |
 | [`PLATFORMS.md`](./PLATFORMS.md) | host requirements, kernel features, the guest support matrix, performance expectations |
 
 Repository process:
@@ -28,11 +29,9 @@ Root of the repository: [`../README.md`](../README.md) ·
 
 ## Language
 
-**English is canonical.** [`ru/`](./ru/) holds an identical Russian mirror with the same heading
-structure; a CI job compares the heading trees and fails when they diverge, because a translation
-that has silently fallen behind is worse than no translation — a reader trusts it.
-
-When a document changes, both versions change in the same commit.
+**English, one version.** A translation kept beside the original falls behind it, and a reader
+trusts the translation — so there is none. A reader who wants another language translates the
+current text, not a copy of an older one.
 
 ## Conventions
 
@@ -44,8 +43,14 @@ When a document changes, both versions change in the same commit.
   here; a chronology is a property of the git history and belongs there.
 - Tables carry decisions; prose carries reasons. If a paragraph does not explain *why*, it is
   probably a table.
-- Every claim about performance, effectiveness or compatibility is either measured or marked as a
-  target. "Fast" and "robust" are not statements.
+- **A number carries its source.** Every claim about performance, effectiveness or compatibility is
+  either measured or marked as a target. A measured number sits inside the sentence it supports,
+  names the host it was taken on, and points at the [`benches/baseline.toml`](../benches/baseline.toml)
+  key that holds it and the command that reproduces it. "Fast" and "robust" are not statements.
+- **What and how to check come before why.** A page opens with what the thing does and the command
+  that shows it; the reasoning follows. Short sentences, in the reader's words rather than ours.
+- **Every mechanism states what it does not do**, in a paragraph of its own rather than a
+  parenthesis. A limit a reader discovers on their own costs more trust than the limit itself.
 - Code comments follow [`ARCHITECTURE.md`](./ARCHITECTURE.md) §8.1 — English, per block, explaining
   why. Documentation is not an excuse to comment less, and comments are not an excuse to document
   less.

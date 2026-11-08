@@ -226,8 +226,8 @@ impl Corpus {
 
     /// Marks an entry as having been mutated from.
     ///
-    /// By name rather than by position: a visit noted between two folds used to be credited to
-    /// whichever entry had taken the place of the one that earned it.
+    /// By name rather than by position: a visit noted between two folds is credited to the entry
+    /// that earned it, not to whichever entry has since taken its place.
     pub fn note_visit(&mut self, id: EntryId) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
             entry.visits += 1;

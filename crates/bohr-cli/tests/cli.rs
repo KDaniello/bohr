@@ -5,7 +5,7 @@
 
 use std::process::Command;
 
-use bohr_trace::{read_events, Bundle, Outcome, SectionId};
+use bohr_trace::{Bundle, Outcome, SectionId, read_events};
 use bohr_types::{OracleId, WorldModelId};
 
 fn bohr() -> Command {
@@ -111,9 +111,14 @@ fn a_saved_bundle_is_self_describing_and_refuses_foreign_components() {
     assert!(bundle.section(SectionId::Tape).is_some());
     assert!(bundle.section(SectionId::DrawJournal).is_some());
 
-    assert!(manifest
-        .check_provenance(&WorldModelId::new("minimal", 1), &OracleId::new("properties+crash", 1))
-        .is_ok());
+    assert!(
+        manifest
+            .check_provenance(
+                &WorldModelId::new("minimal", 1),
+                &OracleId::new("properties+crash", 1)
+            )
+            .is_ok()
+    );
     assert!(
         manifest
             .check_provenance(
@@ -201,10 +206,10 @@ fn a_process_that_ends_with_threads_running_is_not_an_internal_error() {
 /// A name is taken from the directory the call named, not from wherever the program stands.
 ///
 /// The guest judges every answer and returns a different number for each, and one of its checks is
-/// that the file is *not* where it used to end up: the `*at` calls carried a directory descriptor
-/// nothing read, so every relative name went to the working directory and the call reported
-/// success. That is worse than a refusal — what the guest believed it had written and what the
-/// world held parted company with nothing reporting anything wrong.
+/// that the file is *not* in the working directory. An `*at` call whose directory descriptor
+/// nothing read would put every relative name there and report success -- worse than a refusal,
+/// because what the guest believed it had written and what the world held would part with nothing
+/// reporting anything wrong.
 #[test]
 fn a_relative_name_is_taken_from_the_directory_that_was_named() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

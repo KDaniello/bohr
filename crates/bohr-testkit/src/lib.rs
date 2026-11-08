@@ -6,16 +6,15 @@
 //! user can invoke and the guests continuous integration checks the same guests.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 pub mod violation;
 
 use bohr_backend::{CoverageMap, DeterminismBackend as _, GuestSpec};
-use bohr_backend_null::{GuestOp, NullBackend, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
 use bohr_explorer::{RunResult, WorkItem};
-use bohr_kernel::{run, KernelError, RandomPolicy, RunConfig, RunInputs, RunReport, WorldModel};
+use bohr_kernel::{KernelError, RandomPolicy, RunConfig, RunInputs, RunReport, WorldModel, run};
 use bohr_tape::Tape;
-use bohr_trace::{read_events, Event, TraceWriter};
+use bohr_trace::{Event, TraceWriter, read_events};
 use bohr_types::{Digest, GuestAddr, NodeId, Seed};
 use bohr_world::{DistributedWorld, MinimalWorld};
 
@@ -242,10 +241,9 @@ impl Fixture {
 
 /// Runs one scripted program under the lone world, and hands back the backend with the report.
 ///
-/// **The one place a single-guest run is assembled.** Three helpers used to build the same
-/// `RunInputs` from the same five pieces, differing by a line each -- which is rule 7's own
-/// example of the hazard: a change to the shape of a run had to be made in every one of them, and
-/// the one that was missed would go on producing a run nobody meant.
+/// **The one place a single-guest run is assembled**, so a change to the shape of a run is made
+/// once -- rule 7's own hazard is several helpers building the same `RunInputs` and one of them
+/// being missed.
 fn drive_one(fixture: Fixture, tape: &Tape) -> (RunReport, NullBackend) {
     let mut backend = NullBackend::new(fixture.program());
     let mut world = MinimalWorld::new();

@@ -329,7 +329,7 @@ in the table rather than in the machine.
 | `ubuntu-24.04-arm` | 6.x | ARM | **L0–L2 only** — proves the sans-io core is portable, per `TESTING.md` P2 |
 | `macos-14` | — | ARM | L0–L2 only, same purpose |
 | `windows-2022` | — | x86-64 | L0–L2 only, same purpose |
-| self-hosted AMD | 6.x | AMD Zen | nightly; cross-CPU replay against the Intel runner ([`TESTING.md`](./TESTING.md) §7.3) |
+| self-hosted AMD | 6.x | AMD Zen | **not provisioned**, so cross-CPU replay against the Intel runner ([`TESTING.md`](./TESTING.md) §7.3) is unchecked |
 
 The three non-Linux rows enforce a design rule rather than promise a platform: a change that puts a
 syscall in `bohr-kernel` turns those jobs red.

@@ -12,7 +12,7 @@
 
 use bohr_backend::CoverageMap;
 use bohr_explorer::{Origin, RunResult, WorkItem};
-use bohr_tape::{DrawRecord, Journal, DRAW_RECORD_BYTES};
+use bohr_tape::{DRAW_RECORD_BYTES, DrawRecord, Journal};
 use bohr_types::{Digest, Seed};
 
 use crate::CliError;
@@ -212,7 +212,7 @@ mod tests {
         RunResult {
             index,
             digest: Digest::of(&index.to_le_bytes()),
-            outcome: (index % 2 == 0).then(|| "guest crashed".to_owned()),
+            outcome: index.is_multiple_of(2).then(|| "guest crashed".to_owned()),
             coverage,
             guest_edges: 4096,
             journal,

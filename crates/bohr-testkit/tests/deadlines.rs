@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use bohr_backend::{Resume, Stop, StopKind};
 use bohr_backend_null::{GuestOp, NullBackend, NullProgram};
 use bohr_kernel::{
-    run, DueEffects, Effects, FaultCatalog, KernelError, NodeOp, Oracle, RunConfig, RunInputs,
-    RunOutcome, RunReport, Verdict, WorldCtx, WorldModel,
+    DueEffects, Effects, FaultCatalog, KernelError, NodeOp, Oracle, RunConfig, RunInputs,
+    RunOutcome, RunReport, Verdict, WorldCtx, WorldModel, run,
 };
 use bohr_tape::Tape;
 use bohr_trace::TraceWriter;

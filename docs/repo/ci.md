@@ -67,8 +67,8 @@ jobs run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`
 ([`PLATFORMS.md`](../PLATFORMS.md) §3).
 
 Branch counters are unavailable on hosted runners, so `determinism` runs at syscall granularity
-there. The self-hosted nightly runner has them, and `portability` is where the two granularities are
-checked against each other.
+there. No runner of this repository has them, so the two granularities are not checked against each
+other in CI, and `portability` replays across two hosted images rather than two CPU vendors.
 
 ## Secrets
 

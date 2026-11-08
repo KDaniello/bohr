@@ -8,10 +8,10 @@
 use bohr_reducer::{
     Baseline, CandidateOutcome, Keep, Limits, Reduction, Scenario, Size, Violation,
 };
-use bohr_tape::{Tape, TAPE_ABI};
+use bohr_tape::{TAPE_ABI, Tape};
 use bohr_trace::{Bundle, SectionId};
 
-use crate::{execute, replay, CliError};
+use crate::{CliError, execute, replay};
 
 /// Reduces a stored finding and writes what is left.
 pub(crate) fn reduce(
@@ -29,7 +29,7 @@ pub(crate) fn reduce(
             return Err(CliError::Usage(format!(
                 "BOHR-1001: no such thing to keep as {other:?}; this build minimises \
                  events, tape or both"
-            )))
+            )));
         }
     };
 
@@ -171,11 +171,7 @@ pub(crate) fn reduce(
 
 /// The configuration, where there is one.
 fn optional_config(text: &str) -> Result<Option<bohr_world::LoadedConfig>, CliError> {
-    if text.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(bohr_world::config::load(text)?))
-    }
+    if text.trim().is_empty() { Ok(None) } else { Ok(Some(bohr_world::config::load(text)?)) }
 }
 
 /// Writes the tape's first bytes down so every decision the run made sits inside the prefix.
@@ -218,9 +214,10 @@ fn materialise(tape: &Tape, reach: u64, path: &str) -> Result<Vec<u8>, CliError>
 /// that lost its last bytes still says how far the rest of the run reached.
 fn reach_of(section: &[u8]) -> Result<u64, CliError> {
     Ok(section
-        .chunks_exact(bohr_tape::DRAW_RECORD_BYTES)
-        .filter_map(|chunk| chunk.try_into().ok())
-        .filter_map(|bytes: &[u8; bohr_tape::DRAW_RECORD_BYTES]| {
+        .as_chunks::<{ bohr_tape::DRAW_RECORD_BYTES }>()
+        .0
+        .iter()
+        .filter_map(|bytes| {
             // Damage is skipped rather than fatal, for the reason above: how far the readable part
             // of a journal reached is still an answer.
             let record = bohr_tape::DrawRecord::from_bytes(bytes).ok()?;

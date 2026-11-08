@@ -7,7 +7,6 @@
 //! interception.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 use std::collections::BTreeMap;
 
@@ -487,14 +486,13 @@ impl DeterminismBackend for NullBackend {
                 state.budget = Some(budget);
                 self.current = Some(task);
             }
-            // Refused for the same reason `Rewrite` is, and it used to be swallowed as an ordinary
-            // continuation: a scripted guest has no handler to deliver a signal to, and accepting
-            // the request answered a question this backend cannot answer.
+            // Refused for the same reason `Rewrite` is: a scripted guest has no handler to deliver
+            // a signal to, and accepting the request would answer a question this backend cannot.
             Resume::DeliverSignal { .. } => {
-                return Err(BackendError::InvalidResume { action: "DeliverSignal".to_owned() })
+                return Err(BackendError::InvalidResume { action: "DeliverSignal".to_owned() });
             }
             Resume::Rewrite { .. } => {
-                return Err(BackendError::InvalidResume { action: "Rewrite".to_owned() })
+                return Err(BackendError::InvalidResume { action: "Rewrite".to_owned() });
             }
         }
         Ok(())

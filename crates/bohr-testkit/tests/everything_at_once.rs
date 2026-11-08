@@ -17,10 +17,10 @@
 
 use std::collections::BTreeSet;
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::{EventKind, FaultKind, PacketFate};
 use bohr_types::{Seed, Tick};
 use bohr_world::{DiskConfig, FaultPolicy, NetworkConfig, Targeting};

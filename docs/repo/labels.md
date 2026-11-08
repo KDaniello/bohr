@@ -18,7 +18,7 @@ One taxonomy for issues and pull requests. Every issue carries at least one `A-`
 | `A-report` | text, JSON and HTML output |
 | `A-sdk` | any of the five SDKs |
 | `A-cli` | commands, flags, exit codes |
-| `A-docs` | anything in `docs/`, including the Russian mirror |
+| `A-docs` | anything in `docs/` |
 | `A-ci` | workflows, runners, caching |
 
 ## `C-` category

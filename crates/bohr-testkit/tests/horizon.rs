@@ -9,10 +9,10 @@
 //! is a server, and we have seen enough". The difference is visible in exactly one place — whether
 //! the oracle is asked — and these are the properties that keep the two apart.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::{RunConfig, StopReason};
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Scenario};
+use bohr_testkit::{Scenario, judge_scenario};
 use bohr_trace::Outcome;
 use bohr_types::{Seed, Tick};
 

@@ -8,7 +8,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 use bohr_types::{Digest, OracleId, Seed, WorldModelId};
 use serde::{Deserialize, Serialize};
 
-use crate::{TraceError, BUNDLE_FORMAT, SDK_SCHEMA};
+use crate::{BUNDLE_FORMAT, SDK_SCHEMA, TraceError};
 
 /// First eight bytes of a bundle.
 pub const BUNDLE_MAGIC: [u8; 8] = *b"BOHRBNDL";
@@ -1105,9 +1105,9 @@ mod tests {
         let same = execution(&[("height", "bbb"), ("root", "aaa")]);
         let other = execution(&[("root", "ccc"), ("height", "bbb")]);
 
-        assert_eq!(group_digest(&[one.clone()]), group_digest(&[same]));
-        assert_ne!(group_digest(&[one.clone()]), group_digest(&[other]));
-        assert_ne!(group_digest(&[one.clone()]), group_digest(&[one.clone(), one]));
+        assert_eq!(group_digest(std::slice::from_ref(&one)), group_digest(&[same]));
+        assert_ne!(group_digest(std::slice::from_ref(&one)), group_digest(&[other]));
+        assert_ne!(group_digest(std::slice::from_ref(&one)), group_digest(&[one.clone(), one]));
     }
 
     fn execution(projections: &[(&str, &str)]) -> ExecutionRecord {
@@ -1148,12 +1148,13 @@ mod tests {
         let bytes = sample_bundle();
         let m = Bundle::parse(&bytes).expect("parse").manifest().expect("manifest");
 
-        assert!(m
-            .check_provenance(
+        assert!(
+            m.check_provenance(
                 &WorldModelId::new("distributed", 1),
                 &OracleId::new("properties+crash", 1)
             )
-            .is_ok());
+            .is_ok()
+        );
 
         let err = m
             .check_provenance(

@@ -15,9 +15,9 @@ fn tiny_guest() -> Option<String> {
     std::path::Path::new(path).exists().then(|| path.to_owned())
 }
 
-/// **A run may not claim a trap the guest was never given.** The capability used to be read from a
-/// probe in a throwaway child, which answers about the host; `execve` clears the setting, so the
-/// guest never had it and the run still reported `determinism: full`.
+/// **A run may not claim a trap the guest was never given.** A probe in a throwaway child answers
+/// about the host, and `execve` clears the setting, so such a probe would report
+/// `determinism: full` for a guest that never had the trap.
 #[test]
 fn what_the_host_can_do_is_not_what_the_guest_was_given() {
     let Some(program) = tiny_guest() else {

@@ -1,4 +1,5 @@
-msrv = "1.85"
+# No `msrv` here: clippy reads each package's `rust-version`, and the SDK crates' is lower than
+# the tool's.
 
 # Nondeterminism sources banned by docs/ARCHITECTURE.md 8, rules 1, 9 and 10.
 # The grep in scripts/lint-rules.sh catches the rest; these catch it at compile time.

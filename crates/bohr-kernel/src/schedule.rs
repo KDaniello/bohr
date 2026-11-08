@@ -327,12 +327,11 @@ mod tests {
         );
     }
 
-    /// Demotions used to count down from zero and saturate there, so every demoted task shared
-    /// one priority and the identifier tie-break, not demotion order, decided who ran.
+    /// Each demotion lands below the one before it, so demotion order -- not the identifier
+    /// tie-break -- decides who runs among demoted tasks.
     ///
-    /// Driven through the change points, which is the only thing that demotes. The test this
-    /// replaces armed a depth of one -- no change points at all -- and called `yielded` twice,
-    /// so it exercised standing aside and never reached the countdown it is named for.
+    /// Driven through the change points, which are the only thing that demotes; a depth of one has
+    /// none and would exercise standing aside instead.
     #[test]
     fn a_later_demotion_sits_below_an_earlier_one() {
         let tape = Tape::from_seed(Seed(2));

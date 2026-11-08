@@ -14,7 +14,6 @@
 //! - [`Bundle`] — the container, its sections and its manifest
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 mod bundle;
 #[cfg(feature = "chaos-wall-clock-digest")]
@@ -25,18 +24,18 @@ mod redact;
 mod syscalls;
 
 pub use bundle::{
-    derive_run_id, frame_streams, group_digest, manifest_for, now_utc, read_streams, BinaryRecord,
-    Bundle, BundleWriter, Counters, DeterminismReport, ExecutionRecord, Group, HostProfile,
-    Manifest, ManifestInputs, Outcome, PolicyRecord, ProjectionRecord, Provenance, SectionId,
-    SingleExecution, BUNDLE_HEADER_BYTES, BUNDLE_MAGIC, SECTION_ENTRY_BYTES,
+    BUNDLE_HEADER_BYTES, BUNDLE_MAGIC, BinaryRecord, Bundle, BundleWriter, Counters,
+    DeterminismReport, ExecutionRecord, Group, HostProfile, Manifest, ManifestInputs, Outcome,
+    PolicyRecord, ProjectionRecord, Provenance, SECTION_ENTRY_BYTES, SectionId, SingleExecution,
+    derive_run_id, frame_streams, group_digest, manifest_for, now_utc, read_streams,
 };
 pub use event::{
-    short_digest, AssertionKind, DiskOpKind, Endpoint, Event, EventKind, ExitStatus, FaultKind,
-    FaultTarget, NodeState, PacketFate, SwitchReason, DURABILITY_CODE, LIVENESS_CODE,
+    AssertionKind, DURABILITY_CODE, DiskOpKind, Endpoint, Event, EventKind, ExitStatus, FaultKind,
+    FaultTarget, LIVENESS_CODE, NodeState, PacketFate, SwitchReason, short_digest,
 };
-pub use log::{digest_of, read_events, read_events_lossy, TraceWriter};
+pub use log::{TraceWriter, digest_of, read_events, read_events_lossy};
 pub use redact::redact;
-pub use syscalls::{named_syscalls, syscall_args, syscall_name, Arg};
+pub use syscalls::{Arg, named_syscalls, syscall_args, syscall_name};
 
 /// Version of the bundle layout.
 pub const BUNDLE_FORMAT: u16 = 2;

@@ -3,14 +3,12 @@ name: docs
 on:
   # On both events, for the reason given in sdk.yml: gated on a path, never on an event.
   push:
-    branches: [main]
     paths: &docs_paths ["docs/**", "*.md", "scripts/check-docs.sh"]
   pull_request:
     paths: *docs_paths
 
 jobs:
-  # Links resolve, and docs/ru mirrors docs/ section for section. A translation that has
-  # silently fallen behind is worse than none, because a reader trusts it.
+  # Every relative link in the repository resolves.
   structure:
     runs-on: ubuntu-24.04
     steps:
@@ -23,6 +21,6 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --all-features --no-deps

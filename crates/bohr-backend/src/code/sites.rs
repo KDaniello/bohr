@@ -74,12 +74,11 @@ pub fn confirm(object: &[u8], candidates: Vec<Site>) -> Vec<Site> {
             if let Some(len) = starts.get(&site.at) {
                 return Some(Site { at: site.at, len: *len, confirmed: true });
             }
-            if site.at > 0 {
-                if let Some(len) = starts.get(&(site.at - 1)) {
-                    if *len == site.len + 1 {
-                        return Some(Site { at: site.at - 1, len: *len, confirmed: true });
-                    }
-                }
+            if site.at > 0
+                && let Some(len) = starts.get(&(site.at - 1))
+                && *len == site.len + 1
+            {
+                return Some(Site { at: site.at - 1, len: *len, confirmed: true });
             }
             let inside = judged.iter().any(|(from, to)| site.at >= *from && site.at < *to);
             if inside {

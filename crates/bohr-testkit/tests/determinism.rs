@@ -4,7 +4,7 @@
 //! deliberate defect at a time and requires this file to fail. A test that passes under an
 //! injection has a hole in it, and the hole is closed by strengthening the test.
 
-use bohr_testkit::{digests, run_once, Fixture};
+use bohr_testkit::{Fixture, digests, run_once};
 use bohr_types::Seed;
 
 /// Repetitions per fixture. Enough that an ordering that only sometimes differs is caught, and
@@ -103,7 +103,7 @@ fn futex_wake_order_comes_from_the_tape() {
 }
 
 mod cluster {
-    use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+    use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
     use bohr_testkit::{distributed_identity, run_cluster, world_identity};
     use bohr_trace::{EventKind, Outcome};
     use bohr_types::Seed;
@@ -229,7 +229,7 @@ mod cluster {
 }
 
 mod network {
-    use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+    use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
     use bohr_testkit::{run_networked, sockaddr_for};
     use bohr_trace::{EventKind, Outcome, PacketFate};
     use bohr_types::{NodeId, Seed, Tick};
@@ -606,8 +606,8 @@ mod network {
 }
 
 mod disk {
-    use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
-    use bohr_testkit::{run_scenario, Scenario};
+    use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
+    use bohr_testkit::{Scenario, run_scenario};
     use bohr_trace::{DiskOpKind, EventKind, Outcome};
     use bohr_types::{GuestAddr, NodeId, Seed, Tick};
     use bohr_world::{DiskConfig, NodeFaultKind, ScheduledNodeFault};
@@ -883,8 +883,8 @@ mod disk {
 }
 
 mod cluster_scenarios {
-    use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
-    use bohr_testkit::{run_scenario, sockaddr_for, Scenario};
+    use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
+    use bohr_testkit::{Scenario, run_scenario, sockaddr_for};
     use bohr_trace::{EventKind, FaultKind, Outcome, PacketFate};
     use bohr_types::{NodeId, Seed, Tick};
     use bohr_world::{NetworkConfig, NodeFaultKind, ScheduledNodeFault, ScheduledPartition};
@@ -1091,7 +1091,7 @@ mod cluster_scenarios {
     /// interleaving within one node.
     #[test]
     fn threads_race_deterministically_under_the_cluster_world() {
-        use bohr_testkit::{run_cluster, Fixture};
+        use bohr_testkit::{Fixture, run_cluster};
         let program = || vec![Fixture::TwoTasks.program()];
         let (first, _) = run_cluster(program(), &[], Seed(17));
         assert_eq!(first.outcome, Outcome::Clean, "got {:?}", first.outcome);
@@ -1103,8 +1103,8 @@ mod cluster_scenarios {
 }
 
 mod sdk {
-    use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
-    use bohr_testkit::{run_scenario, Scenario};
+    use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
+    use bohr_testkit::{Scenario, run_scenario};
     use bohr_trace::{AssertionKind, EventKind};
     use bohr_types::Seed;
 

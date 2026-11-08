@@ -13,7 +13,6 @@
 //! they cannot reach the work list either.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 mod campaign;
 mod chaos;
@@ -24,6 +23,6 @@ mod properties;
 
 pub use campaign::{Campaign, Finding, Progress, RunResult, WorkItem};
 pub use choices::Choices;
-pub use corpus::{Corpus, Entry, Offer, Origin, DEFAULT_CAPACITY};
-pub use mutate::{mutate, Context, Operator, MAX_PREFIX_BYTES};
-pub use properties::{Properties, Tally, MOST_PROPERTIES};
+pub use corpus::{Corpus, DEFAULT_CAPACITY, Entry, Offer, Origin};
+pub use mutate::{Context, MAX_PREFIX_BYTES, Operator, mutate};
+pub use properties::{MOST_PROPERTIES, Properties, Tally};

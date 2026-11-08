@@ -12,10 +12,10 @@
 //! depended on the clock would move every later decision the moment a run took a different amount
 //! of time to reach the same place, which is the property the whole draw ABI protects.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::{EventKind, FaultKind};
 use bohr_types::{Seed, Tick};
 use bohr_world::{FaultPolicy, NetworkConfig, Targeting};

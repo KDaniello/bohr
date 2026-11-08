@@ -109,8 +109,8 @@ fn degraded_strip(model: &RunModel, page: &mut String) {
 
 /// One sentence, in the words somebody who has never used this tool would use.
 fn verdict(model: &RunModel, page: &mut String) {
-    // The heading carries the verdict. It used to be opened here and closed by every arm below
-    // before it had said anything, so the page had an empty heading and the document no title.
+    // The heading carries the verdict, so it is opened and closed by the arm that knows it: a
+    // heading closed before anything was said leaves the page untitled.
     match (&model.manifest.outcome, &model.violation) {
         (bohr_trace::Outcome::Clean, _) => {
             let _ = writeln!(

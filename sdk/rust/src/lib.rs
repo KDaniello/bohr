@@ -29,13 +29,13 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
-use bohr_sdk_proto::{json::Json, AssertRecord, BohrMeta, FaultPointRecord, Record, SDK_SCHEMA};
-pub use bohr_sdk_proto::{json::Json as Value, AssertType, Location};
+use bohr_sdk_proto::{AssertRecord, BohrMeta, FaultPointRecord, Record, SDK_SCHEMA, json::Json};
+pub use bohr_sdk_proto::{AssertType, Location, json::Json as Value};
 
 /// Where records are written when Bohr is running the program.
 const OUTPUT_VAR: &str = "BOHR_SDK_OUTPUT";

@@ -6,11 +6,11 @@
 //! worked around, because a replay that quietly ran something else would be worse than none.
 //! See `docs/API.md` §7.3.
 
-use bohr_tape::{Tape, TAPE_ABI};
-use bohr_trace::{read_events, Bundle, Manifest, SectionId};
+use bohr_tape::{TAPE_ABI, Tape};
+use bohr_trace::{Bundle, Manifest, SectionId, read_events};
 use bohr_types::Digest;
 
-use crate::{execute, CliError};
+use crate::{CliError, execute};
 
 /// What a replay concluded.
 pub(crate) enum Verdict {

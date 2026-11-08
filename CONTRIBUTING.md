@@ -20,8 +20,8 @@ Most of the codebase is sans-io and needs no Linux, no privileges and no guest p
 `bohr-backend-ptrace` and the L3+ test levels require Linux
 ([`docs/TESTING.md`](./docs/TESTING.md) §2).
 
-Toolchain: pinned in `rust-toolchain.toml`. Formatting requires nightly rustfmt
-(`cargo +nightly fmt --all`); everything else runs on stable.
+Toolchain: pinned in `rust-toolchain.toml`, which CI reads as well. Formatting needs the dated
+nightly the Makefile names (`make fmt`); everything else runs on the pinned toolchain.
 
 ## Reporting a bug
 
@@ -126,9 +126,12 @@ Procedure in [`docs/TESTING.md`](./docs/TESTING.md) §9.
 Full rules in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §8. The ones that trip people up:
 
 - **Everything is in English** — code, comments, doc comments, error messages, identifiers, commits,
-  issues. `docs/ru/` is the one exception and it is a mirror, not a source (§8.1).
+  issues, documentation (§8.1).
 - **Comments explain a block, an algorithm or a contract — never a line.** We comment *why*, not
   *what*. A comment on every line diverges from the code at the first edit and lies from then on.
+- **A doc comment is the contract in its first line and at most two lines more.** A longer argument
+  goes into `docs/` with a § link; the story of the bug that prompted a line goes into the commit
+  message (§8.1).
 - **No `unsafe` outside `bohr-backend-ptrace`**, and there every block carries `// SAFETY:`.
 - **No `Instant::now`, no `thread_rng`, no `HashMap` iteration in a decision path.** Nondeterminism
   in the determinism tool is the one unforgivable class of bug, and CI greps for all three.
@@ -148,12 +151,8 @@ argument was already won.
 
 ## Documentation
 
-`docs/` is English and canonical; `docs/ru/` is an identical Russian mirror with the same heading
-structure, and a CI job fails when they diverge. **Both change in the same commit.** A translation
-that has silently fallen behind is worse than none, because readers trust it.
-
-A pull request that cannot carry the Russian half should say so and we will do it — an English-only
-documentation change is better than a documentation change that does not happen.
+`docs/` is English and the only version. A change to documented behaviour updates the document in
+the same commit, and a measured number names its source ([`docs/README.md`](./docs/README.md)).
 
 ## Code of conduct
 

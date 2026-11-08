@@ -31,7 +31,7 @@ Minor versions may break the CLI and configuration. They may **not** break bundl
 5. `CHANGELOG.md` written: what changed, what breaks, what to do about it.
 6. If `tape_abi` moved: a **loud** section at the top of the notes, plus `bohr version` explaining
    the incompatibility in plain words when it refuses a bundle.
-7. Documentation matches the release: `docs/` and `docs/ru/` both updated, the `docs` CI job green.
+7. Documentation matches the release: `docs/` updated, the `docs` CI job green.
 8. Tag `vX.Y.Z`, push. The release workflow builds artefacts, publishes `SHA256SUMS`, the container
    image and the SDK packages.
 9. Verify the published artefacts from a clean machine: `bohrup` installs, `bohr doctor` passes,

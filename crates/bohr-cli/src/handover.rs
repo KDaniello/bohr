@@ -7,7 +7,7 @@
 
 use bohr_backend::DebuggerTarget;
 
-use crate::{execute::Target, CliError};
+use crate::{CliError, execute::Target};
 
 /// Prints where to attach, what will not work, and waits for the session to end.
 ///

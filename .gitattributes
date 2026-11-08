@@ -5,7 +5,9 @@
 *.toml    text
 *.feature text
 
-# A prepared state is bytes a guest reads, not source: a line-ending normalisation must not touch it.
+# A prepared state is bytes a guest reads, not source. This one holds a version number with no
+# newline after it, and the client that reads it parses the whole file without trimming — so a
+# normalisation that added one would recreate the defect the state exists to route around.
 examples/*/state/** binary
 
 # Binary fixtures: never normalize, never diff. A mangled tape is an unreproducible run.

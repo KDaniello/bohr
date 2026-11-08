@@ -247,9 +247,8 @@ mod tests {
 
     /// A set of one has exactly one question left: is the one needed at all?
     ///
-    /// This used to finish before asking it, so a scenario carrying a single entry kept that entry
-    /// whether or not the finding needed it -- a result the module's own opening paragraph calls
-    /// not one-minimal.
+    /// A scenario carrying a single entry keeps it only if the finding needs it; anything else is
+    /// not one-minimal, in the module's own words.
     #[test]
     fn a_set_of_one_is_asked_whether_it_is_needed() {
         let mut ddmin = DdMin::new(1);

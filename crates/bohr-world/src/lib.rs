@@ -6,7 +6,6 @@
 //! `docs/ARCHITECTURE.md` §5.7.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 #[cfg(any(
     feature = "chaos-syscall-passthru",
@@ -29,14 +28,14 @@ mod state;
 
 pub use config::{Cluster, ConfigError, Differential, Implementation, LoadedConfig};
 pub use distributed::{
-    sdk_violation_code, DiskConfig, DistributedWorld, DrawnFaults, DurabilityConfig, FaultPolicy,
-    GreyWindow, LivenessConfig, NetworkConfig, NodeFaultKind, ScheduledNodeFault,
-    ScheduledPartition, Targeting, Topology,
+    DiskConfig, DistributedWorld, DrawnFaults, DurabilityConfig, FaultPolicy, GreyWindow,
+    LivenessConfig, NetworkConfig, NodeFaultKind, ScheduledNodeFault, ScheduledPartition,
+    Targeting, Topology, sdk_violation_code,
 };
 pub use minimal::{MinimalWorld, OutputSink};
 pub use oracle::{
-    panel, AgreementOracle, DurabilityOracle, LivenessOracle, Panel, PropertiesAndCrashOracle,
-    Watching,
+    AgreementOracle, DurabilityOracle, LivenessOracle, Panel, PropertiesAndCrashOracle, Watching,
+    panel,
 };
-pub use projection::{Projected, ProjectionSpec, Source, Value, MAX_PROJECTION_BYTES};
+pub use projection::{MAX_PROJECTION_BYTES, Projected, ProjectionSpec, Source, Value};
 pub use state::{StateError, StateImage};

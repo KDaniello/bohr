@@ -41,11 +41,7 @@ fn output_dir() -> PathBuf {
 /// A path from the environment, taken as given if absolute and against the checkout if not.
 fn resolve(named: &str) -> PathBuf {
     let path = PathBuf::from(named);
-    if path.is_absolute() {
-        path
-    } else {
-        repo_root().join(path)
-    }
+    if path.is_absolute() { path } else { repo_root().join(path) }
 }
 
 /// A guest this build could actually trace: present on disk, and on a host with a backend.

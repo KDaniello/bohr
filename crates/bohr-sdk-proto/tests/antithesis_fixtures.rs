@@ -4,7 +4,7 @@
 //! it is checked against captured records rather than against our reading of their documentation. A
 //! field we do not model is preserved, never reinterpreted.
 
-use bohr_sdk_proto::{json::Json, AssertType, Record};
+use bohr_sdk_proto::{AssertType, Record, json::Json};
 
 fn fixtures() -> String {
     let path =

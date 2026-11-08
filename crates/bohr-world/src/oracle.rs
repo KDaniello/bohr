@@ -232,11 +232,7 @@ impl Oracle for Panel {
                 Verdict::Skipped => {}
             }
         }
-        if answered {
-            Verdict::Agree
-        } else {
-            Verdict::Skipped
-        }
+        if answered { Verdict::Agree } else { Verdict::Skipped }
     }
 }
 

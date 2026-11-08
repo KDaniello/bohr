@@ -25,14 +25,14 @@ use bohr_types::{Fd, GuestAddr, NodeId, TaskId, Tick, WorldModelId};
 pub use disk::DiskConfig;
 use disk::NodeDisk;
 use epoll::Epolls;
-use net::{decode_sockaddr, Network, PendingAcceptArgs, PendingRecvArgs};
 pub use net::{GreyWindow, NetworkConfig, ScheduledPartition, Topology};
+use net::{Network, PendingAcceptArgs, PendingRecvArgs, decode_sockaddr};
 use timers::{Due, TimerQueue};
 use watch::{Durability, Liveness};
 pub use watch::{DurabilityConfig, LivenessConfig};
 
 use crate::{
-    minimal::{futex_op, MinimalWorld, SYSCALL_COST, TIMER_ABSTIME},
+    minimal::{MinimalWorld, SYSCALL_COST, TIMER_ABSTIME, futex_op},
     nums::{errno, sys},
 };
 
@@ -222,10 +222,10 @@ impl FaultPolicy {
         if now.get() < self.arm_after.get() {
             return (0, 1);
         }
-        if let Some(budget) = self.budget_per_run {
-            if fired >= budget {
-                return (0, 1);
-            }
+        if let Some(budget) = self.budget_per_run
+            && fired >= budget
+        {
+            return (0, 1);
         }
         match self.targeting {
             Targeting::Uniform => self.kill,
@@ -1088,12 +1088,12 @@ impl DistributedWorld {
                     // is where it becomes durable. The failures this model draws stay with the
                     // syncs a caller asks for by name: one asked for at open, once, is not a call
                     // and has nowhere to put a drawn fate.
-                    if let Some(inode) = inode {
-                        if self.node_world(node).writes_through(fd) {
-                            let depth = self.disk_config.snapshot_depth;
-                            let (world, disk) = self.node_parts(node);
-                            disk.commit(world, Some(inode), depth);
-                        }
+                    if let Some(inode) = inode
+                        && self.node_world(node).writes_through(fd)
+                    {
+                        let depth = self.disk_config.snapshot_depth;
+                        let (world, disk) = self.node_parts(node);
+                        disk.commit(world, Some(inode), depth);
                     }
                 }
                 ctx.emit(EventKind::DiskOp {
@@ -1660,7 +1660,7 @@ impl DistributedWorld {
                     match decode_sockaddr(ctx, GuestAddr(args[4]), node)? {
                         Some(named) => Some(named),
                         None => {
-                            return self.answer_socket_call(nr, args, -errno::EINVAL, wakes, ctx)
+                            return self.answer_socket_call(nr, args, -errno::EINVAL, wakes, ctx);
                         }
                     }
                 };
@@ -1705,11 +1705,7 @@ impl DistributedWorld {
                 let mut on = [0u8; 4];
                 ctx.read_mem(GuestAddr(args[2]), &mut on)?;
                 let on = i32::from_le_bytes(on) != 0;
-                if self.net.set_nonblocking(node, fd_of(args), on) {
-                    0
-                } else {
-                    -errno::EBADF
-                }
+                if self.net.set_nonblocking(node, fd_of(args), on) { 0 } else { -errno::EBADF }
             }
             sys::READ => {
                 let recv =
@@ -1888,11 +1884,12 @@ impl WorldModel for DistributedWorld {
                     self.wake_ready_pollers(ctx, &mut effects.wake)?;
                     // A window opens when the cluster can talk to itself again, which is the last
                     // cut lifting and not any cut lifting.
-                    if !raise && self.net.fully_healed() {
-                        if let Some(watch) = self.liveness.as_mut() {
-                            let due = watch.healed(ctx.world_now());
-                            self.timers.arm(due, NodeId::ZERO, Due::LivenessWindow);
-                        }
+                    if !raise
+                        && self.net.fully_healed()
+                        && let Some(watch) = self.liveness.as_mut()
+                    {
+                        let due = watch.healed(ctx.world_now());
+                        self.timers.arm(due, NodeId::ZERO, Due::LivenessWindow);
                     }
                 }
                 Due::GreyChange { index, open } => {
@@ -1974,7 +1971,7 @@ impl WorldModel for DistributedWorld {
                         NodeFaultKind::Isolate | NodeFaultKind::Degrade => {
                             return Err(KernelError::Invariant(
                                 "a link fault is not a listed node fault",
-                            ))
+                            ));
                         }
                         NodeFaultKind::Freeze => {
                             ctx.emit_for(
@@ -2389,15 +2386,13 @@ impl DistributedWorld {
         // An `openat` of the path the guest was told to write records to hands back a descriptor
         // that is the record channel from here on.
         if let StopKind::SyscallEntry { nr, args } = stop.kind {
-            if nr == sys::OPENAT {
-                if let (true, TaskState::Runnable(Resume::Emulate { ret })) =
+            if nr == sys::OPENAT
+                && let (true, TaskState::Runnable(Resume::Emulate { ret })) =
                     (self.sdk_path.is_some(), &effects.state)
-                {
-                    let opened =
-                        if *ret >= 0 { opened_path(ctx, GuestAddr(args[1]))? } else { None };
-                    if opened.is_some() && opened == self.sdk_path {
-                        self.sdk_fds.insert((node, *ret));
-                    }
+            {
+                let opened = if *ret >= 0 { opened_path(ctx, GuestAddr(args[1]))? } else { None };
+                if opened.is_some() && opened == self.sdk_path {
+                    self.sdk_fds.insert((node, *ret));
                 }
             }
             // **A closed descriptor stops being the record channel.** Nothing removed it, and the

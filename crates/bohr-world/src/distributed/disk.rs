@@ -161,13 +161,14 @@ impl NodeDisk {
             return;
         }
         let ranges = self.pending.entry(inode).or_default();
-        if let Some((at, held)) = ranges.last_mut() {
-            if offset <= *at + *held && offset + len >= *at {
-                let end = (*at + *held).max(offset + len);
-                *at = (*at).min(offset);
-                *held = end - *at;
-                return;
-            }
+        if let Some((at, held)) = ranges.last_mut()
+            && offset <= *at + *held
+            && offset + len >= *at
+        {
+            let end = (*at + *held).max(offset + len);
+            *at = (*at).min(offset);
+            *held = end - *at;
+            return;
         }
         ranges.push((offset, len));
     }

@@ -115,8 +115,7 @@ impl CoverageChannel {
     /// killed on the way out of a run has not necessarily been reaped, so a counter may be
     /// incremented while this reads it; the value that comes back is then one increment stale.
     /// Bucketing was chosen to tolerate exactly that, and coverage is outside the trace digest
-    /// (§5.10), so a stale count cannot move what a run is. The two claims used to sit in one
-    /// comment as though both were guarantees, and a reader could not tell which to rely on.
+    /// (§5.10), so a stale count cannot move what a run is.
     pub(super) fn read_into(&self, out: &mut [u8]) {
         let len = out.len().min(self.cells);
         // SAFETY: the counters begin HEADER_BYTES into a mapping of HEADER_BYTES + cells readable

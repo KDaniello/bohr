@@ -3,10 +3,11 @@ name = "bohr-sdk-proto"
 description = "The SDK record format, shared by the supervisor and every SDK."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Lower than the tool's: this crate is compiled inside other people's builds, on their compiler.
+# `make msrv` holds it to the number.
+rust-version = "1.85"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 
 # No dependencies, by rule: this crate is linked into a customer's process through the Rust SDK,

@@ -4,7 +4,6 @@ extend-exclude = [
   "testdata/**",
   "fuzz/corpus/**",
   "fuzz/seeds/**",
-  "docs/ru/**",
   "*.tape",
   "*.bohr",
 ]

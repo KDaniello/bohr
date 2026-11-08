@@ -4,7 +4,7 @@
 //! single digest; these vectors are what proves it. A deliberate behaviour change re-blesses them
 //! in the same commit, and the commit message says why.
 
-use bohr_testkit::{run_once, Fixture};
+use bohr_testkit::{Fixture, run_once};
 use bohr_types::Seed;
 
 const GOLDEN_PATH: &str =

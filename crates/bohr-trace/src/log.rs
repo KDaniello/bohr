@@ -8,7 +8,7 @@ use std::io;
 
 use bohr_types::Digest;
 
-use crate::{event::Event, TraceError};
+use crate::{TraceError, event::Event};
 
 /// Bytes of framing around each record.
 const FRAME_OVERHEAD: usize = 8;

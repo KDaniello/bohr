@@ -12,9 +12,9 @@
 use std::collections::BTreeMap;
 
 use bohr_sdk_proto::{AssertRecord, Record};
-use bohr_tape::{DrawRecord, Journal, DRAW_RECORD_BYTES};
+use bohr_tape::{DRAW_RECORD_BYTES, DrawRecord, Journal};
 use bohr_trace::{
-    read_events_lossy, BinaryRecord, Event, EventKind, HostProfile, Manifest, SectionId,
+    BinaryRecord, Event, EventKind, HostProfile, Manifest, SectionId, read_events_lossy,
 };
 use bohr_types::{EventId, NodeId};
 
@@ -170,14 +170,12 @@ impl RunModel {
 /// shorter journal — and a report that refused to open a damaged bundle would refuse exactly the
 /// bundles somebody most wants to look at.
 fn read_journal(bytes: &[u8]) -> Journal {
-    let records = bytes
-        .chunks_exact(DRAW_RECORD_BYTES)
-        .filter_map(|chunk| {
-            let fixed: &[u8; DRAW_RECORD_BYTES] = chunk.try_into().expect("chunks_exact is exact");
-            // A record with rubbish in its reserved field is damage of the same kind as a short
-            // tail, and it is skipped for the same reason: the page still shows the run.
-            DrawRecord::from_bytes(fixed).ok()
-        })
+    let (whole, _short_tail) = bytes.as_chunks::<DRAW_RECORD_BYTES>();
+    let records = whole
+        .iter()
+        // A record with rubbish in its reserved field is damage of the same kind as a short tail,
+        // and it is skipped for the same reason: the page still shows the run.
+        .filter_map(|fixed| DrawRecord::from_bytes(fixed).ok())
         .collect();
     Journal::from_records(records)
 }

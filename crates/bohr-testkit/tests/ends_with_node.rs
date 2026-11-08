@@ -8,10 +8,10 @@
 //! Stated as a pair, because the saving is the whole point: the same two programs and the same
 //! horizon, and the only difference is whether the scenario named the node whose ending it meant.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::{RunConfig, StopReason};
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Scenario};
+use bohr_testkit::{Scenario, judge_scenario};
 use bohr_types::{NodeId, Seed, Tick};
 use bohr_world::NetworkConfig;
 

@@ -16,12 +16,12 @@
 //! nothing else is until somebody makes it.
 
 use bohr_backend::GuestSpec;
-use bohr_backend_null::{GuestOp, NullBackend, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
 use bohr_kernel::{
-    run, KernelError, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict,
+    KernelError, Oracle, RandomPolicy, RunConfig, RunInputs, RunOutcome, Verdict, run,
 };
 use bohr_tape::Tape;
-use bohr_trace::{read_events, EventKind, TraceWriter};
+use bohr_trace::{EventKind, TraceWriter, read_events};
 use bohr_types::{GuestAddr, OracleId, Seed};
 use bohr_world::MinimalWorld;
 

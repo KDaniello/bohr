@@ -18,7 +18,7 @@ use bohr_trace::Outcome;
 use bohr_types::Seed;
 use bohr_world::LoadedConfig;
 
-use crate::{execute, exit, CliError};
+use crate::{CliError, execute, exit};
 
 /// Runs `program` and reports every syscall it asked for that nothing here models.
 pub(crate) fn run(

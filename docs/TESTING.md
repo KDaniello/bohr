@@ -561,9 +561,9 @@ means a green CI run, and a red CI run after a green local run is itself a bug w
 | `test-linux` | every push | yes | L3–L4 on the supported kernel matrix |
 | `determinism` | every push | yes | §7.1, §7.2 on the small guest set |
 | `mutation` | every push | yes | §7.4 — the injections must break the determinism suite |
-| `sdk` | touching `sdk/` | yes | §6 conformance across every language that has an SDK |
+| `sdk` | touching `sdk/` | yes | §6 conformance across every language that has an SDK; the SDK crates build on their `rust-version` (`make msrv`) |
 | `bdd` | every push | yes | §5 |
-| `docs` | touching `docs/` | yes | link check; `docs/` and `docs/ru/` have identical section structure |
+| `docs` | touching `docs/` | yes | every relative link resolves |
 | `fuzz-short` | every push | yes | 60 s per target |
 | `portability` | nightly | no | §7.3 cross-CPU replay |
 | `hunting` | nightly | no | §8 — does the search still reach the seeded defects |
@@ -575,6 +575,3 @@ react to pull requests alone, and a repository pushed to directly opened none th
 those paths, so two blocking gates had never run once — which is indistinguishable from two
 gates that always passed. A gate that does not fire on push is not a gate, and
 `scripts/check-workflows.py` now refuses one.
-
-The `docs` job's structural check exists because a Russian mirror that silently falls behind the
-English original is worse than no mirror: a reader trusts it. It compares heading trees, not prose.

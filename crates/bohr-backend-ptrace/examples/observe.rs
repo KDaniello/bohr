@@ -16,7 +16,7 @@ fn main() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux {
     use bohr_backend::{DeterminismBackend, GuestSpec, Resume, StopKind};
-    use bohr_backend_ptrace::{syscall_name, PtraceBackend};
+    use bohr_backend_ptrace::{PtraceBackend, syscall_name};
     use bohr_types::NodeId;
 
     pub(super) fn main() {

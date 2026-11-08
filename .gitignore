@@ -29,16 +29,8 @@
 /sdk/**/*.egg-info
 /sdk/**/dist
 
-# Product specification: internal, deliberately not published in this repository.
-deterministic-simulator-spec.md
-
 # Roadmap: internal planning document, deliberately not published in this repository.
 /docs/ROADMAP.md
-/docs/ru/ROADMAP.md
-/docs/ROADMAP.agents.md
-/docs/ru/ROADMAP.agents.md
-/docs/ROADMAP.improves.md
-/docs/ROADMAP.targets.md
 
 # Product ideas: internal, and about products other than this one.
 /ideas

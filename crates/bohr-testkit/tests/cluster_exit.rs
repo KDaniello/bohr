@@ -13,7 +13,7 @@
 use bohr_backend_null::{GuestOp, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Scenario};
+use bohr_testkit::{Scenario, judge_scenario};
 use bohr_trace::Outcome;
 use bohr_types::Seed;
 use bohr_world::NetworkConfig;

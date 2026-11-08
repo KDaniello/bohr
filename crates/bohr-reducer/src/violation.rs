@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 
 use bohr_kernel::StopReason;
-use bohr_trace::{Event, EventKind, ExitStatus, Outcome, DURABILITY_CODE, LIVENESS_CODE};
+use bohr_trace::{DURABILITY_CODE, Event, EventKind, ExitStatus, LIVENESS_CODE, Outcome};
 use bohr_types::NodeId;
 
 /// The kind of thing that went wrong, with its message discarded.

@@ -824,12 +824,11 @@ impl Network {
         match waiting.pop_front() {
             Some(parked) => {
                 Self::hand_over(ctx, &parked, from)?;
-                if parked.nonblocking {
-                    if let Some(Socket::Stream { nonblocking, .. }) =
+                if parked.nonblocking
+                    && let Some(Socket::Stream { nonblocking, .. }) =
                         self.sockets.get_mut(&(to.node, accepted))
-                    {
-                        *nonblocking = true;
-                    }
+                {
+                    *nonblocking = true;
                 }
                 wakes.push(Wake { task: parked.task, ret: accepted });
             }
@@ -869,12 +868,11 @@ impl Network {
             return Ok(None);
         };
         Self::hand_over(ctx, &parked, ready.peer)?;
-        if want.nonblocking {
-            if let Some(Socket::Stream { nonblocking, .. }) =
+        if want.nonblocking
+            && let Some(Socket::Stream { nonblocking, .. }) =
                 self.sockets.get_mut(&(node, ready.fd))
-            {
-                *nonblocking = true;
-            }
+        {
+            *nonblocking = true;
         }
         Ok(Some(ready.fd))
     }
@@ -902,10 +900,10 @@ impl Network {
     /// The port a stream answers on, binding it ephemerally where it has none.
     fn local_port(&mut self, node: NodeId, fd: i64) -> u16 {
         let fd = self.resolve(node, fd);
-        if let Some(Socket::Stream { local, .. }) = self.sockets.get(&(node, fd)) {
-            if *local != 0 {
-                return *local;
-            }
+        if let Some(Socket::Stream { local, .. }) = self.sockets.get(&(node, fd))
+            && *local != 0
+        {
+            return *local;
         }
         if self.bind(node, fd, 0) != 0 {
             return 0;

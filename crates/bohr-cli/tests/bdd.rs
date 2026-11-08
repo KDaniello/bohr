@@ -7,7 +7,7 @@
 
 use std::{path::PathBuf, process::Command};
 
-use cucumber::{given, then, when, World as _};
+use cucumber::{World as _, given, then, when};
 
 /// Whether this build can intercept a program on disk.
 const HAS_BACKEND: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));

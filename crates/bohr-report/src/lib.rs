@@ -10,7 +10,6 @@
 //! next. Every decision here is answerable from that sentence.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 pub mod describe;
 mod escape;

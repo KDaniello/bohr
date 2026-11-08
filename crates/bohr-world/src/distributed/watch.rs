@@ -106,11 +106,7 @@ impl Liveness {
 
     /// How long a node may go without making a call, or nothing where the scenario asked for none.
     pub(crate) const fn quiet_span(&self) -> Option<Tick> {
-        if self.config.quiet_ticks.get() == 0 {
-            None
-        } else {
-            Some(self.config.quiet_ticks)
-        }
+        if self.config.quiet_ticks.get() == 0 { None } else { Some(self.config.quiet_ticks) }
     }
 
     /// Records that a node did something.

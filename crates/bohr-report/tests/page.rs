@@ -150,10 +150,9 @@ fn the_verdict_comes_before_the_machinery() {
 /// A chip carries the slot it stands for, and the slot is not its position in the document.
 ///
 /// **Lanes are written one node at a time and the timeline runs across them**, so with a cluster
-/// the third chip in the document is not the third event of the run. The page used to select by
-/// document position: with one node the two orders coincide, which is why every stored bundle here
-/// agreed, and on the target this tool exists for — a cluster — clicking a chip opened somebody
-/// else's event and "go to the violation" scrolled to an unrelated one.
+/// the third chip in the document is not the third event of the run. With one node the two orders
+/// coincide, which is why only a cluster can tell a page selecting by slot from one selecting by
+/// document position -- and on a cluster the second opens somebody else's event.
 ///
 /// Checked on the rendered page rather than through a browser: what the script reads is
 /// `data-index`, so what a test can decide is that the attribute says the slot and that the slots

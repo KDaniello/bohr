@@ -26,7 +26,7 @@ use bohr_types::{Digest, Seed};
 use crate::{
     choices::Choices,
     corpus::{Corpus, Offer, Origin},
-    mutate::{mutate, Context, Operator},
+    mutate::{Context, Operator, mutate},
 };
 
 /// One run the campaign wants carried out.

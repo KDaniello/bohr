@@ -45,10 +45,10 @@ impl Window {
         let to = (centre + AFTER).min(events.len());
 
         let mut shown: Vec<usize> = (from..to).collect();
-        // **The keep-set is bounded too.** It used to take everything worth showing wherever it
-        // fell, which is right until a guest asserts in a loop: a hundred thousand assertions are
-        // a hundred thousand kept slots, each costing a cell on every node's lane, and the page
-        // went far past the size `MOST_BYTES` documents as the largest this crate will produce.
+        // **The keep-set is bounded too.** Keeping everything worth showing wherever it falls is
+        // right until a guest asserts in a loop: a hundred thousand assertions are a hundred
+        // thousand kept slots, each costing a cell on every node's lane, and the page would pass
+        // the size `MOST_BYTES` documents as the largest this crate produces.
         // What does not fit is counted as elided like anything else, so the page still says so.
         let mut kept: Vec<usize> = events
             .iter()

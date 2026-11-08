@@ -4,7 +4,7 @@
 //! them stops holding, mutation stops being local and search degrades in a way no correctness test
 //! would notice — which is why they are properties over generated tapes rather than examples.
 
-use bohr_tape::{draw_width_bytes, DrawSite, Tape};
+use bohr_tape::{DrawSite, Tape, draw_width_bytes};
 use bohr_types::Seed;
 use proptest::prelude::*;
 

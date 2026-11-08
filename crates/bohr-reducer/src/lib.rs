@@ -22,7 +22,6 @@
 //! thousand replays of a traced cluster is minutes — so the shape is one candidate at a time.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 mod bytes;
 mod config;

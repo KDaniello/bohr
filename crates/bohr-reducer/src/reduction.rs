@@ -3,12 +3,12 @@
 use bohr_tape::Journal;
 
 use crate::{
-    bytes::{decisions, Target},
+    ReducerError,
+    bytes::{Target, decisions},
     config::ConfigDoc,
     ddmin::DdMin,
     scenario::{Scenario, Size},
     violation::Violation,
-    ReducerError,
 };
 
 /// What a reduction may spend, and what it is allowed to make smaller.
@@ -419,12 +419,12 @@ impl Reduction {
         if self.config.entries.is_none() && !doc.entries().is_empty() {
             self.config.entries = Some(DdMin::new(doc.entries().len()));
         }
-        if let Some(ddmin) = self.config.entries.as_ref() {
-            if let Some(keep) = ddmin.next() {
-                let keep = keep.to_vec();
-                let scenario = self.best.with_config(doc.keeping(&keep).to_toml());
-                return Some((self.candidate(scenario), Move::KeepEntries(keep)));
-            }
+        if let Some(ddmin) = self.config.entries.as_ref()
+            && let Some(keep) = ddmin.next()
+        {
+            let keep = keep.to_vec();
+            let scenario = self.best.with_config(doc.keeping(&keep).to_toml());
+            return Some((self.candidate(scenario), Move::KeepEntries(keep)));
         }
 
         // Then the moments. A scenario whose decisive fault fires at the first tick is the same

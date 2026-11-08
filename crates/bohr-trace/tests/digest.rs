@@ -5,8 +5,8 @@
 //! must not. The exclusion list is `docs/API.md` §4.4.
 
 use bohr_trace::{
-    digest_of, AssertionKind, DiskOpKind, Event, EventKind, ExitStatus, FaultKind, NodeState,
-    PacketFate, SwitchReason, TraceWriter,
+    AssertionKind, DiskOpKind, Event, EventKind, ExitStatus, FaultKind, NodeState, PacketFate,
+    SwitchReason, TraceWriter, digest_of,
 };
 use bohr_types::{EventId, NodeId, SyncWordId, TaskId, Tick, WorldModelId};
 
@@ -304,9 +304,9 @@ fn nested_discriminants_are_the_frozen_ones() {
 
 /// Which word a task waited on is part of what the run did, and where that word lived is not.
 ///
-/// Both used to be one thing: the address went into the digest whole, so a run whose heap moved
-/// under a different coverage-map size digested differently having behaved identically — the very
-/// defect `absorb_args` was written to remove, carried on past it by these two variants.
+/// The address must not enter the digest whole: a run whose heap moved under a different
+/// coverage-map size would digest differently having behaved identically, which is the defect
+/// `absorb_args` exists to remove.
 #[test]
 fn waiting_is_told_apart_by_the_word_and_not_by_where_it_lived() {
     let first = digest(EventKind::Waited { on: SyncWordId(0) });
@@ -321,8 +321,8 @@ fn waiting_is_told_apart_by_the_word_and_not_by_where_it_lived() {
 
 /// Length prefixing, shown on a pair of fields the digest actually absorbs.
 ///
-/// The test this replaces used `Diagnostic`, whose message is excluded from the projection — so it
-/// compared "ab" against "a" and passed whether or not anything was length-prefixed.
+/// The fields must be ones the digest absorbs: `Diagnostic`'s message is excluded from the
+/// projection, so "ab" against "a" there passes whether or not anything is length-prefixed.
 #[test]
 fn adjacent_strings_cannot_be_re_split_to_collide() {
     let ab_c = digest(EventKind::Domain {

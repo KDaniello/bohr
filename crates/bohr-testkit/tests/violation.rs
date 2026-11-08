@@ -8,9 +8,8 @@
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
 use bohr_testkit::{
-    judge_scenario,
-    violation::{PingPong, PROMISE},
-    Judged,
+    Judged, judge_scenario,
+    violation::{PROMISE, PingPong},
 };
 use bohr_trace::{EventKind, Outcome};
 use bohr_types::{Seed, Tick};

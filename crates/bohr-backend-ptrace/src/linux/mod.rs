@@ -621,12 +621,12 @@ impl DeterminismBackend for PtraceBackend {
         // An instruction the supervisor answered has to be stepped over however the task leaves
         // this stop. Left outstanding, the debt would be paid against an unrelated instruction the
         // next time the task stopped.
-        if let Some(width) = self.task_mut(task)?.pending_skip.take() {
-            if !matches!(action, Resume::Terminate { .. }) {
-                let mut regs = self.cached_regs(task)?;
-                regs.rip = regs.rip.wrapping_add(width);
-                self.store_regs(task, &regs)?;
-            }
+        if let Some(width) = self.task_mut(task)?.pending_skip.take()
+            && !matches!(action, Resume::Terminate { .. })
+        {
+            let mut regs = self.cached_regs(task)?;
+            regs.rip = regs.rip.wrapping_add(width);
+            self.store_regs(task, &regs)?;
         }
 
         match action {

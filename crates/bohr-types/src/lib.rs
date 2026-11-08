@@ -326,7 +326,7 @@ impl WorldModelId {
 /// the key a replay refuses on, and a key two different panels could share is a refusal that can
 /// be argued with. `+` is deliberately absent — `properties+crash` is one oracle that does two
 /// things, and renaming it would refuse every bundle already written under it.
-const PANEL_SYNTAX: [u8; 4] = [b'(', b')', b',', b'@'];
+const PANEL_SYNTAX: [u8; 4] = *b"(),@";
 
 impl OracleId {
     /// Names an oracle.
@@ -372,8 +372,8 @@ impl OracleId {
     ///
     /// # Panics
     ///
-    /// Panics on an empty panel. Nothing judged the run, so there is no identity to record, and
-    /// the nameless one this used to return was refusable against every other empty panel.
+    /// Panics on an empty panel. Nothing judged the run, so there is no identity to record, and a
+    /// nameless one would be refusable against every other empty panel.
     #[must_use]
     pub fn composed(members: &[Self]) -> Self {
         assert!(!members.is_empty(), "a panel with no members judged nothing");

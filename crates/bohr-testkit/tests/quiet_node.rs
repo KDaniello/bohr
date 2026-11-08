@@ -17,10 +17,10 @@
 //! Stated as a pair, because a watcher that fired on the polling guest too would satisfy any claim
 //! made about it and mean nothing.
 
-use bohr_backend_null::{GuestOp, NullProgram, MEMORY_BASE};
+use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
-use bohr_testkit::{judge_scenario, Judged, Scenario};
+use bohr_testkit::{Judged, Scenario, judge_scenario};
 use bohr_trace::{EventKind, Outcome};
 use bohr_types::{NodeId, Seed, Tick};
 use bohr_world::{LivenessConfig, NetworkConfig};
