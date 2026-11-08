@@ -21,7 +21,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
       # cannot be placed in its own namespaces without them.
@@ -33,7 +33,7 @@ jobs:
       - run: make guests
       - name: Produce bundles
         run: cargo nextest run --test portability -- produce
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: "bundles-${{ matrix.runner }}", path: target/bohr-out/portability/ }
 
   replay-cross:
@@ -47,13 +47,13 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
       # cannot be placed in its own namespaces without them.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: bundles/ }
       - run: make guests
       - uses: taiki-e/install-action@v2
@@ -69,7 +69,7 @@ jobs:
   hunting:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
       # cannot be placed in its own namespaces without them.
@@ -77,14 +77,14 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: make guests
       - run: make test-hunting
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with: { name: hunting-findings, path: /tmp/bohr-hunt-*/findings/ }
 
   perf:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a guest
       # cannot be placed in its own namespaces without them.
@@ -102,13 +102,13 @@ jobs:
       matrix:
         target: [bundle, tape, sdk_record, event_log, syscall_args]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with: { nightly: "true" }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - run: make fuzz T=${{ matrix.target }} S=14400
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with: { name: "fuzz-crash-${{ matrix.target }}", path: fuzz/artifacts/ }
