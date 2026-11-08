@@ -41,7 +41,7 @@ bohr-testkit = { path = "crates/bohr-testkit", version = "0.1.0" }
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
 # The tape's extension keystream (docs/API.md §2.3). Its output is part of the tape ABI, so the
 # version is exact and moves only with a run of every stored tape and bundle.
-chacha20 = "=0.9.1"
+chacha20 = "=0.10.2"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 seccompiler = "0.5"
