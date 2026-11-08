@@ -17,7 +17,7 @@ jobs:
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with: { nightly: "true" }
       - run: make fmt-check
@@ -25,7 +25,7 @@ jobs:
   clippy:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
       - run: make clippy
@@ -35,7 +35,7 @@ jobs:
   rules:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ./scripts/lint-rules.sh
 
   # A workflow that does not parse is one GitHub never runs, and a job that never runs is
@@ -43,8 +43,8 @@ jobs:
   workflows:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
       - run: pip install pyyaml
       - run: python3 scripts/check-workflows.py
@@ -52,11 +52,11 @@ jobs:
   deny:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   typos:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: crate-ci/typos@master

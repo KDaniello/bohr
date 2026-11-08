@@ -23,7 +23,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2022]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       - uses: taiki-e/install-action@v2
         with:
@@ -41,7 +41,7 @@ jobs:
           - { runner: ubuntu-24.04, label: "6.x" }
           - { runner: ubuntu-22.04, label: "5.15" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       - uses: taiki-e/install-action@v2
         with:
@@ -67,7 +67,7 @@ jobs:
   bdd:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
       # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor, and a
@@ -83,7 +83,7 @@ jobs:
       matrix:
         target: [bundle, tape, sdk_record, event_log, syscall_args]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with: { nightly: "true" }
       - uses: taiki-e/install-action@v2
@@ -91,7 +91,7 @@ jobs:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2
       - run: make fuzz T=${{ matrix.target }} S=60
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-crash-${{ matrix.target }}
