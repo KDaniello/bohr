@@ -84,6 +84,8 @@
 87	unlink	p
 88	symlink	pp
 89	readlink	pps
+90	chmod	ps
+91	fchmod	ss
 96	gettimeofday	pp
 97	getrlimit	sp
 98	getrusage	sp
@@ -120,6 +122,8 @@
 232	epoll_wait	spss
 233	epoll_ctl	sssp
 234	tgkill	sss
+254	inotify_add_watch	sps
+255	inotify_rm_watch	ss
 257	openat	spss
 258	mkdirat	sps
 262	newfstatat	spps
@@ -127,13 +131,17 @@
 264	renameat	spsp
 266	symlinkat	psp
 267	readlinkat	spps
+268	fchmodat	sps
 273	set_robust_list	ps
+277	sync_file_range	ssss
 281	epoll_pwait	spssps
+285	fallocate	ssss
 288	accept4	spps
 290	eventfd2	ss
 291	epoll_create1	s
 292	dup3	sss
 293	pipe2	ps
+294	inotify_init1	s
 296	pwritev	spsss
 302	prlimit64	sspp
 316	renameat2	spsps

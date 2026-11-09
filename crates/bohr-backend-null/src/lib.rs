@@ -129,6 +129,8 @@ struct TaskState {
     prev_pc: usize,
     regs: Regs,
     live: bool,
+    /// Signals delivered on an emulated answer, which a scripted guest has no handler for.
+    signals: u32,
 }
 
 /// One simulated machine: a program and an address space of its own.
@@ -324,6 +326,7 @@ impl DeterminismBackend for NullBackend {
                 prev_pc: 0,
                 regs: Regs::default(),
                 live: true,
+                signals: 0,
             },
         );
         Ok(id)
@@ -408,6 +411,7 @@ impl DeterminismBackend for NullBackend {
                             prev_pc: 0,
                             regs: Regs::default(),
                             live: true,
+                            signals: 0,
                         },
                     );
                     return Ok(Some(Stop {
@@ -475,8 +479,15 @@ impl DeterminismBackend for NullBackend {
                 state.live = false;
                 self.current = None;
             }
+            // A scripted guest has no handler to run, so the answer is delivered and the signal is
+            // counted rather than acted on; a test reads the count to see that it was sent.
             Resume::Emulate { ret } => {
                 state.regs.rax = ret as u64;
+                self.current = Some(task);
+            }
+            Resume::EmulateAndSignal { ret, .. } => {
+                state.regs.rax = ret as u64;
+                state.signals += 1;
                 self.current = Some(task);
             }
             Resume::Continue => {

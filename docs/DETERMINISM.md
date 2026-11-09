@@ -75,6 +75,10 @@ un-neutralised `RDRAND` in a mapped page is **never** reported as deterministic.
 | `futex` wake order | the kernel may wake waiters in any order | the wait queue is ours, ordered, and the wake choice is a draw | solved | `integration::futex_wake_order_from_tape` |
 | core migration | a thread moving between cores changes timing and `CPUID` results | `sched_setaffinity` pins a guest and its supervisor to one core; a campaign gives each worker a core of its own (`BOHR_CORE`), one hardware thread of every physical core before a second thread of any | partial — which core is visible without a syscall: `RDPID` and the per-CPU segment limit report it and nothing traps them, so a guest that reads either sees its worker's position, and where `CPUID` is not trapped its APIC id says the same; one run on one host never moves | `system::single_core_pinned`; `hunt::a_pack_is_hunted_in_one_command` runs real guests from several workers |
 | `sched_yield`, `sched_getcpu` | expose real scheduling | emulated; `sched_getcpu` always returns 0 | solved | `system::sched_calls_emulated` |
+| `sched_setscheduler`, `sched_setparam` | a real policy changes when the host runs a thread | answered as an unprivileged process is: a normal policy is accepted and changes nothing, a real-time one is `EPERM` | solved | `bohr-world` `minimal` tests |
+| futex timeouts | a timer is the host's clock | a timed wait arms a timer on the virtual clock; each of a task's waits is numbered, and a timer fires only into the wait that armed it | solved | `determinism::a_timed_wait_woken_early_leaves_no_timer_behind` |
+| signals to another thread (`tgkill`) | delivery depends on where the host finds the thread | queued for the named task, its wait ended with `EINTR`, delivered at its next stop | solved | `determinism` guest `signals_a_thread` |
+| a process failing from a thread other than its first | each thread reports its end in an order the host decides | the loop waits for a task the host is running before it picks, moves time or ends the run | solved | `determinism::a_failure_from_another_thread_is_found_on_every_run` |
 | `rseq` (restartable sequences) | glibc registers it; behaviour depends on preemption points | registration is refused with `ENOSYS`, which glibc handles by falling back | solved | `system::rseq_neutralised` |
 | CPU memory-model effects (store buffering, weak ordering) | genuine parallelism | **not reproduced** — we serialise | **by design** | documented in `ARCHITECTURE.md` §13 |
 | lock contention timing | dependent on real parallelism | interleaving is explored instead of observed; this finds *more* orderings than reality, not fewer | by design | — |
@@ -138,6 +142,9 @@ portability it does not have. Details and detection in [`PLATFORMS.md`](./PLATFO
 | file descriptor numbers | assigned by the kernel; usually deterministic but not guaranteed under our own interception | virtualised at the boundary | solved | `system::fds_virtualised` |
 | `/proc/self/*` | exposes host state broadly | virtual, generated from world state | partial | `system::proc_self_virtual` — the covered set is listed in `PLATFORMS.md` §4 |
 | memory-mapped files | writes bypass syscalls entirely | pages of mapped files are backed by the virtual disk; writes are visible at `msync`/`munmap`/unmapping | partial | `integration::mmap_write_visible_after_msync` |
+| `fallocate`, `sync_file_range`, `chmod` and kin | allocation and modes are the host filesystem's | answered from the world's own file: `fallocate` grows it and a crash treats the reserved bytes as written; modes are held and never consulted | solved | `bohr-world` `minimal` tests |
+| `statx`, `prctl` | the host's file and process state | answered from the world: `statx` as `fstat` is, `prctl` for the names and settings a runtime asks about | solved | `bohr-world` `minimal` tests |
+| `inotify` | a host facility watching the host's files | answered `ENOSYS`, on purpose: the programs that use it fall back to polling | by design | `bohr check geth`, `walls` |
 
 `mmap`-based I/O is `partial` and it is the most likely source of a surprise for embedded databases,
 which is precisely the first hunting target list.
@@ -151,6 +158,8 @@ which is precisely the first hunting target list.
 | **one-directional partitions** | A sees B, B does not see A | first-class in the partition model | solved | `integration::directional_partition` |
 | ephemeral port assignment | kernel-chosen | assigned by us in a defined sequence | solved | `system::ports_virtualised` |
 | DNS | resolver state, network access | a static hosts table from configuration | solved | `system::dns_from_config` |
+| readiness (`epoll`, `poll`, `eventfd`) | the kernel's wait queues | the world's own readiness: level- and edge-triggered and one-shot watches, an `eventfd` write waking its pollers, all ordered | solved | golden `epoll` workload, `bohr check golden` |
+| pipes | a kernel buffer between two descriptors | in a world with a `[cluster]`, a stream pair: a read blocks on empty, a write wakes it, a closed write end reads as the end; the direction is not enforced | partial | golden `pipe` workload |
 | TCP behaviour (Nagle, window scaling, retransmits) | kernel stack details | a simplified stream model preserving ordering and framing, not the RFC | partial | documented; a guest depending on precise TCP timing is out of scope |
 | `SO_REUSEPORT` load balancing | kernel hashes connections across listeners | our own defined distribution, drawn from the tape | solved | — |
 

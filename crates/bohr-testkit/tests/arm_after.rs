@@ -65,6 +65,7 @@ fn run(arm_after: Tick) -> Judged {
         network: NetworkConfig { nodes: 1, ..NetworkConfig::default() },
         fault_policy: FaultPolicy {
             kill: (1, 64),
+            enomem: (0, 0),
             targeting: Targeting::Guided,
             restart_after: Tick(0),
             arm_after,

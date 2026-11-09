@@ -161,6 +161,7 @@ impl LoadedConfig {
     #[must_use]
     pub fn asks_for_adversity(&self) -> bool {
         let drawn = self.fault_policy.kill.0 > 0
+            || self.fault_policy.enomem.0 > 0
             || self.network.drop_probability.0 > 0
             || self.network.duplicate_probability.0 > 0
             || self.network.reorder_probability.0 > 0
@@ -344,6 +345,7 @@ struct RawDurability {
 #[serde(deny_unknown_fields)]
 struct RawFaults {
     kill_probability: Option<String>,
+    enomem_probability: Option<String>,
     targeting: Option<String>,
     restart_after_ticks: Option<u64>,
     arm_after_ticks: Option<u64>,
@@ -408,8 +410,7 @@ struct RawProbe {
     nodes: Option<Vec<u32>>,
     port: Option<u16>,
     rpc: String,
-    #[serde(default)]
-    params: Vec<toml::Value>,
+    params: Option<toml::Value>,
     every_ticks: u64,
     key: Option<toml::Value>,
     value: String,
@@ -575,6 +576,8 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     if let Some(raw_faults) = &raw.faults {
         fault_policy.kill =
             probability(raw_faults.kill_probability.as_deref(), "faults.kill_probability")?;
+        fault_policy.enomem =
+            probability(raw_faults.enomem_probability.as_deref(), "faults.enomem_probability")?;
         fault_policy.targeting = match raw_faults.targeting.as_deref() {
             None | Some("uniform") => Targeting::Uniform,
             Some("guided") => Targeting::Guided,
@@ -1019,15 +1022,24 @@ fn probes(
                 "BOHR-1002: {what}: rpc, value and every key field are named, never empty"
             )));
         }
-        let mut params = Vec::with_capacity(probe.params.len());
-        for value in &probe.params {
-            params.push(json_of(value).ok_or_else(|| {
-                ConfigError::Refused(format!(
-                    "BOHR-1002: {what}: params hold strings, integers, booleans, arrays and \
-                     tables; a float or a date has no single JSON spelling"
-                ))
-            })?);
-        }
+        // An array is positional parameters and a table named ones; JSON-RPC servers take one or
+        // the other, and CometBFT's only the second.
+        let params = match &probe.params {
+            None => bohr_sdk_proto::json::Json::Array(Vec::new()),
+            Some(value @ (toml::Value::Array(_) | toml::Value::Table(_))) => json_of(value)
+                .ok_or_else(|| {
+                    ConfigError::Refused(format!(
+                        "BOHR-1002: {what}: params hold strings, integers, booleans, arrays and \
+                         tables; a float or a date has no single JSON spelling"
+                    ))
+                })?,
+            Some(_) => {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: {what}: params is an array of positional parameters or a table \
+                     of named ones"
+                )));
+            }
+        };
         let name = probe.name.clone().unwrap_or_else(|| format!("{}#{}", probe.rpc, i + 1));
         if out.iter().any(|s: &ProbeSpec| s.name == name) {
             return Err(ConfigError::Refused(format!(
@@ -1039,7 +1051,7 @@ fn probes(
             nodes,
             port: probe.port.unwrap_or(DEFAULT_RPC_PORT),
             rpc: probe.rpc.clone(),
-            params: bohr_sdk_proto::json::Json::Array(params).to_json(),
+            params: params.to_json(),
             every: Tick(probe.every_ticks),
             key,
             value: probe.value.clone(),

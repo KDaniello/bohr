@@ -287,6 +287,7 @@ const fn fault_kind(fault: FaultKind) -> &'static str {
         FaultKind::ClockStep => "clock_step",
         FaultKind::ClockDrift => "clock_drift",
         FaultKind::ChainReorg => "chain_reorg",
+        FaultKind::MemoryExhausted => "memory_exhausted",
     }
 }
 

@@ -114,7 +114,7 @@ fn a_saved_bundle_is_self_describing_and_refuses_foreign_components() {
     assert!(
         manifest
             .check_provenance(
-                &WorldModelId::new("minimal", 1),
+                &WorldModelId::new("minimal", 2),
                 &OracleId::new("properties+crash", 1)
             )
             .is_ok()

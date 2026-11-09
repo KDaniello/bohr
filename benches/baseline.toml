@@ -1341,6 +1341,34 @@ workers_scale = { ratio = 4.56, host_ceiling = 4.89 }                    # P4.0,
 probe_wall = "1.26-1.33x"                                                # P4.1, bound 1.10: fails
 probe_memory_10657_blocks_mb = { run = 140, worker = 53 }                # P4.2, bound 16: fails
 
+# What v0.5.0 was measured to do, on 2026-11-09, on the Ubuntu 24.04 VM (four cores, 4 GB), with
+# v0.4.0's binary run beside it alternately. Each bound was written in roadmap/v0.5.md before its
+# run; G5.1 was restated before its runs from an hour of virtual time on 60 seeds to twenty seeds of
+# each buildable pack at its own horizon.
+#
+# Not measured: G5.6 and P5.1, since no pack declares a `[bench]` workload. Not built: G5.7, since
+# neither host exposes a branch counter to preempt by.
+[v0_5.gates]
+refusals_under_faults = { reth = "0 of 20", geth = "0 of 20", cometbft = "0 of 20" }   # G5.1 restated
+walls = { geth = "inotify_init1, answered ENOSYS on purpose", cometbft = "none", reth = "none" }   # G5.2
+refusals_left = 0                                                        # G5.3
+alloc_unchecked = { with_refusals = "43 of 60", without = "0 of 60" }   # G5.4, bound 20 and 0
+repeat_100 = { reth = "one digest", geth = "one digest", cometbft = "one digest" }   # G5.5
+make_pr = "green"                                                        # G5.8
+make_gate = "green, 13 of 13"
+mutation_injections_caught = "13 of 13"
+checks = { geth = "7 of 7", cometbft = "7 of 7", reth = "6 of 6", chain_toy = "10 of 10", golden = "71 of 71", defects = "17 of 17" }
+
+[v0_5.perf]
+per_call_us = { v0_4 = 8.7, v0_5 = 4.0 }                                 # P5.2, bound v0.4
+startup_ms = { v0_4 = 2.44, v0_5 = 2.64 }                                # P5.4, +8%
+redb_64_runs_ms = { j1 = { v0_4 = 5_487, v0_5 = 2_922 }, j4 = { v0_4 = 1_683, v0_5 = 815 } }
+peak_rss_mb = { v0_4 = 50.1, v0_5 = 14.6 }
+geth_peak_rss_mb = { traced_supervisor = 92, native = 107 }              # P5.3, bound 2x
+gate_s = { v0_4 = 117, v0_5 = 109 }
+pr_s = { v0_4 = 49, v0_5 = 43 }
+probe_cost = { events = "+6.5%", wall = "+47%" }
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

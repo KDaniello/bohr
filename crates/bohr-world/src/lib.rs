@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bytes;
 #[cfg(any(
     feature = "chaos-syscall-passthru",
     feature = "chaos-futex-order",

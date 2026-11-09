@@ -67,6 +67,7 @@ fn run(budget_per_run: Option<u32>, seed: u64) -> Judged {
         network: NetworkConfig { nodes: 1, ..NetworkConfig::default() },
         fault_policy: FaultPolicy {
             kill: (1, 16),
+            enomem: (0, 0),
             targeting: Targeting::Guided,
             // Short enough that the node is back in time to be killed again, which is what makes
             // an unbudgeted run spend itself on restarts.

@@ -1,0 +1,48 @@
+# geth as a development chain that mines a block a second, killed where it stands and started again.
+#
+# Judged three ways. A node that comes back must come back: a crash it cannot start from, or a
+# restart that dies, is a finding. Its head must keep the hashes it reported: the probe asks for the
+# latest block, and a hash at a height that changes is a finding. And the head must move: a height
+# that stays put for ten seconds once the node is up is a finding. The development chain finalises
+# nothing — its finalised block stays the genesis — so the head is what there is to judge.
+
+[run]
+horizon_ticks = 30_000_000_000    # thirty seconds of virtual time
+
+[cluster]
+nodes = 1
+argv = ["targets/geth/build/geth", "--dev", "--dev.period", "1", "--datadir", "/data",
+        "--nodiscover", "--maxpeers", "0", "--ipcdisable", "--verbosity", "2",
+        "--http", "--http.addr", "0.0.0.0", "--http.port", "8545", "--http.api", "eth"]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[disk]
+sync_semantics = "strict"
+
+# Drawn rather than written down, so every seed crashes it somewhere else and brings it back half a
+# second after each death.
+[faults]
+kill_probability = "1/2000"
+restart_after_ticks = 500_000_000
+budget_per_run = 3
+
+[[probe]]
+name = "head-keeps-its-hashes"
+rpc = "eth_getBlockByNumber"
+params = ["latest", false]
+every_ticks = 500_000_000
+key = "number"
+value = "hash"
+property = "never-reverts"
+
+[[probe]]
+name = "head-moves"
+rpc = "eth_getBlockByNumber"
+params = ["latest", false]
+every_ticks = 500_000_000
+value = "number"
+property = "advances"
+within_ticks = 10_000_000_000

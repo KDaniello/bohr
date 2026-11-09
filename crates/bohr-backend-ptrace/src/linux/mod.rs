@@ -57,6 +57,8 @@ struct Task {
     program: String,
     /// Return value owed to a syscall that was skipped, applied at its exit stop.
     pending_return: Option<i64>,
+    /// A signal to deliver as the task leaves its emulated call.
+    pending_signal: Option<u32>,
     /// Whether the exit of the syscall now running is owed to the world as a stop of its own.
     ///
     /// Set when the world replaced a call rather than answering it: a replacement is made because
@@ -88,6 +90,7 @@ impl Task {
             node,
             program,
             pending_return: None,
+            pending_signal: None,
             reporting_exit: false,
             pending_skip: None,
             regs: None,
@@ -147,6 +150,8 @@ pub struct PtraceBackend {
     /// when the backend is dropped: a process that traces once and then starts workers must not
     /// hand every worker the one core its first guest ran on.
     affinity_before: Option<libc::cpu_set_t>,
+    /// Whether `brk`, `mremap` and anonymous `mmap` stop, for a world that refuses allocations.
+    allocations: bool,
 }
 
 impl Default for PtraceBackend {
@@ -183,7 +188,15 @@ impl PtraceBackend {
             coverage: coverage::CoverageChannel::open(bytes),
             covered: CoverageMap::with_bytes(bytes),
             affinity_before: None,
+            allocations: false,
         }
+    }
+
+    /// The same backend, stopping every allocation call so a world can refuse one.
+    #[must_use]
+    pub const fn watching_allocations(mut self) -> Self {
+        self.allocations = true;
+        self
     }
 
     /// Conditions this host imposed that the run should be recorded as degraded for.
@@ -361,7 +374,12 @@ impl DeterminismBackend for PtraceBackend {
                     .then_some(set)
             };
         }
-        let pid = spawn::spawn_traced(spec, self.isolated, self.coverage.as_ref().map(|c| c.fd()))?;
+        let pid = spawn::spawn_traced(
+            spec,
+            self.isolated,
+            self.coverage.as_ref().map(|c| c.fd()),
+            self.allocations,
+        )?;
 
         // Run to the exec, where the stack still carries the auxiliary vector. The guest is already
         // traced, and its own `execve` is filtered like any other syscall, so a seccomp event
@@ -601,7 +619,10 @@ impl DeterminismBackend for PtraceBackend {
                     self.current = None;
                     return Ok(Some(Stop { task: id, kind: StopKind::SyscallExit { ret } }));
                 }
-                self.release(id, libc::PTRACE_CONT, 0)?;
+                // A signal the world sent rides out on the return, so the handler runs with the
+                // call's answer already in place, as it would on a kernel that delivered it there.
+                let signal = self.task_mut(id)?.pending_signal.take().unwrap_or(0);
+                self.release(id, libc::PTRACE_CONT, libc::c_long::from(signal))?;
                 continue;
             }
 
@@ -652,13 +673,24 @@ impl DeterminismBackend for PtraceBackend {
             Resume::DeliverSignal { signal } => {
                 self.release(task, libc::PTRACE_CONT, libc::c_long::from(signal))?;
             }
+            // One stop, not two: at a seccomp stop a call whose number is set to -1 is skipped and
+            // returns whatever the tracer left in `rax`, so the answer is written here and the task
+            // runs on. Only a signal riding on the answer needs the exit stop, because an event
+            // stop cannot carry one.
             Resume::Emulate { ret } => {
-                // Setting the number to -1 makes the kernel skip the call; the value the world
-                // chose is written at the exit stop that follows.
+                let mut regs = self.cached_regs(task)?;
+                regs.orig_rax = u64::MAX;
+                regs.rax = ret as u64;
+                self.store_regs(task, &regs)?;
+                self.release(task, libc::PTRACE_CONT, 0)?;
+            }
+            Resume::EmulateAndSignal { ret, signal } => {
                 let mut regs = self.cached_regs(task)?;
                 regs.orig_rax = u64::MAX;
                 self.store_regs(task, &regs)?;
-                self.task_mut(task)?.pending_return = Some(ret);
+                let state = self.task_mut(task)?;
+                state.pending_return = Some(ret);
+                state.pending_signal = Some(signal);
                 self.release(task, libc::PTRACE_SYSCALL, 0)?;
             }
             Resume::Rewrite { nr, args } => {

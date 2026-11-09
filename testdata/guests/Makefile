@@ -10,7 +10,7 @@ CFLAGS  ?= -O1 -static -fno-stack-protector -no-pie -Wall -Wextra
 LDFLAGS ?= -pthread
 OUT     ?= build
 
-SOURCES := $(wildcard *.c) $(wildcard ../bugs/*/*.c)
+SOURCES := $(wildcard *.c) $(wildcard ../bugs/*/*.c) $(wildcard ../golden/*.c)
 BINARIES := $(patsubst %.c,$(OUT)/%,$(notdir $(SOURCES)))
 VPATH   := $(sort $(dir $(SOURCES)))
 

@@ -196,6 +196,9 @@ impl DrawnFaults {
 pub struct FaultPolicy {
     /// Odds a fault fires at a moment it may fire at, as a rational.
     pub kill: (u32, u32),
+    /// Odds an allocation call — `brk`, an anonymous `mmap`, `mremap` — is refused, as a
+    /// rational; nought where memory never runs out.
+    pub enomem: (u32, u32),
     /// How the moment is chosen.
     pub targeting: Targeting,
     /// Ticks after a drawn kill before the node is started again. Zero leaves it dead.
@@ -423,7 +426,7 @@ const DOMAIN_EXPOSED: u32 = 3;
 /// Incremented when the model's behaviour changes in a way that makes a stored run replay into a
 /// different world. Version 2 made durability a promise about one file rather than about the whole
 /// disk, and made a crash decide each dirty sector for itself.
-const MODEL_VERSION: u16 = 2;
+const MODEL_VERSION: u16 = 3;
 
 /// The namespace this model's domain events are read in.
 ///
@@ -466,7 +469,7 @@ fn fd_of(args: [u64; 6]) -> i64 {
 /// What a delegated call answered, read back off its effects for the disk's own record.
 fn answered(effects: &Effects) -> i64 {
     match effects.state {
-        TaskState::Runnable(Resume::Emulate { ret }) => ret,
+        TaskState::Runnable(Resume::Emulate { ret } | Resume::EmulateAndSignal { ret, .. }) => ret,
         _ => 0,
     }
 }
@@ -515,6 +518,8 @@ pub struct DistributedWorld {
     /// by the callbacks the kernel makes without a context.
     node_of_task: BTreeMap<TaskId, NodeId>,
     timers: TimerQueue,
+    /// Each task's futex waits, counted, so a timer armed for one wait cannot end a later one.
+    futex_seq: BTreeMap<TaskId, u64>,
     net: Network,
     disks: BTreeMap<NodeId, NodeDisk>,
     disk_config: DiskConfig,
@@ -671,6 +676,7 @@ impl DistributedWorld {
             nodes: BTreeMap::new(),
             node_of_task: BTreeMap::new(),
             timers: TimerQueue::default(),
+            futex_seq: BTreeMap::new(),
             net: Network::default(),
             disks: BTreeMap::new(),
             disk_config: DiskConfig::default(),
@@ -708,6 +714,7 @@ impl DistributedWorld {
                 FaultKind::ChainReorg,
                 FaultKind::ClockStep,
                 FaultKind::ClockDrift,
+                FaultKind::MemoryExhausted,
             ]),
         }
     }
@@ -1229,6 +1236,28 @@ impl DistributedWorld {
                 })?;
                 Ok(effects)
             }
+            // Space added to a file is bytes it now has and has not synced, exactly as a write's
+            // are; a reservation that changes nothing marks nothing.
+            sys::FALLOCATE => {
+                let before = self.node_world(node).length_of(fd).unwrap_or(0);
+                let effects = self.node_world(node).handle(stop, ctx)?;
+                let ret = answered(&effects);
+                let after = self.node_world(node).length_of(fd).unwrap_or(0);
+                if ret >= 0 && after > before {
+                    let inode = self.node_world(node).inode_of(fd);
+                    if let (Some(inode), Some(disk)) = (inode, self.disks.get_mut(&node)) {
+                        disk.mark_written(inode, before, after - before);
+                    }
+                }
+                ctx.emit(EventKind::DiskOp {
+                    fd: Fd(fd as i32),
+                    op: DiskOpKind::Truncate,
+                    offset: after,
+                    len: 0,
+                    ret,
+                })?;
+                Ok(effects)
+            }
             _ => Err(ctx.refuse("BOHR-2001", format!("unsupported disk call {nr}"))),
         }
     }
@@ -1248,6 +1277,55 @@ impl DistributedWorld {
         ctx.emit(EventKind::DiskOp { fd: Fd(fd as i32), op, offset, len, ret })?;
         ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
         Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST))
+    }
+
+    /// Draws whether this allocation is refused, where a scenario says memory can run out.
+    ///
+    /// These calls reach the world only where `enomem_probability` is set: otherwise the filter
+    /// lets them run untouched, and an allocator pays no stop for them. One that is not refused is
+    /// carried out by the kernel, since it shapes nothing but the guest's own address space. The
+    /// probe is never refused: it is the instrument.
+    fn maybe_exhaust(
+        &mut self,
+        node: NodeId,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut WorldCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        /// `brk`, `mmap`, `mremap`.
+        const BRK: u32 = 12;
+        const MMAP: u32 = 9;
+        const MREMAP: u32 = 25;
+        /// `MAP_ANONYMOUS`: an allocation rather than a mapping of a file.
+        const MAP_ANONYMOUS: u64 = 0x20;
+        let allocation = nr == BRK || nr == MREMAP || (nr == MMAP && args[3] & MAP_ANONYMOUS != 0);
+        if !allocation || self.fault_policy.enomem.0 == 0 {
+            return Ok(None);
+        }
+        // The probe is outside the fault model: with refusals armed its allocations stop like every
+        // process's, and are let through without a draw, since the per-node world they would
+        // otherwise reach models no allocation.
+        // `brk(0)` asks where the break is and allocates nothing, so nothing can be refused.
+        let refused = Some(node) != self.probe_node
+            && !(nr == BRK && args[0] == 0)
+            && draw_odds(ctx, self.fault_policy.enomem, DrawSite::MemoryExhausted)?;
+        if !refused {
+            ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: false, data_digest: None })?;
+            return Ok(Some(Effects::go(Resume::Continue, SYSCALL_COST)));
+        }
+        ctx.emit(EventKind::FaultFired {
+            fault: FaultKind::MemoryExhausted,
+            target: FaultTarget::Node(node),
+        })?;
+        if nr == BRK {
+            // A break that does not move is how the kernel refuses one; asking for the current
+            // break is the call that returns it unmoved.
+            ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: false, data_digest: None })?;
+            return Ok(Some(Effects::go(Resume::Rewrite { nr: BRK, args: [0; 6] }, SYSCALL_COST)));
+        }
+        let ret = -errno::ENOMEM;
+        ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
+        Ok(Some(Effects::go(Resume::Emulate { ret }, SYSCALL_COST)))
     }
 
     /// Draws whether this node dies at this moment, where a campaign armed drawn faults.
@@ -1525,6 +1603,8 @@ impl DistributedWorld {
                 let ready = self.ready_on(node, epfd);
                 if !ready.is_empty() || timeout == 0 {
                     let wrote = Self::write_ready(ctx, out, max, &ready)?;
+                    let fds: Vec<i64> = ready[..wrote].iter().map(|r| r.fd).collect();
+                    self.epolls.reported(node, epfd, &fds);
                     return answer(wrote as i64, ctx);
                 }
                 // Nothing to report and the guest is willing to wait. A timeout is armed only
@@ -1581,8 +1661,14 @@ impl DistributedWorld {
                 -errno::EBADF
             }
         };
+        // A write to a counter is how one thread wakes another's poller, so a poller parked on it
+        // is told now rather than at the next delivery, which may never come.
+        let mut wakes = Vec::new();
+        if nr != sys::READ && ret > 0 {
+            self.wake_ready_pollers(ctx, &mut wakes)?;
+        }
         ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
-        Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST))
+        Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST).releasing(wakes))
     }
 
     /// Hands every parked poller whatever its instance can now report.
@@ -1594,6 +1680,8 @@ impl DistributedWorld {
         ctx: &mut WorldCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
+        // Whatever called this changed what may be ready, so an edge is due again.
+        self.epolls.bump();
         let instances: Vec<(NodeId, i64)> = self.epolls.parked_instances();
         for (node, epfd) in instances {
             let ready = self.ready_on(node, epfd);
@@ -1615,6 +1703,8 @@ impl DistributedWorld {
                 if !bytes.is_empty() {
                     ctx.write_mem_for(task, out, &bytes)?;
                 }
+                let fds: Vec<i64> = ready[..taken].iter().map(|r| r.fd).collect();
+                self.epolls.reported(node, epfd, &fds);
                 wakes.push(Wake { task, ret: taken as i64 });
             }
         }
@@ -1795,7 +1885,7 @@ impl DistributedWorld {
                 if wanted & epoll::EPOLLOUT != 0 {
                     events |= epoll::EPOLLOUT;
                 }
-                (events != 0).then_some(epoll::Ready { events, token })
+                (events != 0).then_some(epoll::Ready { fd, events, token })
             })
             .collect()
     }
@@ -2131,10 +2221,13 @@ impl WorldModel for DistributedWorld {
         for entry in self.timers.pop_due(ctx.world_now()) {
             match entry {
                 Due::SleepExpiry { task } => effects.wake.push(Wake { task, ret: 0 }),
-                Due::FutexTimeout { node, task, word } => {
-                    // A timeout whose waiter was already woken fires into nothing; checking at
-                    // firing time is what makes cancellation unnecessary.
-                    if self.nodes.get_mut(&node).is_some_and(|w| w.cancel_wait(task, word)) {
+                Due::FutexTimeout { node, task, word, seq } => {
+                    // A timeout fires only into the wait that armed it: one whose waiter was woken,
+                    // or that a later wait of the same task replaced, fires into nothing. Checking
+                    // at firing time is what makes cancellation unnecessary.
+                    if self.futex_seq.get(&task) == Some(&seq)
+                        && self.nodes.get_mut(&node).is_some_and(|w| w.cancel_wait(task, word))
+                    {
                         effects.wake.push(Wake { task, ret: -errno::ETIMEDOUT });
                     }
                 }
@@ -2481,6 +2574,9 @@ impl DistributedWorld {
             if let Some(killed) = self.maybe_kill(node, ctx)? {
                 return Ok(killed);
             }
+            if let Some(answered) = self.maybe_exhaust(node, nr, args, ctx)? {
+                return Ok(answered);
+            }
             if nr == sys::IO_URING_ENTER && self.node_world(node).holds_ring(args[0] as i64) {
                 return self.enter_ring(node, stop, args, ctx);
             }
@@ -2562,11 +2658,13 @@ impl DistributedWorld {
             if poll_family {
                 return self.poll_call(node, nr, args, ctx);
             }
-            // **`poll` on a node with sockets is the network's question.** The node's own world
-            // knows no socket and would answer "nothing is ready" about one holding a
-            // datagram, so the call is answered here, from the readiness the epoll
-            // family computes.
-            if nr == sys::POLL && self.net.node_has_sockets(node) {
+            // **`poll` on a node with sockets, pollers or counters is the cluster's question.** The
+            // node's own world knows none of them and would answer "nothing is ready" about a
+            // socket holding a datagram, or call a counter it never issued invalid, so the call is
+            // answered here, from the readiness the epoll family computes.
+            if nr == sys::POLL
+                && (self.net.node_has_sockets(node) || self.epolls.node_holds_any(node))
+            {
                 return self.poll_sockets(node, args, ctx);
             }
             // A counter is read and written like a file and is neither: eight bytes carrying what
@@ -2603,6 +2701,31 @@ impl DistributedWorld {
                 return Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST));
             }
             if nr == sys::CLOSE && self.epolls.close(node, args[0] as i64) {
+                ctx.emit(EventKind::Syscall {
+                    nr,
+                    args,
+                    ret: 0,
+                    emulated: true,
+                    data_digest: None,
+                })?;
+                return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST));
+            }
+
+            // **A pipe is a stream pair whose ends the guest uses one way each.** Reads block on an
+            // empty pipe and wake on a write, and a closed write end reads as the end of the
+            // stream, all of which a pair of connected streams already does; what this does not
+            // hold to is the direction, so a write to the read end is delivered where the kernel
+            // would answer `EBADF`.
+            if nr == sys::PIPE2 {
+                let (read_end, write_end) = self.net.open_pair(node);
+                if args[1] as i64 & O_NONBLOCK != 0 {
+                    self.net.set_nonblocking(node, read_end, true);
+                    self.net.set_nonblocking(node, write_end, true);
+                }
+                let mut pair = [0u8; 8];
+                pair[..4].copy_from_slice(&(read_end as i32).to_le_bytes());
+                pair[4..].copy_from_slice(&(write_end as i32).to_le_bytes());
+                ctx.write_mem(GuestAddr(args[0]), &pair)?;
                 ctx.emit(EventKind::Syscall {
                     nr,
                     args,
@@ -2704,6 +2827,7 @@ impl DistributedWorld {
                     | sys::FSYNC
                     | sys::FDATASYNC
                     | sys::FTRUNCATE
+                    | sys::FALLOCATE
             );
             if disk_shaped && self.node_world(node).is_file(args[0] as i64) {
                 return self.disk_call(node, nr, args, None, stop, ctx);
@@ -2750,9 +2874,18 @@ impl DistributedWorld {
             // A timed wait is the one call whose timeout the per-node world ignores; the timeout
             // is read before delegation and armed only if the wait actually parked the task.
             let base = futex_op::base(args[1] as u32);
-            let timed_wait = nr == sys::FUTEX
-                && (base == futex_op::WAIT || base == futex_op::WAIT_BITSET)
-                && args[3] != 0;
+            let wait =
+                nr == sys::FUTEX && (base == futex_op::WAIT || base == futex_op::WAIT_BITSET);
+            // Every wait is numbered, timed or not, so a timer armed for an earlier one cannot end
+            // it.
+            let seq = if wait {
+                let seq = self.futex_seq.get(&ctx.task()).map_or(1, |n| n + 1);
+                self.futex_seq.insert(ctx.task(), seq);
+                seq
+            } else {
+                0
+            };
+            let timed_wait = wait && args[3] != 0;
             if timed_wait {
                 let value = MinimalWorld::read_timespec(ctx, GuestAddr(args[3]))?;
                 // WAIT carries a duration, WAIT_BITSET an absolute deadline on the node's clock,
@@ -2769,7 +2902,7 @@ impl DistributedWorld {
                     self.timers.arm(
                         at,
                         node,
-                        Due::FutexTimeout { node, task: ctx.task(), word: args[0] },
+                        Due::FutexTimeout { node, task: ctx.task(), word: args[0], seq },
                     );
                 }
                 return Ok(effects);
@@ -2782,8 +2915,12 @@ impl DistributedWorld {
         // that is the record channel from here on.
         if let StopKind::SyscallEntry { nr, args } = stop.kind {
             if nr == sys::OPENAT
-                && let (true, TaskState::Runnable(Resume::Emulate { ret })) =
-                    (self.sdk_path.is_some(), &effects.state)
+                && let (
+                    true,
+                    TaskState::Runnable(
+                        Resume::Emulate { ret } | Resume::EmulateAndSignal { ret, .. },
+                    ),
+                ) = (self.sdk_path.is_some(), &effects.state)
             {
                 let opened = if *ret >= 0 { opened_path(ctx, GuestAddr(args[1]))? } else { None };
                 if opened.is_some() && opened == self.sdk_path {
@@ -2825,7 +2962,9 @@ impl DistributedWorld {
         if !takes_a_descriptor(nr) {
             return Ok(());
         }
-        let TaskState::Runnable(Resume::Emulate { ret }) = effects.state else {
+        let TaskState::Runnable(Resume::Emulate { ret } | Resume::EmulateAndSignal { ret, .. }) =
+            effects.state
+        else {
             return Ok(());
         };
         if ret != -errno::EBADF {

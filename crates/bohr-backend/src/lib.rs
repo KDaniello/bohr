@@ -277,6 +277,16 @@ pub enum Resume {
         /// What the guest receives.
         ret: i64,
     },
+    /// As [`Resume::Emulate`], and the kernel then delivers `signal` as the task returns.
+    ///
+    /// The kernel applies the task's own disposition — its handler, the default action, or
+    /// nothing — so a signal is handled exactly as the guest arranged, at a moment the run chose.
+    EmulateAndSignal {
+        /// What the guest receives.
+        ret: i64,
+        /// Signal number.
+        signal: u32,
+    },
     /// Execute a different syscall than the guest asked for.
     Rewrite {
         /// Replacement syscall number.

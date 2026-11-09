@@ -1,0 +1,27 @@
+# Four defects of one program, each behind a flag, and what `bohr check chain-toy` holds them to.
+# Each defect's scenario differs from scenario.toml by its flag and its oracle; see docs/TESTING.md §16.
+
+# The correct chain: nothing found, one digest, and probes that cost little.
+[check]
+works = { min_events = 10_000, min_virtual_s = 3.9, probe_answers = 0.9 }
+never_finds = { seeds = "1..200" }
+repeats = { times = 1000 }
+replays = {}
+costs = { against = "scenario-without-probes.toml", metric = "events", max_ratio = 1.10 }
+workers_agree = { runs = 64, jobs = 4 }
+
+[[defect]]
+name = "--revert-finality"
+check.finds = { scenario = "scenario-revert-finality.toml", seeds = "1..60", code = "BOHR-2040", at_least = 30 }
+
+[[defect]]
+name = "--equivocate"
+check.finds = { scenario = "scenario-equivocate.toml", seeds = "1..60", code = "BOHR-2043", at_least = 30 }
+
+[[defect]]
+name = "--fork-on-partition"
+check.finds = { scenario = "scenario-fork-on-partition.toml", seeds = "1..60", code = "BOHR-2041", at_least = 30 }
+
+[[defect]]
+name = "--stall-after-heal"
+check.finds = { scenario = "scenario-stall-after-heal.toml", seeds = "1..60", code = "BOHR-2042", at_least = 30 }

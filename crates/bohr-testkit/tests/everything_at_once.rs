@@ -124,6 +124,7 @@ fn all_of_it() -> Scenario {
         },
         fault_policy: FaultPolicy {
             kill: (1, 64),
+            enomem: (0, 0),
             targeting: Targeting::Guided,
             restart_after: Tick(2 * Tick::MILLISECOND.get()),
             arm_after: Tick(0),

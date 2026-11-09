@@ -57,7 +57,7 @@ example-raft-toy: ## Build the seeded consensus defect (docs/TESTING.md 8)
 
 .PHONY: test-hunting
 test-hunting: build-debug example-raft-toy example-chain-toy probe ## Does the search still reach the seeded defects (8)
-	$(CARGO) test --test hunting -- --ignored --nocapture
+	$(CARGO) test --test hunting --test subjects -- --ignored --nocapture
 
 ##@ Test
 
@@ -161,6 +161,10 @@ fix: ## Apply clippy suggestions, then format
 	$(MAKE) fmt
 
 ##@ Benchmarks and fuzzing
+
+.PHONY: golden
+golden: build guests ## The golden guests: every part of bohr, its speed, memory and determinism (17)
+	target/release/bohr check golden -j 2
 
 .PHONY: bench-slowdown
 bench-slowdown: build guests ## Slowdown versus native against benches/baseline.toml

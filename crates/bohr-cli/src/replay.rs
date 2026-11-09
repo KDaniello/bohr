@@ -143,7 +143,7 @@ fn diverged(bundle: &Bundle, log: &[u8], manifest: &Manifest) -> String {
         .find(|i| recorded.get(*i) != actual.get(*i))
         .unwrap_or(0);
     let describe = |e: Option<&bohr_trace::Event>| match e {
-        Some(e) => format!("{:?}", e.kind),
+        Some(e) => bohr_report::text::event_line(e).trim_end().to_owned(),
         None => "ended before this event".to_owned(),
     };
     format!(

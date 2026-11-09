@@ -25,6 +25,8 @@ struct Read {
     path: PathBuf,
     events: u64,
     signature: String,
+    /// What the run found, in words, with its code.
+    verdict: bohr_report::narrate::Verdict,
 }
 
 /// The signature a bundle's violation is grouped by.
@@ -37,8 +39,13 @@ fn signature_of(outcome: &Outcome, events: &[bohr_trace::Event]) -> String {
         let words: String = said.chars().filter(|c| !c.is_ascii_digit()).collect();
         return format!("GuestHung {}", words.split_whitespace().collect::<Vec<_>>().join(" "));
     }
-    Violation::of(outcome, bohr_kernel::StopReason::GuestFinished, events)
-        .map_or_else(|| format!("{outcome:?}"), |v| v.describe())
+    Violation::of(outcome, bohr_kernel::StopReason::GuestFinished, events).map_or_else(
+        || {
+            let verdict = bohr_report::narrate::verdict(outcome);
+            format!("{}: {}", verdict.code, verdict.headline)
+        },
+        |v| v.describe(),
+    )
 }
 
 /// The programs a run executed, by file name, in the order the run started them.
@@ -73,6 +80,7 @@ fn read(path: &Path) -> Result<Read, CliError> {
             programs_of(&bundle),
             signature_of(&manifest.outcome, &events)
         ),
+        verdict: bohr_report::narrate::verdict(&manifest.outcome),
     })
 }
 
@@ -109,6 +117,8 @@ pub(crate) fn findings(dir: &str, json: bool) -> Result<u8, CliError> {
             .map(|(signature, members)| {
                 serde_json::json!({
                     "signature": signature,
+                    "verdict": members[0].verdict.headline,
+                    "code": members[0].verdict.code,
                     "count": members.len(),
                     "smallest": members[0].path.display().to_string(),
                     "bundles": members.iter().map(|m| serde_json::json!({
@@ -123,11 +133,19 @@ pub(crate) fn findings(dir: &str, json: bool) -> Result<u8, CliError> {
     } else {
         println!("{} findings in {} groups", paths.len(), ordered.len());
         for (signature, members) in &ordered {
-            println!("\n{:>4} × {signature}", members.len());
+            let smallest = &members[0];
             println!(
-                "       smallest: {} ({} events)",
-                members[0].path.display(),
-                members[0].events
+                "\n{:>4} × {}    {}",
+                members.len(),
+                smallest.verdict.headline,
+                smallest.verdict.code
+            );
+            println!("       grouped as {signature}");
+            println!(
+                "       smallest: {} ({} events) · bohr explain {}",
+                smallest.path.display(),
+                smallest.events,
+                smallest.path.display()
             );
         }
     }

@@ -94,6 +94,13 @@ if hits=$(grep -rnE --include='*.rs' \
   report 14j '8.1' $'project meta in a code comment:\n'"$hits"
 fi
 
+# Readability R2: what a person reads is never debug output. An outcome, an event or a pass printed
+# with `{:?}` reads as the identifier it came from; the words for each live in bohr-report.
+if hits=$(grep -rnE --include='*.rs' 'e?print(ln)?!\(.*\{[a-z_.]*:\?\}' crates/bohr-cli/src 2>/dev/null); then
+  report R2 'readability' $'debug formatting in what a user reads; use bohr-report::narrate or describe:
+'"$hits"
+fi
+
 # 8.1: a TODO without an owner and an issue link lives forever.
 if hits=$(grep -rnE --include='*.rs' 'TODO' crates 2>/dev/null | grep -vE 'TODO\([^)]+\).*#[0-9]+'); then
   report 14h '8.1' $'TODO without an owner and an issue link:\n'"$hits"

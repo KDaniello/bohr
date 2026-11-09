@@ -595,7 +595,8 @@ fn save_finding(request: &Request, finding: &bohr_explorer::Finding) -> Result<b
     let bytes = execute::to_bundle(&completed, &tape, None)?;
     std::fs::write(&path, bytes)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display())))?;
-    eprintln!("  found {} · {}", finding.kind, path.display());
+    let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+    eprintln!("  found  {}    {} · {}", verdict.headline, verdict.code, path.display());
     Ok(true)
 }
 
@@ -623,6 +624,9 @@ fn report(campaign: &Campaign, started: Instant, saved: u64) {
     // well, and nothing else here separates them. Faults are drawn, so this is a fact about the
     // runs rather than about the configuration that armed them.
     eprintln!("  findings {saved} · adversity landed {}", campaign.adversity());
+    if saved > 0 {
+        eprintln!("  next     bohr findings <dir> groups them; bohr explain <bundle> tells one");
+    }
     // **The number that says whether the feedback still discriminates.** A map with fewer counters
     // than the guest has edges puts two edges on one counter, and two runs that differ only there
     // are one run to the corpus. Said whenever the guest reported an edge count, because a search

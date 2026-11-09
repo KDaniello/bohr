@@ -132,8 +132,8 @@ pub(crate) fn reduce(
         // Carriage-returned so a long reduction is one line rather than a thousand. On the error
         // stream, because everything the tool says about a run goes there.
         eprint!(
-            "\rreduce  {:?} · {} of {budget} replays · events {} · draws {}   ",
-            reduction.pass(),
+            "\rreduce  {} · {} of {budget} replays · events {} · draws {}   ",
+            pass_word(reduction.pass()),
             reduction.spent().total(),
             reduction.size().events,
             reduction.size().draws
@@ -165,7 +165,12 @@ pub(crate) fn reduce(
         "events: {} → {}, tape: {} → {} draws",
         before.events, after.events, before.draws, after.draws
     );
-    eprintln!("  {:?} · written to {out}, reduced from run {}", reduction.spent(), manifest.run_id);
+    let spent = reduction.spent();
+    eprintln!(
+        "  replays spent: {} verifying, {} on the configuration, {} on deliveries, {} on the tape · \
+         written to {out}, reduced from run {}",
+        spent.verifying, spent.config, spent.events, spent.tape, manifest.run_id
+    );
     Ok(crate::exit::CLEAN)
 }
 
@@ -225,6 +230,16 @@ fn reach_of(section: &[u8]) -> Result<u64, CliError> {
         })
         .max()
         .unwrap_or_default())
+}
+
+/// What a reduction pass is doing, in words.
+const fn pass_word(pass: bohr_reducer::Pass) -> &'static str {
+    match pass {
+        bohr_reducer::Pass::Config => "dropping faults",
+        bohr_reducer::Pass::Events => "dropping deliveries",
+        bohr_reducer::Pass::Tape => "plainer draws",
+        bohr_reducer::Pass::Done => "done",
+    }
 }
 
 #[cfg(test)]

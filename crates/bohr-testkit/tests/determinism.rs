@@ -162,6 +162,64 @@ mod cluster {
         );
     }
 
+    /// `poll` alone: what a file is ready for is reported, an empty wait spends its timeout, and a
+    /// wait with no timeout on nothing is a deadlock rather than a refusal.
+    #[test]
+    fn poll_alone_answers_what_linux_answers() {
+        const POLL: u32 = 7;
+        let entry_at = MEMORY_BASE + 512;
+        // { fd 1, events POLLOUT }, and its revents is written over the last two bytes.
+        let mut entry = vec![0u8; 8];
+        entry[..4].copy_from_slice(&1i32.to_le_bytes());
+        entry[4..6].copy_from_slice(&0x4u16.to_le_bytes());
+        let ready = NullProgram::single(vec![
+            GuestOp::Syscall { nr: POLL, args: [entry_at, 1, u64::MAX, 0, 0, 0] },
+            GuestOp::Exit(0),
+        ]);
+        let report = bohr_testkit::run_alone(ready, &[(entry_at, entry)], Seed(3));
+        assert_eq!(report.outcome, Outcome::Clean, "a ready descriptor ends the wait at once");
+
+        let sleeps = NullProgram::single(vec![
+            GuestOp::Syscall { nr: POLL, args: [0, 0, 5, 0, 0, 0] },
+            GuestOp::Exit(0),
+        ]);
+        let report = bohr_testkit::run_alone(sleeps, &[], Seed(3));
+        assert_eq!(report.outcome, Outcome::Clean);
+        assert!(
+            report.ticks.get() >= 5_000_000,
+            "five milliseconds were spent: {:?}",
+            report.ticks
+        );
+
+        let forever = NullProgram::single(vec![
+            GuestOp::Syscall { nr: POLL, args: [0, 0, u64::MAX, 0, 0, 0] },
+            GuestOp::Exit(0),
+        ]);
+        let report = bohr_testkit::run_alone(forever, &[], Seed(3));
+        assert!(
+            matches!(report.outcome, Outcome::GuestHung(_)),
+            "a wait nothing can end is a hang, got {:?}",
+            report.outcome
+        );
+    }
+
+    /// The same timed wait on a machine of its own: the lone world arms the timer itself.
+    #[test]
+    fn a_timed_wait_alone_expires_too() {
+        let timeout_at = MEMORY_BASE + 256;
+        let two_ms: u64 = 2_000_000;
+        let waiter = NullProgram::single(vec![
+            GuestOp::Syscall { nr: FUTEX, args: [MEMORY_BASE, FUTEX_WAIT, 0, timeout_at, 0, 0] },
+            GuestOp::Exit(0),
+        ]);
+        let mut timespec = vec![0u8; 16];
+        timespec[8..16].copy_from_slice(&two_ms.to_le_bytes());
+
+        let report = bohr_testkit::run_alone(waiter, &[(timeout_at, timespec)], Seed(2));
+        assert_eq!(report.outcome, Outcome::Clean, "got {:?}", report.outcome);
+        assert!(report.ticks.get() >= two_ms, "the wait must have lasted its timeout");
+    }
+
     /// A timed wait that nothing wakes comes back with a timeout instead of hanging the run.
     #[test]
     fn a_timed_wait_expires_instead_of_deadlocking() {

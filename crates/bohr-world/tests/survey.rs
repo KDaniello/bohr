@@ -35,9 +35,9 @@ const IO_URING_ENTER: u32 = 426;
 const EPOLL_CREATE1: u32 = 291;
 /// `getpid`, which every build models.
 const GETPID: u32 = 39;
-/// `statx`, which this build has a row for and deliberately answers "not implemented" — so a
-/// caller falls back to `newfstatat`, which it does model.
-const STATX: u32 = 332;
+/// `inotify_init1`, which this build has a row for and deliberately answers "not implemented" — so
+/// a caller falls back to polling, which needs nothing modelled.
+const INOTIFY_INIT1: u32 = 294;
 
 fn call(nr: u32) -> GuestOp {
     GuestOp::Syscall { nr, args: [0; 6] }
@@ -161,12 +161,12 @@ fn a_survey_only_answers_what_nothing_else_would() {
 #[test]
 fn a_call_answered_on_purpose_is_still_a_wall() {
     let mut world = MinimalWorld::new().surveying();
-    let diagnostics = drive(&mut world, vec![call(STATX), call(STATX)])
+    let diagnostics = drive(&mut world, vec![call(INOTIFY_INIT1), call(INOTIFY_INIT1)])
         .expect("the answer is given rather than the run refused");
 
     assert_eq!(
         world.surveyed(),
-        vec![(STATX, 2)],
+        vec![(INOTIFY_INIT1, 2)],
         "a deliberate ENOSYS is counted like any other wall"
     );
     assert_eq!(diagnostics.len(), 1, "once per number, not per call: {diagnostics:?}");
@@ -174,7 +174,8 @@ fn a_call_answered_on_purpose_is_still_a_wall() {
     // An ordinary run is untouched. The fallback is the point of answering rather than refusing,
     // and a run that started narrating it would be a run whose behaviour changed.
     let mut ordinary = MinimalWorld::new();
-    let quiet = drive(&mut ordinary, vec![call(STATX)]).expect("still answered, and still quietly");
+    let quiet =
+        drive(&mut ordinary, vec![call(INOTIFY_INIT1)]).expect("still answered, and still quietly");
     assert!(ordinary.surveyed().is_empty(), "a world that is not surveying records nothing");
     assert!(quiet.is_empty(), "and says nothing on the timeline: {quiet:?}");
 }

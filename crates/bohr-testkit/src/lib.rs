@@ -266,6 +266,38 @@ fn drive_one(fixture: Fixture, tape: &Tape) -> (RunReport, NullBackend) {
     (report, backend)
 }
 
+/// Runs one scripted program under the lone world, with memory preloaded at the given addresses.
+///
+/// # Panics
+///
+/// Panics if the run cannot be carried out at all, which in a scripted guest means the harness
+/// itself is broken rather than the guest.
+#[must_use]
+pub fn run_alone(program: NullProgram, preloads: &[(u64, Vec<u8>)], seed: Seed) -> RunReport {
+    let mut backend = NullBackend::new(program);
+    for (addr, bytes) in preloads {
+        backend
+            .preload_on(NodeId::ZERO, GuestAddr(*addr), bytes)
+            .expect("preload targets the scripted node");
+    }
+    let mut world = MinimalWorld::new();
+    let mut policy = RandomPolicy;
+    let mut oracle = AcceptEverything;
+    let mut sink = TraceWriter::new(Vec::new());
+    run(RunInputs {
+        tape: &Tape::from_seed(seed),
+        backend: &mut backend,
+        world: &mut world,
+        policy: &mut policy,
+        oracle: &mut oracle,
+        sink: &mut sink,
+        observer: None,
+        specs: std::slice::from_ref(&GuestSpec::default()),
+        config: RunConfig::default(),
+    })
+    .expect("a scripted guest always completes")
+}
+
 /// Runs a fixture once under `seed` and returns what the kernel reported.
 ///
 /// # Panics

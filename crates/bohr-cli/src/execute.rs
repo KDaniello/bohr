@@ -8,7 +8,7 @@ use bohr_kernel::{
 use bohr_tape::Tape;
 use bohr_trace::{
     BinaryRecord, BundleWriter, Counters, Event, HostProfile, PolicyRecord, Provenance, SectionId,
-    TraceWriter, derive_run_id, manifest_for, read_events, read_events_lossy,
+    TraceWriter, derive_run_id, manifest_for, read_events,
 };
 use bohr_world::LoadedConfig;
 
@@ -83,6 +83,8 @@ pub(crate) struct Completed {
     pub(crate) host_profile: HostProfile,
     /// Objects the guest ran, with the fingerprints a replay checks.
     pub(crate) binaries: Vec<BinaryRecord>,
+    /// What the trace writer counted while the run was recorded, so nothing reads the log back.
+    pub(crate) stats: bohr_trace::TraceStats,
     /// The effective configuration, as the text a replay reconstructs the target from.
     pub(crate) config_toml: String,
     /// Records the guests wrote about themselves, one per line.
@@ -119,29 +121,18 @@ pub(crate) struct Completed {
 /// recognises a descriptor opened on it as the record channel rather than as a file.
 pub(crate) const SDK_RECORD_PATH: &str = "/bohr/records.jsonl";
 
-/// Counts a run leaves in its own event log.
+/// Counts a run leaves, as the trace writer counted them while it recorded each event.
 ///
-/// Read back from the log rather than threaded through the kernel: the log is what a bundle
-/// carries, so a counter derived from it can never disagree with what a reader would count.
-fn count_from_log(log: &[u8], report: &RunReport) -> (Counters, Option<u64>) {
-    let (events, _) = read_events_lossy(log);
-    let mut syscalls = 0;
-    let mut tasks = std::collections::BTreeSet::new();
-    let mut nodes = std::collections::BTreeSet::new();
-    for event in &events {
-        nodes.insert(event.node);
-        tasks.insert(event.task);
-        if matches!(event.kind, bohr_trace::EventKind::Syscall { .. }) {
-            syscalls += 1;
-        }
-    }
+/// Counted by the writer rather than read back from the log: the writer sees exactly the events
+/// the log holds, and reading the log again cost more than the run's own bookkeeping.
+fn count_from_stats(stats: &bohr_trace::TraceStats, report: &RunReport) -> (Counters, Option<u64>) {
     let counters = Counters {
         events: report.events,
-        syscalls,
+        syscalls: stats.syscalls,
         draws: report.journal.len() as u64,
         ticks: report.ticks.get(),
-        tasks: tasks.len() as u64,
-        nodes: nodes.len() as u64,
+        tasks: stats.tasks.len() as u64,
+        nodes: stats.nodes.len() as u64,
     };
     // A broken promise names its own event; anything else points at the last thing the run
     // recorded, which for a crash or a hang is where the outcome was reached. The two are
@@ -149,7 +140,7 @@ fn count_from_log(log: &[u8], report: &RunReport) -> (Counters, Option<u64>) {
     let event = match (&report.outcome, report.violation_event) {
         (bohr_trace::Outcome::Clean, _) => None,
         (_, Some(at)) => Some(at.get()),
-        (_, None) => events.last().map(|e| e.id.get()),
+        (_, None) => stats.last.map(bohr_types::EventId::get),
     };
     (counters, event)
 }
@@ -302,6 +293,9 @@ fn run_against(exec: Execution<'_>, worlds: Worlds) -> Result<Completed, CliErro
                     .and_then(|scenario| scenario.coverage_bytes)
                     .unwrap_or(bohr_backend::DEFAULT_COVERAGE_MAP_BYTES),
             );
+            if exec.scenario.is_some_and(|s| s.fault_policy.enomem.0 > 0) {
+                backend = backend.watching_allocations();
+            }
             let completed = drive(&mut backend, "ptrace", specs, exec, worlds)?;
             // Known only once the guest has started, so folded in afterwards.
             Ok(Completed { degradations: backend.degradations().to_vec(), ..completed })
@@ -384,7 +378,12 @@ fn drive(
         .ok_or_else(|| CliError::Internal(format!("no scheduler named {policy_name}")))?;
     let mut oracle =
         bohr_world::panel(scenario.map(bohr_world::LoadedConfig::watching).unwrap_or_default());
-    let mut sink = TraceWriter::new(LogSink::new(record));
+    // A run nobody will read is digested and not encoded: the digest is taken from the events'
+    // fields, so it is the same either way.
+    let mut sink = match record {
+        Record::Log => TraceWriter::new(LogSink::new(record)),
+        Record::DigestOnly => TraceWriter::digest_only(LogSink::new(record)),
+    };
 
     let provenance = Provenance {
         world_model: bohr_kernel::WorldModel::identity(world),
@@ -432,9 +431,9 @@ fn drive(
         Some(_) => cluster.surveyed(),
         None => minimal.surveyed(),
     };
-    let (sink, _, _) = sink.finish().map_err(|e| CliError::Internal(e.to_string()))?;
+    let (sink, stats) = sink.into_parts();
     let log = sink.into_bytes();
-    let (counters, outcome_event) = count_from_log(&log, &report);
+    let (counters, outcome_event) = count_from_stats(&stats, &report);
     let capabilities = backend.capabilities();
     // Read now that the run is over, which is the only moment it may be read: sampling while the
     // guest was running would make what a search does next depend on when it looked.
@@ -466,7 +465,9 @@ fn drive(
             traps_cpuid: capabilities.traps_cpuid,
             traps_rdrand: capabilities.traps_rdrand,
         },
-        binaries: fingerprints(specs),
+        // Only a kept log becomes a bundle, and only a bundle carries fingerprints.
+        binaries: if matches!(record, Record::Log) { fingerprints(specs) } else { Vec::new() },
+        stats,
         config_toml: config_toml.to_owned(),
         sdk_records,
         surveyed,
@@ -499,6 +500,12 @@ const SWITCH_POINTS: &str = "syscall+futex";
 fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
+    // Kept for the life of the process: a campaign worker saves bundle after bundle of one guest,
+    // and reading and hashing the whole binary is a large share of a short run. Keyed by path,
+    // length and modification time, so a binary rebuilt in place is hashed again.
+    type Known = std::collections::BTreeMap<(String, u64, Option<std::time::SystemTime>), String>;
+    static KNOWN: std::sync::Mutex<Known> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
     for spec in specs {
         let Some(path) = spec.argv.first() else {
             continue;
@@ -513,10 +520,24 @@ fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
         let file = spec.executable.as_ref().unwrap_or(path);
         let blake3 = match path.strip_prefix("builtin:") {
             Some(_) => String::new(),
-            None => match std::fs::read(file) {
-                Ok(bytes) => bohr_types::Digest::of(&bytes).to_string(),
-                Err(_) => continue,
-            },
+            None => {
+                let Ok(meta) = std::fs::metadata(file) else { continue };
+                let key = (file.clone(), meta.len(), meta.modified().ok());
+                let cached = KNOWN.lock().ok().and_then(|known| known.get(&key).cloned());
+                match cached {
+                    Some(digest) => digest,
+                    None => match std::fs::read(file) {
+                        Ok(bytes) => {
+                            let digest = bohr_types::Digest::of(&bytes).to_string();
+                            if let Ok(mut known) = KNOWN.lock() {
+                                known.insert(key, digest.clone());
+                            }
+                            digest
+                        }
+                        Err(_) => continue,
+                    },
+                }
+            }
         };
         let role = match (blake3.is_empty(), spec.executable.is_some()) {
             (true, _) => "builtin",
@@ -583,11 +604,11 @@ impl std::fmt::Display for Divergence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "runs diverged at event {} on attempt {}", self.index, self.attempt)?;
         match &self.reference {
-            Some(e) => writeln!(f, "  first run: {:?}", e.kind)?,
+            Some(e) => write!(f, "  first run: {}", bohr_report::text::event_line(e))?,
             None => writeln!(f, "  first run: ended before this event")?,
         }
         match &self.actual {
-            Some(e) => write!(f, "  this run:  {:?}", e.kind),
+            Some(e) => write!(f, "  this run:  {}", bohr_report::text::event_line(e).trim_end()),
             None => write!(f, "  this run:  ended before this event"),
         }
     }
@@ -602,6 +623,11 @@ pub(crate) fn repeat(
     times: usize,
 ) -> Result<Result<Completed, Divergence>, CliError> {
     let first = once(Execution { output: Output::Deliver, ..exec })?;
+    if times <= 1 {
+        return Ok(Ok(first));
+    }
+    // Decoded only where a repetition can disagree with it: one run has nothing to compare, and
+    // reading its whole log back costs a long run as much as recording it did.
     let reference: Vec<Event> =
         read_events(&first.log).map_err(|e| CliError::Internal(e.to_string()))?;
 
@@ -637,19 +663,19 @@ pub(crate) fn repeat(
 /// than it was: a jump here is a syscall that moved from admitted to traced, which is a change in
 /// the table rather than in the machine.
 ///
-/// Read back from the log rather than counted during the run, which keeps the counting out of the
-/// path every syscall takes.
-pub(crate) fn syscall_profile(log: &[u8], take: usize) -> (u64, Vec<(u32, u64)>) {
-    let mut counts: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
-    let (events, _) = bohr_trace::read_events_lossy(log);
-    let mut total = 0u64;
-    for event in events {
-        if let bohr_trace::EventKind::Syscall { nr, .. } = event.kind {
-            *counts.entry(nr).or_default() += 1;
-            total += 1;
-        }
-    }
-    let mut ranked: Vec<(u32, u64)> = counts.into_iter().collect();
+/// Taken from what the trace writer counted, so the log is not read back to answer it.
+pub(crate) fn syscall_profile(
+    stats: &bohr_trace::TraceStats,
+    take: usize,
+) -> (u64, Vec<(u32, u64)>) {
+    let total = stats.syscalls;
+    let mut ranked: Vec<(u32, u64)> = stats
+        .by_nr
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(nr, count)| (nr as u32, *count))
+        .collect();
     ranked.sort_by_key(|(nr, count)| (std::cmp::Reverse(*count), *nr));
     ranked.truncate(take);
     (total, ranked)
@@ -659,17 +685,9 @@ pub(crate) fn syscall_profile(log: &[u8], take: usize) -> (u64, Vec<(u32, u64)>)
 ///
 /// A run that ended badly says what went wrong in its outcome; these say what the supervisor
 /// noticed on the way there, which is usually where the answer is.
-pub(crate) fn last_diagnostics(log: &[u8], take: usize) -> Vec<String> {
-    let (events, _) = bohr_trace::read_events_lossy(log);
-    let mut seen: Vec<String> = events
-        .into_iter()
-        .filter_map(|e| match e.kind {
-            bohr_trace::EventKind::Diagnostic { code, message } => {
-                Some(format!("{code}: {message}"))
-            }
-            _ => None,
-        })
-        .collect();
+pub(crate) fn last_diagnostics(stats: &bohr_trace::TraceStats, take: usize) -> Vec<String> {
+    let mut seen: Vec<String> =
+        stats.diagnostics.iter().map(|(code, message)| format!("{code}: {message}")).collect();
     seen.dedup();
     if seen.len() > take {
         seen.drain(..seen.len() - take);

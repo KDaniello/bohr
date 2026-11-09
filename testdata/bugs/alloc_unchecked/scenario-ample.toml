@@ -1,0 +1,5 @@
+# The same store where memory does not run out: every map is made, and the run is clean.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/alloc_unchecked"]

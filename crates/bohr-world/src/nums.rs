@@ -164,6 +164,18 @@ pub(crate) mod sys {
     pub(crate) const SETPRIORITY: u32 = 141;
     /// `sched_setparam`, answered as for a task under the ordinary policy.
     pub(crate) const SCHED_SETPARAM: u32 = 142;
+    /// `fallocate`: reserving or extending a file's space.
+    pub(crate) const FALLOCATE: u32 = 285;
+    /// `sync_file_range`: write-back started, durability not promised.
+    pub(crate) const SYNC_FILE_RANGE: u32 = 277;
+    /// `chmod`.
+    pub(crate) const CHMOD: u32 = 90;
+    /// `fchmod`.
+    pub(crate) const FCHMOD: u32 = 91;
+    /// `fchmodat`.
+    pub(crate) const FCHMODAT: u32 = 268;
+    /// The `inotify` family, answered `ENOSYS`.
+    pub(crate) const INOTIFY: [u32; 3] = [294, 254, 255];
     /// `sched_setscheduler`, the ordinary policies accepted and the real-time ones refused.
     pub(crate) const SCHED_SETSCHEDULER: u32 = 144;
 
@@ -180,6 +192,18 @@ pub(crate) mod sys {
 pub(crate) mod errno {
     /// Not permitted: the caller lacks the privilege the operation needs.
     pub(crate) const EPERM: i64 = 1;
+    /// No such thread.
+    pub(crate) const ESRCH: i64 = 3;
+    /// Out of memory.
+    pub(crate) const ENOMEM: i64 = 12;
+    /// A wait a signal ended.
+    pub(crate) const EINTR: i64 = 4;
+    /// Operation not supported by this file or filesystem.
+    pub(crate) const EOPNOTSUPP: i64 = 95;
+    /// Not a device a file's space can be reserved on: a socket, a pipe.
+    pub(crate) const ENODEV: i64 = 19;
+    /// A seek, or a range, on something that has no positions.
+    pub(crate) const ESPIPE: i64 = 29;
     /// No such file or directory.
     pub(crate) const ENOENT: i64 = 2;
     /// Bad file descriptor.
