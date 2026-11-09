@@ -74,6 +74,8 @@ pub(crate) struct Request {
     pub(crate) findings: PathBuf,
     /// A corpus carried in and out, where one was named.
     pub(crate) corpus: Option<PathBuf>,
+    /// Where the campaign is written down between generations, and resumed from if it already is.
+    pub(crate) resume: Option<PathBuf>,
     /// Where a machine-readable account of the campaign goes, if one was asked for.
     pub(crate) summary: Option<PathBuf>,
     /// What to search.
@@ -110,7 +112,10 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     })?;
 
     let jobs = request.jobs.max(1);
-    let mut campaign = Campaign::new(request.master);
+    let (mut campaign, mut pending) = match &request.resume {
+        Some(dir) => resume::load(dir, request)?,
+        None => (Campaign::new(request.master), Vec::new()),
+    };
     #[allow(clippy::disallowed_methods)]
     let started = Instant::now();
     let mut saved = 0u64;
@@ -118,7 +123,11 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     // A stored corpus is tapes and nothing else, so what those tapes covered has to be learned by
     // running them. One generation buys back everything a previous campaign found out, and keeps
     // the stored form to a few kilobytes an entry instead of the sixty-four a coverage map costs.
-    if let Some(dir) = &request.corpus {
+    // A resumed campaign has its corpus already, and carrying one in would change it.
+    if let Some(dir) = &request.corpus
+        && campaign.runs() == 0
+        && pending.is_empty()
+    {
         let carried = load_corpus(dir)?;
         if !carried.is_empty() {
             let results = carry_out(request, &carried, jobs, &scratch)?;
@@ -127,23 +136,40 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         }
     }
 
-    while more_to_do(request, &campaign, started) {
-        let size = generation_size(request, &campaign);
-        let planned = campaign.plan(size);
-        let results = carry_out(request, &planned, jobs, &scratch)?;
-
+    // **A generation is folded only when it is whole.** The last one a run budget cuts short is
+    // held as results, not folded: a trimmed plan is a prefix of the full one, so a campaign
+    // resumed from here runs the rest of the same generation and folds all of it at once, as an
+    // uninterrupted campaign does. What is reported folds the held part into a copy.
+    while more_to_do(request, campaign.runs() + pending.len() as u64, started) {
+        let planned = campaign.plan(GENERATION_ITEMS);
+        let size = generation_size(request, campaign.runs()).max(pending.len());
+        let results = carry_out(request, &planned[pending.len()..size], jobs, &scratch)?;
+        pending.extend(results);
+        if pending.len() < GENERATION_ITEMS {
+            continue;
+        }
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
-        campaign.fold(&planned, results);
-
+        campaign.fold(&planned, std::mem::take(&mut pending));
         // Saved after folding, so that a finding reached twice in one generation is written once.
-        for (digest, finding) in campaign.findings() {
-            if known.contains(digest) {
-                continue;
-            }
-            save_finding(request, finding)?;
-            saved += 1;
+        saved += save_new_findings(request, &campaign, &known)?;
+        // Written down after every whole generation, so a campaign stopped at any moment resumes
+        // from the last one rather than from nothing.
+        if let Some(dir) = &request.resume {
+            resume::save(dir, request, &campaign, &pending)?;
         }
     }
+
+    if let Some(dir) = &request.resume {
+        resume::save(dir, request, &campaign, &pending)?;
+    }
+    let mut view = campaign.clone();
+    if !pending.is_empty() {
+        let planned = campaign.plan(GENERATION_ITEMS);
+        let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
+        view.fold(&planned[..pending.len()], pending);
+        saved += save_new_findings(request, &view, &known)?;
+    }
+    let campaign = view;
 
     if let Some(dir) = &request.corpus {
         save_corpus(dir, &campaign)?;
@@ -189,10 +215,25 @@ fn elapsed_since(started: Instant) -> Duration {
     started.elapsed()
 }
 
-/// Whether the budget has anything left.
-fn more_to_do(request: &Request, campaign: &Campaign, started: Instant) -> bool {
+/// Writes the findings a fold added, and says how many.
+fn save_new_findings(
+    request: &Request,
+    campaign: &Campaign,
+    known: &std::collections::BTreeSet<bohr_types::Digest>,
+) -> Result<u64, CliError> {
+    let mut saved = 0;
+    for (digest, finding) in campaign.findings() {
+        if !known.contains(digest) && save_finding(request, finding)? {
+            saved += 1;
+        }
+    }
+    Ok(saved)
+}
+
+/// Whether the budget has anything left, given the runs done so far.
+fn more_to_do(request: &Request, done: u64, started: Instant) -> bool {
     if let Some(runs) = request.runs {
-        return campaign.runs() < runs;
+        return done < runs;
     }
     match request.time {
         // Checked at a generation boundary, never inside one: cutting a generation short would
@@ -202,13 +243,13 @@ fn more_to_do(request: &Request, campaign: &Campaign, started: Instant) -> bool 
     }
 }
 
-/// How many items the next generation holds.
-fn generation_size(request: &Request, campaign: &Campaign) -> usize {
+/// How many items of the next generation to run, given the runs already folded.
+fn generation_size(request: &Request, folded: u64) -> usize {
     let full = GENERATION_ITEMS;
     match request.runs {
         // Trimmed so a run budget is met exactly. `--runs 10` that ran 12 would be a budget in
         // name only, and two campaigns asked for the same number would have done different work.
-        Some(runs) => full.min((runs.saturating_sub(campaign.runs())) as usize).max(1),
+        Some(runs) => full.min((runs.saturating_sub(folded)) as usize).max(1),
         None => full,
     }
 }
@@ -281,6 +322,12 @@ fn run_slices(
                 CliError::Internal(format!("BOHR-3006: cannot find this binary: {e}"))
             })?);
         command.arg("explore-worker").arg("--work").arg(&work).arg("--results").arg(&results);
+        // A core of its own per worker, its supervisor and its guests together on it: the guest
+        // and its supervisor share a core because a stop between cores is a cross-core wake-up,
+        // and workers do not share one because eight of them on one core is one of them. The
+        // position is taken among the cores this process may use, by the backend.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        command.env(bohr_backend_ptrace::CORE_VARIABLE, slice.to_string());
         // Told which world to run in, rather than handed the parsed form: parsing it there is what
         // keeps the two sides reading one file rather than two copies of an idea of it.
         //
@@ -412,7 +459,15 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
 }
 
 /// Writes the bundle a finding is carried in.
-fn save_finding(request: &Request, finding: &bohr_explorer::Finding) -> Result<(), CliError> {
+/// Writes a finding's bundle, and says whether it wrote one: a bundle already on disk under its
+/// digest's name is the same run, written before a campaign was stopped and resumed.
+fn save_finding(request: &Request, finding: &bohr_explorer::Finding) -> Result<bool, CliError> {
+    let short = format!("{}", finding.digest);
+    let short = short.rsplit(':').next().unwrap_or(&short);
+    let path = request.findings.join(format!("finding-{}.bohr", &short[..12.min(short.len())]));
+    if path.is_file() {
+        return Ok(false);
+    }
     // Re-run with the log kept. The campaign never held one — a trace is a pure function of the
     // tape — so the bundle is made by running the finding again, which by construction produces
     // the same run.
@@ -433,14 +488,11 @@ fn save_finding(request: &Request, finding: &bohr_explorer::Finding) -> Result<(
         config_toml: config_text,
     })?;
 
-    let short = format!("{}", finding.digest);
-    let short = short.rsplit(':').next().unwrap_or(&short);
-    let path = request.findings.join(format!("finding-{}.bohr", &short[..12.min(short.len())]));
     let bytes = execute::to_bundle(&completed, &tape, None)?;
     std::fs::write(&path, bytes)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display())))?;
     eprintln!("  found {} · {}", finding.kind, path.display());
-    Ok(())
+    Ok(true)
 }
 
 /// What the campaign amounted to.
@@ -655,4 +707,132 @@ fn campaign_properties(records: &[u8]) -> Vec<(String, bool)> {
             _ => None,
         })
         .collect()
+}
+
+/// A campaign written down in a directory between generations, and taken up again.
+///
+/// `campaign.bin` holds the whole search — the explorer's versioned state and the results of a
+/// generation a run budget cut short, not yet folded — written to a part file and renamed, so a
+/// stop at any moment leaves the last whole save or this one, never half of each. `campaign.toml`
+/// is what a person reads and what a resume is checked against: the master seed, and the question
+/// asked — the program's digest, its arguments and the scenario. A directory holding another
+/// question is refused rather than continued as though it were this one.
+mod resume {
+    use std::path::Path;
+
+    use bohr_explorer::{Campaign, RunResult};
+
+    use super::{Request, Subject};
+    use crate::{CliError, wire};
+
+    fn refused(text: String) -> CliError {
+        CliError::Usage(format!("BOHR-1002: {text}"))
+    }
+
+    /// What the campaign was asked, so a resume can tell this question from another.
+    fn question(request: &Request) -> String {
+        let mut asked = format!("{:?}", request.subject);
+        if let Subject::Program(argv) = &request.subject
+            && let Some(bytes) = argv.first().and_then(|p| std::fs::read(p).ok())
+        {
+            asked.push_str(&bohr_types::Digest::of(&bytes).to_hex());
+        }
+        if let Some((_, text)) = &request.scenario {
+            asked.push_str(text);
+        }
+        bohr_trace::short_digest(asked.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The campaign a directory holds, or a new one where it holds none.
+    pub(super) fn load(
+        dir: &Path,
+        request: &Request,
+    ) -> Result<(Campaign, Vec<RunResult>), CliError> {
+        let state = dir.join("campaign.bin");
+        if !state.is_file() {
+            return Ok((Campaign::new(request.master), Vec::new()));
+        }
+        let header = std::fs::read_to_string(dir.join("campaign.toml"))
+            .map_err(|e| refused(format!("cannot read {}: {e}", dir.display())))?;
+        let field = |key: &str| {
+            header.lines().find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.trim_start().strip_prefix('='))
+                    .map(|value| value.trim().trim_matches('"').to_owned())
+            })
+        };
+        if field("master_seed") != Some(request.master.get().to_string()) {
+            return Err(refused(format!(
+                "{} holds a campaign with master seed {}, not {}",
+                dir.display(),
+                field("master_seed").unwrap_or_default(),
+                request.master.get()
+            )));
+        }
+        if field("question") != Some(question(request)) {
+            return Err(refused(format!(
+                "{} holds a campaign of another program, binary or scenario; resume it with the \
+                 ones it was started with, or name a new directory",
+                dir.display()
+            )));
+        }
+        let bytes = std::fs::read(&state)
+            .map_err(|e| refused(format!("cannot read {}: {e}", state.display())))?;
+        let damaged = || refused(format!("{} is damaged", state.display()));
+        let len = bytes
+            .get(..8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(damaged)?;
+        let split = usize::try_from(len)
+            .ok()
+            .and_then(|n| n.checked_add(8))
+            .filter(|n| *n <= bytes.len())
+            .ok_or_else(damaged)?;
+        let campaign = Campaign::from_state(&bytes[8..split]).map_err(|e| refused(e.0))?;
+        let pending = wire::decode_results(&bytes[split..])?;
+        eprintln!(
+            "resumed {} at {} runs, generation {}",
+            dir.display(),
+            campaign.runs() + pending.len() as u64,
+            campaign.generation()
+        );
+        Ok((campaign, pending))
+    }
+
+    /// Writes the campaign down whole, replacing the last save in one rename.
+    pub(super) fn save(
+        dir: &Path,
+        request: &Request,
+        campaign: &Campaign,
+        pending: &[RunResult],
+    ) -> Result<(), CliError> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| refused(format!("cannot use {}: {e}", dir.display())))?;
+        let state = campaign.to_state();
+        let mut bytes = (state.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&state);
+        bytes.extend_from_slice(&wire::results_header());
+        for result in pending {
+            bytes.extend_from_slice(&wire::encode_result(result));
+        }
+        let header = format!(
+            "# A campaign bohr can resume: bohr explore --resume <this directory>.\n\
+             master_seed = {}\nruns = {}\ngeneration = {}\nquestion = \"{}\"\n",
+            request.master.get(),
+            campaign.runs() + pending.len() as u64,
+            campaign.generation(),
+            question(request)
+        );
+        // The header first: its fields are fixed for a campaign's life, so a stop between the two
+        // renames leaves a header that still describes the state beside it.
+        for (name, content) in [("campaign.toml", header.into_bytes()), ("campaign.bin", bytes)] {
+            let at = dir.join(name);
+            let part = dir.join(format!("{name}.part"));
+            std::fs::write(&part, content)
+                .and_then(|()| std::fs::rename(&part, &at))
+                .map_err(|e| refused(format!("cannot write {}: {e}", at.display())))?;
+        }
+        Ok(())
+    }
 }

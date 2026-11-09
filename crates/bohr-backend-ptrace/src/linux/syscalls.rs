@@ -250,6 +250,9 @@ const UNMODELLED: &[(u32, &str)] = &[
     (101, "ptrace"),
     (321, "bpf"),
     (294, "inotify_init1"),
+    (90, "chmod"),
+    (91, "fchmod"),
+    (268, "fchmodat"),
     (254, "inotify_add_watch"),
     (255, "inotify_rm_watch"),
 ];

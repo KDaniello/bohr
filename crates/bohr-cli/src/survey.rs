@@ -49,29 +49,46 @@ pub(crate) fn run(
         scenario.state = Some(patched);
     }
 
-    let tape = Tape::from_seed(Seed(seed));
-    // The scenario's horizon and its node to end with reach a survey as they reach a run: a survey
-    // that ignored them ran a different, longer program than the one it was asked about.
-    let run_config = crate::run_config_for(loaded.as_ref(), max_events);
-
-    let target = target_for(program, loaded.as_ref())?;
-    let completed = execute::survey_with(execute::Execution {
-        target: &target,
-        tape: &tape,
-        config: run_config,
-        output: execute::Output::Discard,
-        policy: "random",
-        record: execute::Record::DigestOnly,
-        scenario: loaded.as_ref(),
-        config_toml: &config_toml,
-    })?;
-
+    let completed = surface(
+        program,
+        seed,
+        loaded.as_ref(),
+        &config_toml,
+        max_events,
+        execute::Record::DigestOnly,
+    )?;
     report(&completed, seed);
     // Never zero with something to report, and never one: a survey found nothing about the guest,
     // it found something about this build. A guest that did not run to completion is something to
     // report -- see `report` for why it cannot be allowed to read as a clean surface.
     let ran = completed.report.outcome == Outcome::Clean;
     Ok(if completed.surveyed.is_empty() && ran { exit::CLEAN } else { exit::DEGRADED })
+}
+
+/// One survey run: what the program asked for that nothing models, and how it ended.
+pub(crate) fn surface(
+    program: Vec<String>,
+    seed: u64,
+    loaded: Option<&LoadedConfig>,
+    config_toml: &str,
+    max_events: Option<u64>,
+    record: execute::Record,
+) -> Result<execute::Completed, CliError> {
+    let tape = Tape::from_seed(Seed(seed));
+    // The scenario's horizon and its node to end with reach a survey as they reach a run: a survey
+    // that ignored them ran a different, longer program than the one it was asked about.
+    let run_config = crate::run_config_for(loaded, max_events);
+    let target = target_for(program, loaded)?;
+    execute::survey_with(execute::Execution {
+        target: &target,
+        tape: &tape,
+        config: run_config,
+        output: execute::Output::Discard,
+        policy: "random",
+        record,
+        scenario: loaded,
+        config_toml,
+    })
 }
 
 /// The programs to survey, one spec per node, where this host can intercept one at all.
@@ -152,7 +169,7 @@ the guest did not run to completion, so this is not its surface:"
 /// its own fallback. Told apart here because the fix differs: the first wants a row, the second
 /// wants a model.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn describe(nr: u32) -> (&'static str, &'static str) {
+pub(crate) fn describe(nr: u32) -> (&'static str, &'static str) {
     if let Some(name) = bohr_backend_ptrace::unmodelled_syscall_name(nr) {
         return (name, "nothing models it");
     }
@@ -163,6 +180,6 @@ fn describe(nr: u32) -> (&'static str, &'static str) {
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn describe(_nr: u32) -> (&'static str, &'static str) {
+pub(crate) fn describe(_nr: u32) -> (&'static str, &'static str) {
     ("?", "nothing models it")
 }

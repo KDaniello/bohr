@@ -50,15 +50,20 @@ struct Watch {
     token: u64,
 }
 
-/// A task parked in `epoll_wait`, and where its answer goes.
+/// A task parked in `epoll_wait` or `poll`, and where its answer goes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Parked {
     task: TaskId,
-    /// Where the ready list is written.
+    /// Where the ready list is written, or the `pollfd` array for a `poll`.
     out: GuestAddr,
     /// How many entries the buffer holds.
     max: usize,
+    /// Whether the answer is `pollfd` entries rather than `epoll_event`s.
+    poll: bool,
 }
+
+/// A parked task as it is taken back: who, where the answer goes, how much fits, and its shape.
+pub(crate) type Taken = (TaskId, GuestAddr, usize, bool);
 
 /// One epoll instance.
 #[derive(Debug, Default)]
@@ -89,7 +94,13 @@ pub(crate) struct Epolls {
     aliases: BTreeMap<(NodeId, i64), i64>,
     next_epoll: BTreeMap<NodeId, i64>,
     next_counter: BTreeMap<NodeId, i64>,
+    /// The next number for an instance a `poll` makes for itself.
+    next_hidden: BTreeMap<NodeId, i64>,
 }
+
+/// Where the instances a `poll` makes for itself are numbered from: past every number a guest can
+/// hold, so closing one never reaches a descriptor of the guest's, however many polls a run makes.
+pub(crate) const HIDDEN_BASE: i64 = 1 << 40;
 
 /// One descriptor that became ready, as `epoll_wait` reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,6 +146,15 @@ impl Epolls {
         *next += 1;
         self.aliases.insert((node, copy), original);
         Some(copy)
+    }
+
+    /// Opens an instance for one `poll` to wait on, numbered where no guest descriptor is.
+    pub(crate) fn create_hidden(&mut self, node: NodeId) -> i64 {
+        let next = self.next_hidden.entry(node).or_insert(HIDDEN_BASE);
+        let id = *next;
+        *next += 1;
+        self.instances.insert((node, id), Instance::default());
+        id
     }
 
     /// Opens an instance and answers with the descriptor naming it.
@@ -206,22 +226,19 @@ impl Epolls {
         task: TaskId,
         out: GuestAddr,
         max: usize,
+        poll: bool,
     ) {
         let epfd = self.resolve(node, epfd);
         if let Some(instance) = self.instances.get_mut(&(node, epfd)) {
-            instance.parked.push_back(Parked { task, out, max });
+            instance.parked.push_back(Parked { task, out, max, poll });
         }
     }
 
     /// Takes the longest-waiting task on an instance, where one is waiting.
-    pub(crate) fn take_parked(
-        &mut self,
-        node: NodeId,
-        epfd: i64,
-    ) -> Option<(TaskId, GuestAddr, usize)> {
+    pub(crate) fn take_parked(&mut self, node: NodeId, epfd: i64) -> Option<Taken> {
         let epfd = self.resolve(node, epfd);
         let instance = self.instances.get_mut(&(node, epfd))?;
-        instance.parked.pop_front().map(|p| (p.task, p.out, p.max))
+        instance.parked.pop_front().map(|p| (p.task, p.out, p.max, p.poll))
     }
 
     /// Takes one named task off an instance, where it is still waiting there.
@@ -236,11 +253,11 @@ impl Epolls {
         node: NodeId,
         epfd: i64,
         task: TaskId,
-    ) -> Option<(TaskId, GuestAddr, usize)> {
+    ) -> Option<Taken> {
         let epfd = self.resolve(node, epfd);
         let instance = self.instances.get_mut(&(node, epfd))?;
         let at = instance.parked.iter().position(|p| p.task == task)?;
-        instance.parked.remove(at).map(|p| (p.task, p.out, p.max))
+        instance.parked.remove(at).map(|p| (p.task, p.out, p.max, p.poll))
     }
 
     /// Every instance with somebody waiting on it, wherever it is.
@@ -284,6 +301,9 @@ impl Epolls {
         if self.aliases.remove(&(node, fd)).is_some() {
             return true;
         }
+        if fd >= HIDDEN_BASE {
+            return self.instances.remove(&(node, fd)).is_some();
+        }
         let was_ours = self.instances.remove(&(node, fd)).is_some()
             || self.counters.remove(&(node, fd)).is_some();
         // A closed descriptor stops being watched, whether or not it was ours: the guest may close
@@ -311,5 +331,7 @@ impl Epolls {
         for instance in self.instances.values_mut() {
             instance.parked.retain(|p| p.task != task);
         }
+        // A `poll`'s own instance exists for the task waiting on it, and goes with it.
+        self.instances.retain(|(_, id), instance| *id < HIDDEN_BASE || !instance.parked.is_empty());
     }
 }

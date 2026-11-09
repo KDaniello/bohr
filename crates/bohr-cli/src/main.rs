@@ -8,11 +8,15 @@
 mod doctor;
 mod execute;
 mod explore;
+mod findings;
 mod guests;
 mod handover;
+mod hunt;
+mod init;
 mod reduce;
 mod replay;
 mod survey;
+mod targets;
 mod wire;
 
 use std::process::ExitCode;
@@ -178,9 +182,9 @@ enum Command {
     /// in the order it was planned. `--time` is the convenient budget and records how many runs it
     /// reached, so the same campaign can be repeated with `--runs`. See `docs/API.md` §7.2.
     Explore {
-        /// Wall-clock budget, in seconds. Convenient, and not reproducible on its own.
-        #[arg(long, value_name = "SECONDS")]
-        time: Option<u64>,
+        /// Wall-clock budget: `90s`, `30m`, `1h`, `2d`, or bare seconds. Not reproducible alone.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        time: Option<std::time::Duration>,
         /// Run budget. The reproducible one.
         #[arg(long, value_name = "N")]
         runs: Option<u64>,
@@ -193,6 +197,9 @@ enum Command {
         /// A corpus to carry in and write back out.
         #[arg(long, value_name = "DIR")]
         corpus: Option<String>,
+        /// Write the campaign down here between generations, and resume it if it already is.
+        #[arg(long, value_name = "DIR")]
+        resume: Option<String>,
         /// World configuration: cluster, network, disk and drawn faults.
         #[arg(long, value_name = "FILE")]
         config: Option<String>,
@@ -226,6 +233,61 @@ enum Command {
         #[arg(long, value_enum)]
         guest: Option<Demo>,
         /// The program to run, after `--`.
+        #[arg(last = true)]
+        program: Vec<String>,
+    },
+
+    /// Hunt a target from its pack: build or check its binary, run its campaign, group findings.
+    Hunt {
+        /// The pack: a name under `targets/`, or the path of its directory or its file.
+        pack: String,
+        /// Wall-clock budget: `90s`, `30m`, `1h`, `2d`, or bare seconds.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        time: Option<std::time::Duration>,
+        /// Run budget, the one that reproduces.
+        #[arg(long, value_name = "N")]
+        runs: Option<u64>,
+        /// How many workers.
+        #[arg(long, short = 'j', default_value_t = 1)]
+        jobs: usize,
+        /// Run these seeds once each, `a..b`, instead of searching.
+        #[arg(long, value_name = "A..B", value_parser = hunt::parse_seeds)]
+        seeds: Option<(u64, u64)>,
+        /// Run the pack's scenario with every fault taken out.
+        #[arg(long)]
+        no_faults: bool,
+        /// Where findings, the summary and the campaign's state are written.
+        #[arg(short = 'o', long, value_name = "DIR", default_value = "hunt")]
+        out: String,
+        /// Carry on with the campaign already in the output directory.
+        #[arg(long)]
+        resume: bool,
+        /// A binary to use instead of the pack's own; it must have the pack's digest.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<String>,
+        /// Reproduces the whole campaign.
+        #[arg(long, value_name = "U64", default_value_t = 0)]
+        master_seed: u64,
+    },
+
+    /// Group the findings in a directory by what went wrong, each group led by its smallest run.
+    Findings {
+        /// The directory of bundles.
+        dir: String,
+        /// Print JSON rather than text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Write a first scenario for a program, from what a survey of it finds.
+    Init {
+        /// How many nodes the cluster has.
+        #[arg(long, default_value_t = 1)]
+        nodes: u32,
+        /// Where the scenario is written.
+        #[arg(short = 'o', long, value_name = "PATH", default_value = "scenario.toml")]
+        out: String,
+        /// The program, after `--`.
         #[arg(last = true)]
         program: Vec<String>,
     },
@@ -677,6 +739,7 @@ fn dispatch() -> Result<u8, CliError> {
             jobs,
             findings,
             corpus,
+            resume,
             config,
             master_seed,
             summary,
@@ -695,10 +758,11 @@ fn dispatch() -> Result<u8, CliError> {
             explore::explore(&explore::Request {
                 master: Seed(master_seed),
                 runs,
-                time: time.map(std::time::Duration::from_secs),
+                time,
                 jobs,
                 findings: findings.into(),
                 corpus: corpus.map(Into::into),
+                resume: resume.map(Into::into),
                 summary: summary.map(Into::into),
                 scenario_path: config.map(Into::into),
                 scenario,
@@ -717,6 +781,7 @@ fn dispatch() -> Result<u8, CliError> {
                     jobs: 1,
                     findings: std::path::PathBuf::new(),
                     corpus: None,
+                    resume: None,
                     summary: None,
                     scenario_path: config.map(Into::into),
                     scenario,
@@ -724,6 +789,31 @@ fn dispatch() -> Result<u8, CliError> {
                 },
             )
         }
+        Command::Hunt {
+            pack,
+            time,
+            runs,
+            jobs,
+            seeds,
+            no_faults,
+            out,
+            resume,
+            binary,
+            master_seed,
+        } => hunt::hunt(&hunt::Hunt {
+            pack,
+            time,
+            runs,
+            jobs,
+            seeds,
+            no_faults,
+            out: out.into(),
+            resume,
+            binary,
+            master_seed,
+        }),
+        Command::Findings { dir, json } => findings::findings(&dir, json),
+        Command::Init { nodes, out, program } => init::init(program, nodes, &out),
         Command::Reduce { bundle, out, budget, keep, binaries } => {
             reduce::reduce(&bundle, &out, budget, &keep, binaries.as_deref())
         }
@@ -1077,6 +1167,30 @@ fn run_program(
     )))
 }
 
+/// A wall-clock budget as a person writes one: a number and a unit, or a number of seconds.
+///
+/// One parser for every command that takes `--time`, so a value written for one means the same in
+/// another; a unit nobody defined is an error rather than a guess.
+pub(crate) fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let count: u64 = number
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration: it starts with no number"))?;
+    let seconds = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        other => return Err(format!("{other:?} is not a unit: write s, m, h or d")),
+    };
+    count
+        .checked_mul(seconds)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| format!("{text:?} is longer than this build can count"))
+}
+
 /// One line per completed run, in the form both commands report.
 ///
 /// Written to standard error, because standard output carries whatever the guest itself wrote and
@@ -1192,4 +1306,21 @@ fn selftest(
     }
 
     Ok(worst)
+}
+
+#[cfg(test)]
+mod duration_tests {
+    /// Each unit means what it says, a bare number is seconds, and anything else is refused.
+    #[test]
+    fn a_duration_is_a_number_and_a_unit() {
+        use std::time::Duration;
+        assert_eq!(super::parse_duration("90"), Ok(Duration::from_secs(90)));
+        assert_eq!(super::parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(super::parse_duration("30m"), Ok(Duration::from_secs(1_800)));
+        assert_eq!(super::parse_duration("1h"), Ok(Duration::from_secs(3_600)));
+        assert_eq!(super::parse_duration("2d"), Ok(Duration::from_secs(172_800)));
+        assert!(super::parse_duration("1w").is_err());
+        assert!(super::parse_duration("m").is_err());
+        assert!(super::parse_duration("1.5h").is_err());
+    }
 }

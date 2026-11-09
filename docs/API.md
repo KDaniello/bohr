@@ -1525,9 +1525,10 @@ its output; what every repetition wrote is compared through the trace digest.
 bohr explore [OPTIONS] [--guest <name>] [-- <program> [args...]]
 
   --runs <n>              budget in runs; the reproducible one
-  --time <seconds>        budget in wall-clock time; convenient, not reproducible
+  --time <duration>       budget in wall-clock time: 90s, 30m, 1h, 2d, or bare seconds
   -j, --jobs <n>          parallel workers
   --corpus <dir>          corpus carried in and written back out
+  --resume <dir>          write the campaign down here, and carry on with it if it already is
   --findings <dir>        where bundles are written [default: ./findings]
   --summary <file>        a machine-readable account of the campaign
   --master-seed <u64>     everything is derived from this; reproduces a whole campaign
@@ -1556,6 +1557,16 @@ reduction milestone; the flag is absent rather than accepted and ignored.
 A stored corpus holds **tapes only**. What each covered is learned by running it, which costs one
 generation when a campaign starts and keeps an entry to its few kilobytes rather than the
 sixty-four a coverage map would add.
+
+**`--resume` is the whole campaign, not its tapes.** The directory holds `campaign.bin` — the
+corpus with its visit counts and evictions, the coverage seen, findings, credit, properties and
+counters in a versioned format, and the results of a generation a run budget cut short — and
+`campaign.toml`, which a person reads. It is written after every whole generation and at the end,
+each file to a part file and renamed, so a campaign stopped at any moment resumes from its last
+generation. A generation is folded only when it is whole, so a campaign stopped at `--runs 50` and
+resumed to `--runs 100` folds the same generations as one run of `--runs 100`, and its summary is
+byte for byte the same. A directory holding a campaign of another master seed, program, binary or
+scenario is refused (`BOHR-1002`) rather than continued.
 
 ### 7.3 `bohr replay` — reproduce
 
@@ -1652,7 +1663,83 @@ the file rather than a verdict about the host.
 
 `doctor` never changes a host setting. It prints the command that would.
 
-### 7.6 Exit codes
+### 7.6 Target packs and `bohr hunt` — one command
+
+```
+bohr hunt <pack> [--time <duration> | --runs <n> | --seeds <a..b>] [-j <n>] [-o <dir>]
+                 [--no-faults] [--resume] [--binary <path>] [--master-seed <u64>]
+```
+
+A **target pack** is `targets/<name>/target.toml` in this repository:
+
+```toml
+[source]
+repository = "https://github.com/paradigmxyz/reth"
+commit = "3641f10830f44f71c2469fdf7e818ccd4a4b0e76"
+
+[build]
+command = ["targets/reth/build.sh"]       # run from the repository's root
+binary = "targets/reth/build/reth"         # where the build leaves it
+blake3 = "…"                               # the binary's digest
+
+[run]
+scenario = "targets/reth/scenario.toml"
+
+[judge]
+oracle = "crash"                           # crash | durability | liveness | property
+
+[bench]                                    # optional: a workload timed against native
+argv = ["…"]
+```
+
+Unknown keys are refused (`BOHR-1002`), and so is an oracle the scenario does not arm: a
+`durability` pack whose scenario has no `[durability]` would call every run clean for want of
+looking. **The binary is pinned by digest, and a binary that differs is refused before anything
+runs**, with both digests named — never rebuilt over, because that would hide which file is wrong.
+A missing binary is built by the pack's command; the builds write this machine's paths out of the
+binary (`--remap-path-prefix`) and name their compiler, so the digest names the program on a host
+with that compiler and the same C library: a static build links the host's `libc.a`, and the C in
+a client is compiled by the host's compiler. A host with another C library builds another file and
+is told so.
+
+`bohr hunt` resolves the pack, checks the binary and runs the pack's scenario as `bohr explore`
+would, writing `findings/`, `summary.json` and `campaign/` (the state `--resume` carries on from)
+under `-o`. `--seeds a..b` runs those seeds once each instead of searching. `--no-faults` runs the
+scenario with every drawn and scheduled fault taken out, which is how an oracle is checked against
+runs nothing was done to. `--binary <path>` replaces the pack's binary in the scenario's
+`argv`, so the file whose digest is checked is the file that runs. A hunt ends by grouping what it
+found (§7.7).
+
+The packs in this repository: `redb`, `reth`, `op-reth`. `op-reth` is built from `rust/op-reth` in
+`ethereum-optimism/optimism`; the `ethereum-optimism/op-reth` repository is archived.
+
+### 7.7 `bohr findings` — grouped by cause
+
+```
+bohr findings <dir> [--json]
+```
+
+Groups the bundles in a directory by signature — the programs the run executed and the
+violation's class and what tells it from others of its class: the nodes and exit statuses of a
+crash, the promises a property run broke, the files a durability failure lost, the nodes a liveness
+failure silenced. A hang is named by its words with the numbers taken out. Groups are printed
+largest first, each led by its smallest bundle, which is the one to reduce and to read. Two defects
+of one program that leave one signature are one group; that is what a reduction already treats as
+the same finding.
+
+### 7.8 `bohr init` — a first scenario
+
+```
+bohr init [--nodes <n>] [-o <file>] -- <program> [args...]
+```
+
+Surveys the program and writes a scenario: the cluster shape, a minute's horizon, the faults its own
+calls can meet — the disk where it syncs, the network where it talks across nodes, crashes where it
+keeps state — and a comment per wall the survey found. A dynamically linked program gets the
+libraries its loader resolves copied into a prepared state beside the scenario, pinned by digest.
+The probabilities are a first guess and say so; `init` does not write over an existing file.
+
+### 7.9 Exit codes
 
 | Code | Meaning | CI reading |
 |---:|---|---|
@@ -1665,7 +1752,7 @@ the file rather than a verdict about the host.
 The separation of 1 from 2 and 3 is the contract CI pipelines depend on: "the tool found a bug" and
 "the tool is broken" must never share an exit code.
 
-### 7.7 Other commands
+### 7.10 Other commands
 
 **`bohr selftest [--seed N] [--repeat N] [--guest NAME] [--save-dir DIR]`** runs the guests built
 into the binary and requires every repetition to reproduce. It needs no program on disk, no
@@ -1819,4 +1906,4 @@ here so this document is a complete entry point:
 | seed → campaign → minimal reproducer | `ARCHITECTURE.md` §7.3 |
 | SDK call → property state | `ARCHITECTURE.md` §7.4 |
 | bundle → replay → digest comparison | §7.3 and §4.4 of this document |
-| bundle → HTML report | §7.7 and `ARCHITECTURE.md` §5.13 |
+| bundle → HTML report | §7.10 and `ARCHITECTURE.md` §5.13 |

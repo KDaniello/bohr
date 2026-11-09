@@ -1,0 +1,17 @@
+# op-reth, the OP Stack execution client, built from the optimism monorepo, as a development chain
+# under drawn crashes and restarts.
+
+[source]
+repository = "https://github.com/ethereum-optimism/optimism"
+commit = "op-reth/v2.6.1"
+
+[build]
+command = ["targets/op-reth/build.sh"]
+binary = "targets/op-reth/build/op-reth"
+blake3 = "1d7726869529f4fa36d9e99b4b8364d0b47b422be5e37d26e9578c97d1e6eb1a"
+
+[run]
+scenario = "targets/op-reth/scenario.toml"
+
+[judge]
+oracle = "crash"

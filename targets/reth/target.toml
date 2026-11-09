@@ -1,0 +1,16 @@
+# reth, the Ethereum execution client, as a development chain under drawn crashes and restarts.
+
+[source]
+repository = "https://github.com/paradigmxyz/reth"
+commit = "3641f10830f44f71c2469fdf7e818ccd4a4b0e76"
+
+[build]
+command = ["targets/reth/build.sh"]
+binary = "targets/reth/build/reth"
+blake3 = "47d8e0ee44991aaaa51baf129f86f0e950492979f5924382bf08c6bd452b7c3c"
+
+[run]
+scenario = "targets/reth/scenario.toml"
+
+[judge]
+oracle = "crash"

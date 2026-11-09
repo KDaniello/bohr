@@ -8,6 +8,8 @@ mod coverage;
 pub mod doctor;
 mod mem;
 mod spawn;
+
+pub use spawn::CORE_VARIABLE;
 mod syscalls;
 
 use std::collections::BTreeMap;
@@ -141,6 +143,10 @@ pub struct PtraceBackend {
     coverage: Option<coverage::CoverageChannel>,
     /// The counters, copied out of that channel when somebody asks for them.
     covered: CoverageMap,
+    /// The cores this thread could run on before a spawn pinned it beside its guest, given back
+    /// when the backend is dropped: a process that traces once and then starts workers must not
+    /// hand every worker the one core its first guest ran on.
+    affinity_before: Option<libc::cpu_set_t>,
 }
 
 impl Default for PtraceBackend {
@@ -176,6 +182,7 @@ impl PtraceBackend {
             notes: Vec::new(),
             coverage: coverage::CoverageChannel::open(bytes),
             covered: CoverageMap::with_bytes(bytes),
+            affinity_before: None,
         }
     }
 
@@ -346,6 +353,14 @@ impl DeterminismBackend for PtraceBackend {
     }
 
     fn spawn(&mut self, node: NodeId, spec: &GuestSpec) -> Result<TaskId, BackendError> {
+        if self.affinity_before.is_none() {
+            // SAFETY: the set is ours and sized for the call; pid 0 is this thread.
+            self.affinity_before = unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+                    .then_some(set)
+            };
+        }
         let pid = spawn::spawn_traced(spec, self.isolated, self.coverage.as_ref().map(|c| c.fd()))?;
 
         // Run to the exec, where the stack still carries the auxiliary vector. The guest is already
@@ -851,6 +866,10 @@ fn limits() -> Vec<String> {
 /// this as the only thing that can end it — and the guest is not our child, so nothing else will.
 impl Drop for PtraceBackend {
     fn drop(&mut self) {
+        if let Some(set) = self.affinity_before.take() {
+            // SAFETY: a set this thread reported for itself; pid 0 is this thread.
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+        }
         if !self.handed_over {
             return;
         }

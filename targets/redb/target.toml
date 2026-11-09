@@ -1,0 +1,19 @@
+# redb, the embedded store, under a crash campaign: a write the store acknowledged is a write it
+# still has after the node dies and comes back. The harness is examples/redb-hunt, which pins
+# redb 2.6.3 in its lock file; the store is driven by a client on a second node and judged by the
+# client's acknowledgements, so nothing in the harness knows how redb is laid out.
+
+[source]
+repository = "https://github.com/cberner/redb"
+commit = "v2.6.3"
+
+[build]
+command = ["scripts/build-example.sh", "redb-hunt"]
+binary = "examples/redb-hunt/build/redb-hunt"
+blake3 = "b1f4569e5a08b13878c3e260266e5d1938673ac5f243327abc20e5f70434cecd"
+
+[run]
+scenario = "examples/redb-hunt/hunt.toml"
+
+[judge]
+oracle = "durability"

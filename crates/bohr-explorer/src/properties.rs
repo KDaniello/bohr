@@ -70,12 +70,12 @@ pub const MOST_PROPERTIES: usize = 4096;
 /// by line.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Properties {
-    by_name: std::collections::BTreeMap<String, Tally>,
+    pub(crate) by_name: std::collections::BTreeMap<String, Tally>,
     /// Evaluations of names that arrived after the bound was reached.
     ///
     /// Counted and reported rather than dropped in silence: a map of the untested that had quietly
     /// stopped growing would read as a guest with few promises.
-    refused: u64,
+    pub(crate) refused: u64,
 }
 
 impl Properties {

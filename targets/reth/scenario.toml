@@ -1,0 +1,27 @@
+# reth as a development chain that mines a block a second, killed where it stands and started again.
+#
+# What is judged is what every run already judges: a node that comes back must come back. A crash
+# that leaves it unable to start, or a restart that dies, is a finding; one whose blocks merely go
+# missing is the chain's business and a block-level oracle's, which this scenario has not.
+
+[run]
+horizon_ticks = 30_000_000_000    # thirty seconds of virtual time
+
+[cluster]
+nodes = 1
+argv = ["targets/reth/build/reth", "node", "--dev", "--dev.block-time", "1s",
+        "--datadir", "/data", "--disable-discovery", "--ipcdisable"]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[disk]
+sync_semantics = "strict"
+
+# Drawn rather than written down, so every seed crashes it somewhere else, from its first
+# instruction on, and brings it back half a second after each death.
+[faults]
+kill_probability = "1/2000"
+restart_after_ticks = 500_000_000
+budget_per_run = 3

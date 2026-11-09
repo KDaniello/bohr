@@ -38,6 +38,15 @@ use crate::{
     ring,
 };
 
+/// The `poll` event bits this world answers.
+const POLLIN: u16 = 0x001;
+const POLLOUT: u16 = 0x004;
+const POLLNVAL: u16 = 0x020;
+const POLLRDNORM: u16 = 0x040;
+const POLLWRNORM: u16 = 0x100;
+/// The most entries one `poll` may name, as the minimal world bounds it.
+const MAX_POLL_ENTRIES: usize = 1024;
+
 /// How a drawn node fault picks the moment it fires.
 ///
 /// The specification's claim (`docs/API.md` §5.4) is that aiming at dangerous moments finds an
@@ -1472,7 +1481,7 @@ impl DistributedWorld {
                 // Nothing to report and the guest is willing to wait. A timeout is armed only
                 // where one was given, so a poller asked to wait forever waits forever — and a
                 // run where every task does that is a deadlock, which is the truth about it.
-                self.epolls.park(node, epfd, ctx.task(), out, max);
+                self.epolls.park(node, epfd, ctx.task(), out, max, false);
                 if timeout > 0 {
                     let at =
                         Tick(ctx.world_now().get().saturating_add(
@@ -1542,7 +1551,13 @@ impl DistributedWorld {
             if ready.is_empty() {
                 continue;
             }
-            if let Some((task, out, max)) = self.epolls.take_parked(node, epfd) {
+            if let Some((task, out, max, poll)) = self.epolls.take_parked(node, epfd) {
+                if poll {
+                    let answered = Self::write_revents(ctx, task, out, max, &ready)?;
+                    self.epolls.close(node, epfd);
+                    wakes.push(Wake { task, ret: answered });
+                    continue;
+                }
                 let taken = ready.len().min(max);
                 let mut bytes = Vec::with_capacity(taken * epoll::EVENT_BYTES);
                 for one in &ready[..taken] {
@@ -1555,6 +1570,158 @@ impl DistributedWorld {
             }
         }
         Ok(())
+    }
+
+    /// Answers `poll` on a node that holds sockets, from the readiness `epoll` already computes.
+    ///
+    /// **A poll is an epoll instance that lives for one call.** What is ready now is answered now;
+    /// otherwise the descriptors are watched by an instance of the task's own, which the delivery
+    /// that makes one readable wakes, or the timeout ends, and which goes with the answer. A
+    /// descriptor this node does not hold is `POLLNVAL`, as in a kernel.
+    fn poll_sockets(
+        &mut self,
+        node: NodeId,
+        args: [u64; 6],
+        ctx: &mut WorldCtx<'_, '_>,
+    ) -> Result<Effects, KernelError> {
+        let (fds, nfds, timeout) = (GuestAddr(args[0]), args[1] as usize, args[2] as i32);
+        // More entries than a process may hold descriptors is `EINVAL`, as in a kernel; answered
+        // whole rather than cut short, which would leave the entries past the cut unanswered.
+        if nfds > MAX_POLL_ENTRIES {
+            let ret = -errno::EINVAL;
+            ctx.emit(EventKind::Syscall {
+                nr: sys::POLL,
+                args,
+                ret,
+                emulated: true,
+                data_digest: None,
+            })?;
+            return Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST));
+        }
+
+        let mut asked = Vec::with_capacity(nfds);
+        if nfds > 0 {
+            let mut raw = vec![0u8; nfds * 8];
+            ctx.read_mem(fds, &mut raw)?;
+            for entry in raw.as_chunks::<8>().0 {
+                let fd = i64::from(i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]));
+                asked.push((fd, u16::from_le_bytes([entry[4], entry[5]])));
+            }
+        }
+        // Each descriptor's answer now, and what it would be watched for if nothing is ready.
+        let mut revents = vec![0u16; nfds];
+        for (index, (fd, events)) in asked.iter().enumerate() {
+            if *fd < 0 {
+                continue;
+            }
+            // The standard three are held from the start, and every table this world hands
+            // descriptors out of is asked: a `poll` that called one of them invalid would be
+            // the model telling the guest something untrue about its own state.
+            let known = (0..=2).contains(fd) || self.holds_descriptor(node, *fd);
+            if !known {
+                revents[index] = POLLNVAL;
+                continue;
+            }
+            let readable = self
+                .net
+                .readable(node, *fd)
+                .or_else(|| self.epolls.counter(node, *fd).map(|held| held > 0))
+                .unwrap_or(true);
+            if readable && events & (POLLIN | POLLRDNORM) != 0 {
+                revents[index] |= events & (POLLIN | POLLRDNORM);
+            }
+            // Nothing here has a send buffer to fill, as `ready_on` says for epoll.
+            revents[index] |= events & (POLLOUT | POLLWRNORM);
+        }
+        let ready = revents.iter().filter(|r| **r != 0).count();
+
+        if ready > 0 || timeout == 0 {
+            let mut bytes = vec![0u8; nfds * 8];
+            ctx.read_mem(fds, &mut bytes)?;
+            for (index, entry) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                entry[6..8].copy_from_slice(&revents[index].to_le_bytes());
+            }
+            if nfds > 0 {
+                ctx.write_mem(fds, &bytes)?;
+            }
+            let ret = ready as i64;
+            ctx.emit(EventKind::Syscall {
+                nr: sys::POLL,
+                args,
+                ret,
+                emulated: true,
+                data_digest: None,
+            })?;
+            return Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST));
+        }
+
+        // Nothing ready and a wait asked for: an instance of this call's own, its tokens the
+        // indices into the array, so the wake can say which entry became ready.
+        let epfd = self.epolls.create_hidden(node);
+        for (index, (fd, events)) in asked.iter().enumerate() {
+            if *fd >= 0 && events & (POLLIN | POLLRDNORM) != 0 {
+                self.epolls.control(
+                    node,
+                    epfd,
+                    epoll::CTL_ADD,
+                    *fd,
+                    (epoll::EPOLLIN, index as u64),
+                );
+            }
+        }
+        self.epolls.park(node, epfd, ctx.task(), fds, nfds, true);
+        if timeout > 0 {
+            let at = Tick(ctx.world_now().get().saturating_add(
+                u64::from(timeout.unsigned_abs()).saturating_mul(Tick::MILLISECOND.get()),
+            ));
+            self.timers.arm(at, node, Due::PollTimeout { node, epfd, task: ctx.task() });
+        }
+        ctx.emit(EventKind::Syscall {
+            nr: sys::POLL,
+            args,
+            ret: 0,
+            emulated: true,
+            data_digest: None,
+        })?;
+        Ok(Effects::wait(SYSCALL_COST))
+    }
+
+    /// Writes a woken `poll`'s answer: each entry's `revents`, from what its instance reported.
+    fn write_revents(
+        ctx: &mut WorldCtx<'_, '_>,
+        task: TaskId,
+        fds: GuestAddr,
+        nfds: usize,
+        ready: &[epoll::Ready],
+    ) -> Result<i64, KernelError> {
+        if nfds == 0 {
+            return Ok(0);
+        }
+        let mut bytes = vec![0u8; nfds * 8];
+        ctx.read_mem_for(task, fds, &mut bytes)?;
+        for entry in bytes.as_chunks_mut::<8>().0 {
+            entry[6..8].copy_from_slice(&0u16.to_le_bytes());
+        }
+        // An instance watches a descriptor once, so its token names one entry; every entry for that
+        // descriptor is answered, as a kernel answers each entry of the array on its own.
+        let entries = bytes.as_chunks_mut::<8>().0;
+        let became: std::collections::BTreeSet<i32> = ready
+            .iter()
+            .filter_map(|one| entries.get(one.token as usize))
+            .map(|entry| i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]))
+            .collect();
+        let mut answered = 0;
+        for entry in entries.iter_mut() {
+            let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            // The instance watched only for input, so input is what became ready.
+            let asked = u16::from_le_bytes([entry[4], entry[5]]) & (POLLIN | POLLRDNORM);
+            if became.contains(&fd) && asked != 0 {
+                entry[6..8].copy_from_slice(&asked.to_le_bytes());
+                answered += 1;
+            }
+        }
+        ctx.write_mem_for(task, fds, &bytes)?;
+        Ok(answered)
     }
 
     /// What an instance would report right now.
@@ -1929,7 +2096,15 @@ impl WorldModel for DistributedWorld {
                     // left this one parked with its timer already spent. Answered only where it is
                     // still parked, because something may have woken it and waking it twice would
                     // hand the backend a task it has resumed.
-                    if self.epolls.take_parked_task(node, epfd, task).is_some() {
+                    if let Some((_, out, max, poll)) =
+                        self.epolls.take_parked_task(node, epfd, task)
+                    {
+                        // A `poll` that timed out reports every descriptor not ready, and the
+                        // instance it was parked on was only ever its own.
+                        if poll {
+                            Self::write_revents(ctx, task, out, max, &[])?;
+                            self.epolls.close(node, epfd);
+                        }
                         effects.wake.push(Wake { task, ret: 0 });
                     }
                 }
@@ -2318,17 +2493,12 @@ impl DistributedWorld {
             if poll_family {
                 return self.poll_call(node, nr, args, ctx);
             }
-            // **`poll` is not routed to the network, so it must not answer about it.** A socket
-            // holding a queued datagram is ready; delegated to the node's world, the call was
-            // answered "nothing is ready" and a poll-based server -- the older half of Linux
-            // network programming -- spun or hung and was reported hung. Refused by name, which is
-            // what §5.7 asks of a call this build does not model, and the message says what to use.
+            // **`poll` on a node with sockets is the network's question.** The node's own world
+            // knows no socket and would answer "nothing is ready" about one holding a
+            // datagram, so the call is answered here, from the readiness the epoll
+            // family computes.
             if nr == sys::POLL && self.net.node_has_sockets(node) {
-                return Err(ctx.refuse(
-                    "BOHR-2004",
-                    "poll over a socket is not modelled; this world answers the epoll family"
-                        .to_owned(),
-                ));
+                return self.poll_sockets(node, args, ctx);
             }
             // A counter is read and written like a file and is neither: eight bytes carrying what
             // it held, and a write that adds to it. A runtime uses one to wake its own poller.

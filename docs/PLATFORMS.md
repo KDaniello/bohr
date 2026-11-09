@@ -206,6 +206,12 @@ files and its sockets both and only the cluster sees them together. A single-nod
 scenario has no sockets to be ready, and refuses them as before. Every asynchronous runtime is
 built on this family; `tokio` 1.53 runs on it.
 
+**`poll` over sockets** is the same readiness asked one call at a time, and is answered by the
+same model: each `pollfd` gets what `epoll` would report for it, a descriptor the node does not
+hold gets `POLLNVAL`, and a wait parks the task on an instance of its own until a delivery makes a
+socket readable or the timeout passes on the node's clock. Resolvers wait for their answers this
+way; reth, op-reth and Lighthouse ask it before they do anything else. `ppoll` is not answered.
+
 **Sockets** come in two kinds and the model treats them as differently as their transports do.
 Datagrams — `sendto`, `recvfrom` — are drawn upon four times and may be lost, doubled, overtaken or
 late. Streams — `listen`, `accept`, `accept4`, `connect`, `getpeername`, and `read`/`write` on what

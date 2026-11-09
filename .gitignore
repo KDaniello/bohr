@@ -38,6 +38,7 @@
 
 # Example guests: built from committed source, never committed as binaries.
 examples/*/build/
+targets/*/build/
 examples/*/target/
 
 # Fuzzing: the seeds are committed, the corpus a fuzzer grows from them is not.

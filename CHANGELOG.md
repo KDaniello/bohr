@@ -6,6 +6,80 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.3.0 — one command
+
+A campaign against a real client used to be a scenario file, a binary built by hand at a path on
+one machine, and a script that swept seeds. Now it is one command. It is not published.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.3.0` |
+| `tape_abi` | `1` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every stored bundle replays to its digest. Figures are under `[v0_3.*]` and `[walls.*]` in
+[`benches/baseline.toml`](./benches/baseline.toml). `make pr`, `make gate` (12 of 12) and the
+mutation harness (13 of 13) are green; three gates of this version fail as written, and are listed
+below with what they measured.
+
+### A campaign from one command
+
+- **Target packs**: `targets/<name>/target.toml` names where a client comes from, the command that
+  builds it, the binary's blake3 digest, the scenario and the oracle. A binary whose digest differs
+  is refused before anything runs, with both digests named. Builds write this machine's paths out
+  of the binary: `redb-hunt` built in another directory is the same file, byte for byte.
+- **The first packs**: `redb`, `reth` (built statically from `paradigmxyz/reth`) and `op-reth`
+  (from `rust/op-reth` in `ethereum-optimism/optimism`).
+- **`bohr hunt <pack>`**: checks or builds the binary, runs the pack's scenario as a campaign or
+  over `--seeds a..b`, with `--no-faults` for checking an oracle on runs nothing was done to.
+- **Campaigns that resume**: `--resume` writes the whole campaign down — corpus, coverage,
+  findings, credit — and a campaign stopped at 50 runs and resumed to 100 is the 100-run campaign,
+  byte for byte. It is written down after every whole generation, in one file renamed into place.
+  A 4,096-entry state of 2.1 MB, the corpus at capacity, decodes in memory in 0.74 ms.
+- **`bohr findings <dir>`**: groups bundles by the program and the violation's signature, each
+  group led by its smallest run. 399 findings of 6 seeded defects form 6 groups.
+- **`bohr init -- ./node`**: a first scenario from a survey of the program, with the faults its
+  calls can meet and a comment per wall. A dynamic binary gets its libraries copied into a state
+  pinned by digest. Five v0.1 programs: each scenario loads and repeats 100 times to one digest.
+- **One duration format**: `--time 90s`, `30m`, `1h`, `2d`, or bare seconds.
+
+### Speed
+
+- **The supervisor runs on its guest's core.** Every intercepted call is two stops, and between
+  cores each was a cross-core wake-up: 200,000 `getpid` calls took 12.5 s, and take 1.55 s. One
+  intercepted call costs 7.7 µs, against 58.8 µs at v0.2.0 on the same host.
+- **Each campaign worker on a core of its own**, its guests beside it. Against `redb`, 256 runs at
+  one worker went from 3.04 to 12.33 runs a second, and at eight from 8.42 to 57.11; the summaries
+  at one and eight workers are still byte for byte equal.
+- **Not yet linear in workers.** Ten minutes of `bohr hunt redb`: 4,480 runs at one worker, 19,552
+  at eight, 4.36 times as many against a bound of 6. A generation of 32 waits for its slowest run,
+  and every generation starts its workers again.
+
+### The model
+
+- **`poll` over sockets in a cluster** is answered from the readiness the `epoll` family computes
+  and blocks until a descriptor is ready or the timeout passes. It stopped reth, op-reth 2.6.1 and
+  Lighthouse at their start. Surveyed for a minute of virtual time, reth and op-reth now run a
+  development chain to the end of it, 335,455 and 334,944 events.
+
+### What it does not do
+
+- **Report a client's own numbers.** A campaign's summary counts runs, adversity and findings; the
+  acknowledgements a client checks are its output, which no summary reads.
+- **Ship packs for `geth`, CometBFT, Lighthouse or a Solana validator.** Their walls are in the
+  table, and the model does not carry them yet.
+- **Accept a binary nobody can check.** A pack builds from a pinned commit or takes a binary with
+  its digest, and `--binary` replaces the pack's binary in the scenario so the checked file is the
+  one that runs.
+- **Build the same file on another host.** In a fresh `ubuntu:24.04` the one command installed the
+  toolchain, built `redb-hunt` and refused it: another digest, because a static build links that
+  host's C library and compiles the coverage runtime with its compiler. A pinned build image is
+  what makes a digest portable, and there is none yet.
+- **Group a real client's findings.** 620 seeds of `reth` under drawn crashes found nothing to
+  group; grouping is measured on six seeded defects.
+- **Scale linearly in workers**: 4.36× at eight, against 6 (Speed, above).
+
 ## v0.2.0 — the engine, honest
 
 Not new reach but five things v0.1 said about itself and did not make true. It is not published.
@@ -73,15 +147,13 @@ green on the release tree.
 
 ### What it does not do
 
-- **Run a target it could not run before.** The walls are written down, not answered: that is v0.3
-  for `poll` over sockets and v0.5 for the rest.
+- **Run a target it could not run before.** The walls are written down, not answered.
 - **Preempt a thread that spins without a syscall.** One task runs at a time, until its next
   syscall; a thread waiting on another in a loop never yields, and the run stops making events. The
-  Solana validator does this. Preemption at an instruction budget is v0.5.
+  Solana validator does this. Nothing preempts at an instruction budget.
 - **Turn the ring on by default**, or carry sockets, timeouts or registered buffers through it.
 - **Give wall time a date.** It begins at the epoch, so a step back further than the run has lasted
-  holds it there until monotonic time catches up. A realistic epoch changes every stored digest and
-  is v0.6's.
+  holds it there until monotonic time catches up. A realistic epoch changes every stored digest.
 
 ## v0.1.0 — the foundation
 
