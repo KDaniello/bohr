@@ -132,3 +132,51 @@ fn naming_two_subjects_is_refused() {
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("not both"), "{report}");
 }
+
+/// Runs a campaign that writes itself down in `state`, and returns its summary.
+fn resumable(dir: &std::path::Path, runs: &str, seed: &str, jobs: &str) -> (i32, String) {
+    let summary = dir.join(format!("summary-{runs}.json"));
+    let (code, report) = bohr(&[
+        "explore",
+        "--guest",
+        "many-flips",
+        "--runs",
+        runs,
+        "--master-seed",
+        seed,
+        "-j",
+        jobs,
+        "--findings",
+        &dir.join("findings").to_string_lossy(),
+        "--resume",
+        &dir.join("state").to_string_lossy(),
+        "--summary",
+        &summary.to_string_lossy(),
+    ]);
+    (code, std::fs::read_to_string(&summary).unwrap_or(report))
+}
+
+/// Stopped at a run budget that cuts a generation short and resumed to a larger one, a
+/// campaign is the campaign that ran the larger budget at once, byte for byte, whatever the
+/// worker count on either side of the stop.
+#[test]
+fn a_resumed_campaign_is_the_same_campaign() {
+    let whole = campaign("whole", "1", "100", "21");
+    let dir = scratch("resumed");
+    let (code, _) = resumable(&dir, "50", "21", "1");
+    assert!(matches!(code, 0 | 1));
+    let (code, resumed) = resumable(&dir, "100", "21", "4");
+    assert!(matches!(code, 0 | 1), "{resumed}");
+    assert_eq!(whole, resumed, "the stop reached the result");
+}
+
+/// A directory holding another campaign is refused rather than continued as this one.
+#[test]
+fn a_resume_of_another_campaign_is_refused() {
+    let dir = scratch("other");
+    let (code, _) = resumable(&dir, "40", "3", "1");
+    assert!(matches!(code, 0 | 1));
+    let (code, report) = resumable(&dir, "80", "4", "1");
+    assert_eq!(code, 2, "{report}");
+    assert!(report.contains("master seed 3"), "{report}");
+}

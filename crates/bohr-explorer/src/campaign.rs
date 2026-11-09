@@ -127,21 +127,21 @@ fn offer_of<'a>(item: &'a WorkItem, result: &'a RunResult) -> Offer<'a> {
 /// The state a campaign carries between generations.
 #[derive(Clone, Debug)]
 pub struct Campaign {
-    corpus: Corpus,
-    master: Seed,
-    generation: u64,
-    runs: u64,
+    pub(crate) corpus: Corpus,
+    pub(crate) master: Seed,
+    pub(crate) generation: u64,
+    pub(crate) runs: u64,
     /// Faults that landed, across every run.
-    adversity: u64,
-    guest_edges: u64,
+    pub(crate) adversity: u64,
+    pub(crate) guest_edges: u64,
     /// Findings by the digest of the run that produced them, so the same run reached twice is one
     /// finding. A map keyed by digest and iterated in its order, never in discovery order.
-    findings: std::collections::BTreeMap<Digest, Finding>,
+    pub(crate) findings: std::collections::BTreeMap<Digest, Finding>,
     /// How many entries each operator has contributed, for a report that can say which are
     /// earning their place.
-    credit: std::collections::BTreeMap<Operator, u64>,
+    pub(crate) credit: std::collections::BTreeMap<Operator, u64>,
     /// What the guests promised, counted across every run.
-    properties: crate::properties::Properties,
+    pub(crate) properties: crate::properties::Properties,
 }
 
 impl Campaign {

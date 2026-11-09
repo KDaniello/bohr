@@ -85,9 +85,9 @@ pub struct Entry {
     /// sixty-four kilobytes, and the two places that want it — choosing what to mutate and
     /// choosing what to drop — both want it inside a sort, where a linear scan per comparison
     /// turns a campaign into a program that spends its time counting rather than running guests.
-    edges: usize,
+    pub(crate) edges: usize,
     /// The draws this entry's run made inside the prefix, for the mutation that aims at one site.
-    draws: Journal,
+    pub(crate) draws: Journal,
 }
 
 /// Draws an entry remembers, at most.
@@ -139,15 +139,15 @@ impl Entry {
 /// The tapes kept, and everything the campaign has ever covered.
 #[derive(Clone, Debug)]
 pub struct Corpus {
-    entries: Vec<Entry>,
+    pub(crate) entries: Vec<Entry>,
     /// Every bucket any run has reached. The question "is this new" is one comparison against it.
-    seen: CoverageMap,
+    pub(crate) seen: CoverageMap,
     /// Entries dropped because the corpus was full.
-    evicted: u64,
+    pub(crate) evicted: u64,
     /// The most entries to keep.
-    capacity: usize,
+    pub(crate) capacity: usize,
     /// The name the next kept entry is given.
-    next_id: u64,
+    pub(crate) next_id: u64,
 }
 
 /// Entries a corpus holds before it starts dropping the least useful.

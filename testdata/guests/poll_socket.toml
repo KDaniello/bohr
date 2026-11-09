@@ -1,0 +1,8 @@
+# Two nodes: node 0 polls its socket, node 1 sends it one datagram. The run ends with node 0.
+
+[run]
+ends_with_node = 0
+
+[cluster]
+nodes = 2
+argv = ["testdata/guests/build/poll_socket", "{node}"]

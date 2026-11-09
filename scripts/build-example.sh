@@ -24,7 +24,10 @@ if [ -f "$dir/rustflags.txt" ]; then
   extra=$(grep -vE '^\s*(#|$)' "$dir/rustflags.txt" | tr '\n' ' ')
 fi
 
-RUSTFLAGS="-C target-feature=+crt-static $extra" \
+# Paths of this machine are written out of the binary, so a pack's pinned digest names the program
+# and not the directory someone happened to build it in.
+remap="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$PWD=/bohr --remap-path-prefix=$target=/target"
+RUSTFLAGS="-C target-feature=+crt-static $remap $extra" \
   cargo build --release --manifest-path "$dir/Cargo.toml" \
   --target x86_64-unknown-linux-gnu --target-dir "$target"
 

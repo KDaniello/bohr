@@ -32,9 +32,11 @@ nothing, and the harness is what shows each one can.
 | A run travels | 9 of 9 bundles written by a Windows build replayed by a Linux one | `[m2.gates]` |
 | A finding shrinks | a fixture's 49,477 events reduced to 18 in 20 replays, reproducing 100 times of 100 | `[m4.reduction]` |
 | PCT earns its default | a depth-2 race reached on 60 of 60 seeds under PCT, 47 of 60 under uniform choice | `[policies.race_init]` |
-| Interception cost | 53.2 µs per intercepted syscall, against a ceiling of 120 | `[v0_1.gates]` |
+| Interception cost | 7.7 µs per intercepted syscall, against a ceiling of 120, with the supervisor on its guest's core | `[v0_3.perf]` |
 | The suite can fail | 13 of 13 injections turn the determinism suite red; 12 of 12 product scenarios pass | `[v0_1.gates]` |
 | Campaign throughput | 131,000 runs per hour against `redb` 2.6.3 | `[m4_1.slowdown]` |
+| A campaign resumes as itself | `--runs 50`, resumed to `--runs 100`, against one `--runs 100`: summaries byte for byte equal | `[v0_3.gates]` |
+| Findings group by cause | 399 findings of 6 seeded defects form 6 groups, one per defect | `[v0_3.gates]` |
 
 The host for every row is named in its section: a Core i5-12600KF, natively or under the Windows
 subsystem for Linux.

@@ -277,9 +277,10 @@ pub(crate) fn run_with(exec: Execution<'_>) -> Result<Completed, CliError> {
 ///
 /// Everything a survey learns it learns from answers that were invented, so what this produces is
 /// a report and never a verdict. The worlds say so themselves: their identity differs, and a
-/// bundle claiming one is refused before it replays.
+/// bundle claiming one is refused before it replays. The log is kept only where the caller asks,
+/// as `bohr init` does to learn which calls a program makes; no survey writes a bundle.
 pub(crate) fn survey_with(exec: Execution<'_>) -> Result<Completed, CliError> {
-    run_against(Execution { record: Record::DigestOnly, ..exec }, Worlds::Surveying)
+    run_against(exec, Worlds::Surveying)
 }
 
 fn run_against(exec: Execution<'_>, worlds: Worlds) -> Result<Completed, CliError> {

@@ -101,7 +101,8 @@ echo "markers checked: $(rules | grep -c '^marker')"
 if [ "$push" = 1 ]; then
   git commit -q -m "$message" -m "Published from private $rev."
   # A branch is cut from public main, so the pull request it backs carries this publication alone.
-  git push -q origin "HEAD:${branch:-main}"
+  # A branch is a pull request's and is replaced whole; main is never forced.
+  git push -q ${branch:+--force} origin "HEAD:${branch:-main}"
   echo "published $(git rev-parse --short HEAD) from private $rev to ${branch:-main}"
 else
   echo "prepared, not pushed: rerun with --push -m \"<message>\""

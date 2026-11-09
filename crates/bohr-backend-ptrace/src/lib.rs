@@ -8,7 +8,9 @@
 mod linux;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use linux::{PtraceBackend, doctor, syscall_name, syscall_table, unmodelled_syscall_name};
+pub use linux::{
+    CORE_VARIABLE, PtraceBackend, doctor, syscall_name, syscall_table, unmodelled_syscall_name,
+};
 
 /// Whether this build contains a working interceptor.
 ///

@@ -134,6 +134,12 @@ Three, and everything else is a consequence of them:
 A run is therefore described in full by something small and copyable, which makes a finding a file
 rather than an account of the circumstances that produced it.
 
+**A campaign is one command.** `bohr hunt reth --time 1h -j 8` reads `targets/reth/target.toml`,
+takes the binary only if its digest is the pack's (building it where it is missing), runs the
+pack's scenario as a search with its state written down so `--resume` carries on, and ends by
+grouping what it found by cause, each group led by its smallest run ([`API.md`](./API.md) §7.6).
+For a program with no pack, `bohr init -- ./node` writes a first scenario from a survey of it.
+
 ## 6. What is reusable, and what is not
 
 The split determines what a second application of the engine — deterministic testing for a different

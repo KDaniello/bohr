@@ -1278,6 +1278,38 @@ gate_min = 8.3
 pr_min = 2.5
 mutation_min = 6.8
 
+# What v0.3.0 was measured to do, on its own tree, on the host [v0_1.gates] names, on 2026-11-09.
+# Each bound was written in roadmap/v0.3.md before the run that judged it; three of them were
+# restated before their runs, and say so there.
+#
+# Three gates fail as written. G3.1: in a fresh ubuntu:24.04 the one command installed the pinned
+# toolchain, built redb-hunt and checked it, and the build was another file — blake3 19fe434f…
+# against the pack's b1f4569e… — because a static build links that image's C library and its C
+# compiler builds the coverage runtime; the hunt refused it, as it must. G3.4: 620 seeds of reth
+# under drawn crashes found nothing, so there was nothing on a real client to group. P3.1: eight
+# workers did 4.36 times the runs of one, against 6, because a generation of 32 waits for its
+# slowest run and starts its workers again.
+[v0_3.gates]
+one_command_clean_machine = "fails: the build in ubuntu:24.04 has another digest, refused"   # G3.1
+resume_is_the_same_campaign = "byte for byte, --runs 50 resumed to 100 against one --runs 100"  # G3.2
+grouping_seeded_defects = "399 findings of 6 defects, 6 groups, one per defect"           # G3.3
+grouping_real_client = "fails: reth, 620 seeds of drawn crashes, 0 findings"             # G3.4
+init_programs = "5 of 5 load and repeat 100 times to one digest"                         # G3.5
+changed_binary_refused = "before any run, both digests named"                             # G3.6
+make_pr = "green"                                                                         # G3.7
+make_gate = "green, 12 of 12, 13 of 13 injections caught"
+poll_no_longer_stops = "reth, op-reth 2.6.1 and Lighthouse run past their first poll"      # G3.8
+
+[v0_3.perf]
+per_call_us = 7.7                                                  # v0.2.0: 58.8 on this host
+supervisor_on_guest_core = { apart_s = 12.5, together_s = 1.55, calls = 200_000 }
+startup_ms = 2.60
+redb_runs_ten_minutes = { j1 = 4_480, j8 = 19_552, ratio = 4.36 }  # P3.1, bound 6: fails
+second_hunt_whole_s = 0.44                                         # P3.2, bound 5 s to the first run
+full_corpus_state = { entries = 4_096, bytes = 2_103_728, decode_ms = 0.74 }   # P3.3, bound 2 s
+gate_min = 5.4
+pr_min = 2.0
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.
@@ -1306,17 +1338,6 @@ events = 1000001
 ran = "GuestHung(\"event budget reached at 1000001, short of the horizon at tick 60000000000\")"
 walls = 0
 
-[walls.lighthouse]
-binary = "lighthouse"
-sha256 = "11b7bca8df09b3f985a03a72f241ef9e011c99332fe86677b654947eaa1e9e96"
-linkage = "dynamic"
-survey = "--max-events 1000000 --config ~/targets/lighthouse/walls.toml"
-args = "bn --network mainnet --datadir /data --execution-endpoint http://127.0.0.1:8551 --execution-jwt /jwt.hex --allow-insecure-genesis-sync --disable-upnp --listen-address 127.0.0.1"
-seed = 1
-ran = "refused"
-stopped_by = "BOHR-2004: poll over a socket is not modelled; this world answers the epoll family on task0"
-walls = 0
-
 [walls.geth]
 binary = "geth"
 sha256 = "45335929e149413c9f680209c87fa14adc5750387da6f5f30b7b2bd24d2d54ea"
@@ -1334,17 +1355,6 @@ sync_file_range = { nr = 277, calls = 16, wall = "nothing models it" }
 fallocate = { nr = 285, calls = 5, wall = "nothing models it" }
 inotify_init1 = { nr = 294, calls = 1, wall = "nothing models it" }
 
-[walls.reth]
-binary = "reth"
-sha256 = "b7431b12b591add0f24c17caaa39b1972821b60889eb511c3064eb46b1c48995"
-linkage = "dynamic"
-survey = "--max-events 1000000 --config ~/targets/reth/walls.toml"
-args = "node --dev --dev.block-time 1s --datadir /data --disable-discovery --ipcdisable"
-seed = 1
-ran = "refused"
-stopped_by = "BOHR-2004: poll over a socket is not modelled; this world answers the epoll family on task0"
-walls = 0
-
 [walls.solana]
 binary = "solana-test-validator"
 sha256 = "666a27216ab2222f874c45c0470d7b66b702dcf3dd38cc70f3be19cf723560bf"
@@ -1356,13 +1366,40 @@ ran = "no end"
 stopped_by = "no end within 300 s of wall time"
 walls = 0
 
+[walls.lighthouse]
+binary = "lighthouse"
+sha256 = "11b7bca8df09b3f985a03a72f241ef9e011c99332fe86677b654947eaa1e9e96"
+linkage = "dynamic"
+survey = "--max-events 1000000 --config ~/targets/lighthouse/walls.toml"
+args = "bn --network mainnet --datadir /data --execution-endpoint http://127.0.0.1:8551 --execution-jwt /jwt.hex --allow-insecure-genesis-sync --disable-upnp --listen-address 127.0.0.1"
+seed = 1
+events = 338
+ran = "to completion"
+walls = 3
+
+[walls.lighthouse.calls]
+chmod = { nr = 90, calls = 2, wall = "nothing models it" }
+prctl = { nr = 157, calls = 3, wall = "answered ENOSYS" }
+statx = { nr = 332, calls = 10, wall = "answered ENOSYS" }
+
+[walls.reth]
+binary = "reth"
+sha256 = "afdac4c943f44db3d73c122e18eb5932126f57efbd4fd5d4feff55a594d0c8e0"
+linkage = "static"
+survey = "--max-events 1000000 --config targets/reth/scenario.toml"
+args = ""
+seed = 1
+events = 31821
+ran = "to completion"
+walls = 0
+
 [walls.op-reth]
 binary = "op-reth"
-sha256 = "9d55edf4116af17960b32302d43304a46a1423ba71bd9e3c967199506f0cf3ee"
-linkage = "dynamic"
-survey = "--max-events 1000000 --config ~/targets/op-reth/walls.toml"
-args = "node --dev --dev.block-time 1s --datadir /data --disable-discovery --ipcdisable"
+sha256 = "a39efb0e6ce660a7d1da7e965bda57b15eef45a94bd99beb7df81487500f7093"
+linkage = "static"
+survey = "--max-events 1000000 --config targets/op-reth/scenario.toml"
+args = ""
 seed = 1
-ran = "refused"
-stopped_by = "BOHR-2004: poll over a socket is not modelled; this world answers the epoll family on task0"
+events = 31893
+ran = "to completion"
 walls = 0

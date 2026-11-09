@@ -24,6 +24,28 @@ const AT_RANDOM: u64 = 25;
 /// Terminator of the auxiliary vector.
 const AT_NULL: u64 = 0;
 
+/// The variable a campaign names a worker's core in; without it, core nought.
+pub const CORE_VARIABLE: &str = "BOHR_CORE";
+
+/// The core this supervisor and its guests run on: the worker's position, as `BOHR_CORE` names it,
+/// among the cores this process may use; the first of them where no position is named.
+///
+/// A guest can read which core it is on without a syscall — `RDPID`, the per-CPU segment limit —
+/// and nothing traps either, so a guest that does sees its worker's position. `docs/DETERMINISM.md`
+/// says so.
+fn guest_core() -> usize {
+    // SAFETY: the set is ours and sized for the call; pid 0 is this thread.
+    let allowed: Vec<usize> = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return 0;
+        }
+        (0..libc::CPU_SETSIZE as usize).filter(|c| libc::CPU_ISSET(*c, &set)).collect()
+    };
+    let nth = std::env::var(CORE_VARIABLE).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    if allowed.is_empty() { 0 } else { allowed[nth % allowed.len()] }
+}
+
 /// Namespaces the guest is placed in, so that what it can observe of the machine is ours to define
 /// rather than the host's to leak.
 ///
@@ -127,6 +149,18 @@ pub(super) fn spawn_traced(
         program: program.clone(),
         reason: format!("cannot build the syscall filter: {e}"),
     })?;
+
+    // **The supervisor runs on the guest's core.** Every intercepted call is two stops, and with
+    // tracer and guest on different cores each is a cross-core wake-up; on one core it is a plain
+    // context switch. Measured on 200,000 `getpid` calls: 12.5 s apart, 1.55 s together. Best
+    // effort: a supervisor that cannot pin itself is slower, not wrong, so a refusal is ignored.
+    let core = guest_core();
+    // SAFETY: the set is ours and sized for the call; pid 0 is this thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(core, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
 
     // Two pipes: one carries the guest's pid outwards, the other tells the guest it is being
     // traced. Without the second, the guest could reach its filter before the supervisor is
@@ -318,9 +352,15 @@ unsafe fn child_setup(
             libc::_exit(failed::PERSONALITY);
         }
 
-        // One core: migration between cores changes timing and what the processor reports.
+        // One core: migration between cores changes timing and what the processor reports. The
+        // supervisor pinned itself before the fork, so the first core this process may run on is
+        // the one chosen for it; a supervisor that could not pin itself leaves core nought.
+        let mut inherited: libc::cpu_set_t = std::mem::zeroed();
+        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut inherited);
+        let core =
+            (0..libc::CPU_SETSIZE as usize).find(|c| libc::CPU_ISSET(*c, &inherited)).unwrap_or(0);
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(0, &mut set);
+        libc::CPU_SET(core, &mut set);
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == -1 {
             libc::_exit(failed::AFFINITY);
         }

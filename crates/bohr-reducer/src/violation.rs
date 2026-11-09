@@ -170,6 +170,15 @@ impl Violation {
         Some(Self { class, signature })
     }
 
+    /// The violation as one line: its class and what tells it from others of its class.
+    ///
+    /// Two findings with the same line are one defect as far as this build can tell, which is
+    /// what `bohr findings` groups by; the signature is already free of what a reduction moves.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!("{:?} {:?}", self.class, self.signature)
+    }
+
     /// What kind of thing went wrong.
     #[must_use]
     pub const fn class(&self) -> Class {
