@@ -35,13 +35,14 @@ pub(crate) struct Page {
 }
 
 pub(crate) fn render(model: &RunModel, sidecar: Option<&str>) -> String {
-    render_with(model, sidecar, None).html
+    render_with(model, sidecar, None, &[]).html
 }
 
 pub(crate) fn render_with(
     model: &RunModel,
     sidecar: Option<&str>,
     bundle_name: Option<&str>,
+    lanes: &[crate::chain::Lane],
 ) -> Page {
     let violation_at = model
         .violation
@@ -65,6 +66,7 @@ pub(crate) fn render_with(
     reproduction(model, bundle_name, &mut page);
     orientation(&mut page);
     violation_card(model, violation_at, &mut page);
+    chain_timeline(model, lanes, &mut page);
     at_a_glance(model, &mut page);
     timeline(model, &window, violation_at, sidecar, &mut page);
     faults(model, &mut page);
@@ -135,16 +137,34 @@ fn verdict(model: &RunModel, page: &mut String) {
             );
         }
         (outcome, None) => {
-            let detail = describe::outcome_detail(outcome).unwrap_or_default();
+            // The verdict every other view prints, so a page and a terminal never word one finding
+            // two ways.
+            let verdict = crate::narrate::verdict(outcome);
             let _ = writeln!(
                 page,
                 "<h1><span class=\"bad\">This run found a bug.</span></h1>\n\
-                 <p class=\"verdict\">The {} — {}.</p>",
-                escape::text(describe::outcome_word(outcome)),
-                escape::text(detail)
+                 <p class=\"verdict\">{} <code>{}</code></p>",
+                escape::text(&verdict.headline),
+                escape::text(&verdict.code)
             );
         }
     }
+}
+
+/// The chain, node by node: what each answered the probe over virtual time, beside its faults.
+fn chain_timeline(model: &RunModel, lanes: &[crate::chain::Lane], page: &mut String) {
+    let Some(svg) = crate::chain::svg(model, lanes) else {
+        return;
+    };
+    page.push_str(
+        "<h2>The chain, node by node</h2>\n<div class=\"card\">\n<p>Each dot is an answer the \
+         probe got, drawn the first time a node gave it: across is virtual time, up is the key it \
+         answered for, the colour is the value. A dot at a key a lane already showed, in another \
+         colour, is a value that changed; shaded stretches are a node down. Hover a dot for its \
+         words.</p>\n",
+    );
+    page.push_str(&svg);
+    page.push_str("</div>\n");
 }
 
 /// The line a maintainer runs, above the fold and copyable.

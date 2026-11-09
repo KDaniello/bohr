@@ -1,0 +1,27 @@
+# CometBFT, one validator running the kvstore application, under drawn crashes and restarts.
+
+[source]
+repository = "https://github.com/cometbft/cometbft"
+commit = "v0.38.26"
+
+[build]
+command = ["targets/cometbft/build.sh"]
+binary = "targets/cometbft/build/cometbft"
+blake3 = "c9a7172c1d01f28dff5fa70f876c53aac7b691fc03b8df7c59a08c4b78fcf769"
+
+[run]
+scenario = "targets/cometbft/scenario.toml"
+
+[judge]
+oracle = "chain"
+
+# What `bohr check cometbft` holds the pack to; see docs/TESTING.md §16.
+[check]
+works = { min_events = 20_000, min_virtual_s = 29, probe_answers = 0.9 }
+repeats = { times = 20 }
+replays = {}
+clean = { seeds = "1..10" }
+adversity = { seeds = "1..20", at_least = 0.5 }
+walls = {}
+# A changed binary is refused by its digest before anything runs.
+refuses_changed = true

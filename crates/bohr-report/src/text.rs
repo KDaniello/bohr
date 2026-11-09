@@ -98,6 +98,119 @@ pub fn event_line(event: &Event) -> String {
     out
 }
 
+/// The kinds `bohr trace --kind` selects by, one word per kind of event.
+pub const KINDS: [&str; 13] = [
+    "syscall",
+    "schedule",
+    "task",
+    "packet",
+    "disk",
+    "fault",
+    "node",
+    "wait",
+    "clock",
+    "assertion",
+    "record",
+    "diagnostic",
+    "domain",
+];
+
+/// The word an event's kind is selected by.
+///
+/// One word per kind and every kind has one, so a selection and its complement are the whole log.
+#[must_use]
+pub const fn kind_word(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::Syscall { .. } => "syscall",
+        EventKind::Schedule { .. } => "schedule",
+        EventKind::TaskSpawned { .. } | EventKind::TaskExited { .. } => "task",
+        EventKind::PacketSent { .. } | EventKind::PacketFate { .. } => "packet",
+        EventKind::DiskOp { .. } => "disk",
+        EventKind::FaultFired { .. } => "fault",
+        EventKind::NodeState { .. } => "node",
+        EventKind::Waited { .. } | EventKind::Woke { .. } => "wait",
+        EventKind::ClockRead { .. } => "clock",
+        EventKind::Assertion { .. } => "assertion",
+        EventKind::SdkRecord { .. } => "record",
+        EventKind::Diagnostic { .. } => "diagnostic",
+        EventKind::Domain { .. } => "domain",
+    }
+}
+
+/// What makes two events the same step of a loop: where, which kind, which call and its answer.
+fn shape(event: &Event) -> (u32, u32, &'static str, u32, i64) {
+    let (nr, ret) = match &event.kind {
+        EventKind::Syscall { nr, ret, .. } => (*nr, *ret),
+        _ => (0, 0),
+    };
+    (event.node.get(), event.task.get(), kind_word(&event.kind), nr, ret)
+}
+
+/// What one step of a loop is, in a word or two.
+fn step_name(event: &Event) -> String {
+    match &event.kind {
+        EventKind::Syscall { nr, ret, .. } => {
+            format!("{} → {ret}", crate::syscall_name(*nr).unwrap_or("?"))
+        }
+        other => kind_word(other).to_owned(),
+    }
+}
+
+/// The log, one event per line, with a loop that repeats folded into two lines.
+///
+/// **A fold is a view, not a deletion.** The two lines name the first and the last event of the
+/// stretch, how many times the steps repeated and over how much virtual time; `--json` and the
+/// bundle still hold every one of them. A stretch is folded from three repetitions of a pattern of
+/// up to four events on one task.
+#[must_use]
+pub fn write_squashed(events: &[Event], records: &[bohr_sdk_proto::Record]) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    while at < events.len() {
+        let mut folded = false;
+        for period in 1..=4 {
+            let mut times = 1;
+            while at + (times + 1) * period <= events.len()
+                && (0..period)
+                    .all(|k| shape(&events[at + k]) == shape(&events[at + times * period + k]))
+            {
+                times += 1;
+            }
+            if times >= 3 {
+                let first = &events[at];
+                let last = &events[at + times * period - 1];
+                let steps: Vec<String> = events[at..at + period].iter().map(step_name).collect();
+                let _ = writeln!(
+                    out,
+                    "{:>8} t{:<14} n{} task{} ┐ {times} × [{}]",
+                    first.id.get(),
+                    first.tick.get(),
+                    first.node.get(),
+                    first.task.get(),
+                    steps.join(", ")
+                );
+                let _ = writeln!(
+                    out,
+                    "{:>8} t{:<14} n{} task{} ┘ over {}",
+                    last.id.get(),
+                    last.tick.get(),
+                    last.node.get(),
+                    last.task.get(),
+                    crate::narrate::seconds(last.tick.get().saturating_sub(first.tick.get()))
+                );
+                at += times * period;
+                folded = true;
+                break;
+            }
+        }
+        if !folded {
+            out.push_str(&write_log_with(&events[at..=at], records));
+            at += 1;
+        }
+    }
+    out
+}
+
 /// The whole log, one event per line.
 #[must_use]
 pub fn write_log(events: &[Event]) -> String {
@@ -165,4 +278,43 @@ pub fn summary(manifest: &Manifest) -> String {
         let _ = writeln!(out, "  degraded: {}", manifest.determinism.reasons.join(", "));
     }
     out
+}
+
+#[cfg(test)]
+mod squash_tests {
+    use bohr_trace::{Event, EventKind};
+    use bohr_types::{EventId, NodeId, TaskId, Tick};
+
+    use super::*;
+
+    fn call(id: u64, nr: u32) -> Event {
+        Event {
+            id: EventId(id),
+            tick: Tick(id * 1000),
+            node: NodeId(0),
+            task: TaskId(1),
+            kind: EventKind::Syscall {
+                nr,
+                args: [0; 6],
+                ret: 0,
+                emulated: true,
+                data_digest: None,
+            },
+        }
+    }
+
+    /// A loop folds to two lines, and what is not a loop is printed as it is.
+    #[test]
+    fn a_loop_folds_and_the_rest_does_not() {
+        let mut events = vec![call(0, 1)];
+        for i in 0..30 {
+            events.push(call(1 + i * 2, 228));
+            events.push(call(2 + i * 2, 232));
+        }
+        events.push(call(100, 60));
+        let out = write_squashed(&events, &[]);
+        assert_eq!(out.lines().count(), 4, "{out}");
+        assert!(out.contains("30 × [clock_gettime → 0, epoll_wait → 0]"), "{out}");
+        assert!(KINDS.iter().all(|k| !k.is_empty()));
+    }
 }

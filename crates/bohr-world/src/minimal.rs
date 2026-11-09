@@ -1,15 +1,15 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bohr_backend::{Resume, Stop, StopKind};
-use bohr_kernel::{Effects, FaultCatalog, KernelError, NodeOp, Wake, WorldCtx, WorldModel};
+use bohr_kernel::{
+    DueEffects, Effects, FaultCatalog, KernelError, NodeOp, TaskState, Wake, WorldCtx, WorldModel,
+};
 use bohr_tape::DrawSite;
 use bohr_trace::{EventKind, short_digest};
 use bohr_types::{GuestAddr, SyncWordId, TaskId, Tick, WorldModelId};
 
 use crate::{
+    bytes::FileBytes,
     nums::{errno, sys},
     ring,
 };
@@ -188,7 +188,9 @@ pub(crate) fn submission_answer(
     effects: &Effects,
 ) -> Result<i64, KernelError> {
     match effects.state {
-        bohr_kernel::TaskState::Runnable(Resume::Emulate { ret }) => Ok(ret),
+        bohr_kernel::TaskState::Runnable(
+            Resume::Emulate { ret } | Resume::EmulateAndSignal { ret, .. },
+        ) => Ok(ret),
         _ => Err(refuse_submission(ctx, "a submission that waits or reaches the host")),
     }
 }
@@ -460,10 +462,10 @@ struct Waiter {
 /// **File bytes are shared, not copied.** An image is taken at every completed `fsync`, and a store
 /// syncing a file it has grown to megabytes would otherwise copy every other file on the disk each
 /// time — a cost of disk size times sync count, per run, per worker. Sharing makes an image cost
-/// one counted reference per file, and a write copies only the file it lands in.
+/// one counted reference per block of each file, and a write copies only the blocks it lands in.
 #[derive(Clone, Debug)]
 pub(crate) struct DiskImage {
-    pub(crate) content: BTreeMap<u64, Arc<Vec<u8>>>,
+    pub(crate) content: BTreeMap<u64, FileBytes>,
     pub(crate) names: BTreeMap<String, u64>,
     /// Which of those names are directories, held with them because a restore that rolled the
     /// namespace back and left the set alone would leave a name that is a file and a directory at
@@ -492,9 +494,9 @@ pub struct MinimalWorld {
     /// run has to start from the same state every time, and a file left over from the last run is
     /// state.
     ///
-    /// Shared with every disk image taken of this world, so a write goes through `Arc::make_mut`
-    /// and copies the file only while a snapshot still holds the bytes it is about to change.
-    content: BTreeMap<u64, Arc<Vec<u8>>>,
+    /// Shared block by block with every disk image taken of this world, so a write copies a block
+    /// only while a snapshot still holds the bytes it is about to change.
+    content: BTreeMap<u64, FileBytes>,
     /// Names, each pointing at content. Unlinking removes the name and leaves the content, which
     /// is what an open descriptor still refers to.
     names: BTreeMap<String, u64>,
@@ -522,6 +524,18 @@ pub struct MinimalWorld {
     directories: BTreeSet<u64>,
     /// Whether the guest is shown a kernel with `io_uring` (`[linux] io_uring = "ring"`).
     io_uring: bool,
+    /// Permission bits a guest set with the `chmod` family, by inode; the rest read as made.
+    ///
+    /// Held beside the content rather than in it, so a crash image keeps a file's bytes and a
+    /// restarted node sees the bits a file was made with.
+    modes: BTreeMap<u64, u32>,
+    /// What each task called itself with `PR_SET_NAME`, sixteen bytes as the kernel keeps it.
+    thread_names: BTreeMap<TaskId, [u8; 16]>,
+    /// Timed futex waits this world arms itself, when no cluster arms them for it: by deadline,
+    /// then by task, each with the word the task waits on.
+    timeouts: BTreeMap<(Tick, TaskId), (u64, u64)>,
+    /// Each task's futex waits, counted, so a timer armed for one wait cannot end a later one.
+    wait_seq: BTreeMap<TaskId, u64>,
     /// Submission rings the guest has open, by the descriptor each was given.
     rings: BTreeMap<i64, ring::Ring>,
     /// Whether the guest has already been told this kernel has no `io_uring`.
@@ -559,6 +573,14 @@ pub struct MinimalWorld {
     /// The word named by the most recent creation call in each task, waiting for the task it
     /// produced to be announced.
     creating: BTreeMap<TaskId, u64>,
+    /// Signals sent to a task by another, waiting for that task's next stop.
+    pending_signals: BTreeMap<TaskId, Vec<u32>>,
+    /// Signals this world has had the kernel raise on a task, which come back as a stop to be let
+    /// through rather than withheld.
+    raised: BTreeMap<TaskId, Vec<u32>>,
+    /// Tasks this world has seen begin, and those it has seen end, to tell a thread from a number.
+    born: BTreeSet<TaskId>,
+    ended: BTreeSet<TaskId>,
     /// Reused across transfers so a guest reading in a loop does not allocate per call.
     transfer: Vec<u8>,
     /// Everything the guest wrote to its standard output, where a projection asks for it.
@@ -632,6 +654,10 @@ impl MinimalWorld {
             mapping: BTreeMap::new(),
             directories: [ROOT_INODE].into_iter().collect(),
             io_uring: false,
+            modes: BTreeMap::new(),
+            thread_names: BTreeMap::new(),
+            timeouts: BTreeMap::new(),
+            wait_seq: BTreeMap::new(),
             rings: BTreeMap::new(),
             declined_ring: false,
             dir_of: BTreeMap::new(),
@@ -641,6 +667,10 @@ impl MinimalWorld {
             waiters: BTreeMap::new(),
             exit_word: BTreeMap::new(),
             creating: BTreeMap::new(),
+            pending_signals: BTreeMap::new(),
+            raised: BTreeMap::new(),
+            born: BTreeSet::new(),
+            ended: BTreeSet::new(),
             transfer: Vec::new(),
             stdout: None,
             cwd: "/".to_owned(),
@@ -692,7 +722,7 @@ impl MinimalWorld {
         let bytes = match source {
             crate::Source::File(path) => {
                 let inode = self.names.get(path)?;
-                (**self.content.get(inode)?).clone()
+                self.content.get(inode)?.to_vec()
             }
             crate::Source::Stdout => self.stdout.clone()?,
         };
@@ -722,7 +752,7 @@ impl MinimalWorld {
             self.make_parents(path);
             let inode = self.next_inode;
             self.next_inode += 1;
-            self.content.insert(inode, Arc::new(content.clone()));
+            self.content.insert(inode, FileBytes::from_vec(content.clone()));
             self.names.insert(path.clone(), inode);
         }
         self
@@ -1116,14 +1146,10 @@ impl MinimalWorld {
             None if file.appending => self.content.get(&inode).map_or(0, |held| held.len()),
             None => file.position as usize,
         };
-        let Some(end) = grown_end(start, bytes.len()) else {
+        if grown_end(start, bytes.len()).is_none() {
             return (-errno::EFBIG, None);
-        };
-        let content = Arc::make_mut(self.content.entry(inode).or_default());
-        if content.len() < end {
-            content.resize(end, 0);
         }
-        content[start..end].copy_from_slice(bytes);
+        self.content.entry(inode).or_default().write_at(start, bytes);
         if at.is_none()
             && let Some(open) = self.open.get_mut(&fd)
         {
@@ -1157,7 +1183,7 @@ impl MinimalWorld {
             let inode = self.next_inode;
             self.next_inode += 1;
             self.names.insert(path.clone(), inode);
-            self.content.insert(inode, Arc::new(content));
+            self.content.insert(inode, FileBytes::from_vec(content));
             self.synthetic.insert(inode);
         }
 
@@ -1200,12 +1226,12 @@ impl MinimalWorld {
                     let inode = self.next_inode;
                     self.next_inode += 1;
                     self.names.insert(path.clone(), inode);
-                    self.content.insert(inode, Arc::default());
+                    self.content.insert(inode, FileBytes::default());
                     inode
                 }
             };
             if flags & O_TRUNC != 0 && !self.directories.contains(&inode) {
-                self.content.insert(inode, Arc::default());
+                self.content.insert(inode, FileBytes::default());
             }
             Some(inode)
         };
@@ -1502,8 +1528,11 @@ impl MinimalWorld {
         if from >= to {
             return Ok(());
         }
-        let at = mapping.at.saturating_add(from - mapping.offset);
-        ctx.write_mem(GuestAddr(at), &content[from as usize..to as usize])
+        for (offset, part) in content.segments(from as usize..to as usize) {
+            let at = mapping.at.saturating_add(offset as u64 - mapping.offset);
+            ctx.write_mem(GuestAddr(at), part)?;
+        }
+        Ok(())
     }
 
     /// Shows every mapping of a file what changed in it, in the file's own terms.
@@ -1549,9 +1578,10 @@ impl MinimalWorld {
             }
             let mut bytes = vec![0u8; take as usize];
             ctx.read_mem(GuestAddr(mapping.at), &mut bytes)?;
-            let content = Arc::make_mut(self.content.entry(mapping.inode).or_default());
-            let at = mapping.offset as usize;
-            content[at..at + bytes.len()].copy_from_slice(&bytes);
+            self.content
+                .entry(mapping.inode)
+                .or_default()
+                .write_changed(mapping.offset as usize, &bytes);
         }
         Ok(())
     }
@@ -1738,11 +1768,15 @@ impl MinimalWorld {
             return Ok((len as i64, Some(short_digest(&self.transfer))));
         };
 
-        let content = self.content.get(&inode).map_or(&[][..], |c| c.as_slice());
         let from = usize::try_from(at.unwrap_or(file.position)).unwrap_or(usize::MAX);
-        let take = content.len().saturating_sub(from).min(len);
         self.transfer.clear();
-        self.transfer.extend_from_slice(&content[from.min(content.len())..][..take]);
+        if let Some(content) = self.content.get(&inode) {
+            let take = content.len().saturating_sub(from).min(len);
+            for (_, part) in content.segments(from..from.saturating_add(take)) {
+                self.transfer.extend_from_slice(part);
+            }
+        }
+        let take = self.transfer.len();
         ctx.write_mem(addr, &self.transfer)?;
         if at.is_none()
             && let Some(open) = self.open.get_mut(&fd)
@@ -1792,7 +1826,7 @@ impl MinimalWorld {
         if length > MAX_FILE_BYTES {
             return -errno::EFBIG;
         }
-        Arc::make_mut(self.content.entry(inode).or_default()).resize(length, 0);
+        self.content.entry(inode).or_default().resize(length);
         0
     }
 
@@ -1873,19 +1907,49 @@ impl MinimalWorld {
     }
 
     /// Reports that none of the descriptors a caller asked about are ready, and none are invalid.
-    fn clear_poll_results(
+    /// Writes each entry's `revents` and says how many are ready, or the error the array earned.
+    fn poll_ready(
+        &self,
         ctx: &mut WorldCtx<'_, '_>,
         addr: GuestAddr,
         count: u64,
     ) -> Result<i64, KernelError> {
-        let count = usize::try_from(count).unwrap_or(0).min(MAX_POLL_ENTRIES);
+        /// What a file is always ready for: `POLLIN`, `POLLOUT`, `POLLRDNORM`, `POLLWRNORM`.
+        const ALWAYS: u16 = 0x1 | 0x4 | 0x40 | 0x100;
+        /// `POLLNVAL`.
+        const INVALID: u16 = 0x20;
+        let Ok(count) = usize::try_from(count) else { return Ok(-errno::EINVAL) };
+        if count > MAX_POLL_ENTRIES {
+            return Ok(-errno::EINVAL);
+        }
+        let mut ready = 0;
         for i in 0..count {
-            let Some(at) = offset(addr, (i * POLLFD_BYTES) as u64 + 6) else {
+            // The whole entry has to lie before the end of the address space, not only its start.
+            let (Some(at), Some(_)) = (
+                offset(addr, (i * POLLFD_BYTES) as u64),
+                offset(addr, ((i + 1) * POLLFD_BYTES) as u64),
+            ) else {
                 return Ok(-errno::EFAULT);
             };
-            ctx.write_mem(at, &0u16.to_le_bytes())?;
+            let mut entry = [0u8; POLLFD_BYTES];
+            ctx.read_mem(at, &mut entry)?;
+            let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let events = u16::from_le_bytes([entry[4], entry[5]]);
+            // A negative descriptor is an entry the caller switched off, and reports nothing.
+            let revents = if fd < 0 {
+                0
+            } else if self.open.contains_key(&i64::from(fd)) {
+                events & ALWAYS
+            } else {
+                INVALID
+            };
+            if revents != 0 {
+                ready += 1;
+            }
+            let Some(out) = offset(at, 6) else { return Ok(-errno::EFAULT) };
+            ctx.write_mem(out, &revents.to_le_bytes())?;
         }
-        Ok(0)
+        Ok(ready)
     }
 
     /// Copies bytes into a guest buffer, reporting the length or that it did not fit.
@@ -1941,7 +2005,7 @@ impl MinimalWorld {
     }
 
     /// The length of what a descriptor refers to, or `None` for a descriptor nothing is open on.
-    fn length_of(&self, fd: i64) -> Option<u64> {
+    pub(crate) fn length_of(&self, fd: i64) -> Option<u64> {
         let file = self.open.get(&fd)?;
         match file.inode {
             Some(inode) => Some(self.content.get(&inode).map_or(0, |c| c.len() as u64)),
@@ -2256,11 +2320,7 @@ impl MinimalWorld {
     fn statx_of(&self, inode: Option<u64>, length: u64) -> [u8; STATX_BYTES] {
         /// `STATX_BASIC_STATS`: type, mode, links, owner, times, inode, size and blocks.
         const BASIC_STATS: u32 = 0x7ff;
-        let mode = match inode {
-            Some(inode) if self.directories.contains(&inode) => stat::DIRECTORY_MODE,
-            Some(_) => stat::REGULAR_MODE,
-            None => stat::CHAR_MODE,
-        };
+        let mode = self.mode_of(inode);
         let length = if mode == stat::DIRECTORY_MODE { 0 } else { length };
 
         // Field offsets are those of `struct statx`; the device is split the way `makedev` packs
@@ -2279,17 +2339,84 @@ impl MinimalWorld {
         buf
     }
 
+    /// An object's type and permission bits: the bits a guest set, or the ones it was made with.
+    fn mode_of(&self, inode: Option<u64>) -> u32 {
+        let made = match inode {
+            Some(inode) if self.directories.contains(&inode) => stat::DIRECTORY_MODE,
+            Some(_) => stat::REGULAR_MODE,
+            None => stat::CHAR_MODE,
+        };
+        match inode.and_then(|i| self.modes.get(&i)) {
+            Some(bits) => (made & !0o7777) | bits,
+            None => made,
+        }
+    }
+
+    /// Answers `prctl`, for the options a process sets and reads about itself.
+    ///
+    /// Each is answered as an unprivileged process on an ordinary kernel is; one that would hand
+    /// the guest a capability this world does not model — its own syscall filter, its memory map's
+    /// layout — is refused `EINVAL`, the answer for an option a kernel does not have.
+    fn prctl(&mut self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+        const PR_SET_PDEATHSIG: u64 = 1;
+        const PR_GET_PDEATHSIG: u64 = 2;
+        const PR_GET_DUMPABLE: u64 = 3;
+        const PR_SET_DUMPABLE: u64 = 4;
+        const PR_SET_NAME: u64 = 15;
+        const PR_GET_NAME: u64 = 16;
+        const PR_GET_TIMERSLACK: u64 = 30;
+        const PR_SET_TIMERSLACK: u64 = 29;
+        const PR_SET_NO_NEW_PRIVS: u64 = 38;
+        const PR_GET_NO_NEW_PRIVS: u64 = 39;
+        const PR_SET_THP_DISABLE: u64 = 41;
+        const PR_GET_THP_DISABLE: u64 = 42;
+        const PR_SET_VMA: u64 = 0x5356_4d41;
+        Ok(match args[0] {
+            PR_SET_NAME => {
+                let mut name = [0u8; 16];
+                ctx.read_mem(GuestAddr(args[1]), &mut name)?;
+                // The kernel keeps fifteen bytes and a terminator, however long the name given.
+                let end = name.iter().position(|b| *b == 0).unwrap_or(15).min(15);
+                name[end..].fill(0);
+                self.thread_names.insert(ctx.task(), name);
+                0
+            }
+            PR_GET_NAME => {
+                let name = self.thread_names.get(&ctx.task()).copied().unwrap_or_else(|| {
+                    // Unnamed, a thread is called after its program, as the kernel calls it.
+                    let mut name = [0u8; 16];
+                    let program = self.program.as_deref().unwrap_or("guest");
+                    let base = program.rsplit('/').next().unwrap_or(program).as_bytes();
+                    let n = base.len().min(15);
+                    name[..n].copy_from_slice(&base[..n]);
+                    name
+                });
+                ctx.write_mem(GuestAddr(args[1]), &name)?;
+                0
+            }
+            PR_GET_PDEATHSIG => {
+                ctx.write_mem(GuestAddr(args[1]), &0i32.to_le_bytes())?;
+                0
+            }
+            PR_GET_DUMPABLE | PR_GET_NO_NEW_PRIVS => 1,
+            PR_GET_TIMERSLACK => 50_000,
+            PR_GET_THP_DISABLE => 0,
+            // Accepted and of no effect: who is told of a parent's death, whether a core may be
+            // written, how late a timer may fire, a name for a mapping. None of it is anything this
+            // world's answers depend on.
+            PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_TIMERSLACK | PR_SET_NO_NEW_PRIVS
+            | PR_SET_THP_DISABLE | PR_SET_VMA => 0,
+            _ => -errno::EINVAL,
+        })
+    }
+
     /// The `struct stat` for one object, as the guest's C library expects to read it.
     ///
     /// Field offsets are those of `struct stat` on x86-64. Everything not written stays zero,
     /// which is a valid value for every field a guest reads. No inode at all is the endless random
     /// source, which is a character device and has no length.
     fn stat_of(&self, inode: Option<u64>, length: u64) -> [u8; STAT_BYTES] {
-        let mode = match inode {
-            Some(inode) if self.directories.contains(&inode) => stat::DIRECTORY_MODE,
-            Some(_) => stat::REGULAR_MODE,
-            None => stat::CHAR_MODE,
-        };
+        let mode = self.mode_of(inode);
         let length = if mode == stat::DIRECTORY_MODE { 0 } else { length };
 
         let mut buf = [0u8; STAT_BYTES];
@@ -2325,14 +2452,29 @@ impl MinimalWorld {
                 if Self::read_word(ctx, word)? != val {
                     return Ok((Some(-errno::EAGAIN), Vec::new()));
                 }
-                // **A timeout this world cannot arm is refused, not ignored.** Timers belong to
-                // the cluster model; alone, this world cannot make one fire, so a
-                // `pthread_cond_timedwait` that nothing wakes would wait for ever and be called a
-                // deadlock -- a finding invented against a correct program. Refusing says which
-                // call could not be answered, which is what §5.7 asks for.
+                // A signal already waiting for this task ends the wait before it begins, and
+                // before any timer is armed for a wait that never happened.
+                if self.pending_signals.get(&ctx.task()).is_some_and(|q| !q.is_empty()) {
+                    return Ok((Some(-errno::EINTR), Vec::new()));
+                }
+                // **A timer ends the wait that armed it and no later one.** It is not taken back
+                // when the wait ends some other way; it is numbered, and a timer whose number is
+                // not the task's current wait fires into nothing.
+                let seq = self.wait_seq.get(&ctx.task()).map_or(1, |n| n + 1);
+                self.wait_seq.insert(ctx.task(), seq);
+                // A timed wait alone arms a timer here; in a cluster the cluster arms it, around
+                // this call. WAIT carries a duration, WAIT_BITSET an absolute deadline on the
+                // clock its flags name.
                 if args[3] != 0 && !self.timeouts_armed {
-                    let why = "a futex wait with a timeout needs a timer this world has none of";
-                    return Err(ctx.refuse("BOHR-2004", why.to_owned()));
+                    let value = Self::read_timespec(ctx, GuestAddr(args[3]))?;
+                    let wall = args[1] as u32 & futex_op::CLOCK_REALTIME != 0;
+                    let ahead = if op == futex_op::WAIT_BITSET {
+                        value.saturating_sub(Self::deadline_clock(ctx, wall).get())
+                    } else {
+                        value
+                    };
+                    let at = Tick(ctx.world_now().get().saturating_add(ahead));
+                    self.timeouts.insert((at, ctx.task()), (word, seq));
                 }
                 self.waiters.entry(word).or_default().push(Waiter { task: ctx.task(), bits });
                 Ok((None, Vec::new()))
@@ -2517,7 +2659,7 @@ impl MinimalWorld {
         let inode = self.next_inode;
         self.next_inode += 1;
         self.names.insert(path.to_owned(), inode);
-        self.content.insert(inode, Arc::new(content));
+        self.content.insert(inode, FileBytes::from_vec(content));
         self.synthetic.insert(inode);
         inode
     }
@@ -2529,9 +2671,8 @@ impl MinimalWorld {
 
     /// One file's bytes, by the number that identifies it.
     ///
-    /// The counted pointer rather than a borrow, so a crash that keeps a file whole shares it
-    /// instead of copying it; readers take a slice through it.
-    pub(crate) fn file_content(&self, inode: u64) -> Option<&Arc<Vec<u8>>> {
+    /// Cloned rather than copied by a crash that keeps a file whole, which shares its blocks.
+    pub(crate) fn file_content(&self, inode: u64) -> Option<&FileBytes> {
         self.content.get(&inode)
     }
 
@@ -2540,7 +2681,7 @@ impl MinimalWorld {
     /// One file and not the disk: a failed sync loses what it was asked to make durable and says
     /// nothing about any other file, and restoring the whole disk would quietly undo writes to
     /// files the failure never touched.
-    pub(crate) fn restore_file(&mut self, inode: u64, content: Option<Arc<Vec<u8>>>) {
+    pub(crate) fn restore_file(&mut self, inode: u64, content: Option<FileBytes>) {
         match content {
             Some(bytes) => {
                 self.content.insert(inode, bytes);
@@ -2558,7 +2699,7 @@ impl MinimalWorld {
     /// that comes back from a crash and asks the system about itself is answered, exactly as one on
     /// a real machine is.
     pub(crate) fn restore_disk(&mut self, image: DiskImage) {
-        let kept: Vec<(u64, Arc<Vec<u8>>, String)> = self
+        let kept: Vec<(u64, FileBytes, String)> = self
             .synthetic
             .iter()
             .filter_map(|inode| {
@@ -2686,6 +2827,44 @@ impl MinimalWorld {
     /// own identifier to decide whether it already holds the lock.
     fn thread_id(task: TaskId) -> u32 {
         (i64::from(task.get()) + GUEST_PID) as u32
+    }
+
+    /// Releases a task parked in a futex wait this world holds, to take a signal: the wait ends
+    /// with `EINTR`, and the signal rides on the task's next stop.
+    fn interrupt_wait(&mut self, task: TaskId) -> Vec<Wake> {
+        let mut released = Vec::new();
+        for queue in self.waiters.values_mut() {
+            let before = queue.len();
+            queue.retain(|w| w.task != task);
+            if queue.len() != before {
+                released.push(Wake { task, ret: -errno::EINTR });
+            }
+        }
+        self.waiters.retain(|_, queue| !queue.is_empty());
+        released
+    }
+
+    /// The effects with the oldest signal waiting for this task attached, where the task carries
+    /// on from this stop with an answer: the kernel delivers it as the task returns.
+    fn with_pending_signal(&mut self, task: TaskId, mut effects: Effects) -> Effects {
+        let TaskState::Runnable(Resume::Emulate { ret } | Resume::EmulateAndSignal { ret, .. }) =
+            effects.state
+        else {
+            return effects;
+        };
+        let Some(queue) = self.pending_signals.get_mut(&task) else {
+            return effects;
+        };
+        if queue.is_empty() {
+            return effects;
+        }
+        let signal = queue.remove(0);
+        if queue.is_empty() {
+            self.pending_signals.remove(&task);
+        }
+        self.raised.entry(task).or_default().push(signal);
+        effects.state = TaskState::Runnable(Resume::EmulateAndSignal { ret, signal });
+        effects
     }
 
     /// Reads a `timespec` as a count of nanoseconds.
@@ -3069,11 +3248,31 @@ impl MinimalWorld {
             // at the caller is answered here; one aimed elsewhere is refused rather than
             // misdirected and delivering to another task is not something this world
             // can do.
+            // A signal to another thread waits for that thread's next stop, where the kernel
+            // delivers it under the thread's own disposition. A thread parked in a wait this world
+            // holds is released from it with `EINTR`, as a signal releases it on Linux.
             sys::TGKILL if args[1] as u32 != Self::thread_id(ctx.task()) => {
-                return Err(ctx.refuse(
-                    "BOHR-2004",
-                    "a signal sent to another thread is not modelled here".to_owned(),
-                ));
+                let target = TaskId(i64::from(args[1] as u32).wrapping_sub(GUEST_PID) as u32);
+                let alive = self.born.contains(&target) && !self.ended.contains(&target);
+                let signal = args[2] as u32;
+                let ret = if !alive {
+                    -errno::ESRCH
+                } else if signal == 0 || signal > 64 {
+                    if signal == 0 { 0 } else { -errno::EINVAL }
+                } else {
+                    self.pending_signals.entry(target).or_default().push(signal);
+                    let interrupted = self.interrupt_wait(target);
+                    ctx.emit(EventKind::Syscall {
+                        nr,
+                        args,
+                        ret: 0,
+                        emulated: true,
+                        data_digest: None,
+                    })?;
+                    return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST)
+                        .releasing(interrupted));
+                };
+                (ret, Resume::Emulate { ret }, None)
             }
             sys::TGKILL | sys::KILL => {
                 let signal = if nr == sys::KILL { args[1] } else { args[2] } as u32;
@@ -3145,28 +3344,36 @@ impl MinimalWorld {
                 let ret = self.make_directory(ctx, dirfd, GuestAddr(at))?;
                 (ret, Resume::Emulate { ret }, None)
             }
-            // Pipes would need a second endpoint the model has no way to schedule.
+            // A pipe is a stream pair, and streams are the cluster's: a world with a `[cluster]`
+            // answers this call, and one without has no network to make the pair from.
             sys::PIPE2 => {
                 let ret = self.unimplemented(ctx, nr)?;
                 (ret, Resume::Emulate { ret }, None)
             }
-            // Nothing is ever ready, and saying so is not the same as refusing: a caller reads the
-            // absence of `POLLNVAL` as proof the descriptors it asked about are open, and a C
-            // library that concludes otherwise aborts before `main` runs.
-            // **An infinite wait cannot be answered by saying nothing happened.** Nothing this
-            // world holds becomes ready on its own, so `poll` with no timeout is a wait with no
-            // end, and returning nought is a value Linux cannot produce for one. A wait with a
-            // timeout is answered as the timeout expiring, which is true.
-            sys::POLL if (args[2] as i32) < 0 => {
-                return Err(ctx.refuse(
-                    "BOHR-2004",
-                    "poll with no timeout waits on something this world cannot make ready"
-                        .to_owned(),
-                ));
-            }
+            // Readiness as Linux reports it for what this world holds: a file, a directory and the
+            // standard descriptors are always ready for what was asked, a descriptor nobody holds
+            // is `POLLNVAL`. Where nothing is ready the call is the wait it asked for: its timeout
+            // spent in virtual time, or, with none, a wait nothing here can end — judged as any
+            // other wait, which is a deadlock once every task is in one.
             sys::POLL => {
-                let ret = Self::clear_poll_results(ctx, GuestAddr(args[0]), args[1])?;
-                (ret, Resume::Emulate { ret }, None)
+                let ready = self.poll_ready(ctx, GuestAddr(args[0]), args[1])?;
+                let timeout = args[2] as i32;
+                if ready != 0 || timeout == 0 {
+                    (ready, Resume::Emulate { ret: ready }, None)
+                } else {
+                    ctx.emit(EventKind::Syscall {
+                        nr,
+                        args,
+                        ret: 0,
+                        emulated: true,
+                        data_digest: None,
+                    })?;
+                    if timeout < 0 {
+                        return Ok(Effects::wait(SYSCALL_COST));
+                    }
+                    let ahead = Tick(u64::from(timeout.unsigned_abs()).saturating_mul(1_000_000));
+                    return Ok(Effects::go(Resume::Emulate { ret: 0 }, ahead));
+                }
             }
             // Sleeping costs virtual time and no real time at all, which is what makes a test that
             // waits a day finish in the time it takes to run the code around the waiting.
@@ -3275,12 +3482,84 @@ impl MinimalWorld {
                 let ret = if self.is_file(args[0] as i64) { 0 } else { -errno::EBADF };
                 (ret, Resume::Emulate { ret }, None)
             }
-            sys::STATX if self.io_uring => {
+            sys::STATX => {
                 let ret = self.statx_at(ctx, args)?;
                 (ret, Resume::Emulate { ret }, None)
             }
-            sys::PRCTL | sys::STATX => {
+            sys::PRCTL => {
+                let ret = self.prctl(ctx, args)?;
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // Watching files for change has a fallback in every program that uses it, polling,
+            // and a world whose files change only by the guest's own calls has nothing a watch
+            // would report that the guest does not already know.
+            nr if sys::INOTIFY.contains(&nr) => {
                 let ret = self.unimplemented(ctx, nr)?;
+                (ret, Resume::Emulate { ret }, None)
+            }
+            sys::CHMOD | sys::FCHMODAT => {
+                let (dirfd, path, mode) = if nr == sys::CHMOD {
+                    (AT_FDCWD as u64, args[0], args[1])
+                } else {
+                    (args[0], args[1], args[2])
+                };
+                let ret = match self.stat_target(ctx, dirfd, path, 0)? {
+                    Ok((Some(inode), _)) => {
+                        self.modes.insert(inode, (mode as u32) & 0o7777);
+                        0
+                    }
+                    Ok((None, _)) => 0,
+                    Err(errno) => errno,
+                };
+                (ret, Resume::Emulate { ret }, None)
+            }
+            sys::FCHMOD => {
+                let ret = match self.open.get(&(args[0] as i64)) {
+                    Some(file) => {
+                        if let Some(inode) = file.inode {
+                            self.modes.insert(inode, (args[1] as u32) & 0o7777);
+                        }
+                        0
+                    }
+                    None => -errno::EBADF,
+                };
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // Space reserved, or a file extended with zeros; nothing else this world can promise.
+            // Punching holes and collapsing ranges are refused as a filesystem without them
+            // refuses them, and every caller keeps the path for that.
+            sys::FALLOCATE => {
+                /// `FALLOC_FL_KEEP_SIZE`.
+                const KEEP_SIZE: u64 = 1;
+                let fd = args[0] as i64;
+                let ret = if !self.open.contains_key(&fd) {
+                    -errno::EBADF
+                } else if !self.is_file(fd) {
+                    -errno::ENODEV
+                } else {
+                    match args[1] {
+                        0 => {
+                            let end = args[2].saturating_add(args[3]);
+                            let length = self.length_of(fd).unwrap_or(0);
+                            if end > length { self.truncate(fd, end) } else { 0 }
+                        }
+                        KEEP_SIZE => 0,
+                        _ => -errno::EOPNOTSUPP,
+                    }
+                };
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // Write-back started and nothing promised: the call says so itself, so it marks
+            // nothing durable here.
+            sys::SYNC_FILE_RANGE => {
+                let fd = args[0] as i64;
+                let ret = if !self.open.contains_key(&fd) {
+                    -errno::EBADF
+                } else if self.is_file(fd) {
+                    0
+                } else {
+                    -errno::ESPIPE
+                };
                 (ret, Resume::Emulate { ret }, None)
             }
             sys::NEWFSTATAT => {
@@ -3595,15 +3874,41 @@ pub(crate) fn read_c_string(
 }
 
 impl WorldModel for MinimalWorld {
+    /// The earliest timed wait this world armed itself.
+    fn next_deadline(&self) -> Option<Tick> {
+        self.timeouts.keys().next().map(|(at, _)| *at)
+    }
+
+    /// Ends every timed wait whose deadline has come with `ETIMEDOUT`.
+    ///
+    /// A timer fires only into the wait that armed it: the task must still be in that wait, by its
+    /// number, and on the word it named. Checked when it fires, which is what makes cancelling it
+    /// on a wake unnecessary.
+    fn on_deadline(&mut self, ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
+        let now = ctx.world_now();
+        let mut effects = DueEffects::default();
+        while let Some(entry) = self.timeouts.first_entry() {
+            if entry.key().0 > now {
+                break;
+            }
+            let ((_, task), (word, seq)) = entry.remove_entry();
+            if self.wait_seq.get(&task) == Some(&seq) && self.cancel_wait(task, word) {
+                effects.wake.push(Wake { task, ret: -errno::ETIMEDOUT });
+            }
+        }
+        Ok(effects)
+    }
+
     fn identity(&self) -> WorldModelId {
         if self.surveying.is_some() {
-            WorldModelId::new("minimal-survey", 1)
+            WorldModelId::new("minimal-survey", 2)
         } else {
-            WorldModelId::new("minimal", 1)
+            WorldModelId::new("minimal", 2)
         }
     }
 
     fn task_created(&mut self, task: TaskId, parent: TaskId) {
+        self.born.insert(task);
         if let Some(word) = self.creating.remove(&parent) {
             self.exit_word.insert(task, word);
         }
@@ -3611,6 +3916,9 @@ impl WorldModel for MinimalWorld {
 
     fn task_exited(&mut self, task: TaskId) -> Vec<Wake> {
         self.creating.remove(&task);
+        self.ended.insert(task);
+        self.pending_signals.remove(&task);
+        self.raised.remove(&task);
 
         // A task can end while queued on a word, by its group exiting around it. Left in the queue
         // it would be chosen by a later wake, and released into a run it is no longer part of.
@@ -3634,6 +3942,10 @@ impl WorldModel for MinimalWorld {
     }
 
     fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError> {
+        // A node's first task is nobody's clone, so it is known from its first stop here: without
+        // it a thread signalling its own main thread was told the thread did not exist, on every
+        // node but the first and after every restart.
+        self.born.insert(ctx.task());
         match &stop.kind {
             // `exit_group` ends the process, so every task of this node goes with it — including
             // the ones parked in a call this model is holding. Said here rather than left to the
@@ -3644,7 +3956,10 @@ impl WorldModel for MinimalWorld {
                 let ended = NodeOp::Ended { node: ctx.node(), by: ctx.task() };
                 Ok(Effects { node_ops: vec![ended], ..effects })
             }
-            StopKind::SyscallEntry { nr, args } => self.syscall(*nr, *args, ctx),
+            StopKind::SyscallEntry { nr, args } => {
+                let effects = self.syscall(*nr, *args, ctx)?;
+                Ok(self.with_pending_signal(ctx.task(), effects))
+            }
 
             // The only call this model replaces rather than answers is a mapping, and the address
             // it landed at exists only here.
@@ -3679,6 +3994,22 @@ impl WorldModel for MinimalWorld {
                 ctx.set_regs(&regs)?;
                 ctx.emit(EventKind::ClockRead { presented: now })?;
                 Ok(Effects::go(Resume::Continue, SYSCALL_COST))
+            }
+
+            // A signal this world sent comes back from the kernel on its way to the task, and is
+            // let through: the task's own disposition decides what it does.
+            StopKind::Signal { signal }
+                if self.raised.get(&ctx.task()).is_some_and(|sent| sent.contains(signal)) =>
+            {
+                if let Some(sent) = self.raised.get_mut(&ctx.task()) {
+                    if let Some(at) = sent.iter().position(|s| s == signal) {
+                        sent.remove(at);
+                    }
+                    if sent.is_empty() {
+                        self.raised.remove(&ctx.task());
+                    }
+                }
+                Ok(Effects::go(Resume::DeliverSignal { signal: *signal }, Tick::ZERO))
             }
 
             // A signal that would end the task ends it. Letting the task carry on leaves it to

@@ -1,0 +1,9 @@
+# The seeded defect, and what `bohr check lease_clock` holds it to; see docs/TESTING.md §16.
+defect = "trusts the wall clock for a lease, and outlives it when the clock is set back"
+
+[check]
+works = { min_events = 100 }
+# The step back is written down, so every seed finds it; without it, none does.
+finds = { seeds = "1..10", code = "GuestCrashed", at_least = 10 }
+never_finds = { scenario = "scenario-steady.toml", seeds = "1..10" }
+repeats = { scenario = "scenario-drawn.toml", seed = 7, times = 50 }

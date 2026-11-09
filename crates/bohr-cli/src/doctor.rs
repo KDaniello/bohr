@@ -177,18 +177,20 @@ fn host_checks() -> Vec<Check> {
         describe(seccomp, "a filter can be installed", "filters are unavailable"),
     ));
 
+    // A failure, not a warning: without its own identifier namespace a guest's threads carry the
+    // host's numbers, the kernel writes them into guest memory, and two runs of one seed differ.
     let namespaces = probe::can_use_namespaces();
     checks.push(
         Check::new(
             "namespaces",
-            verdict(namespaces, Verdict::Warn),
+            verdict(namespaces, Verdict::Fail),
             describe(
                 namespaces,
                 "a guest can be isolated",
-                "a guest would see the host's own machine",
+                "a guest would see the host's own machine, and threaded runs diverge",
             ),
         )
-        .with_remedy("sysctl user.max_user_namespaces   # must be above zero"),
+        .with_remedy(namespace_remedy()),
     );
 
     let aslr = probe::can_disable_aslr();
@@ -343,4 +345,24 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
         Verdict::Skip,
         "this build cannot inspect a program it could not run",
     )])
+}
+
+/// What to type where namespaces are refused, which depends on who refuses them.
+///
+/// Ubuntu from 24.04 refuses them to unprivileged programs through AppArmor unless a profile names
+/// the program; the answer there is a profile for this binary, not a host-wide switch. Elsewhere
+/// the count of namespaces a user may hold is the setting.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn namespace_remedy() -> String {
+    let restricted =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_ok_and(|v| v.trim() == "1");
+    if !restricted {
+        return "sysctl user.max_user_namespaces   # must be above zero".to_owned();
+    }
+    let exe = std::env::current_exe()
+        .map_or_else(|_| "/usr/local/bin/bohr".to_owned(), |p| p.display().to_string());
+    format!(
+        "printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile bohr {exe} flags=(unconfined) {{\n  userns,\n}}\n' | sudo tee /etc/apparmor.d/bohr && sudo apparmor_parser -r /etc/apparmor.d/bohr   # AppArmor lets this binary, and no other, make namespaces"
+    )
 }

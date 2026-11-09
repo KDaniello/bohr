@@ -78,6 +78,7 @@ fn run(kinds: DrawnFaults, seed: u64) -> Judged {
         disk: DiskConfig::default(),
         fault_policy: FaultPolicy {
             kill: (1, 32),
+            enomem: (0, 0),
             targeting: Targeting::Guided,
             restart_after: Tick(Tick::MILLISECOND.get()),
             arm_after: Tick(0),
@@ -113,6 +114,7 @@ fn run_two(kinds: DrawnFaults, seed: u64) -> Judged {
         disk: DiskConfig::default(),
         fault_policy: FaultPolicy {
             kill: (1, 32),
+            enomem: (0, 0),
             targeting: Targeting::Guided,
             restart_after: Tick(Tick::MILLISECOND.get()),
             arm_after: Tick(0),

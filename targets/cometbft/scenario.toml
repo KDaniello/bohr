@@ -1,0 +1,51 @@
+# CometBFT with one validator and the kvstore application, killed where it stands and started again.
+#
+# A block CometBFT commits is final, so what it answers for a height may never change: the probe
+# asks for the latest block, and a hash at a height that changes is a finding. The height must also
+# move once the node is up. The prepared state is a chain made by `cometbft init` with its genesis
+# at the start of the epoch, because the world's wall clock starts there and a genesis in the
+# future is a node that sleeps until it.
+
+[run]
+horizon_ticks = 30_000_000_000    # thirty seconds of virtual time
+
+[state]
+dir = "targets/cometbft/state"
+cwd = "/"
+
+[cluster]
+nodes = 1
+argv = ["targets/cometbft/build/cometbft", "start", "--home", "/data", "--proxy_app", "kvstore"]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[disk]
+sync_semantics = "strict"
+
+[faults]
+kill_probability = "1/2000"
+restart_after_ticks = 500_000_000
+budget_per_run = 3
+
+# CometBFT's JSON-RPC takes named parameters only, so an empty table rather than an empty list.
+[[probe]]
+name = "finality"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 500_000_000
+key = "block.header.height"
+value = "block_id.hash"
+property = "never-reverts"
+
+[[probe]]
+name = "liveness"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 500_000_000
+value = "block.header.height"
+property = "advances"
+within_ticks = 10_000_000_000

@@ -5,9 +5,11 @@
 
 #![forbid(unsafe_code)]
 
+mod check;
 mod doctor;
 mod execute;
 mod explore;
+mod facts;
 mod findings;
 mod guests;
 mod handover;
@@ -17,6 +19,7 @@ mod init;
 mod probe;
 mod reduce;
 mod replay;
+mod subjects;
 mod survey;
 mod targets;
 mod wire;
@@ -32,7 +35,7 @@ use clap::{Parser, Subcommand};
 use crate::guests::Demo;
 
 /// Exit codes are part of the contract: a pipeline branches on them, so "the tool found a bug" and
-/// "the tool is broken" must never share one. See `docs/API.md` §7.6.
+/// "the tool is broken" must never share one. See `docs/API.md` §7.10.
 mod exit {
     /// Nothing was found.
     pub(crate) const CLEAN: u8 = 0;
@@ -116,6 +119,9 @@ enum Command {
         /// Write a scenario bundle even for a clean run.
         #[arg(long, value_name = "FILE")]
         save: Option<String>,
+        /// Write what the run came to as one line of JSON, for a program to read.
+        #[arg(long, value_name = "FILE")]
+        facts: Option<String>,
         /// How execution is interleaved.
         #[arg(long, default_value = "pct")]
         scheduler: String,
@@ -269,6 +275,57 @@ enum Command {
         master_seed: u64,
     },
 
+    /// Hold subjects to the checks they declare: a pack's `[check]`, a seeded defect's `bug.toml`.
+    ///
+    /// Each check is a property of runs — they repeat, stay clean without faults, find what was
+    /// seeded — and is the same code for every subject. See `docs/API.md` §7.9.
+    Check {
+        /// Subjects: a pack name, a defect's directory name, or the path of either's file.
+        subjects: Vec<String>,
+        /// Every subject in this repository.
+        #[arg(long)]
+        all: bool,
+        /// Only these checks, comma-separated.
+        #[arg(long, value_delimiter = ',', value_name = "CHECKS")]
+        only: Vec<String>,
+        /// Fewer repeats, and nothing that sweeps a range of seeds.
+        #[arg(long)]
+        quick: bool,
+        /// Print what would be checked, and run nothing.
+        #[arg(long)]
+        plan: bool,
+        /// How many runs at once.
+        #[arg(long, short = 'j', default_value_t = 4)]
+        jobs: usize,
+        /// Where results are written, one JSON file per subject.
+        #[arg(short = 'o', long, value_name = "DIR", default_value = "target/check")]
+        out: String,
+    },
+
+    /// Run each seed of a range once and say what was found on which.
+    Sweep {
+        /// The scenario.
+        scenario: String,
+        /// The seeds, `a..b`, both ends included.
+        #[arg(long, value_name = "A..B", value_parser = hunt::parse_seeds)]
+        seeds: (u64, u64),
+        /// Count the seeds that found this: an outcome kind or a diagnostic code.
+        #[arg(long, value_name = "CODE")]
+        expect: Option<String>,
+        /// Exit 0 only if at least this many seeds found what --expect names.
+        #[arg(long, value_name = "N", requires = "expect")]
+        at_least: Option<u64>,
+        /// Take every fault out of the scenario first.
+        #[arg(long)]
+        no_faults: bool,
+        /// How many runs at once.
+        #[arg(long, short = 'j', default_value_t = 4)]
+        jobs: usize,
+        /// The program, after `--`; the first word of the scenario's argv when not given.
+        #[arg(last = true)]
+        program: Vec<String>,
+    },
+
     /// Group the findings in a directory by what went wrong, each group led by its smallest run.
     Findings {
         /// The directory of bundles.
@@ -373,6 +430,34 @@ enum Command {
         /// How to write it.
         #[arg(long, value_name = "FORMAT", default_value = "text")]
         format: String,
+        /// Only these nodes, comma-separated.
+        #[arg(long, value_delimiter = ',', value_name = "N")]
+        node: Vec<u32>,
+        /// Only these kinds of event, comma-separated: syscall, schedule, task, packet, disk,
+        /// fault, node, wait, clock, assertion, record, diagnostic, domain.
+        #[arg(long, value_delimiter = ',', value_name = "KINDS")]
+        kind: Vec<String>,
+        /// From this virtual time on: `1.3s`, `250ms`.
+        #[arg(long, value_name = "TIME", value_parser = parse_virtual)]
+        from: Option<u64>,
+        /// Up to this virtual time.
+        #[arg(long, value_name = "TIME", value_parser = parse_virtual)]
+        to: Option<u64>,
+        /// Twenty events before this one and five after.
+        #[arg(long, value_name = "EVENT")]
+        around: Option<u64>,
+        /// Fold a loop of up to four events, repeated three times or more, into two lines.
+        #[arg(long)]
+        squash: bool,
+    },
+
+    /// Tell how a stored run got to what it found: the verdict, the steps before it, what next.
+    Explain {
+        /// The bundle to explain.
+        bundle: String,
+        /// Print the same as one JSON object.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print the version, and the four contract numbers a bug report needs.
@@ -601,7 +686,8 @@ fn compare_implementations(
     // also why they would have: an implementation that crashed produced no value to compare.
     for (name, completed) in group.names.iter().zip(&group.executions) {
         if !matches!(completed.report.outcome, Outcome::Clean) {
-            eprintln!("{name}: {:?}", completed.report.outcome);
+            let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+            eprintln!("{name}: {}    {}", verdict.headline, verdict.code);
             return Ok(exit::FINDING);
         }
     }
@@ -613,7 +699,8 @@ fn compare_implementations(
         }
         bohr_kernel::Verdict::Finding(outcome) => {
             println!("{}", bohr_report::describe::outcome_word(&outcome));
-            eprintln!("{outcome:?}");
+            let verdict = bohr_report::narrate::verdict(&outcome);
+            eprintln!("{}    {}", verdict.headline, verdict.code);
             Ok(exit::FINDING)
         }
         bohr_kernel::Verdict::Clean | bohr_kernel::Verdict::Skipped => Err(CliError::Internal(
@@ -646,6 +733,7 @@ fn dispatch() -> Result<u8, CliError> {
             tape,
             repeat,
             save,
+            facts,
             scheduler,
             strict_determinism,
             max_events,
@@ -730,6 +818,7 @@ fn dispatch() -> Result<u8, CliError> {
                 &tape,
                 repeat,
                 save.as_deref(),
+                facts.as_deref(),
                 strict_determinism,
                 &scheduler,
                 config,
@@ -845,6 +934,49 @@ fn dispatch() -> Result<u8, CliError> {
             binary,
             master_seed,
         }),
+        Command::Check { subjects, all, only, quick, plan, jobs, out } => {
+            let subjects = if all {
+                if !subjects.is_empty() {
+                    return Err(CliError::Usage(
+                        "BOHR-1001: --all names every subject; naming some as well says two things"
+                            .to_owned(),
+                    ));
+                }
+                subjects::all()?
+            } else if subjects.is_empty() {
+                return Err(CliError::Usage(
+                    "BOHR-1001: name a subject to check, or pass --all".to_owned(),
+                ));
+            } else {
+                subjects.iter().map(|s| subjects::resolve(s)).collect::<Result<_, _>>()?
+            };
+            check::check(&check::Request {
+                subjects,
+                only,
+                options: check::Options { quick },
+                plan,
+                jobs,
+                out: out.into(),
+            })
+        }
+        Command::Sweep { scenario, seeds, expect, at_least, no_faults, jobs, program } => {
+            if program.len() > 1 {
+                return Err(CliError::Usage(
+                    "BOHR-1001: a sweep runs one program; its arguments belong in the scenario's \
+                     argv"
+                        .to_owned(),
+                ));
+            }
+            check::sweep(&check::Sweep {
+                scenario: scenario.into(),
+                seeds,
+                expect,
+                at_least,
+                no_faults,
+                jobs,
+                program: program.into_iter().next(),
+            })
+        }
         Command::Findings { dir, json } => findings::findings(&dir, json),
         Command::Init { nodes, out, program } => init::init(program, nodes, &out),
         Command::Reduce { bundle, out, budget, keep, binaries } => {
@@ -874,7 +1006,10 @@ fn dispatch() -> Result<u8, CliError> {
             survey::run(program, seed, config.as_deref(), max_events, patch_cpuid)
         }
         Command::Note { bundle, text } => note(&bundle, &text),
-        Command::Trace { bundle, format } => trace(&bundle, &format),
+        Command::Trace { bundle, format, node, kind, from, to, around, squash } => {
+            trace(&bundle, &format, &Selection { node, kind, from, to, around }, squash)
+        }
+        Command::Explain { bundle, json } => explain(&bundle, json),
         Command::Doctor { target, syscalls } => doctor::run(target.as_deref(), syscalls),
         Command::Selftest { seed, repeat, guest, save_dir } => {
             selftest(Seed(seed), repeat, guest, save_dir.as_deref())
@@ -950,6 +1085,38 @@ fn replay_bundles(
 /// Two files rather than one only where the run was too long to draw whole. The page names the
 /// second and says what is in it, so a reader who has both knows why, and a reader who has only
 /// the page is not left wondering what it is not showing them.
+/// What each probe request of a stored run reads: its node, and the fields of its answer.
+///
+/// Derived from the scenario the bundle carries, by the same code that wrote the probe's plan, so
+/// request `i` on the page is request `i` the probe asked. A bundle with no scenario, or no probe
+/// in it, has no lanes and the page draws no chain.
+fn chain_lanes(bundle: &bohr_trace::Bundle) -> Vec<bohr_report::chain::Lane> {
+    let Some(text) = bundle.section(bohr_trace::SectionId::Config) else {
+        return Vec::new();
+    };
+    let Ok(loaded) = bohr_world::config::load(&String::from_utf8_lossy(text)) else {
+        return Vec::new();
+    };
+    bohr_world::probe::requests_of(&loaded.probes)
+        .iter()
+        .map(|request| {
+            // The first probe that reads this request names its key and value; others reading it
+            // compare the same answer.
+            let reader = loaded.probes.iter().find(|p| {
+                p.nodes.contains(&request.node)
+                    && p.port == request.port
+                    && p.rpc == request.rpc
+                    && p.params == request.params
+            });
+            bohr_report::chain::Lane {
+                node: request.node,
+                key: reader.and_then(|p| p.key.first().cloned()),
+                value: reader.map_or_else(String::new, |p| p.value.clone()),
+            }
+        })
+        .collect()
+}
+
 fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
@@ -969,7 +1136,8 @@ fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_owned());
-    let rendered = bohr_report::render_from(&bundle, Some(&short), Some(&named))
+    let lanes = chain_lanes(&bundle);
+    let rendered = bohr_report::render_chain(&bundle, Some(&short), Some(&named), &lanes)
         .map_err(|e| CliError::Usage(e.to_string()))?;
 
     if rendered.html.len() > bohr_report::MOST_BYTES {
@@ -1044,13 +1212,79 @@ fn note(path: &str, text: &str) -> Result<u8, CliError> {
 ///
 /// Read rather than replayed: a bundle carries its log, and re-running the guest to print what is
 /// already in the file would need the guest to still exist and would take as long as the run did.
-fn trace(path: &str, format: &str) -> Result<u8, CliError> {
+/// Which events `bohr trace` prints.
+///
+/// By the events' own fields, never by the text of a line: a selection and its complement are the
+/// whole log, and `json` selects exactly what `text` does.
+#[derive(Debug, Default)]
+struct Selection {
+    node: Vec<u32>,
+    kind: Vec<String>,
+    from: Option<u64>,
+    to: Option<u64>,
+    around: Option<u64>,
+}
+
+impl Selection {
+    fn admits(&self, event: &bohr_trace::Event) -> bool {
+        (self.node.is_empty() || self.node.contains(&event.node.get()))
+            && (self.kind.is_empty()
+                || self.kind.iter().any(|k| k == bohr_report::text::kind_word(&event.kind)))
+            && self.from.is_none_or(|from| event.tick.get() >= from)
+            && self.to.is_none_or(|to| event.tick.get() <= to)
+            && self.around.is_none_or(|at| {
+                let id = event.id.get();
+                id.saturating_add(20) >= at && id <= at.saturating_add(5)
+            })
+    }
+}
+
+/// Virtual time as a person writes it: `1.3s`, `250ms`, `40us`, `100ns`, in nanoseconds.
+///
+/// Parsed from its digits, never through floating point, so `1.3s` is exactly 1 300 000 000.
+fn parse_virtual(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let scale: u64 = match unit {
+        "s" => 1_000_000_000,
+        "ms" => 1_000_000,
+        "us" | "µs" => 1_000,
+        "ns" | "" => 1,
+        other => return Err(format!("{other:?} is not a unit of time: write s, ms, us or ns")),
+    };
+    let (whole, part) = number.split_once('.').unwrap_or((number, ""));
+    let whole: u64 = whole.parse().map_err(|_| format!("{text:?} is not a time"))?;
+    let digits = scale.to_string().len() - 1;
+    if part.len() > digits || !part.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("{text:?} is finer than a nanosecond"));
+    }
+    let part: u64 =
+        if part.is_empty() { 0 } else { format!("{part:0<digits$}").parse().unwrap_or(0) };
+    whole
+        .checked_mul(scale)
+        .and_then(|n| n.checked_add(part))
+        .ok_or_else(|| format!("{text:?} is longer than a run can be"))
+}
+
+fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Result<u8, CliError> {
+    for kind in &selection.kind {
+        if !bohr_report::text::KINDS.contains(&kind.as_str()) {
+            return Err(CliError::Usage(format!(
+                "BOHR-1001: no kind of event named {kind:?}; the kinds are {}",
+                bohr_report::text::KINDS.join(", ")
+            )));
+        }
+    }
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
     let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
-    let model = bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+    let mut model =
+        bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+    model.events.retain(|e| selection.admits(e));
 
     let written = match format {
+        "text" if squash => bohr_report::text::write_squashed(&model.events, &model.records),
         "text" => bohr_report::text::write_log_with(&model.events, &model.records),
         "json" => bohr_report::jsonl::write_log(&model.events),
         other => {
@@ -1065,6 +1299,24 @@ fn trace(path: &str, format: &str) -> Result<u8, CliError> {
     // the most misleading thing a bundle can hand a reader, because every event in it is true.
     if let Some(damage) = &model.truncated {
         eprintln!("{path}: the log ends early: {damage}");
+    }
+    Ok(exit::CLEAN)
+}
+
+/// How a stored run got to what it found, from the bundle alone.
+fn explain(path: &str, json: bool) -> Result<u8, CliError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+    let model = bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+    let story = bohr_report::narrate::story(&model, path);
+    if json {
+        println!("{}", bohr_report::narrate::story_json(&story));
+    } else {
+        print!("{}", bohr_report::narrate::write_story(&story));
+    }
+    if let Some(damage) = &model.truncated {
+        eprintln!("{path}: the log ends early, so the story may too: {damage}");
     }
     Ok(exit::CLEAN)
 }
@@ -1096,6 +1348,7 @@ fn run_program(
     tape: &Tape,
     repeat: usize,
     save: Option<&str>,
+    facts: Option<&str>,
     strict: bool,
     scheduler: &str,
     config: RunConfig,
@@ -1158,12 +1411,18 @@ fn run_program(
         }
         Ok(completed) => {
             let armed = loaded.is_some_and(bohr_world::LoadedConfig::asks_for_adversity);
-            report_run(&path, repeat, &completed, armed);
+            report_run(&path, repeat, &completed, armed, save);
             if let Some(file) = save {
                 let bytes = execute::to_bundle(&completed, tape, None)?;
                 std::fs::write(file, bytes)
                     .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
                 eprintln!("  saved {file}");
+            }
+            if let Some(file) = facts {
+                let mut line = crate::facts::Facts::of(&completed).to_json();
+                line.push('\n');
+                std::fs::write(file, line)
+                    .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
             }
             if !matches!(completed.report.outcome, Outcome::Clean) {
                 return Ok(exit::FINDING);
@@ -1187,6 +1446,7 @@ fn run_program(
     _tape: &Tape,
     _repeat: usize,
     _save: Option<&str>,
+    _facts: Option<&str>,
     _strict: bool,
     _scheduler: &str,
     _config: RunConfig,
@@ -1232,32 +1492,60 @@ pub(crate) fn parse_duration(text: &str) -> Result<std::time::Duration, String> 
 /// `armed` says the scenario asked for something to go wrong, which is read against what landed:
 /// the two come apart, and a run that met no adversity at all reads exactly like one that met
 /// plenty and answered it.
-fn report_run(label: &str, repeat: usize, completed: &execute::Completed, armed: bool) {
+fn report_run(
+    label: &str,
+    repeat: usize,
+    completed: &execute::Completed,
+    armed: bool,
+    saved: Option<&str>,
+) {
     let outcome = &completed.report.outcome;
-    let status = if matches!(outcome, Outcome::Clean) { "ok" } else { "finding" };
-    let (syscalls, busiest) = execute::syscall_profile(&completed.log, 5);
-    // `stops` is how many times the guest crossed into the supervisor, which is what a run costs;
-    // `syscalls` counts what the trace records, where one ring entry is a call of its own.
-    eprintln!(
-        "{label:<18} {status:<8} {repeat} runs · {} events · {syscalls} syscalls · {} stops · {} \
-         draws · {}",
-        completed.report.events,
-        completed.report.metrics.stops,
-        completed.report.journal.len(),
-        completed.report.digest
-    );
-    if !matches!(outcome, Outcome::Clean) {
-        eprintln!("  {outcome:?}");
-        for note in execute::last_diagnostics(&completed.log, 3) {
-            eprintln!("  {note}");
+    let verdict = bohr_report::narrate::verdict(outcome);
+    let program = std::path::Path::new(label)
+        .file_name()
+        .map_or_else(|| label.to_owned(), |n| n.to_string_lossy().into_owned());
+    let virtual_time = bohr_report::narrate::seconds(completed.report.ticks.get());
+    let nodes = completed.counters.nodes;
+    // The verdict first, in words, with its code to search by; the counters last, where a reader
+    // who fixes bohr itself looks and nobody else has to.
+    if verdict.found {
+        eprintln!("FINDING  {}    {}", verdict.headline, verdict.code);
+    } else {
+        eprintln!(
+            "ok       {program} · {virtual_time} virtual · {nodes} node{}",
+            if nodes == 1 { "" } else { "s" }
+        );
+    }
+    if verdict.found {
+        // What else the outcome names, once each: the verdict says the first, and a diagnostic
+        // repeating the outcome's own words is the same fact a second time.
+        let detail = bohr_report::describe::outcome_detail(outcome).unwrap_or("");
+        for also in detail.split("; ").skip(1) {
+            eprintln!("  also     {also}");
+        }
+        for note in execute::last_diagnostics(&completed.stats, 3) {
+            let message = note.split_once(": ").map_or(note.as_str(), |(_, m)| m);
+            if !detail.contains(message) {
+                eprintln!("  {note}");
+            }
         }
         // A run that hung says nothing about where. The calls it made most is the shortest route
         // to the loop it is in.
         if matches!(outcome, Outcome::GuestHung(_)) {
+            let (_, busiest) = execute::syscall_profile(&completed.stats, 5);
+            eprintln!("  the calls it made most");
             for (nr, count) in busiest {
                 let name = bohr_report::syscall_name(nr).unwrap_or("?");
                 eprintln!("  {count:>9} × {nr:<4} {name}");
             }
+        }
+        eprintln!("  next");
+        match saved {
+            Some(file) => {
+                eprintln!("    bohr explain {file}     how it got there, step by step");
+                eprintln!("    bohr report {file}      one page");
+            }
+            None => eprintln!("    run it again with --save run.bohr, then bohr explain run.bohr"),
         }
     }
     // Where the guest carries the coverage runtime, what it covered and whether the map could
@@ -1279,8 +1567,30 @@ fn report_run(label: &str, repeat: usize, completed: &execute::Completed, armed:
         }
     }
     if !completed.degradations.is_empty() {
-        eprintln!("  degraded: {}", completed.degradations.join(", "));
+        // Once per cause with how many said it: one per node made the same line seven times.
+        let mut causes: Vec<(&str, usize)> = Vec::new();
+        for cause in &completed.degradations {
+            match causes.iter_mut().find(|(c, _)| c == cause) {
+                Some((_, n)) => *n += 1,
+                None => causes.push((cause, 1)),
+            }
+        }
+        let said: Vec<String> = causes
+            .iter()
+            .map(|(c, n)| if *n == 1 { (*c).to_owned() } else { format!("{c} ×{n}") })
+            .collect();
+        eprintln!("  degraded: {}", said.join(", "));
     }
+    let (syscalls, _) = execute::syscall_profile(&completed.stats, 0);
+    // `stops` is how many times the guest crossed into the supervisor, which is what a run costs;
+    // `syscalls` counts what the trace records, where one ring entry is a call of its own.
+    eprintln!(
+        "  {repeat} runs · {} events · {syscalls} syscalls · {} stops · {} draws · {}",
+        completed.report.events,
+        completed.report.metrics.stops,
+        completed.report.journal.len(),
+        completed.report.digest
+    );
 }
 
 fn selftest(
@@ -1322,7 +1632,7 @@ fn selftest(
             }
             Ok(completed) => {
                 // A built-in guest runs against no scenario, so nothing was armed to land.
-                report_run(guest.name(), repeat, &completed, false);
+                report_run(guest.name(), repeat, &completed, false, None);
                 if !matches!(completed.report.outcome, Outcome::Clean) {
                     worst = worst.max(exit::FINDING);
                 }

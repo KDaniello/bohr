@@ -11,11 +11,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chain;
 pub mod describe;
 mod escape;
 mod html;
 pub mod jsonl;
 mod model;
+pub mod narrate;
 pub mod text;
 mod window;
 
@@ -83,7 +85,28 @@ pub fn render_from(
     // One criterion, read once. The sidecar was written on the event count and the page said so on
     // whether the window elided anything, so a run whose keep-set covered everything got a file
     // the page never mentioned.
-    let rendered = html::render_with(&model, sidecar_name, bundle_name);
+    let rendered = html::render_with(&model, sidecar_name, bundle_name, &[]);
+    let sidecar = rendered.partial.then(|| jsonl::write_log(&model.events));
+    Ok(Rendered { html: rendered.html, sidecar })
+}
+
+/// The same, with the lanes the chain's timeline is drawn from.
+///
+/// The lanes are the scenario's — which node each probe request asks, and which fields of its
+/// answer are the key and the value — and the caller derives them, because this crate reads the
+/// bundle and not the world model that knows what a probe is.
+///
+/// # Errors
+///
+/// As [`render`].
+pub fn render_chain(
+    bundle: &bohr_trace::Bundle,
+    sidecar_name: Option<&str>,
+    bundle_name: Option<&str>,
+    lanes: &[chain::Lane],
+) -> Result<Rendered, ReportError> {
+    let model = RunModel::of(bundle)?;
+    let rendered = html::render_with(&model, sidecar_name, bundle_name, lanes);
     let sidecar = rendered.partial.then(|| jsonl::write_log(&model.events));
     Ok(Rendered { html: rendered.html, sidecar })
 }

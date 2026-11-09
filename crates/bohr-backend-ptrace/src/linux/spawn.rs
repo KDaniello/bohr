@@ -180,6 +180,7 @@ pub(super) fn spawn_traced(
     spec: &GuestSpec,
     isolate: bool,
     coverage: Option<libc::c_int>,
+    allocations: bool,
 ) -> Result<libc::pid_t, BackendError> {
     let program = spec.executable.as_ref().or(spec.argv.first()).ok_or_else(|| {
         BackendError::CannotStart {
@@ -209,7 +210,7 @@ pub(super) fn spawn_traced(
         reason: "program path contains a NUL".to_owned(),
     })?;
 
-    let filter = syscalls::filter_program().map_err(|e| BackendError::CannotStart {
+    let filter = syscalls::filter_program(allocations).map_err(|e| BackendError::CannotStart {
         program: program.clone(),
         reason: format!("cannot build the syscall filter: {e}"),
     })?;
@@ -250,6 +251,12 @@ pub(super) fn spawn_traced(
         }
         return Err(BackendError::CannotStart { program: program.clone(), reason });
     }
+
+    // The guest is a grandchild, and its parent exits before it is attached to. Orphaned, it would
+    // pass to init and stop being this process's descendant, which is all `ptrace_scope = 1` —
+    // Ubuntu's default — lets a process attach to. As a subreaper this process takes it instead.
+    // SAFETY: a flag on this process, with no pointer passed.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
 
     // SAFETY: fork is async-signal-safe. Neither child returns to the caller: every path ends in
     // execve or _exit.

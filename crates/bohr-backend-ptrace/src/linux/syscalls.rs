@@ -141,6 +141,14 @@ pub(crate) const TABLE: &[Entry] = &[
     trace(141, "setpriority"),
     trace(142, "sched_setparam"),
     trace(144, "sched_setscheduler"),
+    trace(285, "fallocate"),
+    trace(277, "sync_file_range"),
+    trace(90, "chmod"),
+    trace(91, "fchmod"),
+    trace(268, "fchmodat"),
+    trace(294, "inotify_init1"),
+    trace(254, "inotify_add_watch"),
+    trace(255, "inotify_rm_watch"),
     trace(84, "rmdir"),
     trace(32, "dup"),
     trace(33, "dup2"),
@@ -247,16 +255,8 @@ const UNMODELLED: &[(u32, &str)] = &[
     (40, "sendfile"),
     (326, "copy_file_range"),
     (437, "openat2"),
-    (285, "fallocate"),
-    (277, "sync_file_range"),
     (101, "ptrace"),
     (321, "bpf"),
-    (294, "inotify_init1"),
-    (90, "chmod"),
-    (91, "fchmod"),
-    (268, "fchmodat"),
-    (254, "inotify_add_watch"),
-    (255, "inotify_rm_watch"),
 ];
 
 /// Name of a syscall this build does not model, where one is known.
@@ -272,13 +272,24 @@ pub(crate) fn name_of_unmodelled(nr: u32) -> Option<&'static str> {
 /// The default action is to trace, not to allow: an unknown syscall must reach the supervisor to be
 /// refused by name. Bare tracing would stop twice on every syscall including the ones nothing
 /// models, which is the cost this filter exists to avoid.
-pub(crate) fn filter_program() -> Result<BpfProgram, String> {
+///
+/// `allocations` stops `brk`, `mremap` and an anonymous `mmap` as well, which a run where memory
+/// can run out needs and every other run would pay a stop per allocation for.
+pub(crate) fn filter_program(allocations: bool) -> Result<BpfProgram, String> {
+    /// `brk` and `mremap`, admitted unless allocations are watched.
+    const ALLOCATING: [i64; 2] = [12, 25];
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = TABLE
         .iter()
         .filter(|e| e.disposition == Disposition::Admit)
+        .filter(|e| !(allocations && ALLOCATING.contains(&e.nr)))
         .map(|e| (e.nr, vec![]))
         .collect();
-    rules.insert(MMAP, mapping_rules()?);
+    let mut mapping = mapping_rules()?;
+    if allocations {
+        // The coverage map stays admitted; the anonymous mapping, the first rule, does not.
+        mapping.remove(0);
+    }
+    rules.insert(MMAP, mapping);
 
     let filter = SeccompFilter::new(
         rules,
@@ -329,7 +340,7 @@ mod tests {
 
     #[test]
     fn the_filter_builds_from_the_table() {
-        let program = filter_program().expect("filter");
+        let program = filter_program(false).expect("filter");
         assert!(!program.is_empty(), "an empty filter would trace nothing");
     }
 

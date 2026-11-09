@@ -346,7 +346,7 @@ recorded difficulty:
 | `race_counter` | classic lost update between two threads | 1 | < 100 runs |
 | `race_init` | double initialisation under a specific interleaving | 2 | < 1 000 runs |
 | `raft_toy` | acknowledged write lost when the leader dies before it replicates | 3 | 256 runs |
-| `kv_ack_quiet` | the same as `kv_fsync`, with the self-check removed: the store loses an acknowledged write and exits 0 | 2 | 60 of 60 seeds |
+| `kv_ack_quiet` | the same as `kv_fsync`, with the self-check removed: the store loses an acknowledged write and exits 0 | 2 | 44 of 60 seeds: a crash lands every unsynced write a quarter of the time, and then nothing is lost |
 | `kv_fsync` | acknowledged write lost after crash, no `fsync` | 2 | < 2 min |
 | `partition_split_brain` | two leaders under a one-directional partition | 3 | < 10 min |
 
@@ -614,3 +614,77 @@ react to pull requests alone, and a repository pushed to directly opened none th
 those paths, so two blocking gates had never run once — which is indistinguishable from two
 gates that always passed. A gate that does not fire on push is not a gate, and
 `scripts/check-workflows.py` now refuses one.
+
+## 16. Subjects and checks
+
+**A gate is not a script, but a line in a subject's file.** Until v0.5 every gate on a real program
+was a shell script of its own, each repeating one of five moves — run seeds and count a code, repeat
+a seed, run without faults, survey the walls, compare with and without — and a pack got checks only
+where somebody typed them. The v0.3 reth pack exited on `EFBIG` at ten virtual seconds, reported
+itself clean, and lived a whole version that way: nothing asked whether the program had run at all.
+
+A *subject* is a pack's `[check]` table or a seeded defect's `bug.toml`; a *check* is one of eleven
+properties of runs, the same code for every subject ([`API.md`](./API.md) §7.9). `works` comes first
+and is the one v0.3 lacked: enough events, enough virtual time, a probe that was answered.
+
+| Gate | Was | Is |
+|---|---|---|
+| G4.1 | `g41all.sh` | four `finds` in `examples/chain-toy/bug.toml` |
+| G4.2 | `g41.sh scenario.toml 1 200` | `never_finds` in the same file |
+| G4.3 | `bohr run --repeat 1000` by hand | `repeats` |
+| G4.5 | `g45.sh` | `costs` with `metric = "events"` |
+| G5.1 | not automated | `works` and `adversity` in each pack |
+| G5.2 | `walls5.sh` | `walls` in each pack |
+| G5.4 | a script | `finds` and `never_finds` in `testdata/bugs/alloc_unchecked/bug.toml` |
+| G3.6 | a test in `hunt.rs` | `refuses_changed` |
+
+`crates/bohr-cli/tests/subjects.rs` reads every subject rather than listing them: the declarations
+must parse, every seeded defect with a scenario must have a `bug.toml`, and the quick checks hold on
+every built defect in `make test`; every check in full runs in `make test-hunting`. Packs are checked
+by `bohr check <pack>` in the Linux gate, because their binaries are built by the pack and are not
+in a checkout.
+
+What this does not do: write a bound. `at_least = 30` is the subject author's, written before the
+run; a check that fails is reported with the bound it missed, never moved to meet the measurement.
+
+A new target or defect is therefore files and not code: a subject declares, and eleven checks that
+already exist hold it to what it declared.
+
+## 17. Golden guests
+
+**A golden guest is not a test of a program, but a known load on one part of bohr.** One program,
+`testdata/golden/golden.c`, has a mode per subsystem and does exactly the number of operations it
+is given; `testdata/golden/golden.toml` lists the workloads and holds each to the same checks. What
+the packs measure is bohr and a client together, and a slowdown there names neither the subsystem
+nor the cause; a golden workload names both.
+
+| Workload | Part of bohr it loads |
+|---|---|
+| `syscall` | the stop path: seccomp, ptrace, the kernel loop, the trace writer |
+| `clock` | the clock model |
+| `write`, `read` | the file model |
+| `fsync`, `bigfile` | sync: disk images and the snapshots that share their blocks |
+| `mmap` | mappings and the write-back of mapped pages |
+| `pipe` | pipes, which a world with a `[cluster]` models as a stream pair |
+| `futex`, `threads` | futex waits and wakes, scheduling, the task books |
+| `epoll` | readiness: epoll and eventfd |
+| `socketpair`, `udp` | sockets in a node, the network between nodes |
+| `alloc` | the filter: what passes without a stop |
+| `compute` | the floor: a guest that asks nothing |
+
+Every workload is held to `works`, `repeats` and `replays`, and the calm ones to `performs`:
+microseconds per operation with startup taken out, the same natively, stops, events and bytes of
+log per operation, the supervisor's peak memory and its processor time. Five more entries put a
+workload under the faults of its own subsystem — a disk answering `EIO`, kills, refused memory,
+stepped clocks, dropped datagrams — and ask that the faults land and the runs still repeat.
+
+`make golden` runs the lot in about seventy seconds on four cores. The bounds are ceilings at about
+twice the first measurement on that machine, written in the file beside the workload.
+
+What this does not do: stand in for a client. A golden workload is one load at a time, and a client
+mixes them; the packs remain where a release is measured, and the golden set is where a cost is
+explained.
+
+The golden set is therefore the place a change to any part of bohr is measured first: a regression
+in a subsystem shows as its own workload's line, before any client is built.
+

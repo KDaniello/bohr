@@ -1363,7 +1363,7 @@ Three error classes, with different handling:
 | Determinism hazard | unsupported syscall, un-neutralised `RDRAND`, unavailable branch counter | abort the run or mark it `degraded`, never continue silently |
 | Finding | property violated, guest crash, hang | **not an error**: this is a successful run that found something, exit code 1 |
 
-Exit codes are part of the contract ([`API.md`](./API.md) §7.9) because a CI pipeline branches on
+Exit codes are part of the contract ([`API.md`](./API.md) §7.10) because a CI pipeline branches on
 them: `0` clean, `1` finding, `2` usage, `3` internal.
 
 **Logs.** `tracing`, human-readable by default, `--log-format json` for CI. Mandatory span fields

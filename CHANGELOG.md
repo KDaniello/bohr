@@ -6,6 +6,140 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.5.0 — the model the targets need, and checks that say so
+
+A target that bohr cannot model is not tested: it stops at the first call nobody answers, or runs
+on a model that answers it wrongly, and either way the run that comes back proves nothing. v0.5
+answers what geth and CometBFT ask, makes every claim about a target or a seeded defect a check
+anyone can run, says what a run found in words, and runs about twice as fast. It is not published.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.5.0` |
+| `tape_abi` | `1` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every stored bundle replays to its digest. Figures are under `[v0_5.*]` in
+[`benches/baseline.toml`](./benches/baseline.toml). `make pr`, `make gate` (13 of 13) and the
+mutation harness (13 of 13) are green on Ubuntu 24.04; two gates of this version are not measured
+and one is not built, and are listed below.
+
+### The model
+
+- **Answered now**: `statx`, `prctl`, `chmod`, `fchmod`, `fchmodat`, `fallocate` (and a crash
+  treats the bytes it reserved as written), `sync_file_range`, `sched_setparam` and
+  `sched_setscheduler` as an unprivileged process is answered. `inotify_init1` is answered `ENOSYS`
+  on purpose: geth falls back to polling its keystore.
+- **Waits that end**: futex waits with a timeout in a world without a cluster, an endless `poll`
+  that blocks until something is ready, and a timer that belongs to the wait that armed it — one
+  woken early can no longer end a later wait with `ETIMEDOUT`.
+- **Signals to another thread**: `tgkill` queues the signal for the named task, ends its wait with
+  `EINTR`, and delivers it at its next stop.
+- **Readiness as Linux reports it**: `EPOLLET` and `EPOLLONESHOT`, and a write to an `eventfd`
+  wakes whoever polls it. reth stopped spinning on a descriptor reported ready forever: 352,301
+  events in 5.4 s for fourteen virtual seconds, against 6.67 million in 62 s.
+- **Pipes**, in a world with a `[cluster]`, as a stream pair: a read blocks on an empty pipe, a
+  write wakes it, a closed write end reads as the end.
+- **Memory that runs out**: `[faults] enomem_probability = "1/500"` refuses `brk`, `mremap` and
+  anonymous `mmap` at drawn moments, as a fault. A store that writes through a refused mapping is
+  found on 43 of 60 seeds with refusals and on none of 60 without.
+- **Packs for geth and CometBFT**: each reaches thirty virtual seconds, serves its RPC to the probe
+  (59 of 59 and 58 of 58 answered), repeats 100 times to one digest, and stays clean on ten seeds
+  with no faults.
+
+### A claim is a check
+
+- **`bohr check <subject>`** holds a pack's `[check]` table or a seeded defect's `bug.toml` to
+  eleven checks that are the same code for every subject: `works`, `repeats`, `replays`, `clean`,
+  `adversity`, `finds`, `never_finds`, `walls`, `costs`, `workers_agree`, `refuses_changed`. A
+  bound is written in the file before the run; a check or a parameter nobody reads is refused.
+- **`bohr sweep <scenario> --seeds a..b --expect CODE`** is one `finds` as a command.
+- **`bohr run --facts FILE`** writes what a run came to as one line of JSON for a program to read.
+- **The golden guests** (`make golden`): one program with a mode per part of bohr — the stop path,
+  the clock, files, syncs, mappings, pipes, futexes, threads, readiness, sockets, the network
+  between nodes, the filter, a guest that only computes — each a known number of operations, held
+  to `works`, `repeats`, `replays` and `performs`: microseconds per operation with startup taken out,
+  the same natively, stops and events per operation, and the supervisor's peak memory. Five more put
+  a workload under its own subsystem's faults. 71 checks, about seventy seconds on four cores.
+- **What the checks found on their first run**: a kernel defect that made a process failing from a
+  thread other than its first lose its status on some runs (fixed in v0.4.0); a seeded defect whose
+  documented 60 of 60 had become 44 of 60 when the crash model began to land every unsynced write a
+  quarter of the time — bisected to that change and rewritten as a bound from the model; pipes,
+  never modelled; and a `msync` that copied a whole mapped file on every call.
+
+### Reading a run
+
+- **A run says its verdict first**: `FINDING`, what broke in words, and the code to search it by;
+  then what else the outcome names, the commands that show more, and last the counters. No outcome
+  is printed in a program's debug form any more.
+- **`bohr explain <bundle>`** tells how a run got to what it found: the faults, the node changes,
+  the failed tasks and the diagnostics before the violation, at the moment a probe saw it rather
+  than when the run was judged. `--json` carries the same fields.
+- **`bohr trace` selects**: `--node`, `--kind`, `--from`/`--to` in virtual time as written,
+  `--around`, and `--squash`, which folds a repeating loop into two lines.
+- **The report draws the chain**: one lane per node, what it answered the probe over virtual time,
+  coloured by value, with the stretches it was down shaded and the moment of the violation marked.
+- **`bohr findings`** words each group's verdict and names the command that explains its smallest
+  run.
+
+### Speed
+
+Against v0.4.0's binary on one host, alternately:
+
+| | v0.4 | v0.5 |
+|---|---:|---:|
+| one intercepted call | 8.7–8.8 µs | 4.0–4.3 µs |
+| a 64-run `redb` campaign, one worker | 5,487 ms | 2,922 ms |
+| the same, four workers | 1,683 ms | 815 ms |
+| a campaign worker's peak memory | 50.1 MB | 14.6 MB |
+
+geth's dev chain over thirty virtual seconds holds the supervisor at 92 MB, against 107 MB for geth
+itself over thirty seconds run natively (P5.3, bound twice).
+
+- **An emulated call is one stop, not two**: answered at the seccomp stop and released.
+- **Nothing reads a run's log back**: the counts are kept while it is written, a run nobody will
+  read is digested and not encoded, and a binary is hashed once per process.
+- **A file is held in 64 KiB blocks**, each shared with the disk images taken at every sync, so a
+  write after a sync copies a block and not the file; a file grown with zeros shares one block of
+  them; a mapping written back copies only the pages that changed.
+
+### Fixed
+
+- **A futex timer belongs to the wait that armed it.** In a cluster, a timed wait woken early left
+  its timer armed, and the same task's next wait on that word ended with `ETIMEDOUT` at the first
+  one's deadline; v0.4.0 ends `rewaits_after_a_timed_wait` with status 1, this release with 0.
+- **A thread can signal a node's first thread on every node.** `tgkill` answered `ESRCH` for the
+  first thread of any node but node 0, and of node 0 after a restart.
+- **A write made while a signal waits is a write.** A call answered with a signal to deliver after
+  it was read as answering 0: the disk never marked the write as unsynced, so no crash could lose
+  it, and the record channel was not recognised.
+- **`poll` sees a node's `eventfd` and `epoll` descriptors** on a node with no socket, where it called
+  them invalid.
+- **A probe runs under memory refusals**: its allocations were handed to a world that models none,
+  and every probed run with `enomem_probability` was refused at the probe's start.
+
+### What it does not do
+
+- **Preempt a thread that spins.** The instruction budget needs a branch counter, and neither host
+  this was built on exposes one; G5.7 is not built, and the Solana validator, which spins, has no
+  pack.
+- **Run Lighthouse.** A consensus client needs an execution client beside it, and no pack pairs
+  them yet.
+- **Measure a pack against native** (G5.6, P5.1): no pack declares a `[bench]` workload.
+- **Run a probe cheaply.** The probe costs 6.5% more events and 47% more wall time on `chain-toy`;
+  each round's answers are parsed by the world, and a file appended to after a sync copies its last
+  block.
+- **Tell a host's out-of-memory kill from a guest's crash.** A guest the host kills reads as
+  `GuestCrashed: killed by signal 9`.
+- **Keep a pipe one-way.** A write to a pipe's read end is delivered where the kernel answers
+  `EBADF`, and a world without a `[cluster]` still refuses pipes.
+- **Rebuild `redb-hunt` to its pinned digest on another host**: the pack refuses the binary built on
+  the test VM, as it must.
+- **Hold G5.1 as written.** An hour of virtual time on 60 seeds is seventeen hours of reth; it was
+  restated, before its runs, to twenty seeds of each pack at its own horizon. None of the sixty
+  seeds ended in a model refusal.
+
 ## v0.4.0 — blockchain oracles
 
 A blockchain client that is wrong does not crash: it finalises a block and later reports another at

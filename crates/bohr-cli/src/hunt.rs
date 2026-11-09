@@ -57,7 +57,7 @@ pub(crate) fn parse_seeds(text: &str) -> Result<(u64, u64), String> {
 ///
 /// `[durability]` goes with the faults: it judges what a restarted node came back without, a run
 /// with no kill has nothing for it to judge, and a scenario arming it without one is refused.
-fn without_faults(text: &str) -> Result<String, CliError> {
+pub(crate) fn without_faults(text: &str) -> Result<String, CliError> {
     let mut value: toml::Table =
         toml::from_str(text).map_err(|e| refused(format!("the pack's scenario: {e}")))?;
     value.remove("faults");

@@ -35,7 +35,7 @@ pub use event::{
     NEVER_REVERTS_CODE, NodeState, PROBE_CODES, PacketFate, SwitchReason, UNIQUE_CODE,
     short_digest,
 };
-pub use log::{TraceWriter, digest_of, read_events, read_events_lossy};
+pub use log::{TraceStats, TraceWriter, digest_of, read_events, read_events_lossy};
 pub use redact::redact;
 pub use syscalls::{Arg, named_syscalls, syscall_args, syscall_name};
 

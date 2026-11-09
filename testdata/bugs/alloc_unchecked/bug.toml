@@ -1,0 +1,12 @@
+# The seeded defect, and what `bohr check alloc_unchecked` holds it to; see docs/TESTING.md §16.
+defect = "writes through MAP_FAILED when an allocation is refused"
+
+[check]
+# Without refusals nothing about memory is intercepted, so a calm run is a handful of events.
+works = {}
+finds = { seeds = "1..60", code = "GuestCrashed", at_least = 20 }
+# With memory to spare the store never meets a refusal, so the defect is out of reach.
+never_finds = { scenario = "scenario-ample.toml", seeds = "1..60" }
+repeats = { times = 100 }
+replays = {}
+walls = {}

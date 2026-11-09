@@ -259,7 +259,7 @@ impl NodeDisk {
             return;
         };
         self.pending.remove(&inode);
-        world.restore_file(inode, self.durable.content.get(&inode).map(Arc::clone));
+        world.restore_file(inode, self.durable.content.get(&inode).cloned());
     }
 
     /// Rewinds the durability baseline to an older synced image, and forgets what came after it.
@@ -326,11 +326,10 @@ impl NodeDisk {
             match landing {
                 Landing::Nothing => {}
                 Landing::Everything => {
-                    image.content.insert(*inode, Arc::clone(current));
+                    image.content.insert(*inode, current.clone());
                 }
                 Landing::PerSector => {
-                    let mut out =
-                        image.content.get(inode).map_or_else(Vec::new, |held| (**held).clone());
+                    let mut out = image.content.get(inode).cloned().unwrap_or_default();
                     // **A length is metadata, and it survives whole.** The size that comes back is
                     // the one the file had or the one it grew to, never a figure between them, and
                     // under the ordered mode every mainstream filesystem defaults to the data a
@@ -344,7 +343,8 @@ impl NodeDisk {
                     // meet.
                     let durable_len = out.len() as u64;
                     if landed_at(seed, *inode, u64::MAX) && current.len() as u64 > durable_len {
-                        out.extend_from_slice(&current[durable_len as usize..]);
+                        let tail = current.range_to_vec(durable_len as usize..current.len());
+                        out.write_at(durable_len as usize, &tail);
                     }
 
                     // **Bounded by both files, not by one of them.** A sector is copied out of
@@ -371,8 +371,8 @@ impl NodeDisk {
                                 continue;
                             }
                             if landed_at(seed, *inode, sector) {
-                                out[start as usize..end as usize]
-                                    .copy_from_slice(&current[start as usize..end as usize]);
+                                let sector = current.range_to_vec(start as usize..end as usize);
+                                out.write_at(start as usize, &sector);
                                 landed = true;
                             } else {
                                 lost = true;
@@ -380,7 +380,7 @@ impl NodeDisk {
                         }
                     }
                     torn |= landed && lost;
-                    image.content.insert(*inode, Arc::new(out));
+                    image.content.insert(*inode, out);
                 }
             }
         }
@@ -432,7 +432,7 @@ impl NodeDisk {
                 ));
             }
             let durable = self.durable.content.get(inode);
-            if durable.is_some_and(|held| Arc::ptr_eq(held, content)) {
+            if durable.is_some_and(|held| held.same(content)) {
                 continue;
             }
             let live_content = live.file_content(*inode);
@@ -448,10 +448,14 @@ impl NodeDisk {
             // Every byte is one somebody put there: what the last sync promised, what a write
             // since then put in its place, or nothing at all where the file grew past what was
             // durable and the hole below reads as a sparse file does.
-            for (at, byte) in content.iter().enumerate() {
+            for (at, byte) in
+                content.segments(0..content.len()).flat_map(|(from, part)| (from..).zip(part))
+            {
                 let held = durable.and_then(|b| b.get(at));
                 let written = live_content.and_then(|b| b.get(at));
-                if held != Some(byte) && written != Some(byte) && !(at >= durable_len && *byte == 0)
+                if held != Some(*byte)
+                    && written != Some(*byte)
+                    && !(at >= durable_len && *byte == 0)
                 {
                     return Some(format!(
                         "inode {inode} came back holding a byte at {at} that nothing wrote"
@@ -495,6 +499,7 @@ fn landed_at(seed: u64, inode: u64, sector: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytes::FileBytes;
 
     /// A disk holding `count` synced images, the newest last, each one byte longer than the last.
     ///
@@ -506,7 +511,7 @@ mod tests {
         for length in 1..=count {
             let mut grown = MinimalWorld::new();
             grown.restore_disk(crate::minimal::DiskImage {
-                content: [(2, Arc::new(vec![b'x'; length]))].into_iter().collect(),
+                content: [(2, FileBytes::from_vec(vec![b'x'; length]))].into_iter().collect(),
                 names: [("/log".to_owned(), 2)].into_iter().collect(),
                 directories: std::collections::BTreeSet::new(),
                 next_inode: 3,
@@ -524,7 +529,7 @@ mod tests {
     fn holding(bytes: &[u8]) -> MinimalWorld {
         let mut world = MinimalWorld::new();
         world.restore_disk(crate::minimal::DiskImage {
-            content: [(2, Arc::new(bytes.to_vec()))].into_iter().collect(),
+            content: [(2, FileBytes::from_vec(bytes.to_vec()))].into_iter().collect(),
             names: [("/log".to_owned(), 2)].into_iter().collect(),
             directories: std::collections::BTreeSet::new(),
             next_inode: 3,
@@ -535,7 +540,7 @@ mod tests {
     /// The image a crash would have produced, edited by hand into one it must not.
     fn edited(disk: &NodeDisk, inode: u64, content: Vec<u8>) -> DiskImage {
         let mut image = disk.durable_image();
-        image.content.insert(inode, Arc::new(content));
+        image.content.insert(inode, FileBytes::from_vec(content));
         image
     }
 
@@ -635,9 +640,12 @@ mod tests {
     fn a_sync_shares_every_file_it_was_not_about() {
         let mut world = MinimalWorld::new();
         world.restore_disk(crate::minimal::DiskImage {
-            content: [(2, Arc::new(vec![b'a'; 64])), (3, Arc::new(vec![b'b'; 64]))]
-                .into_iter()
-                .collect(),
+            content: [
+                (2, FileBytes::from_vec(vec![b'a'; 64])),
+                (3, FileBytes::from_vec(vec![b'b'; 64])),
+            ]
+            .into_iter()
+            .collect(),
             names: [("/data".to_owned(), 2), ("/log".to_owned(), 3)].into_iter().collect(),
             directories: std::collections::BTreeSet::new(),
             next_inode: 4,
@@ -648,7 +656,7 @@ mod tests {
 
         let held = disk.durable.content.get(&3).expect("the untouched file is durable");
         let live = world.file_content(3).expect("and the world still holds it");
-        assert!(Arc::ptr_eq(held, live), "syncing one file copied another");
+        assert!(held.same(live), "syncing one file copied another");
     }
 
     /// A node that never synced has nothing to rewind to, and asking for one is not an error.

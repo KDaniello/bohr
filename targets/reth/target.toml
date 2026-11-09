@@ -14,3 +14,14 @@ scenario = "targets/reth/scenario.toml"
 
 [judge]
 oracle = "chain"
+
+# What `bohr check reth` holds the pack to; see docs/TESTING.md §16.
+[check]
+# A calm run reaches its fourteen virtual seconds and answers the probe, rather than failing on the way.
+works = { min_events = 100_000, min_virtual_s = 13, probe_answers = 0.9 }
+repeats = { times = 10 }
+replays = {}
+clean = { seeds = "1..10" }
+walls = {}
+# A changed binary is refused by its digest before anything runs.
+refuses_changed = true

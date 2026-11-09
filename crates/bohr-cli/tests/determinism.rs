@@ -223,6 +223,29 @@ fn a_failure_from_another_thread_is_found_on_every_run() {
     assert!(report.contains("exit status 3"), "{report}");
 }
 
+/// A timer armed for one futex wait ends that wait and no later one, alone and in a cluster.
+#[test]
+fn a_timed_wait_woken_early_leaves_no_timer_behind() {
+    let Some(path) = guest("rewaits_after_a_timed_wait") else {
+        return;
+    };
+    let (code, _, report) = bohr(&["run", "--seed", "1", "--repeat", "20", "--", &path]);
+    assert_eq!(code, 0, "{report}");
+    let cluster = write_scenario(
+        "rewaits",
+        &format!(
+            "[cluster]
+nodes = 1
+argv = [\"{path}\"]
+[run]
+horizon_ticks = 20_000_000_000
+"
+        ),
+    );
+    let (code, _, report) = bohr(&["run", "--seed", "1", "--config", &cluster, "--", &path]);
+    assert_eq!(code, 0, "{report}");
+}
+
 /// A file survives being unlinked while it is open, which is how a temporary file works and what a
 /// database relies on.
 #[test]
@@ -381,4 +404,24 @@ fn a_multi_node_cluster_of_real_programs_reproduces() {
         bohr(&["run", "--seed", "1", "--repeat", "20", "--config", &config, "--", &path]);
     assert!(code == 0 || code == 4, "three nodes must run as one world: {report}");
     assert!(!report.contains("DIVERGED"), "{report}");
+}
+
+/// The three waits a model once refused on purpose, each answered now and each repeating: a signal
+/// sent to another thread runs that thread's handler, a timed wait on a machine of its own times
+/// out, and a poll with no timeout on a ready descriptor returns.
+#[test]
+fn what_was_refused_on_purpose_now_runs_and_repeats() {
+    for (name, says) in [
+        ("signals_a_thread", "handled by the waiter"),
+        ("waits_with_a_timeout", "timed out"),
+        ("polls_forever", "ready"),
+    ] {
+        let Some(path) = guest(name) else {
+            continue;
+        };
+        let (code, out, report) = bohr(&["run", "--seed", "3", "--repeat", "100", "--", &path]);
+        assert_eq!(code, 0, "{name}: {report}");
+        assert!(!report.contains("DIVERGED"), "{name}: {report}");
+        assert!(String::from_utf8_lossy(&out).contains(says), "{name} said: {report}");
+    }
 }

@@ -24,6 +24,8 @@ struct RawPack {
     run: RawRun,
     judge: RawJudge,
     bench: Option<RawBench>,
+    /// The checks `bohr check` holds the pack to, read by [`crate::subjects`].
+    check: Option<toml::Table>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +85,8 @@ pub(crate) struct Pack {
     pub(crate) scenario: PathBuf,
     /// What judges a run.
     pub(crate) oracle: String,
+    /// The pack's `[check]` table, as written.
+    pub(crate) checks: Option<toml::Table>,
 }
 
 fn refused(text: String) -> CliError {
@@ -136,6 +140,7 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
         digest: raw.build.blake3.to_lowercase(),
         scenario: root.join(raw.run.scenario),
         oracle: raw.judge.oracle,
+        checks: raw.check,
         root,
     })
 }

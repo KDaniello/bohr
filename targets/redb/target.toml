@@ -17,3 +17,15 @@ scenario = "examples/redb-hunt/hunt.toml"
 
 [judge]
 oracle = "durability"
+
+# What `bohr check redb` holds the pack to; see docs/TESTING.md §16.
+[check]
+works = { min_events = 1_000 }
+repeats = { times = 50 }
+replays = {}
+clean = { seeds = "1..20" }
+adversity = { seeds = "1..20", at_least = 0.5 }
+walls = {}
+workers_agree = { runs = 64, jobs = 4 }
+# A changed binary is refused by its digest before anything runs.
+refuses_changed = true

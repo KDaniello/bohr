@@ -54,6 +54,8 @@ pub enum DrawSite {
     NodeFault = 30,
     /// Node clock: drift and step.
     ClockSkew = 31,
+    /// Node memory: whether an allocation is refused.
+    MemoryExhausted = 32,
 
     /// Guest randomness: `getrandom`, `/dev/urandom`, `AT_RANDOM`, the `RDRAND` trampoline.
     GuestRandom = 40,
@@ -87,6 +89,7 @@ impl DrawSite {
             Self::DiskError => "a disk error",
             Self::NodeFault => "whether a node dies",
             Self::ClockSkew => "a node's clock offset and drift",
+            Self::MemoryExhausted => "whether memory ran out",
             Self::GuestRandom => "randomness the guest asked for",
             Self::SdkRandom => "randomness the SDK asked for",
             Self::SdkFaultPoint => "whether a fault point fires",
@@ -115,6 +118,7 @@ impl DrawSite {
             23 => Self::DiskError,
             30 => Self::NodeFault,
             31 => Self::ClockSkew,
+            32 => Self::MemoryExhausted,
             40 => Self::GuestRandom,
             41 => Self::SdkRandom,
             42 => Self::SdkFaultPoint,
@@ -322,6 +326,7 @@ mod tests {
             DrawSite::DiskError,
             DrawSite::NodeFault,
             DrawSite::ClockSkew,
+            DrawSite::MemoryExhausted,
             DrawSite::GuestRandom,
             DrawSite::SdkRandom,
             DrawSite::SdkFaultPoint,

@@ -1,0 +1,9 @@
+# Memory that runs out: each allocation call is refused at the corpus-wide odds, drawn from the tape.
+# The store maps 600 records; a seed reaches the defect when one of its maps is refused.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/alloc_unchecked"]
+
+[faults]
+enomem_probability = "1/500"

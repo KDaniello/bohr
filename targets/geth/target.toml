@@ -1,0 +1,29 @@
+# geth, the Ethereum execution client, as a development chain under drawn crashes and restarts.
+
+[source]
+repository = "https://github.com/ethereum/go-ethereum"
+commit = "v1.17.10"
+
+[build]
+command = ["targets/geth/build.sh"]
+binary = "targets/geth/build/geth"
+blake3 = "7db156f6acbb64101c2940935b95f03fc3b85603735ecd23b57a991f4fad3827"
+
+[run]
+scenario = "targets/geth/scenario.toml"
+
+[judge]
+oracle = "chain"
+
+# What `bohr check geth` holds the pack to; see docs/TESTING.md §16.
+[check]
+# Thirty virtual seconds reached, not an exit on the way: a node that stops early is no measurement.
+works = { min_events = 20_000, min_virtual_s = 29, probe_answers = 0.9 }
+repeats = { times = 20 }
+replays = {}
+clean = { seeds = "1..10" }
+adversity = { seeds = "1..20", at_least = 0.5 }
+# inotify is answered ENOSYS on purpose; geth falls back to polling its keystore.
+walls = { allow = ["inotify_init1"] }
+# A changed binary is refused by its digest before anything runs.
+refuses_changed = true

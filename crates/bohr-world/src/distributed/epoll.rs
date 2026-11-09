@@ -35,6 +35,10 @@ pub(crate) const CTL_MOD: u64 = 3;
 pub(crate) const EPOLLIN: u32 = 0x001;
 /// The descriptor will accept a write.
 pub(crate) const EPOLLOUT: u32 = 0x004;
+/// Report a descriptor once, when it becomes ready, rather than for as long as it is.
+pub(crate) const EPOLLET: u32 = 1 << 31;
+/// Report a descriptor once, and then not again until it is modified.
+pub(crate) const EPOLLONESHOT: u32 = 1 << 30;
 
 /// Size of `struct epoll_event` on x86-64, which is packed: a `u32` and a `u64` with no padding.
 pub(crate) const EVENT_BYTES: usize = 12;
@@ -48,6 +52,10 @@ struct Watch {
     /// index in the guest's world, and a model that read it would be reading somebody else's
     /// bookkeeping.
     token: u64,
+    /// The readiness epoch this descriptor was last reported in, for an edge-triggered watch.
+    seen: Option<u64>,
+    /// Whether a one-shot watch has fired, and so reports nothing until it is modified.
+    fired: bool,
 }
 
 /// A task parked in `epoll_wait` or `poll`, and where its answer goes.
@@ -96,6 +104,10 @@ pub(crate) struct Epolls {
     next_counter: BTreeMap<NodeId, i64>,
     /// The next number for an instance a `poll` makes for itself.
     next_hidden: BTreeMap<NodeId, i64>,
+    /// Counts the moments something may have become ready: a delivery, a write to a counter, a
+    /// heal. An edge-triggered watch reports a descriptor once per epoch, which is what
+    /// "when it becomes ready" means to a model whose readiness only changes at those moments.
+    epoch: u64,
 }
 
 /// Where the instances a `poll` makes for itself are numbered from: past every number a guest can
@@ -105,6 +117,8 @@ pub(crate) const HIDDEN_BASE: i64 = 1 << 40;
 /// One descriptor that became ready, as `epoll_wait` reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Ready {
+    /// The descriptor, which the guest is never shown: it reads the token.
+    pub(crate) fd: i64,
     /// What happened.
     pub(crate) events: u32,
     /// The guest's token for the descriptor it happened on.
@@ -180,6 +194,11 @@ impl Epolls {
         self.counters.contains_key(&(node, self.resolve(node, fd)))
     }
 
+    /// Whether a node holds any poller or counter.
+    pub(crate) fn node_holds_any(&self, node: NodeId) -> bool {
+        self.instances.keys().chain(self.counters.keys()).any(|(held, _)| *held == node)
+    }
+
     /// Whether this is a descriptor these tables issued: a poller, a counter, or a copy of one.
     pub(crate) fn holds(&self, node: NodeId, fd: i64) -> bool {
         let at = (node, self.resolve(node, fd));
@@ -201,7 +220,10 @@ impl Epolls {
         };
         match op {
             CTL_ADD | CTL_MOD => {
-                instance.watched.insert(fd, Watch { events: watch.0, token: watch.1 });
+                instance.watched.insert(
+                    fd,
+                    Watch { events: watch.0, token: watch.1, seen: None, fired: false },
+                );
             }
             CTL_DEL => {
                 instance.watched.remove(&fd);
@@ -211,11 +233,42 @@ impl Epolls {
         true
     }
 
-    /// Everything an instance watches, as `(descriptor, wanted events, token)`.
+    /// Everything an instance may report now, as `(descriptor, wanted events, token)`.
+    ///
+    /// An edge-triggered watch already reported in this epoch is left out, and so is a one-shot
+    /// watch that has fired: reporting either again is a level a guest that asked for an edge
+    /// spins on.
     pub(crate) fn watched(&self, node: NodeId, epfd: i64) -> Vec<(i64, u32, u64)> {
         self.instances.get(&(node, self.resolve(node, epfd))).map_or_else(Vec::new, |instance| {
-            instance.watched.iter().map(|(fd, w)| (*fd, w.events, w.token)).collect()
+            instance
+                .watched
+                .iter()
+                .filter(|(_, w)| !w.fired)
+                .filter(|(_, w)| w.events & EPOLLET == 0 || w.seen != Some(self.epoch))
+                .map(|(fd, w)| (*fd, w.events, w.token))
+                .collect()
         })
+    }
+
+    /// Records that these descriptors were reported to the guest from an instance.
+    pub(crate) fn reported(&mut self, node: NodeId, epfd: i64, fds: &[i64]) {
+        let epoch = self.epoch;
+        let epfd = self.resolve(node, epfd);
+        if let Some(instance) = self.instances.get_mut(&(node, epfd)) {
+            for fd in fds {
+                if let Some(watch) = instance.watched.get_mut(fd) {
+                    watch.seen = Some(epoch);
+                    if watch.events & EPOLLONESHOT != 0 {
+                        watch.fired = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Opens a new readiness epoch: something may have become ready.
+    pub(crate) fn bump(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Parks a task until something the instance watches becomes ready.

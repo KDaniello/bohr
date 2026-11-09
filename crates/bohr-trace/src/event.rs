@@ -286,6 +286,9 @@ pub enum FaultKind {
     /// as its declaration-order discriminant, so a variant added anywhere but the end renumbers
     /// the ones after it and changes what every stored bundle hashes to.
     ChainReorg,
+    /// Refuse an allocation: `mmap` and `mremap` answer `ENOMEM`, `brk` leaves the break where it
+    /// was. Appended, for the reason above.
+    MemoryExhausted,
 }
 
 /// What a fault was applied to.

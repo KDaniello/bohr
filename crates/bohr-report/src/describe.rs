@@ -84,6 +84,7 @@ pub const fn fault_action(fault: FaultKind) -> &'static str {
         FaultKind::ClockStep => "a clock was stepped",
         FaultKind::ClockDrift => "a clock was set drifting",
         FaultKind::ChainReorg => "history was rewound and run again",
+        FaultKind::MemoryExhausted => "memory ran out",
     }
 }
 

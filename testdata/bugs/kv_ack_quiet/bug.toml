@@ -1,0 +1,11 @@
+# The seeded defect, and what `bohr check kv_ack_quiet` holds it to; see docs/TESTING.md §16.
+defect = "acknowledges a write before it is durable, and says nothing when it is lost"
+
+[check]
+works = { min_events = 100 }
+# The kill is written down inside the window, so every seed meets it; what the crash does with the
+# unsynced write is drawn — nothing landed half the time, everything a quarter, each sector the
+# rest — and the write survives where it all landed. About three seeds in four lose it.
+finds = { seeds = "1..20", code = "DurabilityViolated", at_least = 10 }
+repeats = { times = 100 }
+replays = {}

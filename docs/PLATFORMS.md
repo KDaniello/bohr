@@ -89,6 +89,7 @@ a host setting ourselves.**
 | `kernel.yama.ptrace_scope` | `0` or `1` (1 is fine: we are the parent) | `ptrace` denied, `BOHR-3001` |
 | `kernel.unprivileged_userns_clone` | `1` where the distribution has it (Debian derivatives) | namespace creation fails, `BOHR-3002` |
 | `user.max_user_namespaces` | `> 0` | same |
+| `kernel.apparmor_restrict_unprivileged_userns` | `0`, or a profile granting `userns` to the `bohr` binary (Ubuntu 23.10 and later set `1`) | namespace creation fails and threaded runs diverge; `bohr doctor` fails the check and prints the profile to install |
 | `kernel.perf_event_paranoid` | `≤ 2` for branch counters | `BOHR-2005`, degraded progress measurement |
 | `/proc/sys/vm/overcommit_memory` | any | none; noted because guests sometimes depend on it |
 

@@ -20,6 +20,8 @@ pub(crate) enum Due {
         task: TaskId,
         /// The word it waited on.
         word: u64,
+        /// Which of the task's waits armed it.
+        seq: u64,
     },
     /// A bounded `epoll_wait` ran out with nothing to report.
     PollTimeout {

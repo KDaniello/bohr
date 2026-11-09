@@ -245,7 +245,11 @@ fn then_names_the_finding(world: &mut Bohr) {
         return;
     }
     let run = world.last();
-    assert!(run.output.contains("finding"), "the finding was not reported:\n{}", run.output);
+    assert!(
+        run.output.to_lowercase().contains("finding"),
+        "the finding was not reported:\n{}",
+        run.output
+    );
 }
 
 #[then("a verdict is reached")]

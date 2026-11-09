@@ -141,7 +141,8 @@ fn report(completed: &execute::Completed, seed: u64) {
             "
 the guest did not run to completion, so this is not its surface:"
         );
-        println!("  {:?}", completed.report.outcome);
+        let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+        println!("  {}    {}", verdict.headline, verdict.code);
     }
 
     if completed.surveyed.is_empty() {

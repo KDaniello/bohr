@@ -739,6 +739,7 @@ enabled = ["net_partition", "node_kill", "node_freeze", "node_thaw", "node_resta
            "node_restart_from_snapshot", "disk_tear", "clock_skew"]
 budget_per_run = 8              # hard cap on drawn faults in one run
 kill_probability = "1/1000"     # odds a drawn node kill fires at a moment it may fire at
+enomem_probability = "1/500"    # odds a brk, mremap or anonymous mmap is refused with ENOMEM
 restart_after_ticks = 3_000_000 # 0 leaves a killed node dead, a cut standing, a link bad
 arm_after_ticks = 300_000_000   # nothing is drawn before here; 0 arms from the first instruction
 draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade", "recover_from_snapshot",
@@ -756,6 +757,14 @@ drift_ppm_max = 200
 mode = "auto"                   # auto | shm | pt | sdk | off
 shm_size = 65536
 ```
+
+**Memory that runs out.** `enomem_probability` refuses an allocation — `brk`, `mremap`, `mmap` of
+anonymous memory — at drawn moments, each a `memory_exhausted` fault counted as adversity: `mmap` and
+`mremap` answer `ENOMEM`, `brk` leaves the break where it was, which is how the kernel refuses one.
+`brk(0)`, which asks where the break is, is never refused. With it set, allocation calls stop in the
+supervisor and cost what any traced call does; without it the filter lets them through untraced, so
+a scenario that does not arm it pays nothing. The probe's node is outside it, as it is outside every
+fault.
 
 **What a build accepts is smaller than the shape, and says so.** Unknown keys are refused by name
 (`BOHR-1002`) rather than skipped, so a typo is never silently a default — and a section this build
@@ -1373,7 +1382,7 @@ port = 8545                      # optional; Ethereum's by default
 name = "head"                    # optional; what findings call it
 node = 0                         # or nodes = [...]; every node by default
 rpc = "eth_blockNumber"
-params = []                      # strings, integers, booleans, arrays and tables
+params = []                      # an array, or a table for a method that takes named params
 every_ticks = 50_000_000
 value = "."                      # a field of the result, dotted for nesting; "." is the result itself
 key = []                         # fields naming what a value belongs to; none for a single value
@@ -1576,6 +1585,7 @@ bohr run [OPTIONS] -- <program> [args...]
   --tape <file>           use this tape instead of deriving from a seed
   --repeat <n>            run n times and assert all trace digests are identical
   --save <file.bohr>      write a bundle even for a clean run
+  --facts <file.json>     write what the run came to as one line of JSON
   --scheduler <policy>    interleaving policy: pct, random or fair [default: pct]
   --strict-determinism    exit 4 if the run could not be fully guaranteed
 ```
@@ -1591,6 +1601,22 @@ a run goes to standard error. `bohr run -- ./cat /dev/urandom | head -c 100` the
 guest's bytes, and one seed puts the same bytes on the pipe every time. A repetition beyond the
 first is a check rather than an execution the user asked to see, so only one run of a seed delivers
 its output; what every repetition wrote is compared through the trace digest.
+
+**What a run says is in three levels: the verdict, then the evidence, then the log.** The summary
+on standard error leads with one line — `ok` and what ran, or `FINDING`, the verdict in words and
+the code to search it by (`BOHR-2040`, or the outcome's kind) — then whatever else the outcome
+names, the commands that show more, and last the counters a maintainer of bohr reads:
+`N runs · events · syscalls · stops · draws · digest`. No outcome is printed in a program's debug
+form; every view words it through one table (`bohr-report` `narrate`), so a summary, a story and a
+page never say one finding two ways.
+
+`--facts` is the run's outcome for a program to read, not the bundle and not the text on standard
+error: `outcome` (the outcome's kind, `Clean`, `GuestCrashed`, `ProbeViolated`, …), `detail`, `codes`
+(every `BOHR-NNNN` the outcome names), `digest`, `events`, `syscalls`, `stops`, `virtual_ns`,
+`adversity`, `probe_asked` and `probe_answered` (counted from each request's first answer, since a
+node asked before it serves its API is starting rather than failing), `log_bytes`, `peak_rss_kib` (the supervisor's own peak), `cpu_user_ms`,
+`cpu_system_ms`, `guest_cpu_ms`, `stop`, `degraded`. It is written for a completed run only; a
+run that did not complete leaves no file, and that absence is the answer.
 
 ### 7.2 `bohr explore` — the search
 
@@ -1812,7 +1838,65 @@ keeps state — and a comment per wall the survey found. A dynamically linked pr
 libraries its loader resolves copied into a prepared state beside the scenario, pinned by digest.
 The probabilities are a first guess and say so; `init` does not write over an existing file.
 
-### 7.9 Exit codes
+### 7.9 `bohr check` and `bohr sweep` — subjects and their checks
+
+```
+bohr check <subject>... | --all  [--only <checks>] [--quick] [--plan] [-j N] [-o <dir>]
+bohr sweep <scenario> --seeds <a..b> [--expect <code>] [--at-least N] [--no-faults] [-j N] [-- <program>]
+```
+
+A *subject* is not a test, but a declaration: a pack's `[check]` table in its `target.toml`, or a
+seeded defect's `bug.toml`. It names checks from one fixed set and the bounds they are held to, and
+`bohr check` carries them out by starting `bohr run --facts` as many times as each needs, `-j` at
+once. A subject named bare is looked up as `targets/<name>/`, then `testdata/bugs/<name>/`, then
+`examples/<name>/`.
+
+| Check | Holds when | Parameters |
+|---|---|---|
+| `works` | with every fault taken out, the program ran: no finding, enough events and virtual time, and a probe answered at least `probe_answers` of what it asked from each request's first answer on | `min_events`, `min_virtual_s`, `probe_answers`, `seed` |
+| `repeats` | `times` runs of one seed leave one digest | `times`, `seed` |
+| `replays` | a saved run of `seed` replays to its digest | `seed` |
+| `clean` | with every fault taken out, no seed finds anything | `seeds` |
+| `adversity` | at least `at_least` of the seeds met a fault | `seeds`, `at_least` |
+| `finds` | at least `at_least` seeds found `code`: an outcome kind or a diagnostic code | `seeds`, `code`, `at_least` |
+| `never_finds` | no seed finds anything | `seeds` |
+| `walls` | a survey without faults meets no wall outside `allow` | `allow`, `seed` |
+| `costs` | the scenario costs at most `max_ratio` of `against` by `events` or by `wall` | `against`, `metric`, `max_ratio`, `seed` |
+| `performs` | a golden workload costs at most its bounds per operation: time, slowdown against native, stops, the supervisor's peak memory | `max_us_per_op`, `max_slowdown`, `max_stops_per_op`, `max_rss_mib`, `best_of` |
+| `workers_agree` | a campaign of `runs` writes one summary at `-j 1` and at `-j jobs` | `runs`, `jobs` |
+| `refuses_changed` | a copy of the pack's binary one byte longer is refused by its digest | — |
+
+Every check also takes `scenario`, found beside the file that names it; without it, a pack's checks
+run the pack's scenario and a defect's run `scenario.toml` beside its `bug.toml`. The program is the
+pack's verified binary, or the first word of the scenario's argv. A `bug.toml` holds `defect` (one
+line saying what is wrong), `[check]`, and for a program with several defects one `[[defect]]` per
+defect with a `name` and its own `check` table. Fractions and ratios are read from their text in
+thousandths, never computed in floating point. A check or a parameter nobody reads is refused with
+`BOHR-1002`; a misspelt bound that was skipped would hold every time.
+
+The golden guests are a subject of their own, `testdata/golden/golden.toml`, named `golden`. Its
+`[[workload]]` entries carry `name`, `workload` (the golden program's mode, the name by default),
+`count`, `nodes`, `module` (the part of bohr it loads, in a line), `scenario` (tables added to the
+scenario it generates, such as a failing disk) and `check`. The scenario is generated: one node, or
+`nodes` of them, each running `program workload count`. `performs` belongs to a workload alone: it
+runs the workload and the same with a count of 0, both traced and natively, best of `best_of`, and
+divides what is left by the count; a workload of several nodes, or one with faults, has no native
+form and reports none.
+
+A run that did not complete is never counted as clean: `never_finds` over a range where runs died
+does not hold. `--quick` caps `repeats` at ten and skips every check that sweeps seeds; `--plan`
+prints what would run and runs nothing. Results go to `<dir>/<subject>.json`, one object per check
+with what was measured and the bound. The exit code is 0 when every check carried out held, 1 when
+one did not.
+
+`bohr sweep` is one `finds` or `never_finds` as a command: each seed once, then how many found what,
+and on which seeds. With `--expect` and `--at-least` it exits 0 only when the bound held.
+
+What these do not do: choose a bound, or judge what a program means. The bound is written in the
+subject before the run; what a run is judged by is still its scenario's oracle, the guest's SDK
+assertions and its probes.
+
+### 7.10 Exit codes
 
 | Code | Meaning | CI reading |
 |---:|---|---|
@@ -1825,7 +1909,7 @@ The probabilities are a first guess and say so; `init` does not write over an ex
 The separation of 1 from 2 and 3 is the contract CI pipelines depend on: "the tool found a bug" and
 "the tool is broken" must never share an exit code.
 
-### 7.10 Other commands
+### 7.11 Other commands
 
 **`bohr selftest [--seed N] [--repeat N] [--guest NAME] [--save-dir DIR]`** runs the guests built
 into the binary and requires every repetition to reproduce. It needs no program on disk, no
@@ -1834,8 +1918,24 @@ machine" wherever the binary runs — including hosts where the syscall backend 
 Exit codes are the ordinary ones: `0` if every guest reproduced, `1` if any run diverged from its
 first repetition or produced a finding.
 
-**`bohr trace <bundle> [--format text|json]`** prints the run's event log, read from the bundle
-rather than replayed: what the file carries is what it prints, so it needs neither the guest nor a
+**`bohr explain <bundle> [--json]`** tells how a stored run got to what it found: the verdict and
+its code, what the run was, the steps before the violation — the faults, the node changes, the
+tasks that failed, the diagnostics, nearest last, at most twelve — and the commands that show more.
+For a finding a probe reported, the violation is where the probe first saw it, not where the oracle
+judged the run. The steps are gathered by rule and without knowing the program; that they caused
+the violation is not shown, only that they came first, and the story says so. Told from the bundle
+alone, so a bundle tells one story every time.
+
+**`bohr trace <bundle> [--format text|json] [--node N,…] [--kind K,…] [--from T] [--to T]
+[--around EVENT] [--squash]`** prints the run's event log, read from the bundle rather than
+replayed. The filters select by the events' own fields, never by the text of a line, so `json`
+selects exactly what `text` does: `--kind` takes `syscall`, `schedule`, `task`, `packet`, `disk`,
+`fault`, `node`, `wait`, `clock`, `assertion`, `record`, `diagnostic` and `domain`, one word per kind
+of event, and a kind with every other kind is the whole log. `--from` and `--to` take virtual time
+as written — `1.3s`, `250ms`, `40us` — read from its digits and never through floating point.
+`--around` keeps twenty events before one and five after. `--squash` folds a loop of up to four
+events on one task, repeated three times or more, into two lines that say how many times and over
+how long; it is a view, and `json` and the bundle still hold every event. What the file carries is what it prints, so it needs neither the guest nor a
 host that could run it. `text` is for reading and grepping; `json` is the JSON Lines projection
 §4.3 defines, and is the same bytes a report leaves beside itself for events it did not show. A log
 that ends early is printed as far as it goes and said so about on standard error, because every
@@ -1843,7 +1943,10 @@ event in a truncated log is true and the last one is not the end of the run.
 
 **`bohr report <bundle> [-o report.html] [--redact]`** writes the run as one page: no framework,
 nothing fetched, opens from a file in ten years' time (`ARCHITECTURE.md` §5.13). Verdict first, then
-the line that reproduces it, then what a reader needs to understand either. A run too long to draw
+the line that reproduces it, then what a reader needs to understand either. Where the run was
+probed, the page draws the chain node by node: across is virtual time, up is the key each node
+answered for, the colour is the value, the stretches a node was down are shaded, and the moment the
+violation was seen is a line across every lane — a revert, a fork and a stall each look different. A run too long to draw
 is windowed — the neighbourhood of the failure plus every fault, every promise and every node
 change wherever they fall — and the events not drawn are written beside it as `<name>.events.jsonl`,
 which is the projection §4.3 defines. What is left out is counted on the page rather than dropped.
@@ -1985,4 +2088,4 @@ here so this document is a complete entry point:
 | seed → campaign → minimal reproducer | `ARCHITECTURE.md` §7.3 |
 | SDK call → property state | `ARCHITECTURE.md` §7.4 |
 | bundle → replay → digest comparison | §7.3 and §4.4 of this document |
-| bundle → HTML report | §7.10 and `ARCHITECTURE.md` §5.13 |
+| bundle → HTML report | §7.11 and `ARCHITECTURE.md` §5.13 |

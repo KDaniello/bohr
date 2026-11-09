@@ -1,0 +1,205 @@
+# The golden guests: one workload per part of bohr, each held to the same checks.
+#
+# A workload is not a test of a program, but a known number of operations on one subsystem. Every
+# workload is held to `works`, `repeats` and `replays`, and the calm ones to `performs`: time per
+# operation with startup taken out, the same against the host, stops and events per operation, and
+# the supervisor's peak memory. The ones below the calm set put the same workloads under the faults
+# of their own subsystem: the faults must land, and the runs must still repeat.
+#
+# The `performs` bounds are ceilings, set at about twice what the first measurement on the
+# four-core VM gave: a ceiling is there to catch a regression, not to describe the machine. A
+# bound that fails is reported with the figure it missed, never moved to meet it.
+#
+# Run with `bohr check golden`; see docs/TESTING.md §17.
+
+about = "one workload per part of bohr: speed, memory and load per operation, determinism, faults"
+program = "testdata/guests/build/golden"
+
+[[workload]]
+name = "syscall"
+module = "the stop path: seccomp, ptrace, the kernel loop, the trace writer"
+count = 100_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 10, max_rss_mib = 64, max_stops_per_op = 1.01 }
+
+[[workload]]
+name = "clock"
+module = "the clock model: virtual time read by the guest"
+count = 100_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 10, max_rss_mib = 64 }
+
+[[workload]]
+name = "write"
+module = "the file model: bytes held in blocks, positions, growth"
+count = 2_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 30, max_rss_mib = 64 }
+
+[[workload]]
+name = "read"
+module = "file reads through the transfer buffer"
+count = 20_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 20, max_rss_mib = 64 }
+
+[[workload]]
+name = "fsync"
+module = "sync: disk images and the snapshots that share their blocks"
+count = 2_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 40, max_rss_mib = 64 }
+
+[[workload]]
+name = "bigfile"
+module = "a 64 MiB file under sync: a write copies one block, not the file"
+count = 500
+check.works = {}
+check.repeats = { times = 3 }
+check.replays = {}
+check.performs = { max_us_per_op = 120, max_rss_mib = 256 }
+
+[[workload]]
+name = "mmap"
+module = "mappings: pages written through a map, carried back into the file"
+count = 500
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 200, max_rss_mib = 64 }
+
+[[workload]]
+name = "pipe"
+module = "pipes: two threads handing a byte back and forth"
+count = 5_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 60, max_rss_mib = 64 }
+
+[[workload]]
+name = "futex"
+module = "futex waits and wakes, and the scheduler's hand-over between threads"
+count = 5_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 100, max_rss_mib = 64 }
+
+[[workload]]
+name = "threads"
+module = "thread creation and exit, and the task books"
+count = 500
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 200, max_rss_mib = 64 }
+
+[[workload]]
+name = "epoll"
+module = "readiness: epoll and eventfd"
+count = 10_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 40, max_rss_mib = 64 }
+
+[[workload]]
+name = "socketpair"
+module = "sockets inside a node"
+count = 5_000
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+check.performs = { max_us_per_op = 70, max_rss_mib = 64 }
+
+[[workload]]
+name = "udp"
+module = "the network between nodes: delivery, latency, two processes"
+count = 2_000
+nodes = 2
+check.works = {}
+check.repeats = { times = 5 }
+check.replays = {}
+# Best of seven: two guest processes on two cores make every hand-over a wake across cores, and one
+# run of this workload took from 113 to 228 ms on the same machine minutes apart.
+check.performs = { max_us_per_op = 80, max_rss_mib = 64, best_of = 7 }
+
+[[workload]]
+name = "alloc"
+module = "the filter: an anonymous mapping is let through, its release is stopped"
+count = 10_000
+check.works = {}
+check.repeats = { times = 5 }
+# One stop per operation and no more: `mmap` of anonymous memory passes the filter, `munmap` stops,
+# because only the world knows whether the range it releases held a file.
+check.performs = { max_rss_mib = 64, max_stops_per_op = 1.01 }
+
+[[workload]]
+name = "compute"
+module = "a guest that only computes: what bohr costs when asked nothing"
+count = 200
+check.works = {}
+check.repeats = { times = 5 }
+check.performs = { max_slowdown = 1.5, max_rss_mib = 64 }
+
+# The same workloads under the faults of their own subsystem.
+
+[[workload]]
+name = "fsync under EIO"
+workload = "fsync"
+module = "disk faults: a sync that fails reaches the guest as EIO"
+count = 2_000
+scenario.disk = { eio_probability = "1/200" }
+check.repeats = { times = 5 }
+check.replays = {}
+check.finds = { seeds = "1..10", code = "GuestCrashed", at_least = 10 }
+
+[[workload]]
+name = "fsync under kills"
+workload = "fsync"
+module = "node faults: kills and restarts, and the disk a restart comes back to"
+count = 2_000
+scenario.faults = { kill_probability = "1/500", restart_after_ticks = 1_000_000, budget_per_run = 3 }
+check.repeats = { times = 5 }
+check.replays = {}
+check.adversity = { seeds = "1..10", at_least = 0.9 }
+
+[[workload]]
+name = "alloc under refusals"
+workload = "alloc"
+module = "memory faults: an allocation refused with ENOMEM"
+count = 10_000
+scenario.faults = { enomem_probability = "1/100" }
+check.repeats = { times = 5 }
+check.finds = { seeds = "1..10", code = "GuestCrashed", at_least = 10 }
+
+[[workload]]
+name = "clock under steps"
+workload = "clock"
+module = "clock faults: the wall clock stepped and drifted"
+count = 100_000
+scenario.faults = { kill_probability = "1/2000", draw = ["clock_step", "clock_drift"], budget_per_run = 3 }
+check.repeats = { times = 5 }
+check.replays = {}
+check.adversity = { seeds = "1..10", at_least = 0.9 }
+
+[[workload]]
+name = "udp under drops"
+workload = "udp"
+module = "network faults: datagrams dropped between nodes"
+count = 2_000
+nodes = 2
+scenario.network = { drop_probability = "1/500" }
+check.repeats = { times = 5 }
+check.adversity = { seeds = "1..10", at_least = 0.9 }

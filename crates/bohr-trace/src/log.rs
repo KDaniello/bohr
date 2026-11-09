@@ -24,27 +24,96 @@ pub struct TraceWriter<W: io::Write> {
     count: u64,
     /// Reused across records: an event is encoded once per record, and a run records millions.
     scratch: Vec<u8>,
+    /// Whether the log is kept, or only digested: a run nobody will read pays no encoding.
+    keep: bool,
+    stats: TraceStats,
 }
 
+/// What a writer learned from the events it saw, so nothing has to read the log back to know it.
+#[derive(Clone, Debug, Default)]
+pub struct TraceStats {
+    /// Syscall events.
+    pub syscalls: u64,
+    /// Syscall events by number, for the numbers below 512.
+    pub by_nr: Vec<u64>,
+    /// Nodes and tasks that recorded anything.
+    pub nodes: std::collections::BTreeSet<bohr_types::NodeId>,
+    pub tasks: std::collections::BTreeSet<bohr_types::TaskId>,
+    /// The last event recorded.
+    pub last: Option<bohr_types::EventId>,
+    /// The most recent diagnostics, as `(code, message)`, oldest first.
+    pub diagnostics: std::collections::VecDeque<(String, String)>,
+}
+
+/// Diagnostics a writer remembers, the most recent ones.
+const KEPT_DIAGNOSTICS: usize = 8;
+
 impl<W: io::Write> TraceWriter<W> {
-    /// Wraps a sink.
+    /// Wraps a sink that keeps the log.
     pub fn new(inner: W) -> Self {
-        Self { inner, hasher: blake3::Hasher::new(), count: 0, scratch: Vec::new() }
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            count: 0,
+            scratch: Vec::new(),
+            keep: true,
+            stats: TraceStats::default(),
+        }
+    }
+
+    /// Wraps a sink, digesting every event and encoding none: the log of a run nobody will read.
+    pub fn digest_only(inner: W) -> Self {
+        Self { keep: false, ..Self::new(inner) }
+    }
+
+    /// What the events recorded so far amount to.
+    #[must_use]
+    pub const fn stats(&self) -> &TraceStats {
+        &self.stats
     }
 
     /// Appends one event.
     pub fn record(&mut self, event: &Event) -> Result<(), TraceError> {
-        self.scratch.clear();
-        ciborium::into_writer(event, &mut self.scratch)
-            .map_err(|e| TraceError::Encode(e.to_string()))?;
-        let len = u32::try_from(self.scratch.len()).map_err(|_| TraceError::RecordTooLarge)?;
-        if len > MAX_RECORD_BYTES {
-            return Err(TraceError::RecordTooLarge);
+        if self.keep {
+            self.scratch.clear();
+            ciborium::into_writer(event, &mut self.scratch)
+                .map_err(|e| TraceError::Encode(e.to_string()))?;
+            let len = u32::try_from(self.scratch.len()).map_err(|_| TraceError::RecordTooLarge)?;
+            if len > MAX_RECORD_BYTES {
+                return Err(TraceError::RecordTooLarge);
+            }
+            self.inner.write_all(&len.to_le_bytes())?;
+            self.inner.write_all(&self.scratch)?;
+            self.inner.write_all(&len.to_le_bytes())?;
         }
 
-        self.inner.write_all(&len.to_le_bytes())?;
-        self.inner.write_all(&self.scratch)?;
-        self.inner.write_all(&len.to_le_bytes())?;
+        let stats = &mut self.stats;
+        stats.nodes.insert(event.node);
+        stats.tasks.insert(event.task);
+        stats.last = Some(event.id);
+        match &event.kind {
+            crate::EventKind::Syscall { nr, .. } => {
+                stats.syscalls += 1;
+                let at = *nr as usize;
+                if at < 512 {
+                    if stats.by_nr.len() <= at {
+                        stats.by_nr.resize(512, 0);
+                    }
+                    stats.by_nr[at] += 1;
+                }
+            }
+            crate::EventKind::Diagnostic { code, message } => {
+                // The last few distinct ones: a line repeated at the end would otherwise push out
+                // every different thing said before it.
+                let said = (code.clone(), message.clone());
+                stats.diagnostics.retain(|kept| *kept != said);
+                if stats.diagnostics.len() == KEPT_DIAGNOSTICS {
+                    stats.diagnostics.pop_front();
+                }
+                stats.diagnostics.push_back(said);
+            }
+            _ => {}
+        }
 
         event.absorb(&mut self.hasher);
         #[cfg(feature = "chaos-wall-clock-digest")]
@@ -71,6 +140,11 @@ impl<W: io::Write> TraceWriter<W> {
         self.inner.flush()?;
         let digest = self.digest();
         Ok((self.inner, digest, self.count))
+    }
+
+    /// Yields the sink and what the writer learned, without flushing it.
+    pub fn into_parts(self) -> (W, TraceStats) {
+        (self.inner, self.stats)
     }
 }
 
