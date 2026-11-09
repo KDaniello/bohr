@@ -81,6 +81,10 @@ pub struct LoadedConfig {
     ///
     /// Empty where the scenario asks nothing, and then no probe node is started.
     pub probes: Vec<ProbeSpec>,
+    /// The SDK fault points a run may arm, by the names the guest gives them.
+    pub fault_points: Vec<String>,
+    /// The odds each listed fault point is armed on a node, drawn once per run.
+    pub fault_point_odds: (u32, u32),
 }
 
 /// The `[linux]` section: which kernel facilities the guest is told exist.
@@ -165,6 +169,7 @@ impl LoadedConfig {
             || self.network.drop_probability.0 > 0
             || self.network.duplicate_probability.0 > 0
             || self.network.reorder_probability.0 > 0
+            || self.network.corrupt_probability.0 > 0
             || self.disk.stall_probability.0 > 0
             || self.disk.eio_probability.0 > 0
             || self.disk.enospc_probability.0 > 0;
@@ -351,6 +356,8 @@ struct RawFaults {
     arm_after_ticks: Option<u64>,
     budget_per_run: Option<u32>,
     draw: Option<Vec<String>>,
+    fault_points: Option<Vec<String>>,
+    fault_point_probability: Option<String>,
 }
 
 /// The `[coverage]` section, for the one key this build can honour.
@@ -381,6 +388,8 @@ struct RawNetwork {
     drop_probability: Option<String>,
     duplicate_probability: Option<String>,
     reorder_probability: Option<String>,
+    corrupt_probability: Option<String>,
+    corrupt_bytes: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -427,6 +436,7 @@ struct RawDisk {
     eio_probability: Option<String>,
     enospc_probability: Option<String>,
     snapshot_depth: Option<usize>,
+    reorder_unsynced: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +522,19 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
             probability(net.duplicate_probability.as_deref(), "network.duplicate_probability")?;
         network.reorder_probability =
             probability(net.reorder_probability.as_deref(), "network.reorder_probability")?;
+        network.corrupt_probability =
+            probability(net.corrupt_probability.as_deref(), "network.corrupt_probability")?;
+        if let Some(bytes) = net.corrupt_bytes {
+            // Bounded, because every armed datagram draws eight bytes per flip whether or not it
+            // is altered.
+            if bytes == 0 || bytes > 64 {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: network.corrupt_bytes is {bytes}; an altered datagram has 1 to 64 \
+                     bytes altered"
+                )));
+            }
+            network.corrupt_bytes = bytes;
+        }
     }
     if let Some(cluster) = &raw.cluster {
         network.nodes = cluster.nodes;
@@ -567,13 +590,33 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
             probability(raw_disk.eio_probability.as_deref(), "disk.eio_probability")?;
         disk.enospc_probability =
             probability(raw_disk.enospc_probability.as_deref(), "disk.enospc_probability")?;
+        if let Some(reorder) = raw_disk.reorder_unsynced {
+            disk.reorder_unsynced = reorder;
+        }
         if let Some(depth) = raw_disk.snapshot_depth {
             disk.snapshot_depth = depth;
         }
     }
 
     let mut fault_policy = FaultPolicy::default();
+    let mut fault_points = Vec::new();
+    let mut fault_point_odds = (1, 2);
     if let Some(raw_faults) = &raw.faults {
+        if let Some(names) = &raw_faults.fault_points {
+            // A name with a comma in it could never be armed: the SDKs read the list split on them.
+            if let Some(bad) = names.iter().find(|n| n.is_empty() || n.contains(',')) {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: faults.fault_points {bad:?} is not a name a fault point can have"
+                )));
+            }
+            fault_points.clone_from(names);
+        }
+        if raw_faults.fault_point_probability.is_some() {
+            fault_point_odds = probability(
+                raw_faults.fault_point_probability.as_deref(),
+                "faults.fault_point_probability",
+            )?;
+        }
         fault_policy.kill =
             probability(raw_faults.kill_probability.as_deref(), "faults.kill_probability")?;
         fault_policy.enomem =
@@ -819,6 +862,8 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         coverage_bytes: coverage(raw.coverage.as_ref())?,
         linux: linux(raw.linux.as_ref(), &disk)?,
         probes,
+        fault_points,
+        fault_point_odds,
     })
 }
 

@@ -48,6 +48,9 @@ pub struct DiskConfig {
     pub enospc_probability: (u32, u32),
     /// Disk images kept for restart-from-snapshot, newest last.
     pub snapshot_depth: usize,
+    /// Whether a crash may keep some unsynced writes and lose others — a later one surviving an
+    /// earlier — or only all of them or none.
+    pub reorder_unsynced: bool,
 }
 
 impl Default for DiskConfig {
@@ -58,6 +61,7 @@ impl Default for DiskConfig {
             eio_probability: (0, 1),
             enospc_probability: (0, 1),
             snapshot_depth: 4,
+            reorder_unsynced: true,
         }
     }
 }
@@ -304,6 +308,7 @@ impl NodeDisk {
         &mut self,
         node: NodeId,
         live: &MinimalWorld,
+        reorder: bool,
         ctx: &mut WorldCtx<'_, '_>,
     ) -> Result<DiskImage, KernelError> {
         // One draw, always, whatever the disk holds. Its width is a fact about the crash rather
@@ -316,8 +321,15 @@ impl NodeDisk {
         self.inflight.clear();
 
         let mut image = self.durable_image();
-        let landing = Landing::of(seed);
+        // Without reordering a crash keeps all of what was unsynced or none of it: the quarter of
+        // crashes that would have decided sector by sector lose it all, which is the harsher of
+        // the two states a store has to survive anyway. The draw is the same either way.
+        let landing = match Landing::of(seed) {
+            Landing::PerSector if !reorder => Landing::Nothing,
+            other => other,
+        };
         let mut torn = false;
+        let mut reordered = false;
 
         for (inode, ranges) in &self.pending {
             let Some(current) = live.file_content(*inode) else {
@@ -342,7 +354,8 @@ impl NodeDisk {
                     // and a store that trusts its own length is accused of a state it will never
                     // meet.
                     let durable_len = out.len() as u64;
-                    if landed_at(seed, *inode, u64::MAX) && current.len() as u64 > durable_len {
+                    let tail_landed = landed_at(seed, *inode, u64::MAX);
+                    if tail_landed && current.len() as u64 > durable_len {
                         let tail = current.range_to_vec(durable_len as usize..current.len());
                         out.write_at(durable_len as usize, &tail);
                     }
@@ -357,29 +370,51 @@ impl NodeDisk {
                     // drawn crash. A panic there destroys the run it exists to record, and the
                     // audit that would have named an impossible image runs after this arithmetic.
                     let reach = durable_len.min(current.len() as u64);
-                    let (mut landed, mut lost) = (false, false);
+                    // Whether a write before this one lost a sector: a write that then lands is a
+                    // later write kept where an earlier was not, which is reordering, and the
+                    // state a store that orders its writes by issuing them in order never sees.
+                    let mut earlier_lost = false;
+                    // Each write's bytes are decided by what decided them: below the durable length
+                    // by their sector's coin, above it by the tail's, and past what the live file
+                    // still holds by nothing, since there is nothing there to land.
+                    let live_len = current.len() as u64;
                     for (offset, len) in ranges {
+                        let (mut range_landed, mut range_lost) = (false, false);
+                        let write_end = offset + len;
                         for sector in
                             (*offset / SECTOR)..=((offset + len).saturating_sub(1) / SECTOR)
                         {
                             let start = sector * SECTOR;
                             let end = ((sector + 1) * SECTOR).min(reach);
-                            if end <= start {
-                                // Either the sector is past what is durable, or past what the live
-                                // file still holds. A sector nobody can read did not land.
-                                lost = true;
-                                continue;
+                            // The part of this write inside this sector.
+                            let (lo, hi) =
+                                (start.max(*offset), ((sector + 1) * SECTOR).min(write_end));
+                            if end > start {
+                                let kept = landed_at(seed, *inode, sector);
+                                if kept {
+                                    let sector = current.range_to_vec(start as usize..end as usize);
+                                    out.write_at(start as usize, &sector);
+                                }
+                                if lo < reach {
+                                    if kept {
+                                        range_landed = true;
+                                    } else {
+                                        range_lost = true;
+                                    }
+                                }
                             }
-                            if landed_at(seed, *inode, sector) {
-                                let sector = current.range_to_vec(start as usize..end as usize);
-                                out.write_at(start as usize, &sector);
-                                landed = true;
-                            } else {
-                                lost = true;
+                            if hi > durable_len.max(lo) {
+                                if tail_landed && lo.max(durable_len) < live_len {
+                                    range_landed = true;
+                                } else {
+                                    range_lost = true;
+                                }
                             }
                         }
+                        reordered |= range_landed && earlier_lost;
+                        earlier_lost |= range_lost;
+                        torn |= range_landed && range_lost;
                     }
-                    torn |= landed && lost;
                     image.content.insert(*inode, out);
                 }
             }
@@ -400,6 +435,18 @@ impl NodeDisk {
         }
 
         self.pending.clear();
+        if reordered {
+            ctx.emit_for(
+                node,
+                TaskId::ZERO,
+                EventKind::FaultFired {
+                    fault: FaultKind::DiskReorder,
+                    target: FaultTarget::Node(node),
+                },
+            )?;
+        }
+        // One fault per crash and kind: a tear is a write split, a reorder is a later write kept
+        // where an earlier was lost, and a crash that did both did both.
         if torn {
             ctx.emit_for(
                 node,

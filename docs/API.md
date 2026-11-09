@@ -75,7 +75,7 @@ A 64-byte header followed by the prefix bytes. Little-endian.
 |---:|---:|---|---|
 | 0 | 4 | `magic` | `b"BTP\x01"` |
 | 4 | 2 | `format_version` | container version, currently `1` |
-| 6 | 2 | `tape_abi` | draw ABI version, currently `1` (§2.3) |
+| 6 | 2 | `tape_abi` | draw ABI version, currently `2` (§2.3) |
 | 8 | 8 | `seed` | `u64`, drives the extension |
 | 16 | 8 | `prefix_len` | bytes of prefix that follow |
 | 24 | 32 | `prefix_hash` | `blake3(prefix)`, verified on load |
@@ -470,7 +470,7 @@ when passed through an older tool.
 ```json
 {
   "bundle_format": 1,
-  "tape_abi": 1,
+  "tape_abi": 2,
   "sdk_schema": 1,
   "tool_version": "0.1.0",
   "run_id": "0f3a…",
@@ -725,6 +725,8 @@ latency_jitter_ticks = 200_000
 drop_probability = "1/1000"     # rationals, never floats (§1 rule 2)
 duplicate_probability = "1/10000"
 reorder_probability = "1/100"
+corrupt_probability = "1/500"   # a datagram arrives with bytes altered; never a stream
+corrupt_bytes = 1               # how many bytes an altered datagram has flipped
 
 [disk]
 sync_semantics = "strict"       # strict | lenient — strict loses everything unsynced on crash
@@ -733,6 +735,7 @@ stall_mean_ticks = 5_000_000
 eio_probability = "1/10000"
 enospc_probability = "1/10000"
 snapshot_depth = 4              # synced images kept for node_restart_from_snapshot
+reorder_unsynced = true         # a crash may keep some unsynced writes and lose others
 
 [faults]
 enabled = ["net_partition", "node_kill", "node_freeze", "node_thaw", "node_restart",
@@ -740,6 +743,8 @@ enabled = ["net_partition", "node_kill", "node_freeze", "node_thaw", "node_resta
 budget_per_run = 8              # hard cap on drawn faults in one run
 kill_probability = "1/1000"     # odds a drawn node kill fires at a moment it may fire at
 enomem_probability = "1/500"    # odds a brk, mremap or anonymous mmap is refused with ENOMEM
+fault_points = ["after_ack"]    # SDK fault points a run may arm, by name
+fault_point_probability = "1/2" # odds each is armed on a node, drawn once per run
 restart_after_ticks = 3_000_000 # 0 leaves a killed node dead, a cut standing, a link bad
 arm_after_ticks = 300_000_000   # nothing is drawn before here; 0 arms from the first instruction
 draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade", "recover_from_snapshot",
@@ -757,6 +762,24 @@ drift_ppm_max = 200
 mode = "auto"                   # auto | shm | pt | sdk | off
 shm_size = 65536
 ```
+
+**Altered datagrams.** `corrupt_probability` delivers a datagram with `corrupt_bytes` bytes flipped
+at drawn offsets, each by a drawn mask that changes at least one bit, as a `net_corrupt` fault and a
+`corrupted` packet fate. Never a stream: a stream's transport checks and retransmits, and what
+reaches the program is what was sent. Drawn only where the scenario sets it, and then always at one
+width — the decision and every flip — so a run that arms no corruption keeps the tape it had.
+
+**Writes reordered before a crash.** A crash keeps all of what was unsynced, none of it, or — a
+quarter of the time — each sector for itself, with a file's grown tail landing with its length or
+not at all. That last case can keep a later write and lose an earlier one, and a crash that does
+fires `disk_reorder`. `reorder_unsynced = false` takes it away: every crash then keeps all or
+nothing, which is the state a store that orders its writes by issuing them in order is written for.
+
+**Wall time has a date.** Every wall clock starts at 2025-01-01 00:00:00 UTC, the same on every run
+and every host, so a clock stepped back in a run's first minute moves back rather than standing at
+1970, and a program that checks the date it is shown sees a year it can believe. A file's access,
+change and modification times are that date, so its age read against the clock is the run's own
+duration.
 
 **Memory that runs out.** `enomem_probability` refuses an allocation — `brk`, `mremap`, `mmap` of
 anonymous memory — at drawn moments, each a `memory_exhausted` fault counted as adversity: `mmap` and
@@ -1057,11 +1080,14 @@ of **candidate moments** and draws among those:
 
 Without the SDK the heuristics are syscall-shaped and weaker; with it they are exact.
 
-**The two rows that read a `fault_point` are inert, and stay inert until arming is built.** Nothing
-in the supervisor sets `BOHR_ARMED_FAULT_POINTS`, so `fault_point` reports itself and returns false
-in every run: the guest is heard, and is never armed. Arming needs a draw made before the first node
-clock, which moves every later tape offset and invalidates stored bundles — which is why it is named
-here rather than slipped in.
+**A fault point is armed by the run.** `[faults] fault_points` lists the names a guest gives its
+`fault_point` calls, and each is armed on each node at `fault_point_probability` (one in two by
+default). Which ones are armed is drawn once, before the first node clock: eight bytes, made in
+every run whatever the scenario lists, so a scenario that names a fault point moves no other
+decision. The supervisor puts the armed names in `BOHR_ARMED_FAULT_POINTS` of every start of the
+node, a restart included, and says so on the timeline with `BOHR-2008`. That draw is why the tape
+ABI is 2: every tape offset after it moved, and a bundle of ABI 1 is refused rather than misread.
+A campaign varies what is armed as it varies the tape; the names are the scenario's to list.
 
 **The order-of-magnitude claim is not supported by measurement, and is withdrawn until it is.**
 The specification claimed guided targeting finds ten times what uniform chaos does. Measured on
@@ -2010,6 +2036,7 @@ to do.
 | `BOHR-2005` | branch counter unavailable; falling back to syscall-granularity progress |
 | `BOHR-2006` | guest read a clock in a tight loop with no other syscall — likely a wall-clock spin |
 | `BOHR-2007` | processor identification answered from the presented profile rather than the host |
+| `BOHR-2008` | a node started with SDK fault points armed, named |
 | `BOHR-2010` | regenerated draw journal disagrees with the stored one (§2.6) |
 | `BOHR-2011` | trace digest mismatch on replay, with the first diverging event |
 | `BOHR-2012` | a per-run assertion the guest makes about itself did not hold |

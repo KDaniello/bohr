@@ -1,0 +1,13 @@
+# Two nodes and a wire that alters a datagram now and then: node 1 sends numbered updates, node 0
+# applies what arrives. Found where an altered update is applied.
+
+[cluster]
+nodes = 2
+argv = ["testdata/guests/build/no_checksum", "500", "{node}"]
+
+[run]
+horizon_ticks = 30_000_000_000
+
+[network]
+latency_mean_ticks = 200_000
+corrupt_probability = "1/200"

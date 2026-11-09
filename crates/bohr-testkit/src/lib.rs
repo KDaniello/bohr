@@ -252,6 +252,7 @@ fn drive_one(fixture: Fixture, tape: &Tape) -> (RunReport, NullBackend) {
     let mut sink = TraceWriter::new(Vec::new());
 
     let report = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape,
         backend: &mut backend,
         world: &mut world,
@@ -285,6 +286,7 @@ pub fn run_alone(program: NullProgram, preloads: &[(u64, Vec<u8>)], seed: Seed) 
     let mut oracle = AcceptEverything;
     let mut sink = TraceWriter::new(Vec::new());
     run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &Tape::from_seed(seed),
         backend: &mut backend,
         world: &mut world,
@@ -488,6 +490,7 @@ pub fn refusable_scenario(
     let specs = vec![GuestSpec::default(); node_count];
 
     let report = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,
@@ -575,6 +578,7 @@ pub fn judge_scenario(
     let specs = vec![GuestSpec::default(); node_count];
 
     let report = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape,
         backend: &mut backend,
         world: &mut world,

@@ -350,9 +350,15 @@ The catalog is closed; adding a variant is a bundle-format minor version.
 
 | Family | Variants |
 |---|---|
-| Network | delay, drop, duplicate, reorder, partition (including **one-directional**), grey degradation |
-| Disk | tear a write, stall a sync, `ENOSPC`, `EIO`, lose unsynced data on crash |
+| Network | delay, drop, duplicate, reorder, **alter a datagram's bytes**, partition (including **one-directional**), grey degradation |
+| Disk | tear a write, **keep a later unsynced write and lose an earlier one**, stall a sync, `ENOSPC`, `EIO`, lose unsynced data on crash |
+| Memory | refuse an allocation with `ENOMEM` |
+| SDK | arm a guest's own `fault_point`, by name, per node |
 | Node | kill (`SIGKILL` equivalent), freeze/thaw (GC pause, CPU starvation), restart clean, restart from an older disk snapshot, rewind a set of nodes to a common ancestor |
+
+Every kind in this table is one the trace format names and a world fires, and the three lists — the
+format's `FaultKind`, the world's catalogue, what it narrates — are held to one by the linter
+(rule 14m): a kind in one and not the others fails `make pr`.
 
 One-directional partition is called out explicitly because it is the case teams most often fail to
 test and the one that breaks consensus implementations most reliably.

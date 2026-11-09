@@ -6,6 +6,92 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.6.0 — every fault real
+
+**The tape ABI is 2.** Every bundle recorded by an earlier release is refused by name — `BOHR-4005:
+bundle tape ABI 1 is not this build's (2)` — and never replayed. A run now draws which SDK fault
+points to arm before anything else, and every later decision reads its bytes from a different
+place; a bundle of ABI 1 replayed under ABI 2 would be a different run that looked like the
+recorded one. Record findings you need to keep again under v0.6. It is not published.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.6.0` |
+| `tape_abi` | `2` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Figures are under `[v0_6.*]` in [`benches/baseline.toml`](./benches/baseline.toml). `make pr`,
+`make gate` (13 of 13) and the mutation harness (13 of 13) are green on Ubuntu 24.04, with 693
+tests; one gate of this version fails as written, and is listed below with what it measured.
+
+### Faults that were named and never fired
+
+- **One list of faults.** Duplication, reordering and stalls fired only as a packet's or a disk's
+  fate; each now fires its own fault as well, counted once. The trace format's fault kinds, the
+  world's catalogue and what it narrates are one list, and `make pr` fails on a kind in one and not
+  the others.
+- **Altered datagrams**: `[network] corrupt_probability`, `corrupt_bytes`. A datagram arrives with
+  drawn bytes flipped, as a `net_corrupt` fault and a `corrupted` fate; never a stream, whose
+  transport checks. A protocol with no checksum (`testdata/bugs/no_checksum`) applies an altered
+  update on 58 of 60 seeds with corruption and on none of 60 without.
+- **Writes reordered before a crash**: a crash that keeps a later unsynced write and loses an
+  earlier one fires `disk_reorder`, and `[disk] reorder_unsynced = false` makes every crash keep
+  all or nothing. A store that rewrites its header to point at an appended record and syncs once
+  after both (`testdata/bugs/header_without_record`) is found on 11 of 60 seeds with reordering and
+  on none of 60 without.
+- **SDK fault points are armed**: `[faults] fault_points = [...]` and `fault_point_probability`.
+  Which are armed is drawn per node once per run, put in `BOHR_ARMED_FAULT_POINTS` at every start
+  of the node, a restart included, and said on the timeline as `BOHR-2008`.
+- **Wall time has a date**: every wall clock starts at 2025-01-01 00:00:00 UTC, so a clock stepped
+  back in a run's first minute moves back instead of standing at 1970, and a file's times are that
+  date, so its age read against the clock is the run's own duration.
+
+### Where faults land
+
+`guided` targeting places a drawn node fault only where a crash would lose something — a node
+holding writes not yet synced. Measured on every seeded defect whose scenario draws node faults,
+the same 60 seeds each way:
+
+| Defect scenario | uniform | guided |
+|---|---:|---:|
+| `header_without_record` | 11 | 15 |
+| `header_without_record`, in order | 0 | 0 |
+| `lease_clock`, drawn clock faults | 23 | 0 |
+
+Guided wins where the defect is a crash during a write and loses everything where the fault is a
+clock step on a node that writes nothing, because it never fires there. It stays opt-in.
+
+### Speed
+
+Against v0.5.0's binary on one host, alternately: an intercepted call costs 4.0 µs against 4.3, a
+guest starts in 2.41 ms against 2.63, a 64-run campaign at one worker takes 2,771 ms against 3,003,
+and a worker peaks at 14.1 MB against 14.5. Every fault armed at odds of zero costs nothing a run
+can measure — 850 ms against 852, the median of fifteen — and a crash of a node holding a gibibyte
+across sixteen files, with a thousand pages unsynced, builds its image within the noise of a 37 ms
+run.
+
+### Fixed
+
+- **A test of streams measured a parked call.** A blocking read is recorded with what it answered
+  when it parked, and the test read that as the length; it now reads once the answer is there.
+- **Three tests of the run loop held only on one schedule.** A node acted on by another could end
+  first on a different tape; each is now alive whatever the order.
+
+### What it does not do
+
+- **Reach `header_without_record` as often as G6.3 asked** (20 of 60): a crash decides sector by
+  sector only a quarter of the time, and only then can the header outlive the record. The defect is
+  reached by reordering and by nothing else, which is the claim; the rate is not.
+- **Tell two adjacent writes apart once they are merged.** The disk keeps unsynced writes as ranges
+  and joins those that touch, so a later write kept and an earlier lost inside one joined range is a
+  tear on the timeline, not a reorder.
+- **Alter a stream's bytes**, or forge what a protocol checks: an altered message is the fault a
+  model of the wire can draw, and a valid forged signature is not one.
+- **Learn fault points by itself.** The names a run may arm are the scenario's; a campaign varies
+  which are armed, not which exist.
+- **Make guided targeting the default.** It loses on a defect the measurement covers.
+
 ## v0.5.0 — the model the targets need, and checks that say so
 
 A target that bohr cannot model is not tested: it stops at the first call nobody answers, or runs

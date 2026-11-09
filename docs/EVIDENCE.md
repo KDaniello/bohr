@@ -48,6 +48,10 @@ Recorded as measured, with the same weight as the rows above.
 - **Guided fault targeting loses to uniform.** It was specified to find an order of magnitude more;
   on a depth-2 durability defect it finds less at every probability, because its candidate moments
   are a subset of uniform's (`[m3.targeting]`). [`API.md`](./API.md) §5.4 withdraws the claim.
+  Measured again in v0.6 on every seeded defect whose scenario draws node faults
+  (`[targeting.v0_6]`): guided finds a header outliving its record on 15 of 60 seeds against 11, and
+  a lease outliving a stepped clock on none of 60 against 23 — it fires only on a node holding
+  unsynced writes, and that node writes nothing. It stays opt-in.
 - **Reduction does not reach real-client scale within a small budget.** Against a real execution
   client, 20 replays at 75 s each took 1,222,888 events to 1,189,704 (`[m5.op_reth.reduction]`). The
   fixture's ratio does not transfer.

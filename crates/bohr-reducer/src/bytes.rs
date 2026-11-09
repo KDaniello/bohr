@@ -113,6 +113,7 @@ impl Decision {
                 _,
                 DrawSite::NetDeliver
                 | DrawSite::NetReorder
+                | DrawSite::NetCorrupt
                 | DrawSite::NetPartition
                 | DrawSite::DiskError
                 | DrawSite::DiskTear

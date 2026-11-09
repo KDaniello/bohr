@@ -120,6 +120,7 @@ fn record(fixture: Fixture) -> Vec<u8> {
     let mut sink = TraceWriter::new(Vec::new());
 
     run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,

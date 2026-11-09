@@ -1,0 +1,12 @@
+# The same two nodes on a wire that alters nothing: clean on every seed.
+
+[cluster]
+nodes = 2
+argv = ["testdata/guests/build/no_checksum", "500", "{node}"]
+
+[run]
+horizon_ticks = 30_000_000_000
+
+[network]
+latency_mean_ticks = 200_000
+

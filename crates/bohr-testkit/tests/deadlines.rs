@@ -131,6 +131,7 @@ fn execute(programs: Vec<NullProgram>, seed: u64) -> RunReport {
     let specs = vec![bohr_backend::GuestSpec::default(); programs.len()];
 
     run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,

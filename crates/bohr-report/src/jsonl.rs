@@ -246,6 +246,7 @@ const fn packet_fate(fate: PacketFate) -> &'static str {
         PacketFate::Dropped => "dropped",
         PacketFate::Duplicated => "duplicated",
         PacketFate::Reordered => "reordered",
+        PacketFate::Corrupted => "corrupted",
     }
 }
 
@@ -288,6 +289,7 @@ const fn fault_kind(fault: FaultKind) -> &'static str {
         FaultKind::ClockDrift => "clock_drift",
         FaultKind::ChainReorg => "chain_reorg",
         FaultKind::MemoryExhausted => "memory_exhausted",
+        FaultKind::NetCorrupt => "net_corrupt",
     }
 }
 

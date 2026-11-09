@@ -1,0 +1,34 @@
+# The chain under every kind of fault this build draws at once, for one claim: a run with all of
+# them repeats to one digest. Not a scenario for finding anything; the chain may well break.
+
+[cluster]
+nodes = 3
+argv = ["examples/chain-toy/build/chain-toy-node", "{node}"]
+
+[run]
+horizon_ticks = 4_000_000_000
+
+[network]
+topology = "full"
+latency_mean_ticks = 2_000_000
+latency_jitter_ticks = 1_000_000
+drop_probability = "1/200"
+duplicate_probability = "1/200"
+reorder_probability = "1/100"
+corrupt_probability = "1/500"
+
+[disk]
+sync_semantics = "strict"
+stall_probability = "1/100"
+stall_mean_ticks = 2_000_000
+eio_probability = "1/2000"
+
+[faults]
+kill_probability = "1/200"
+enomem_probability = "1/5000"
+targeting = "uniform"
+draw = ["node_kill", "node_isolate", "node_freeze", "clock_step", "clock_drift"]
+restart_after_ticks = 400_000_000
+arm_after_ticks = 500_000_000
+budget_per_run = 8
+fault_points = ["any"]

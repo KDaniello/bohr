@@ -66,7 +66,15 @@ pub(crate) fn without_faults(text: &str) -> Result<String, CliError> {
     value.remove("partition");
     value.remove("grey");
     for (section, keys) in [
-        ("network", &["drop_probability", "duplicate_probability", "reorder_probability"][..]),
+        (
+            "network",
+            &[
+                "drop_probability",
+                "duplicate_probability",
+                "reorder_probability",
+                "corrupt_probability",
+            ][..],
+        ),
         ("disk", &["stall_probability", "eio_probability", "enospc_probability"][..]),
     ] {
         if let Some(toml::Value::Table(table)) = value.get_mut(section) {
@@ -355,6 +363,7 @@ nodes = 2
 [network]
 latency_mean_ticks = 10
 drop_probability = "1/10"
+corrupt_probability = "1/50"
 [disk]
 stall_probability = "1/16"
 snapshot_depth = 2

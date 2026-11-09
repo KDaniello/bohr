@@ -11,6 +11,7 @@
 # ...except the golden bundles the replay, reduce, report and handover tests read.
 # They are 2 KB each and a clean clone without them fails 184 tests.
 !/testdata/bundles/*.bohr
+!/testdata/bundles/abi1/*.bohr
 *.profraw
 
 # Editors

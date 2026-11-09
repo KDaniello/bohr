@@ -42,6 +42,7 @@ gap written down.
 | `timerfd`, `setitimer`, `alarm`, `poll`/`epoll` timeouts | timers fire at real moments | all timers are virtual: expiry is a tick in the world's timer queue | solved | `integration::virtual_time_compresses_sleep` |
 | `sleep` of any form | real elapsed time | the clock jumps; the guest wakes instantly | solved | same |
 | clock skew between nodes | a real cluster's nodes disagree | each node has an offset and a drift rate, both drawn from the tape (`ClockSkew`) | solved | `integration::clock_skew_visible_to_guest` |
+| the date | a real clock reads today | every wall clock starts at 2025-01-01 00:00:00 UTC, fixed in the kernel (`WALL_EPOCH`), so a step back moves it and every host reads the same dates | solved | `bohr-kernel` `clock` tests |
 | CPU frequency scaling affecting measured durations | a guest that measures work in cycles sees different numbers | logical time is a function of progress units, not of host frequency | solved | `portability::cross_cpu` |
 
 **The one shape we handle badly and say so:** a guest that busy-polls a clock expecting real time to
@@ -137,7 +138,7 @@ portability it does not have. Details and detection in [`PLATFORMS.md`](./PLATFO
 | directory iteration order | filesystem-dependent | our virtual filesystem returns entries in a defined order | solved | `system::readdir_order_stable` |
 | inode numbers, device numbers | host-assigned | virtualised | solved | `system::stat_fields_virtual` |
 | free space, `statfs` | machine-dependent | from configuration | solved | same |
-| **`fsync` semantics** | what survives a crash | strict model: unsynced data is **lost** on a node kill | solved | `integration::unsynced_data_lost_on_crash` |
+| **`fsync` semantics** | what survives a crash | unsynced data is lost, kept, or kept sector by sector on a crash, by one fixed-width draw; `reorder_unsynced = false` keeps all or none | solved | `integration::unsynced_data_lost_on_crash`, `bohr check header_without_record` |
 | write tearing, pre-`fsync` reordering | real disks do both | modelled as faults drawn from the tape | solved | `integration::torn_write_visible` |
 | file descriptor numbers | assigned by the kernel; usually deterministic but not guaranteed under our own interception | virtualised at the boundary | solved | `system::fds_virtualised` |
 | `/proc/self/*` | exposes host state broadly | virtual, generated from world state | partial | `system::proc_self_virtual` — the covered set is listed in `PLATFORMS.md` §4 |
@@ -159,6 +160,7 @@ which is precisely the first hunting target list.
 | ephemeral port assignment | kernel-chosen | assigned by us in a defined sequence | solved | `system::ports_virtualised` |
 | DNS | resolver state, network access | a static hosts table from configuration | solved | `system::dns_from_config` |
 | readiness (`epoll`, `poll`, `eventfd`) | the kernel's wait queues | the world's own readiness: level- and edge-triggered and one-shot watches, an `eventfd` write waking its pollers, all ordered | solved | golden `epoll` workload, `bohr check golden` |
+| datagram corruption | bit errors are physical | drawn at one width per datagram where the scenario arms it: whether, where and by which mask | solved | `bohr check no_checksum` |
 | pipes | a kernel buffer between two descriptors | in a world with a `[cluster]`, a stream pair: a read blocks on empty, a write wakes it, a closed write end reads as the end; the direction is not enforced | partial | golden `pipe` workload |
 | TCP behaviour (Nagle, window scaling, retransmits) | kernel stack details | a simplified stream model preserving ordering and framing, not the RFC | partial | documented; a guest depending on precise TCP timing is out of scope |
 | `SO_REUSEPORT` load balancing | kernel hashes connections across listeners | our own defined distribution, drawn from the tape | solved | — |

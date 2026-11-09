@@ -246,6 +246,50 @@ horizon_ticks = 20_000_000_000
     assert_eq!(code, 0, "{report}");
 }
 
+/// A fault point is armed by the run's own draw: always at certain odds, never where none is
+/// listed, and at even odds on some seeds and not others — the same on every repeat of one seed.
+#[test]
+fn a_fault_point_is_armed_by_the_run_and_repeats() {
+    let Some(path) = guest("reads_its_armed_fault_points") else {
+        return;
+    };
+    let scenario = |odds: &str, listed: bool| {
+        let points = if listed {
+            "fault_points = [\"skip_sync\"]
+"
+        } else {
+            ""
+        };
+        write_scenario(
+            &format!("armed-{}-{listed}", odds.replace('/', "-")),
+            &format!(
+                "[cluster]
+nodes = 1
+argv = [\"{path}\"]
+[faults]
+{points}                 fault_point_probability = \"{odds}\"
+"
+            ),
+        )
+    };
+    let status = |file: &str, seed: u32| {
+        let (code, _, report) =
+            bohr(&["run", "--seed", &seed.to_string(), "--config", file, "--", &path]);
+        (code, report.contains("exit status 7"))
+    };
+    let always = scenario("1/1", true);
+    assert_eq!(status(&always, 1), (1, true), "armed at certain odds");
+    let unlisted = scenario("1/1", false);
+    assert_eq!(status(&unlisted, 1), (0, false), "nothing listed, nothing armed");
+    let even = scenario("1/2", true);
+    let armed: Vec<bool> = (1..=20).map(|seed| status(&even, seed).1).collect();
+    assert!(armed.iter().any(|a| *a) && armed.iter().any(|a| !*a), "{armed:?}");
+    let (code, _, report) =
+        bohr(&["run", "--seed", "3", "--repeat", "20", "--config", &even, "--", &path]);
+    assert!(!report.contains("DIVERGED"), "{report}");
+    assert!(code == 0 || code == 1, "{report}");
+}
+
 /// A file survives being unlinked while it is open, which is how a temporary file works and what a
 /// database relies on.
 #[test]

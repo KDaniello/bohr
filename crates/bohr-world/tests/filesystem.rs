@@ -78,6 +78,7 @@ fn answers(paths: &[&str], ops: Vec<GuestOp>) -> Result<Vec<(u32, i64)>, KernelE
     let mut sink = TraceWriter::new(Vec::new());
 
     run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,

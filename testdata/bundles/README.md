@@ -18,5 +18,9 @@ A bundle named `traced-*` was produced under interception and is skipped where t
 trace a guest; every other bundle here comes from a guest built into the binary and replays
 anywhere the tool builds.
 
+`abi1/` keeps the same three as v0.5 recorded them, under tape ABI 1. They are not replayed: each
+must be refused with both ABI versions named (`a_bundle_of_an_older_tape_abi_is_refused_by_name`),
+which is what an upgrade promises a stored finding it can no longer reproduce.
+
 Bundles are produced by `bohr selftest --save-dir`, never edited by hand: a hand-edited bundle
 would fail its own section hashes, which is exactly what those hashes are for.

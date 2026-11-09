@@ -145,6 +145,9 @@ fn asking_client() -> NullProgram {
     ops.push(GuestOp::Syscall { nr: SOCKET, args: INET_STREAM });
     ops.push(GuestOp::Syscall { nr: CONNECT, args: [CLIENT_FD, SOCKADDR_AT, 16, 0, 0, 0] });
     ops.push(GuestOp::Syscall { nr: WRITE, args: [CLIENT_FD, PAYLOAD_AT, 5, 0, 0, 0] });
+    // Read once the answer is there: a read that parks is recorded with what it answered when it
+    // parked, and the length it came back with is not on its event.
+    ops.extend(sleeps(2));
     ops.push(GuestOp::Syscall { nr: READ, args: [CLIENT_FD, INBOX_AT, 64, 0, 0, 0] });
     ops.extend(sleeps(30));
     NullProgram::single(ops)

@@ -55,6 +55,7 @@ fn drive(
     let mut sink = TraceWriter::new(Vec::new());
 
     run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world,

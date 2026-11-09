@@ -78,6 +78,10 @@ pub struct NetworkConfig {
     pub duplicate_probability: (u32, u32),
     /// Probability a packet is reordered.
     pub reorder_probability: (u32, u32),
+    /// Probability a datagram arrives with bytes altered.
+    pub corrupt_probability: (u32, u32),
+    /// How many bytes an altered datagram has flipped.
+    pub corrupt_bytes: u32,
     /// Scheduled directed cuts, raised and healed at their ticks.
     pub partitions: Vec<ScheduledPartition>,
     /// Scheduled grey windows: links that degrade without breaking.
@@ -94,6 +98,8 @@ impl Default for NetworkConfig {
             drop_probability: (0, 1),
             duplicate_probability: (0, 1),
             reorder_probability: (0, 1),
+            corrupt_probability: (0, 1),
+            corrupt_bytes: 1,
             partitions: Vec::new(),
             grey: Vec::new(),
         }
@@ -135,6 +141,8 @@ struct InFlight {
     payload: Vec<u8>,
     delay: u64,
     duplicated: bool,
+    /// Whether bytes were altered on the wire.
+    corrupted: bool,
 }
 
 /// A datagram that arrived and waits to be read.
@@ -995,6 +1003,22 @@ impl Network {
         let reordered = draw_odds(ctx, self.config.reorder_probability, DrawSite::NetReorder)?;
         let jitter = ctx.draw_exponential(self.config.latency_jitter_ticks, DrawSite::NetDelay)?;
         let delay = mean.saturating_add(jitter);
+        // **Drawn only where the scenario asks for it, and then always at one width.** A run that
+        // arms no corruption keeps the tape every earlier run of it had; one that does draws the
+        // decision and every flip whether or not the datagram is altered, so where the tape stands
+        // never depends on what was drawn.
+        let flips = if self.config.corrupt_probability.0 > 0 {
+            let corrupted = draw_odds(ctx, self.config.corrupt_probability, DrawSite::NetCorrupt)?;
+            let mut flips = Vec::with_capacity(self.config.corrupt_bytes as usize);
+            for _ in 0..self.config.corrupt_bytes {
+                let mut drawn = [0u8; 8];
+                ctx.draw_into(&mut drawn, DrawSite::NetCorrupt);
+                flips.push(u64::from_le_bytes(drawn));
+            }
+            if corrupted && !payload.is_empty() { flips } else { Vec::new() }
+        } else {
+            Vec::new()
+        };
 
         let unreachable = !self.linked(node, dest_node);
         let cut = self.cuts.contains(&(node, dest_node));
@@ -1007,26 +1031,50 @@ impl Network {
         let natural = Tick(now.get().saturating_add(delay).max(now.get() + 1));
         // Reordering slots this packet just before the earliest one still flying on the same
         // directed link; with an empty link the fate degrades to an ordinary delivery.
-        let at = if reordered {
-            match self
-                .on_link
-                .get(&(node, dest_node))
-                .and_then(|flights| flights.iter().map(|(_, at)| *at).min())
-            {
-                Some(earliest) => Tick(earliest.get().saturating_sub(1).max(now.get() + 1)),
-                None => natural,
-            }
-        } else {
-            natural
+        let earliest = reordered
+            .then(|| {
+                self.on_link
+                    .get(&(node, dest_node))
+                    .and_then(|flights| flights.iter().map(|(_, at)| *at).min())
+            })
+            .flatten();
+        // Slotted just before the earliest packet still flying, where that is before this one's own
+        // moment and leaves it first; anything else delivers as it would have, and is no fault.
+        let overtakes = earliest.map(|e| (e, Tick(e.get().saturating_sub(1).max(now.get() + 1))));
+        let at = match overtakes {
+            Some((e, slot)) if slot < e && slot < natural => slot,
+            _ => natural,
         };
+        let link = FaultTarget::Link { from: node, to: dest_node };
+        if at < natural {
+            ctx.emit(EventKind::FaultFired { fault: FaultKind::NetReorder, target: link })?;
+        }
+        if duplicated {
+            ctx.emit(EventKind::FaultFired { fault: FaultKind::NetDuplicate, target: link })?;
+        }
 
         // Copied only where a duplicate was drawn. Every datagram would otherwise pay for the one
-        // in a thousand that is sent twice.
+        // in a thousand that is sent twice. The copy is the bytes as sent: what the wire alters it
+        // alters once, on the delivery it was drawn for.
         let copy = duplicated.then(|| payload.clone());
+        let mut payload = payload;
+        let corrupted = !flips.is_empty();
+        // Each flip on a byte no earlier flip took, so two cannot cancel: an offset into the
+        // datagram and a mask that changes at least one bit.
+        let mut taken = BTreeSet::new();
+        for flip in flips {
+            let at = (flip % payload.len() as u64) as usize;
+            if taken.insert(at) {
+                payload[at] ^= ((flip >> 32) as u8) | 1;
+            }
+        }
+        if corrupted {
+            ctx.emit(EventKind::FaultFired { fault: FaultKind::NetCorrupt, target: link })?;
+        }
         self.enqueue(
             node,
             dest_node,
-            InFlight { from, to, payload, delay, duplicated: false },
+            InFlight { from, to, payload, delay, duplicated: false, corrupted },
             at,
             arm,
         );
@@ -1034,7 +1082,7 @@ impl Network {
             self.enqueue(
                 node,
                 dest_node,
-                InFlight { from, to, payload, delay, duplicated: true },
+                InFlight { from, to, payload, delay, duplicated: true, corrupted: false },
                 natural,
                 arm,
             );
@@ -1075,7 +1123,13 @@ impl Network {
         }
 
         let dest = packet.to.node;
-        let fate = if packet.duplicated { PacketFate::Duplicated } else { PacketFate::Delivered };
+        let fate = if packet.corrupted {
+            PacketFate::Corrupted
+        } else if packet.duplicated {
+            PacketFate::Duplicated
+        } else {
+            PacketFate::Delivered
+        };
         let Some(fd) = self.holder(ctx, dest, Transport::Datagram, packet.to.port)? else {
             // Nobody listens on the port: the packet evaporates, which is what UDP promises.
             ctx.emit_for(
