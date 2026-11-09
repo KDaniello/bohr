@@ -1,0 +1,9 @@
+# The seeded defect, and what `bohr check header_without_record` holds it to; see docs/TESTING.md §16.
+defect = "rewrites a header pointing at a record and syncs once after both, so a crash can keep the header alone"
+
+[check]
+works = {}
+finds = { seeds = "1..60", code = "GuestCrashed", at_least = 20 }
+never_finds = { scenario = "scenario-in-order.toml", seeds = "1..60" }
+repeats = { times = 100 }
+replays = {}

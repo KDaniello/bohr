@@ -56,4 +56,26 @@ for guest in race_counter race_init; do
   fi
 done
 
+# Fault targeting: where a drawn fault lands, uniformly or only at moments a crash would lose
+# something. Over every seeded defect whose scenario draws node faults, the same seeds both ways.
+# The result is recorded either way; guided becomes the default only where it finds at least as
+# often as uniform on every defect, and this script does not make it so — it reports.
+if [ "${TARGETING:-1}" = 1 ]; then
+  printf '\n%-46s %12s %12s\n' "defect scenario" uniform guided
+  work=$(mktemp -d -t bohr-targeting-XXXXXX)
+  trap 'rm -rf "$work"' EXIT
+  found() { # scenario file
+    "$BOHR" sweep "$1" --seeds "1..$SEEDS" -j "${JOBS:-4}" 2>/dev/null \
+      | sed -nE 's/^ *[0-9]+ seeds · ([0-9]+) findings.*/\1/p' | head -1
+  }
+  for scenario in testdata/bugs/*/scenario*.toml; do
+    grep -q '^kill_probability' "$scenario" || continue
+    uniform=$work/uniform.toml guided=$work/guided.toml
+    sed -E '/^targeting *=/d' "$scenario" > "$uniform"
+    sed -E '/^targeting *=/d; /^\[faults\]$/a targeting = "guided"' "$scenario" > "$guided"
+    printf '%-46s %9s/%-2s %9s/%-2s\n' "$scenario" "$(found "$uniform")" "$SEEDS" \
+      "$(found "$guided")" "$SEEDS"
+  done
+fi
+
 exit $fail

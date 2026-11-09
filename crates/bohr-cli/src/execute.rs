@@ -391,7 +391,17 @@ fn drive(
         backend: backend_name.to_owned(),
     };
 
+    // The probe is the last node where the scenario asks for one, and is armed with nothing.
+    let probe = scenario
+        .filter(|s| !s.probes.is_empty())
+        .and_then(|_| u32::try_from(specs.len().checked_sub(1)?).ok());
+    let arming = scenario.map_or(bohr_kernel::Arming::NONE, |s| bohr_kernel::Arming {
+        names: &s.fault_points,
+        odds: s.fault_point_odds,
+        except: probe,
+    });
     let report = run(RunInputs {
+        arming,
         tape,
         backend,
         world,

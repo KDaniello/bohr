@@ -18,12 +18,15 @@ mod ports;
 mod run;
 mod schedule;
 
-pub use clock::{Clock, MAX_DRIFT_PPM, NodeClock};
+pub use clock::{Clock, MAX_DRIFT_PPM, NodeClock, WALL_EPOCH};
 pub use ports::{
     Diagnostic, DueEffects, Effects, EventSink, FaultCatalog, NodeOp, Observer, Oracle, Progress,
     RunOutcome, TaskState, Verdict, Wake, WorldCtx, WorldModel,
 };
-pub use run::{PROGRESS_EVERY, RunConfig, RunInputs, RunMetrics, RunReport, run};
+pub use run::{
+    ARMED_VARIABLE, ARMING, Arming, PROGRESS_EVERY, RunConfig, RunInputs, RunMetrics, RunReport,
+    run,
+};
 pub use schedule::{FairPolicy, PctPolicy, RandomPolicy, SchedulePolicy};
 
 /// Failures that originate in the kernel.

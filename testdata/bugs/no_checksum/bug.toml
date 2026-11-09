@@ -1,0 +1,9 @@
+# The seeded defect, and what `bohr check no_checksum` holds it to; see docs/TESTING.md §16.
+defect = "applies a datagram without a checksum, so an altered update is acted on"
+
+[check]
+works = {}
+finds = { seeds = "1..60", code = "GuestCrashed", at_least = 20 }
+never_finds = { scenario = "scenario-intact.toml", seeds = "1..60" }
+repeats = { times = 100 }
+replays = {}

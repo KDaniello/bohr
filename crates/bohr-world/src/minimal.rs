@@ -195,6 +195,11 @@ pub(crate) fn submission_answer(
     }
 }
 
+/// The epoch every wall clock starts from, in whole seconds, as a file's times are stated.
+fn epoch_seconds() -> i64 {
+    (bohr_kernel::WALL_EPOCH.get() / 1_000_000_000) as i64
+}
+
 /// The one descriptor number this model never hands out.
 ///
 /// The guest already holds a descriptor at this number that means something else: the coverage
@@ -2336,6 +2341,10 @@ impl MinimalWorld {
         let (major, minor) = ((stat::DEVICE >> 8) & 0xfff, stat::DEVICE & 0xff);
         put(&mut buf, 136, &(major as u32).to_le_bytes());
         put(&mut buf, 140, &(minor as u32).to_le_bytes());
+        // Access, birth, change and modification, at the epoch, as `stat` says them.
+        for at in [64, 80, 96, 112] {
+            put(&mut buf, at, &epoch_seconds().to_le_bytes());
+        }
         buf
     }
 
@@ -2427,6 +2436,11 @@ impl MinimalWorld {
         put(&mut buf, 48, &length.to_le_bytes());
         put(&mut buf, 56, &stat::BLOCK_SIZE.to_le_bytes());
         put(&mut buf, 64, &length.div_ceil(512).to_le_bytes());
+        // Access, change and modification at the epoch every wall clock starts from, so a file's
+        // age read against the time is the run's own duration and never 1970's.
+        for at in [72, 88, 104] {
+            put(&mut buf, at, &epoch_seconds().to_le_bytes());
+        }
         buf
     }
 
@@ -2734,8 +2748,9 @@ impl MinimalWorld {
         ctx.now()
     }
 
-    /// What the guest is told the wall time is: the same reading until the node's clock is
-    /// stepped, after which it can move back while [`Self::presented_now`] never does.
+    /// What the guest is told the wall time is: the same reading on top of the wall epoch until
+    /// the node's clock is stepped, after which it can move back while [`Self::presented_now`]
+    /// never does.
     pub(crate) fn presented_wall(ctx: &WorldCtx<'_, '_>) -> Tick {
         #[cfg(feature = "chaos-node-clock-shared")]
         return crate::chaos::shared_now(ctx);

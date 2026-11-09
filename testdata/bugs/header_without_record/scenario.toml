@@ -1,0 +1,15 @@
+# One node killed at drawn moments and started again on what its disk kept. A crash may keep some
+# unsynced writes and lose others, which is the only state that leaves the header without its
+# record.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/header_without_record"]
+
+[run]
+horizon_ticks = 3_000_000_000
+
+[faults]
+kill_probability = "1/300"
+restart_after_ticks = 5_000_000
+budget_per_run = 10

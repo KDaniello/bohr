@@ -1369,6 +1369,36 @@ gate_s = { v0_4 = 117, v0_5 = 109 }
 pr_s = { v0_4 = 49, v0_5 = 43 }
 probe_cost = { events = "+6.5%", wall = "+47%" }
 
+# What v0.6.0 was measured to do, on 2026-11-09, on the Ubuntu 24.04 VM, v0.5.0's binary beside it.
+# Each bound was written in roadmap/v0.6.md before its run. G6.3 fails as written: the defect is
+# reached by reordering alone, on 11 of 60 seeds against a bound of 20.
+[v0_6.gates]
+fault_lists_agree = "the format, the catalogue and what the world narrates: one list"   # G6.1
+no_checksum = { with_corruption = "58 of 60", without = "0 of 60" }                     # G6.2
+header_without_record = { with_reordering = "11 of 60", without = "0 of 60" }           # G6.3, bound 20: fails
+repeat_1000_every_fault = "one digest"                                                   # G6.5
+abi1_bundles_refused = "3 of 3, both versions named"                                     # G6.6
+make_pr = "green"                                                                        # G6.7
+make_gate = "green, 13 of 13"
+mutation_injections_caught = "13 of 13"
+tests = 693
+
+[targeting.v0_6]                                                                         # G6.4
+header_without_record = { uniform = "11 of 60", guided = "15 of 60" }
+header_without_record_in_order = { uniform = "0 of 60", guided = "0 of 60" }
+lease_clock_drawn = { uniform = "23 of 60", guided = "0 of 60" }
+default = "uniform: guided loses on lease_clock"
+
+[v0_6.perf]
+per_call_us = { v0_5 = 4.3, v0_6 = 4.0 }                                 # P6.3
+startup_ms = { v0_5 = 2.63, v0_6 = 2.41 }
+redb_64_runs_ms = { j1 = { v0_5 = 3_003, v0_6 = 2_771 }, j4 = { v0_5 = 803, v0_6 = 799 } }
+peak_rss_mb = { v0_5 = 14.5, v0_6 = 14.1 }
+faults_at_zero_ms = { none = 852, zero = 850 }                           # P6.1, median of 15, bound 1.01x
+gibibyte_crash_run_ms = { calm = 37, crashed = 37 }                      # P6.2, bound 100 ms for the image
+gate_s = 118
+pr_s = 45
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

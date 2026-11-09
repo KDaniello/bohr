@@ -61,6 +61,7 @@ fn outcome(ops: Vec<GuestOp>) -> Result<Vec<i64>, KernelError> {
     let mut sink = TraceWriter::new(Vec::new());
 
     run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,

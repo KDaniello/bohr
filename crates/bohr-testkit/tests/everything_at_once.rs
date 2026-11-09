@@ -121,6 +121,7 @@ fn all_of_it() -> Scenario {
             eio_probability: (1, 16),
             enospc_probability: (1, 16),
             snapshot_depth: 4,
+            reorder_unsynced: true,
         },
         fault_policy: FaultPolicy {
             kill: (1, 64),

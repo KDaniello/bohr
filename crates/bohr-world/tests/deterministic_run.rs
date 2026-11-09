@@ -78,6 +78,7 @@ fn execute_with_memory(
     let spec = bohr_backend::GuestSpec::default();
 
     let report = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,
@@ -122,6 +123,7 @@ fn execute_cluster(programs: Vec<NullProgram>, seed: u64) -> Result<(Digest, Vec
     let specs = vec![bohr_backend::GuestSpec::default(); programs.len()];
 
     let report = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,
@@ -299,6 +301,7 @@ fn a_guest_that_never_ends_is_stopped_by_the_tick_budget() {
     let spec = bohr_backend::GuestSpec::default();
 
     let report = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,

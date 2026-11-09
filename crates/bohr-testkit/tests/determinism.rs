@@ -133,7 +133,13 @@ mod cluster {
             }
         }
         assert_eq!(first_read.len(), 2, "both nodes read the clock");
-        let loudest = first_read.values().max().copied().unwrap_or(0);
+        // The wall clock starts at the epoch on every node; what a node's own offset adds is above
+        // it, so the epoch is taken off before asking whether any offset shows.
+        let loudest = first_read
+            .values()
+            .map(|at| at.saturating_sub(bohr_kernel::WALL_EPOCH.get()))
+            .max()
+            .unwrap_or(0);
         assert!(
             loudest > 1_000_000,
             "no node shows its drawn offset; the cluster is reading one shared clock ({loudest})"

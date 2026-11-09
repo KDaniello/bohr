@@ -939,7 +939,7 @@ fn format_rfc3339(seconds: u64) -> String {
 /// Duplicated as a constant rather than taken from `bohr-tape`, which this crate does not depend
 /// on; a mismatch is caught by the check in `scripts/lint-rules.sh`.
 const fn bohr_tape_abi() -> u16 {
-    1
+    2
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {

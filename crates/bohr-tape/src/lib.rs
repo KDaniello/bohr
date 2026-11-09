@@ -37,7 +37,7 @@ pub const TAPE_FORMAT_VERSION: u16 = 1;
 ///
 /// A bundle recording a different value is refused rather than replayed. A run derived from
 /// differently interpreted bytes is a different run. See `docs/API.md` §9.
-pub const TAPE_ABI: u16 = 1;
+pub const TAPE_ABI: u16 = 2;
 
 /// Largest denominator the boolean draw can express.
 ///

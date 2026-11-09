@@ -441,8 +441,8 @@ impl<'a, 't> WorldCtx<'a, 't> {
 
     /// What the node this stop happened on reads for wall time (`CLOCK_REALTIME`).
     ///
-    /// The same as [`Self::now`] until the node's clock is stepped; after a step back it can read
-    /// earlier than before, as a wall clock can.
+    /// [`Self::now`] on top of the wall epoch until the node's clock is stepped; after a step back
+    /// it can read earlier than before, as a wall clock can.
     ///
     /// # Panics
     /// On a detached context; use [`Self::wall_on`] there.
@@ -616,14 +616,12 @@ impl<'a, 't> WorldCtx<'a, 't> {
                 self.recorded.violation_event.get_or_insert(*self.next_event);
             }
             // Both vocabularies, because the guest cannot tell them apart and this number is about
-            // the guest. A fault is something the world was told to do; a packet that was lost,
-            // doubled or overtaken is the medium being the medium — and a campaign whose only
-            // adversity is a lossy link would otherwise report that it injected nothing.
+            // the guest. A fault is something the world was told to do; a packet lost on a lossy
+            // link is the medium being the medium — and a campaign whose only adversity is a lossy
+            // link would otherwise report that it injected nothing. A packet doubled, overtaken or
+            // altered fires a fault of its own, and is counted there once.
             EventKind::FaultFired { .. }
-            | EventKind::PacketFate {
-                fate: PacketFate::Dropped | PacketFate::Duplicated | PacketFate::Reordered,
-                ..
-            } => {
+            | EventKind::PacketFate { fate: PacketFate::Dropped, .. } => {
                 self.recorded.adversity = self.recorded.adversity.saturating_add(1);
             }
             _ => {}

@@ -230,6 +230,8 @@ pub enum PacketFate {
     Duplicated,
     /// Delivered out of send order.
     Reordered,
+    /// Delivered with bytes altered on the wire. Appended: the discriminant reaches the digest.
+    Corrupted,
 }
 
 /// A virtual disk operation.
@@ -289,6 +291,8 @@ pub enum FaultKind {
     /// Refuse an allocation: `mmap` and `mremap` answer `ENOMEM`, `brk` leaves the break where it
     /// was. Appended, for the reason above.
     MemoryExhausted,
+    /// Flip bytes of a datagram on the wire. Appended, for the reason above.
+    NetCorrupt,
 }
 
 /// What a fault was applied to.

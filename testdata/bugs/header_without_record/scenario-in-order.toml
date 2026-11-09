@@ -1,0 +1,17 @@
+# The same crashes, each keeping every unsynced write or none: the store always comes back
+# consistent, because the header and the record land together or not at all.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/header_without_record"]
+
+[run]
+horizon_ticks = 3_000_000_000
+
+[faults]
+kill_probability = "1/300"
+restart_after_ticks = 5_000_000
+budget_per_run = 10
+
+[disk]
+reorder_unsynced = false

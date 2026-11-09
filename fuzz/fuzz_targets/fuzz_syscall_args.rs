@@ -72,6 +72,7 @@ fuzz_target!(|data: &[u8]| {
     // A run that ends in an error is a valid outcome — a refusal is the world working. What is
     // being fuzzed is that it ends: no panic, no unbounded allocation, no loop without a budget.
     let _ = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,

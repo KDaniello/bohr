@@ -85,6 +85,7 @@ pub const fn fault_action(fault: FaultKind) -> &'static str {
         FaultKind::ClockDrift => "a clock was set drifting",
         FaultKind::ChainReorg => "history was rewound and run again",
         FaultKind::MemoryExhausted => "memory ran out",
+        FaultKind::NetCorrupt => "a datagram was altered on the wire",
     }
 }
 
@@ -107,6 +108,7 @@ pub const fn packet_fate(fate: PacketFate) -> &'static str {
         PacketFate::Dropped => "dropped",
         PacketFate::Duplicated => "duplicated",
         PacketFate::Reordered => "reordered",
+        PacketFate::Corrupted => "delivered altered",
     }
 }
 

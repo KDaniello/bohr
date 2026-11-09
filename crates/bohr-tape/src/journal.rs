@@ -40,6 +40,8 @@ pub enum DrawSite {
     NetPartition = 13,
     /// Which socket of several sharing one port receives.
     NetSocket = 14,
+    /// Network: whether a datagram is altered on the wire, and where.
+    NetCorrupt = 15,
 
     /// Disk: operation stall.
     DiskLatency = 20,
@@ -83,6 +85,7 @@ impl DrawSite {
             Self::NetReorder => "reordering within a link",
             Self::NetPartition => "a partition event",
             Self::NetSocket => "which socket of a shared port receives",
+            Self::NetCorrupt => "whether and where a datagram is altered",
             Self::DiskLatency => "a disk stall",
             Self::DiskTear => "how a write tears",
             Self::DiskReorder => "reordering before a sync",
@@ -112,6 +115,7 @@ impl DrawSite {
             12 => Self::NetReorder,
             13 => Self::NetPartition,
             14 => Self::NetSocket,
+            15 => Self::NetCorrupt,
             20 => Self::DiskLatency,
             21 => Self::DiskTear,
             22 => Self::DiskReorder,
@@ -320,6 +324,7 @@ mod tests {
             DrawSite::NetReorder,
             DrawSite::NetPartition,
             DrawSite::NetSocket,
+            DrawSite::NetCorrupt,
             DrawSite::DiskLatency,
             DrawSite::DiskTear,
             DrawSite::DiskReorder,

@@ -269,6 +269,7 @@ fn run_scripts(scripts: Vec<Vec<Step>>, child: Vec<Step>, config: RunConfig) -> 
     let mut watching = Watching::default();
     let specs = vec![GuestSpec::default(); scripts.len()];
     let result = run(RunInputs {
+        arming: bohr_kernel::Arming::NONE,
         tape: &tape,
         backend: &mut backend,
         world: &mut world,
@@ -280,6 +281,14 @@ fn run_scripts(scripts: Vec<Vec<Step>>, child: Vec<Step>, config: RunConfig) -> 
         config,
     });
     Ran { result, backend, progress: watching.reports }
+}
+
+/// A node that is still running when another node acts on it, whatever order the schedule draws:
+/// one call and an exit can be over before the other node's first call.
+fn long_lived() -> Vec<Step> {
+    let mut steps = vec![Step::Call(call::PLAIN); 20];
+    steps.push(Step::Exit(0));
+    steps
 }
 
 fn report(scripts: Vec<Vec<Step>>, config: RunConfig) -> RunReport {
@@ -386,10 +395,7 @@ fn a_killed_node_is_not_a_crash_of_the_guest() {
 #[test]
 fn a_frozen_node_left_frozen_is_waited_for_and_thawed_runs() {
     let frozen = report(
-        vec![
-            vec![Step::Call(call::FREEZE_NODE_1), Step::Exit(0)],
-            vec![Step::Call(call::PLAIN), Step::Exit(0)],
-        ],
+        vec![vec![Step::Call(call::FREEZE_NODE_1), Step::Exit(0)], long_lived()],
         RunConfig::default(),
     );
     assert_eq!(frozen.stop_reason, StopReason::Deadlock, "a frozen task is not runnable");
@@ -397,7 +403,7 @@ fn a_frozen_node_left_frozen_is_waited_for_and_thawed_runs() {
     let thawed = report(
         vec![
             vec![Step::Call(call::FREEZE_NODE_1), Step::Call(call::THAW_NODE_1), Step::Exit(0)],
-            vec![Step::Call(call::PLAIN), Step::Exit(0)],
+            long_lived(),
         ],
         RunConfig::default(),
     );
@@ -409,7 +415,7 @@ fn a_restarted_node_runs_its_program_again() {
     let ran = run_scripts(
         vec![
             vec![Step::Call(call::KILL_NODE_1), Step::Call(call::RESTART_NODE_1), Step::Exit(0)],
-            vec![Step::Call(call::PLAIN), Step::Exit(0)],
+            long_lived(),
         ],
         Vec::new(),
         RunConfig::default(),

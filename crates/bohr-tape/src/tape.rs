@@ -386,11 +386,11 @@ mod tests {
         let bytes = Tape::with_prefix(Seed(3), vec![1, 2, 3]).to_container();
 
         let mut older = bytes.clone();
-        older[6] = 0;
+        older[6] = (crate::TAPE_ABI - 1) as u8;
         assert!(matches!(Tape::from_container(&older), Err(TapeError::UnsupportedAbi { .. })));
 
         let mut newer = bytes.clone();
-        newer[6] = 2;
+        newer[6] = (crate::TAPE_ABI + 1) as u8;
         assert!(matches!(Tape::from_container(&newer), Err(TapeError::UnsupportedAbi { .. })));
 
         assert!(Tape::from_container(&bytes).is_ok(), "the ABI this build writes still reads");

@@ -703,8 +703,12 @@ impl DistributedWorld {
             catalog: FaultCatalog::new(vec![
                 FaultKind::NetDelay,
                 FaultKind::NetDrop,
+                FaultKind::NetDuplicate,
+                FaultKind::NetReorder,
                 FaultKind::NetPartition,
                 FaultKind::DiskTear,
+                FaultKind::DiskReorder,
+                FaultKind::DiskStall,
                 FaultKind::DiskFull,
                 FaultKind::DiskError,
                 FaultKind::NodeKill,
@@ -715,6 +719,7 @@ impl DistributedWorld {
                 FaultKind::ClockStep,
                 FaultKind::ClockDrift,
                 FaultKind::MemoryExhausted,
+                FaultKind::NetCorrupt,
             ]),
         }
     }
@@ -1037,8 +1042,9 @@ impl DistributedWorld {
                 EventKind::Domain { ns: domain_ns(), kind: DOMAIN_EXPOSED, payload },
             )?;
         }
+        let reorder = self.disk_config.reorder_unsynced;
         let (world, disk) = self.node_parts(node);
-        let image = disk.crash_image(node, world, ctx)?;
+        let image = disk.crash_image(node, world, reorder, ctx)?;
         self.nodes.insert(node, restored_node(&self.template, image));
         self.node_of_task.retain(|_, n| *n != node);
         self.net.drop_node(node, wakes);
@@ -1101,6 +1107,10 @@ impl DistributedWorld {
                     disk.stall(task, inode);
                     let at = Tick(ctx.world_now().get().saturating_add(duration.max(1)));
                     self.timers.arm(at, node, Due::DiskStallDone { node, task });
+                    ctx.emit(EventKind::FaultFired {
+                        fault: FaultKind::DiskStall,
+                        target: FaultTarget::Descriptor(Fd(fd as i32)),
+                    })?;
                     ctx.emit(EventKind::DiskOp {
                         fd: Fd(fd as i32),
                         op: DiskOpKind::Fsync,

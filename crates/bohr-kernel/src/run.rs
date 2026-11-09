@@ -67,6 +67,30 @@ pub struct RunConfig {
     pub ticks_per_progress_unit: Option<u64>,
 }
 
+/// The SDK fault points a run may arm, by name, and the odds each is armed on a node.
+///
+/// Empty arms nothing; the draw that decides is made either way (see [`ARMING`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Arming<'a> {
+    /// The names, as the guest gives them to `fault_point`.
+    pub names: &'a [String],
+    /// The odds each is armed on a node.
+    pub odds: (u32, u32),
+    /// A node never armed, whatever is listed: the probe's, which is not the cluster's.
+    pub except: Option<u32>,
+}
+
+impl Arming<'_> {
+    /// Nothing armed.
+    pub const NONE: Arming<'static> = Arming { names: &[], odds: (0, 1), except: None };
+}
+
+/// The variable the SDKs read the armed fault points from: names, comma-separated.
+pub const ARMED_VARIABLE: &str = "BOHR_ARMED_FAULT_POINTS";
+
+/// The diagnostic that says which fault points a node was started with armed.
+pub const ARMING: &str = "BOHR-2008";
+
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +103,27 @@ impl Default for RunConfig {
             ticks_per_progress_unit: None,
         }
     }
+}
+
+/// Whether `name` is armed on `node`, from the run's arming draw.
+///
+/// A hash of the draw, the node and the name rather than a draw each: the tape then spends the same
+/// eight bytes whatever a scenario lists, so adding a fault point to a scenario moves no other
+/// decision of the run.
+///
+/// All-ones arms nothing: it is what a reduction writes over a decision to make it quiet, and a
+/// hashed draw would otherwise turn a reduction's quietest tape into an arbitrary set.
+fn armed(seed: u64, node: u32, name: &str, (num, den): (u32, u32)) -> bool {
+    if num == 0 || den == 0 || seed == u64::MAX {
+        return false;
+    }
+    let mut bytes = seed.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&node.to_le_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    let digest = Digest::of(&bytes);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(first) % u64::from(den) < u64::from(num)
 }
 
 /// Virtual hours a run may reach before it is called hung.
@@ -116,6 +161,8 @@ pub struct RunInputs<'a, 't> {
     pub specs: &'a [GuestSpec],
     /// Bounds on the run.
     pub config: RunConfig,
+    /// Which SDK fault points the run may arm.
+    pub arming: Arming<'a>,
 }
 
 /// What a run produced.
@@ -351,7 +398,8 @@ impl Tasks {
 
 /// Drives one guest to completion.
 pub fn run(inputs: RunInputs<'_, '_>) -> Result<RunReport, KernelError> {
-    let RunInputs { tape, backend, world, policy, oracle, sink, observer, specs, config } = inputs;
+    let RunInputs { tape, backend, world, policy, oracle, sink, observer, specs, config, arming } =
+        inputs;
     let mut run = Run {
         backend,
         world,
@@ -373,6 +421,8 @@ pub fn run(inputs: RunInputs<'_, '_>) -> Result<RunReport, KernelError> {
         metrics: RunMetrics::default(),
         reported_at: 0,
         handling: None,
+        arming,
+        armed: Vec::new(),
     };
     let ended = run.start().and_then(|()| run.drive());
     match ended {
@@ -410,6 +460,10 @@ struct Run<'a, 't> {
     reported_at: u64,
     /// The task whose stop is being handled, for saying where an invariant failed.
     handling: Option<TaskId>,
+    /// What the run may arm.
+    arming: Arming<'a>,
+    /// The fault points armed on each node, by index, drawn at the start.
+    armed: Vec<Vec<String>>,
 }
 
 /// What the loop does when nothing is runnable.
@@ -434,18 +488,65 @@ impl Run<'_, '_> {
         if self.specs.is_empty() {
             return Err(KernelError::Invariant("a run needs at least one node"));
         }
+        // **Which fault points are armed is drawn first, and always.** Eight bytes before the first
+        // node clock, whatever the scenario lists, so the tape's layout is one thing for every run
+        // and a scenario that names a fault point moves no other decision. See `docs/API.md` §5.4.
+        let mut drawn = [0u8; 8];
+        self.cursor.draw_into(&mut drawn, DrawSite::SdkFaultPoint);
+        let seed = u64::from_le_bytes(drawn);
+        self.armed = (0..self.specs.len() as u32)
+            .map(|node| {
+                if self.arming.except == Some(node) {
+                    return Vec::new();
+                }
+                self.arming
+                    .names
+                    .iter()
+                    .filter(|name| armed(seed, node, name, self.arming.odds))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
         // Every node gets a clock of its own before anything runs. Two machines never agree on the
         // time, and a run where they did would never reach the bugs that depend on them
         // disagreeing.
-        for (index, spec) in self.specs.iter().enumerate() {
+        for index in 0..self.specs.len() {
             let node = NodeId(index as u32);
             let node_clock = draw_node_clock(&mut self.cursor, self.config.max_clock_skew)?;
             self.clock.set_node_clock(node, node_clock);
-            let first = self.backend.spawn(node, spec)?;
+            let spec = self.spec_for(node)?;
+            self.say_armed(node)?;
+            let first = self.backend.spawn(node, &spec)?;
             self.tasks.add(first, node, Slot::Pending(Resume::Continue));
             self.tasks.node_state.insert(node, NodeLifecycle::Running);
         }
         Ok(())
+    }
+
+    /// A node's program as it is started: its spec, with the fault points armed on it.
+    ///
+    /// The same at every start of the node, a restart included: what a node was armed with is
+    /// drawn once for the run, and a restarted node that came back unarmed would be another test.
+    fn spec_for(&self, node: NodeId) -> Result<GuestSpec, KernelError> {
+        let mut spec = self
+            .specs
+            .get(node.get() as usize)
+            .ok_or(KernelError::Invariant("starting a node that the run does not have"))?
+            .clone();
+        if let Some(names) = self.armed.get(node.get() as usize).filter(|n| !n.is_empty()) {
+            spec.env.push((ARMED_VARIABLE.to_owned(), names.join(",")));
+        }
+        Ok(spec)
+    }
+
+    /// Says which fault points a node starts with armed, at every start of it.
+    fn say_armed(&mut self, node: NodeId) -> Result<(), KernelError> {
+        let Some(names) = self.armed.get(node.get() as usize).filter(|n| !n.is_empty()) else {
+            return Ok(());
+        };
+        let message =
+            format!("node {} starts with fault points armed: {}", node.get(), names.join(", "));
+        self.emit(node, TaskId::ZERO, EventKind::Diagnostic { code: ARMING.to_owned(), message })
     }
 
     /// The loop: fire what is due, check every ending, pick, run, and answer the stop.
@@ -841,10 +942,9 @@ impl Run<'_, '_> {
                     if self.tasks.node_state.get(&node) != Some(&NodeLifecycle::Dead) {
                         return Err(KernelError::Invariant("restarting a node that is not dead"));
                     }
-                    let spec = self.specs.get(node.get() as usize).ok_or(
-                        KernelError::Invariant("restarting a node that was never started"),
-                    )?;
-                    let first = self.backend.spawn(node, spec)?;
+                    let spec = self.spec_for(node)?;
+                    self.say_armed(node)?;
+                    let first = self.backend.spawn(node, &spec)?;
                     self.tasks.add(first, node, Slot::Pending(Resume::Continue));
                     self.tasks.node_state.insert(node, NodeLifecycle::Running);
                 }

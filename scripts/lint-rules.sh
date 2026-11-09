@@ -142,6 +142,15 @@ if [ -f crates/bohr-trace/src/lib.rs ]; then
         diff <(echo "$advertised") <(echo "$narrated") \
           | sed 's/^</  advertised, never narrated: /;s/^>/  narrated, never advertised: /')"
     fi
+    # The third list: every kind the trace format names. A kind the format names and no world
+    # fires is a promise in the format nobody keeps, and a campaign planning from it plans nothing.
+    named=$(sed -n '/^pub enum FaultKind/,/^}/p' crates/bohr-trace/src/event.rs \
+      | grep -oE '^    [A-Z][A-Za-z]+' | tr -d ' ' | sort -u)
+    if [ -n "$named" ] && [ "$named" != "$narrated" ]; then
+      report 14m §4.5 $'the trace format names fault kinds no world fires, or the reverse:\n'"$(
+        diff <(echo "$named") <(echo "$narrated") \
+          | sed 's/^</  named, never fired: /;s/^>/  fired, never named: /')"
+    fi
   fi
 
   # §5.13: the report is one static file. Nothing in its behaviour may reach the network, load a
