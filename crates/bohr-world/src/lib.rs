@@ -23,6 +23,7 @@ mod distributed;
 mod minimal;
 mod nums;
 mod oracle;
+pub mod probe;
 mod projection;
 mod ring;
 mod state;
@@ -37,8 +38,9 @@ pub use distributed::{
 };
 pub use minimal::{MinimalWorld, OutputSink};
 pub use oracle::{
-    AgreementOracle, DurabilityOracle, LivenessOracle, Panel, PropertiesAndCrashOracle, Watching,
-    panel,
+    AgreementOracle, DurabilityOracle, LivenessOracle, Panel, ProbeOracle, Probed,
+    PropertiesAndCrashOracle, Watching, panel,
 };
+pub use probe::{ProbeSpec, Property};
 pub use projection::{MAX_PROJECTION_BYTES, Projected, ProjectionSpec, Source, Value};
 pub use state::{StateError, StateImage};

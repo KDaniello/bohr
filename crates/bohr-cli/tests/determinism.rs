@@ -208,6 +208,21 @@ fn a_known_race_is_found_by_searching_seeds() {
     assert!(found.is_some(), "the race went unfound in 100 seeds");
 }
 
+/// A process that fails from a thread other than its first is a finding, on every run alike.
+///
+/// Every thread of the group reports its own end, in an order the host decides; a run that ended
+/// on the first report to arrive lost the failing status on some runs and kept it on others. A
+/// hundred repetitions is where that showed as two digests.
+#[test]
+fn a_failure_from_another_thread_is_found_on_every_run() {
+    let Some(path) = guest("exits_from_a_thread") else {
+        return;
+    };
+    let (code, _, report) = bohr(&["run", "--seed", "1", "--repeat", "100", "--", &path]);
+    assert_eq!(code, 1, "{report}");
+    assert!(report.contains("exit status 3"), "{report}");
+}
+
 /// A file survives being unlinked while it is open, which is how a temporary file works and what a
 /// database relies on.
 #[test]

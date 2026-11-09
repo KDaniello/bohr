@@ -118,3 +118,69 @@ fn the_defect_is_out_of_reach_without_faults() {
          to be, and the gate would be measuring the scheduler"
     );
 }
+
+/// The chain, if `make example-chain-toy probe` has been run.
+fn chain() -> Option<PathBuf> {
+    let path = root().join("examples/chain-toy/build/chain-toy-node");
+    path.is_file().then_some(path)
+}
+
+/// Runs the chain once under a scenario and says which probe codes the run reported.
+fn chain_codes(scenario: &str, seed: u32) -> Vec<String> {
+    let node = chain().expect("checked by the caller");
+    let out = Command::new(env!("CARGO_BIN_EXE_bohr"))
+        .current_dir(root())
+        .args(["run", "--seed", &seed.to_string(), "--config", scenario, "--"])
+        .arg(&node)
+        .output()
+        .expect("the binary under test must be runnable");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        matches!(out.status.code(), Some(0 | 1)),
+        "the run did not complete ({:?}): {said}",
+        out.status.code()
+    );
+    ["BOHR-2040", "BOHR-2041", "BOHR-2042", "BOHR-2043"]
+        .into_iter()
+        .filter(|code| said.contains(code))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Each blockchain oracle reports its own code on most seeds of the chain with its defect.
+///
+/// Ten seeds rather than the sixty the gate in `docs/TESTING.md` §8 uses: this is the nightly check
+/// that the reach has not collapsed, and the gate is where the number is recorded.
+#[test]
+#[ignore = "nightly: each run is a traced three-node chain and its probe"]
+fn each_chain_oracle_catches_its_defect() {
+    if chain().is_none() {
+        eprintln!("examples/chain-toy is not built; run `make example-chain-toy probe`");
+        return;
+    }
+    for (flag, code) in [
+        ("revert-finality", "BOHR-2040"),
+        ("equivocate", "BOHR-2043"),
+        ("fork-on-partition", "BOHR-2041"),
+        ("stall-after-heal", "BOHR-2042"),
+    ] {
+        let scenario = format!("examples/chain-toy/scenario-{flag}.toml");
+        let caught =
+            (1..=10).filter(|seed| chain_codes(&scenario, *seed).iter().any(|c| c == code)).count();
+        assert!(caught > 5, "--{flag}: {code} on {caught} of 10 seeds");
+    }
+}
+
+/// And none of them reports anything on the chain without a defect.
+#[test]
+#[ignore = "nightly: each run is a traced three-node chain and its probe"]
+fn no_chain_oracle_cries_wolf() {
+    if chain().is_none() {
+        eprintln!("examples/chain-toy is not built; run `make example-chain-toy probe`");
+        return;
+    }
+    for seed in 1..=10 {
+        let codes = chain_codes("examples/chain-toy/scenario.toml", seed);
+        assert!(codes.is_empty(), "seed {seed}: {codes:?} on the correct chain");
+    }
+}

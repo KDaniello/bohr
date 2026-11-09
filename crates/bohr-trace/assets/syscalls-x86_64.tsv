@@ -99,7 +99,9 @@
 138	fstatfs	sp
 140	getpriority	ss
 141	setpriority	sss
+142	sched_setparam	sp
 143	sched_getparam	sp
+144	sched_setscheduler	ssp
 145	sched_getscheduler	s
 157	prctl	sssss
 158	arch_prctl	ss

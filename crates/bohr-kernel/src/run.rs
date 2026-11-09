@@ -283,6 +283,14 @@ impl Tasks {
         self.entries.values().any(|e| matches!(e.slot, Slot::Pending(_) | Slot::Blocked))
     }
 
+    /// Whether a task the host is executing still owes the loop its next stop.
+    ///
+    /// A retired task is not one: its node ended, and whatever the backend reports about it is
+    /// dropped on arrival.
+    fn in_flight(&self) -> bool {
+        self.entries.values().any(|e| matches!(e.slot, Slot::Out) && !e.retired)
+    }
+
     fn schedulable(&self, task: TaskId) -> bool {
         // A task whose node is gone is not a task to run, and the state of node nought is not an
         // answer about it.
@@ -443,6 +451,19 @@ impl Run<'_, '_> {
     /// The loop: fire what is due, check every ending, pick, run, and answer the stop.
     fn drive(&mut self) -> Result<StopReason, KernelError> {
         loop {
+            // **A task the host is running is waited for before anything else is decided.** The
+            // backend reports stops in the order the host delivers them, and a thread group that
+            // ends reports each thread's death in an order no tape decides. Choosing another task,
+            // moving time or ending the run while one is still in flight let that order through:
+            // a process that failed from a thread other than its first ended the run before its own
+            // exit arrived, and its status was lost on some runs and kept on others.
+            if self.tasks.in_flight() {
+                let stop = self.backend.next_stop()?;
+                if !self.take(stop)? {
+                    return Ok(StopReason::GuestFinished);
+                }
+                continue;
+            }
             self.fire_due()?;
             if let Some(ending) = self.ending() {
                 return Ok(ending);
@@ -454,21 +475,30 @@ impl Run<'_, '_> {
                     Idle::Ended(reason) => return Ok(reason),
                 }
             }
-            let Some(stop) = self.dispatch()? else {
-                // A backend answering `None` with work still outstanding turns a half-finished run
-                // into a clean verdict, and the oracle then judges a prefix as the whole execution.
-                if self.tasks.anything_outstanding() {
-                    return Err(KernelError::Invariant(
-                        "the backend reported every task finished while tasks were still to run",
-                    ));
-                }
+            let stop = self.dispatch()?;
+            if !self.take(stop)? {
                 return Ok(StopReason::GuestFinished);
-            };
-            self.handling = Some(stop.task);
-            self.on_stop(&stop)?;
-            self.handling = None;
-            self.report_progress(false);
+            }
         }
+    }
+
+    /// Answers a stop the backend reported; `false` where it reported that nothing is left.
+    fn take(&mut self, stop: Option<Stop>) -> Result<bool, KernelError> {
+        let Some(stop) = stop else {
+            // A backend answering `None` with work still outstanding turns a half-finished run
+            // into a clean verdict, and the oracle then judges a prefix as the whole execution.
+            if self.tasks.anything_outstanding() || self.tasks.in_flight() {
+                return Err(KernelError::Invariant(
+                    "the backend reported every task finished while tasks were still to run",
+                ));
+            }
+            return Ok(false);
+        };
+        self.handling = Some(stop.task);
+        self.on_stop(&stop)?;
+        self.handling = None;
+        self.report_progress(false);
+        Ok(true)
     }
 
     /// Fires every deadline at or before now: what was armed for this tick happens before anything

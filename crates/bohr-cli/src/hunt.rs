@@ -54,11 +54,15 @@ pub(crate) fn parse_seeds(text: &str) -> Result<(u64, u64), String> {
 
 /// The scenario with every drawn and scheduled fault taken out, for checking an oracle on runs
 /// nothing was done to: a pack whose oracle fires here is judging the client's normal behaviour.
+///
+/// `[durability]` goes with the faults: it judges what a restarted node came back without, a run
+/// with no kill has nothing for it to judge, and a scenario arming it without one is refused.
 fn without_faults(text: &str) -> Result<String, CliError> {
     let mut value: toml::Table =
         toml::from_str(text).map_err(|e| refused(format!("the pack's scenario: {e}")))?;
     value.remove("faults");
     value.remove("fault");
+    value.remove("durability");
     value.remove("partition");
     value.remove("grey");
     for (section, keys) in [
@@ -142,12 +146,19 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
     let armed = match pack.oracle.as_str() {
         "durability" => loaded.durability.is_some(),
         "liveness" => loaded.liveness.is_some(),
+        "chain" => !loaded.probes.is_empty(),
         _ => true,
     };
     if !armed {
         return Err(refused(format!(
-            "pack {} judges by {}, and its scenario has no [{}] section to judge with",
-            pack.name, pack.oracle, pack.oracle
+            "pack {} judges by {}, and its scenario has nothing to judge with: {}",
+            pack.name,
+            pack.oracle,
+            match pack.oracle.as_str() {
+                "chain" => "no [chain] and no [[probe]]",
+                "durability" => "no [durability]",
+                _ => "no [liveness]",
+            }
         )));
     }
     // **The binary checked is the binary run.** A scenario names its program in its own argv, and
@@ -347,6 +358,8 @@ drop_probability = "1/10"
 [disk]
 stall_probability = "1/16"
 snapshot_depth = 2
+[durability]
+ack = "send_while_dirty"
 [faults]
 kill_probability = "1/20"
 [[fault]]
@@ -360,5 +373,6 @@ at_tick = 3
         assert!(out.contains("latency_mean_ticks"), "the world stays: {out}");
         assert!(out.contains("snapshot_depth"), "{out}");
         assert!(loaded.node_faults.is_empty());
+        assert!(loaded.durability.is_none(), "nothing is killed, so nothing is judged durable");
     }
 }

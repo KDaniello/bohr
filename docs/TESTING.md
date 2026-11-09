@@ -384,6 +384,24 @@ measure the knob.
 Time is recorded and published as measured. A search that has become twice as slow is worth
 noticing, and that is what the number is for; it is not what the milestone claims.
 
+**The chain oracles have a corpus of their own.** `examples/chain-toy` is a three-node chain that
+finalises a block on two votes of three, correct without a flag; each flag adds one defect, and each
+needs the faults its scenario draws — a kill, an isolation — to show:
+
+| Flag | Defect | Oracle | Code |
+|---|---|---|---|
+| `--revert-finality` | the finalised log is written without a sync; after a crash the node rebuilds the heights it lost from blocks of its own | `finality` | `BOHR-2040` |
+| `--equivocate` | a proposer resending before its block is final builds a new one and signs it too | `double-sign` | `BOHR-2043` |
+| `--fork-on-partition` | a node that hears no peer finalises blocks of its own, alone | `agreement` | `BOHR-2041` |
+| `--stall-after-heal` | a node that was cut off stops proposing once it hears its peers again | `liveness` | `BOHR-2042` |
+
+The gate is the same pair as for the durability twins: each oracle **reports its code on at least
+30 of seeds 1–60** with its flag, and **no oracle reports anything on seeds 1–200** without one.
+The scenarios differ from `scenario.toml` by the flag and the oracle and by nothing else, so a
+number here measures the oracle and not a scenario tuned to show it. The fixture was shaped on
+seeds 1001 and up and judged once on 1–60; figures under `[v0_4.gates]`. The oracles' own
+correctness is proved without a guest, by the observer's unit tests in `crates/bohr-world/src/probe.rs`.
+
 **Policy comparison** (`scripts/policy-comparison.sh`). The same corpus is hunted with `random` and
 with `pct`, and what is recorded is the share of seeds that expose each defect rather than the first
 seed that does: once a defect is reachable from most orderings both policies answer "the first one",

@@ -59,6 +59,19 @@ same_bytes() { # guest, args...
   [ -n "$a" ] && [ "$a" = "$b" ]
 }
 
+# The chain under every blockchain oracle, its probe a node of the run: one digest a hundred times.
+#
+# Skipped where the chain or the static probe has not been built, as the cluster gate is.
+chain_gate() {
+  local node="examples/chain-toy/build/chain-toy-node"
+  local probe="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release/bohr-probe"
+  if [ ! -x "$node" ] || { [ -z "${BOHR_PROBE:-}" ] && [ ! -x "$probe" ]; }; then
+    echo "not built; run: make example-chain-toy probe"
+    return 0
+  fi
+  "$BOHR" run --seed 42 --repeat 100 --config examples/chain-toy/scenario.toml -- "$node" >/dev/null
+}
+
 # The M2 gate: five real raft-rs processes through a split and a heal, one digest.
 #
 # Skipped rather than failed where the example has not been built: it needs a network to fetch
@@ -83,6 +96,7 @@ check "a known race is found" finds race_counter 100
 check "pct is no worse than random" bash scripts/policy-comparison.sh
 check "slowdown is within its ceiling" bash scripts/bench-slowdown.sh
 check "the cluster gate repeats 100x" cluster_gate
+check "the probed chain repeats 100x" chain_gate
 check "every injection breaks the suite" bash scripts/mutation-harness.sh
 
 exit $fail

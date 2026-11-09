@@ -216,6 +216,11 @@ pub enum Outcome {
     /// defects: a reduction that turned a lost write into a silent cluster would be reporting that
     /// it had preserved the bug.
     DurabilityViolated(String),
+    /// A probe asked a node's own API, and the answers broke the property it watched.
+    ///
+    /// Its own outcome for the reason the two above have theirs: the guest asserted nothing, so a
+    /// reduction reading it as a property violation would match it against every other one.
+    ProbeViolated(String),
     /// A syscall outside the support table was reached.
     UnsupportedSyscall(String),
     /// Independent implementations produced different results.

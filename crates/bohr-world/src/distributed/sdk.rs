@@ -28,6 +28,11 @@ pub(crate) struct SdkRecords {
     /// Lines that did not parse. Counted rather than kept: a malformed line is a defect in
     /// whatever wrote it, and a run that filled its bundle with them would bury the rest.
     malformed: u64,
+    /// The node the probe runs on, the one node whose probe rounds are read as answers.
+    ///
+    /// Any guest can write an event of that name; only the probe's are evidence. A node under test
+    /// that wrote rounds of its own would otherwise be grading its own answers.
+    pub(crate) probe_node: Option<NodeId>,
 }
 
 /// What a batch of records asks the run to do.
@@ -39,6 +44,8 @@ pub(crate) struct Digested {
     pub(crate) diagnostics: Vec<(String, String)>,
     /// An assertion that failed and ends the run as a finding, where one did.
     pub(crate) violated: Option<String>,
+    /// Rounds of answers the probe reported, each as the event's details.
+    pub(crate) probe_rounds: Vec<bohr_sdk_proto::json::Json>,
 }
 
 impl SdkRecords {
@@ -113,6 +120,13 @@ impl SdkRecords {
         let index = self.lines.len() as u32;
         self.lines.push(line);
         digested.events.push(EventKind::SdkRecord { index });
+
+        if let Record::Event(name, details, _) = &record
+            && name == crate::probe::PROBE_EVENT
+            && self.probe_node == Some(node)
+        {
+            digested.probe_rounds.push(details.clone());
+        }
 
         if let Record::Assert(assertion, _) = &record {
             let kind = match assertion.assert_type {

@@ -32,6 +32,21 @@ pub const LIVENESS_CODE: &str = "BOHR-2030";
 /// A node answered while what it had written was not durable, and came back without it.
 pub const DURABILITY_CODE: &str = "BOHR-2031";
 
+/// A probe saw a value at a key change after it was seen, on one node.
+pub const NEVER_REVERTS_CODE: &str = "BOHR-2040";
+/// A probe saw two nodes answer differently for one key.
+pub const AGREES_CODE: &str = "BOHR-2041";
+/// A probe saw a value stand still for its span while the cluster was whole.
+pub const ADVANCES_CODE: &str = "BOHR-2042";
+/// A probe saw one key carry two values, on any node, at any time.
+pub const UNIQUE_CODE: &str = "BOHR-2043";
+/// A probe saw a number go down, on one node.
+pub const MONOTONIC_CODE: &str = "BOHR-2044";
+
+/// Every code a probe raises as a finding, which is what a reduction identifies such a run by.
+pub const PROBE_CODES: [&str; 5] =
+    [NEVER_REVERTS_CODE, AGREES_CODE, ADVANCES_CODE, UNIQUE_CODE, MONOTONIC_CODE];
+
 /// What happened. Closed apart from [`EventKind::Domain`], which world models extend through.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum EventKind {

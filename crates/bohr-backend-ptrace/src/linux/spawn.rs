@@ -28,7 +28,8 @@ const AT_NULL: u64 = 0;
 pub const CORE_VARIABLE: &str = "BOHR_CORE";
 
 /// The core this supervisor and its guests run on: the worker's position, as `BOHR_CORE` names it,
-/// among the cores this process may use; the first of them where no position is named.
+/// among the cores this process may use, in the order [`spread`] puts them; the first of them where
+/// no position is named.
 ///
 /// A guest can read which core it is on without a syscall — `RDPID`, the per-CPU segment limit —
 /// and nothing traps either, so a guest that does sees its worker's position. `docs/DETERMINISM.md`
@@ -43,7 +44,68 @@ fn guest_core() -> usize {
         (0..libc::CPU_SETSIZE as usize).filter(|c| libc::CPU_ISSET(*c, &set)).collect()
     };
     let nth = std::env::var(CORE_VARIABLE).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-    if allowed.is_empty() { 0 } else { allowed[nth % allowed.len()] }
+    // Read once per process: the topology does not change while a campaign runs, and a worker
+    // spawns thousands of guests.
+    static ORDER: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    let order = ORDER.get_or_init(|| {
+        spread(&allowed, |cpu| {
+            let read = |what: &str| {
+                std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/{what}"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<usize>().ok())
+            };
+            read("physical_package_id").zip(read("core_id"))
+        })
+    });
+    if order.is_empty() { 0 } else { order[nth % order.len()] }
+}
+
+/// The cores in the order workers take them: one hardware thread of every physical core before a
+/// second thread of any.
+///
+/// Linux numbers a core's two threads next to each other on common parts, so position by number
+/// alone would put two workers on one core while other cores sat idle. A CPU whose core this
+/// cannot read keeps its place among the first, as a core of its own.
+pub(super) fn spread(
+    allowed: &[usize],
+    core_of: impl Fn(usize) -> Option<(usize, usize)>,
+) -> Vec<usize> {
+    let mut seen: std::collections::BTreeMap<(usize, usize), usize> =
+        std::collections::BTreeMap::new();
+    let mut ranked: Vec<(usize, usize)> = allowed
+        .iter()
+        .map(|&cpu| {
+            let rank = core_of(cpu).map_or(0, |core| {
+                let n = seen.entry(core).or_default();
+                *n += 1;
+                *n - 1
+            });
+            (rank, cpu)
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.into_iter().map(|(_, cpu)| cpu).collect()
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::spread;
+
+    #[test]
+    fn every_physical_core_is_taken_before_a_second_thread_of_any() {
+        // Six cores, two threads each, numbered as this kind of part numbers them.
+        let allowed: Vec<usize> = (0..12).collect();
+        let order = spread(&allowed, |cpu| Some((0, cpu / 2)));
+        assert_eq!(order, [0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11]);
+        // Numbered the other common way, threads a socket apart, the order is unchanged.
+        let order = spread(&allowed, |cpu| Some((0, cpu % 6)));
+        assert_eq!(order[..6], [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_core_that_cannot_be_read_is_a_core_of_its_own() {
+        assert_eq!(spread(&[3, 1, 2], |_| None), [1, 2, 3]);
+    }
 }
 
 /// Namespaces the guest is placed in, so that what it can observe of the machine is ours to define
@@ -119,9 +181,11 @@ pub(super) fn spawn_traced(
     isolate: bool,
     coverage: Option<libc::c_int>,
 ) -> Result<libc::pid_t, BackendError> {
-    let program = spec.argv.first().ok_or_else(|| BackendError::CannotStart {
-        program: "<none>".to_owned(),
-        reason: "no program given".to_owned(),
+    let program = spec.executable.as_ref().or(spec.argv.first()).ok_or_else(|| {
+        BackendError::CannotStart {
+            program: "<none>".to_owned(),
+            reason: "no program given".to_owned(),
+        }
     })?;
 
     let argv = to_c_strings(&spec.argv)?;
@@ -364,6 +428,12 @@ unsafe fn child_setup(
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == -1 {
             libc::_exit(failed::AFFINITY);
         }
+
+        // No core file. A guest dying of a signal is a finding the trace records; a core written
+        // on the host is the host's business, and some hosts hand every one to a crash collector
+        // that a campaign of crashing guests overwhelms.
+        let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
 
         // A filter may only be installed by a process that cannot gain privileges, and the
         // guarantee must outlive the exec.

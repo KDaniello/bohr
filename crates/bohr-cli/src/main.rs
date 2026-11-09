@@ -13,6 +13,8 @@ mod guests;
 mod handover;
 mod hunt;
 mod init;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod probe;
 mod reduce;
 mod replay;
 mod survey;
@@ -217,15 +219,12 @@ enum Command {
         program: Vec<String>,
     },
 
-    /// Carry out one slice of a campaign. Started by `bohr explore`, not by a person.
+    /// Carry out a campaign's runs. Started by `bohr explore`, not by a person.
     #[command(hide = true)]
     ExploreWorker {
-        /// The work to do.
-        #[arg(long, value_name = "FILE")]
-        work: String,
-        /// Where to write what happened.
-        #[arg(long, value_name = "FILE")]
-        results: String,
+        /// Take items on stdin and answer each on stdout until stdin closes.
+        #[arg(long)]
+        serve: bool,
         /// World configuration, the same file the campaign was given.
         #[arg(long, value_name = "FILE")]
         config: Option<String>,
@@ -509,13 +508,13 @@ pub(crate) fn specs_for(
     argv: Vec<String>,
     loaded: Option<&bohr_world::LoadedConfig>,
     standing_in: Option<&bohr_world::Implementation>,
-) -> Vec<bohr_backend::GuestSpec> {
+) -> Result<Vec<bohr_backend::GuestSpec>, CliError> {
     // The one node a comparison replaces, where this is one execution of one. Everything else the
     // scenario describes is left alone: the caller that drives the node under comparison is part of
     // the conditions, not part of what is being compared.
     let standing_in = standing_in.and_then(|i| i.argv_for().map(|own| (i.node, own)));
 
-    match loaded.and_then(|l| l.cluster.as_ref()) {
+    let specs = match loaded.and_then(|l| l.cluster.as_ref()) {
         Some(cluster) => (0..cluster.nodes.max(1))
             .map(|index| {
                 let argv = match &standing_in {
@@ -529,14 +528,47 @@ pub(crate) fn specs_for(
                 // the host would be told about a machine it is not on.
                 env.push(("BOHR_SDK_OUTPUT".to_owned(), execute::SDK_RECORD_PATH.to_owned()));
                 env.push(("BOHR_SDK_NODE".to_owned(), index.to_string()));
-                bohr_backend::GuestSpec { argv, env }
+                bohr_backend::GuestSpec { argv, env, executable: None }
             })
-            .collect(),
+            .collect::<Vec<_>>(),
         None => {
             let argv = standing_in.map_or(argv, |(_, own)| own);
-            vec![bohr_backend::GuestSpec { argv, env: Vec::new() }]
+            vec![bohr_backend::GuestSpec { argv, env: Vec::new(), executable: None }]
         }
-    }
+    };
+    with_probe(specs, loaded)
+}
+
+/// What the probe is called inside a run: one name on every host, so a bundle replays wherever the
+/// file is kept.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PROBE_ARGV0: &str = "/bohr/probe";
+
+/// The specs with the probe appended as the last node, where the scenario has probes.
+///
+/// Last, so every node the scenario numbers keeps its number and its address; the probe takes the
+/// next one. Its environment is the SDK's and nothing of the cluster's, because it is not one of
+/// the nodes the cluster's environment describes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn with_probe(
+    mut specs: Vec<bohr_backend::GuestSpec>,
+    loaded: Option<&bohr_world::LoadedConfig>,
+) -> Result<Vec<bohr_backend::GuestSpec>, CliError> {
+    let Some(loaded) = loaded.filter(|l| !l.probes.is_empty()) else {
+        return Ok(specs);
+    };
+    let index = specs.len();
+    let plan = bohr_world::probe::plan_of(&bohr_world::probe::requests_of(&loaded.probes));
+    specs.push(bohr_backend::GuestSpec {
+        // The name the probe goes by inside the run, whatever this host calls the file.
+        argv: vec![PROBE_ARGV0.to_owned(), plan],
+        executable: Some(probe::program()?),
+        env: vec![
+            ("BOHR_SDK_OUTPUT".to_owned(), execute::SDK_RECORD_PATH.to_owned()),
+            ("BOHR_SDK_NODE".to_owned(), index.to_string()),
+        ],
+    });
+    Ok(specs)
 }
 
 /// Runs every implementation a differential scenario names, and says what came of it.
@@ -769,25 +801,26 @@ fn dispatch() -> Result<u8, CliError> {
                 subject,
             })
         }
-        Command::ExploreWorker { work, results, config, guest, program } => {
+        Command::ExploreWorker { serve, config, guest, program } => {
             let scenario = read_scenario(config.as_deref())?;
-            explore::work(
-                &work,
-                &results,
-                &explore::Request {
-                    master: Seed(0),
-                    runs: None,
-                    time: None,
-                    jobs: 1,
-                    findings: std::path::PathBuf::new(),
-                    corpus: None,
-                    resume: None,
-                    summary: None,
-                    scenario_path: config.map(Into::into),
-                    scenario,
-                    subject: subject_of(guest, program)?,
-                },
-            )
+            let request = explore::Request {
+                master: Seed(0),
+                runs: None,
+                time: None,
+                jobs: 1,
+                findings: std::path::PathBuf::new(),
+                corpus: None,
+                resume: None,
+                summary: None,
+                scenario_path: config.map(Into::into),
+                scenario,
+                subject: subject_of(guest, program)?,
+            };
+            if serve {
+                explore::serve(&request)
+            } else {
+                Err(CliError::Usage("BOHR-1001: a worker takes --serve".to_owned()))
+            }
         }
         Command::Hunt {
             pack,
@@ -1018,7 +1051,7 @@ fn trace(path: &str, format: &str) -> Result<u8, CliError> {
     let model = bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
 
     let written = match format {
-        "text" => bohr_report::text::write_log(&model.events),
+        "text" => bohr_report::text::write_log_with(&model.events, &model.records),
         "json" => bohr_report::jsonl::write_log(&model.events),
         other => {
             return Err(CliError::Usage(format!(
@@ -1105,7 +1138,7 @@ fn run_program(
         return Err(CliError::Usage(format!("BOHR-1001: {path} is not a file")));
     }
 
-    let target = execute::Target::Program(specs_for(program, loaded, None));
+    let target = execute::Target::Program(specs_for(program, loaded, None)?);
     let exec = execute::Execution {
         target: &target,
         tape,

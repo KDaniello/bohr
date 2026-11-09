@@ -101,9 +101,34 @@ pub fn event_line(event: &Event) -> String {
 /// The whole log, one event per line.
 #[must_use]
 pub fn write_log(events: &[Event]) -> String {
+    write_log_with(events, &[])
+}
+
+/// Longest stretch of a guest's record shown on its line; the rest is in the bundle.
+const RECORD_SHOWN: usize = 240;
+
+/// The whole log, each record from a guest followed by what it said.
+///
+/// What the record said, and not only that it was written, because a run judged by a probe is
+/// judged by those words, and a reader asking why has nowhere else to look.
+#[must_use]
+pub fn write_log_with(events: &[Event], records: &[bohr_sdk_proto::Record]) -> String {
     let mut out = String::with_capacity(events.len() * 80);
     for event in events {
-        out.push_str(&event_line(event));
+        let line = event_line(event);
+        match &event.kind {
+            EventKind::SdkRecord { index } if (*index as usize) < records.len() => {
+                let said = records[*index as usize].to_line();
+                let cut = said.char_indices().nth(RECORD_SHOWN).map_or(said.len(), |(at, _)| at);
+                out.push_str(line.trim_end_matches('\n'));
+                let _ = write!(out, " · {}", &said[..cut]);
+                if cut < said.len() {
+                    out.push('…');
+                }
+                out.push('\n');
+            }
+            _ => out.push_str(&line),
+        }
     }
     out
 }

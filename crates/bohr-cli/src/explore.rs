@@ -1,10 +1,10 @@
 //! Driving a campaign, and the workers that carry it out.
 //!
 //! The search itself is in `bohr-explorer` and knows nothing about processes. What is here is the
-//! plumbing: split a generation across workers, wait, hand the results back in one piece, and save
-//! what was found. The division matters — every claim about reproducibility is decided in the
-//! crate that has no processes in it, and this file cannot weaken one by being written badly. The
-//! worst it can do is be slow, or lose a result and say so.
+//! plumbing: hand a generation's items to workers as they come free, gather the results in one
+//! piece, and save what was found. The division matters — every claim about reproducibility is
+//! decided in the crate that has no processes in it, and this file cannot weaken one by being
+//! written badly. The worst it can do is be slow, or lose a result and say so.
 //!
 //! **Workers are processes.** A guest wedged in a way that confuses the kernel's `ptrace`
 //! bookkeeping must take one worker with it and not the campaign; and two traced guests in one
@@ -95,23 +95,12 @@ pub(crate) struct Request {
 /// The exit code is the usual one: nothing found is zero, something found is one. A campaign that
 /// finds a bug has succeeded, and a pipeline branching on that must not have to parse text.
 pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
-    // Named by the process as well as by the seed. Running one master seed twice at once is an
-    // ordinary thing to want — the same search at two budgets — and a directory named by the seed
-    // alone would have each campaign deleting the other's handover files between generations.
-    let scratch = std::env::temp_dir().join(format!(
-        "bohr-campaign-{}-{}",
-        request.master.get(),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).map_err(|e| {
-        CliError::Usage(format!("BOHR-1002: cannot use {}: {e}", scratch.display()))
-    })?;
     std::fs::create_dir_all(&request.findings).map_err(|e| {
         CliError::Usage(format!("BOHR-1002: cannot use {}: {e}", request.findings.display()))
     })?;
 
     let jobs = request.jobs.max(1);
+    let mut pool = Pool::start(request, jobs)?;
     let (mut campaign, mut pending) = match &request.resume {
         Some(dir) => resume::load(dir, request)?,
         None => (Campaign::new(request.master), Vec::new()),
@@ -130,7 +119,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     {
         let carried = load_corpus(dir)?;
         if !carried.is_empty() {
-            let results = carry_out(request, &carried, jobs, &scratch)?;
+            let results = carry_out(&mut pool, &carried)?;
             campaign.adopt(&carried, results);
             eprintln!("carried {} tapes in from {}", carried.len(), dir.display());
         }
@@ -143,7 +132,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     while more_to_do(request, campaign.runs() + pending.len() as u64, started) {
         let planned = campaign.plan(GENERATION_ITEMS);
         let size = generation_size(request, campaign.runs()).max(pending.len());
-        let results = carry_out(request, &planned[pending.len()..size], jobs, &scratch)?;
+        let results = carry_out(&mut pool, &planned[pending.len()..size])?;
         pending.extend(results);
         if pending.len() < GENERATION_ITEMS {
             continue;
@@ -162,6 +151,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     if let Some(dir) = &request.resume {
         resume::save(dir, request, &campaign, &pending)?;
     }
+    drop(pool);
     let mut view = campaign.clone();
     if !pending.is_empty() {
         let planned = campaign.plan(GENERATION_ITEMS);
@@ -180,9 +170,6 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
             CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
         })?;
     }
-    // A campaign that ended is a campaign whose handover files are of no further use. One that
-    // failed keeps them, because the work a worker did not answer for is what someone will look at.
-    let _ = std::fs::remove_dir_all(&scratch);
 
     // **A campaign that armed adversity and landed none has measured a guest under no pressure**,
     // and is indistinguishable from one that pressed hard and was answered well. Refused for the
@@ -254,143 +241,260 @@ fn generation_size(request: &Request, folded: u64) -> usize {
     }
 }
 
-/// Splits a generation across workers and gathers what they answer.
+/// Carries out `planned` on the pool and gathers what the workers answer.
 ///
 /// Items whose worker died come back missing, and are reissued once. A second failure is reported
 /// rather than skipped: a campaign quietly missing a run is a campaign that cannot be repeated,
 /// which is worse than one that stopped.
-fn carry_out(
-    request: &Request,
-    planned: &[WorkItem],
-    jobs: usize,
-    scratch: &Path,
-) -> Result<Vec<RunResult>, CliError> {
-    let mut gathered = run_slices(request, planned, jobs, scratch, 0)?;
-
-    let answered: std::collections::BTreeSet<u32> = gathered.iter().map(|r| r.index).collect();
-    let missing: Vec<WorkItem> =
-        planned.iter().filter(|i| !answered.contains(&i.index)).cloned().collect();
-    if !missing.is_empty() {
-        gathered.extend(run_slices(request, &missing, 1, scratch, 1)?);
-    }
-
-    let answered: std::collections::BTreeSet<u32> = gathered.iter().map(|r| r.index).collect();
-    if answered.len() != planned.len() {
-        return Err(CliError::Internal(format!(
-            "BOHR-3006: {} of {} runs never came back, twice; the campaign cannot be repeated \
-             from here. The worker's own error is above and says what stopped it — a worker that \
-             will not start twice has usually been refused something by the host rather than \
-             defeated by the search.",
-            planned.len() - answered.len(),
-            planned.len()
-        )));
+fn carry_out(pool: &mut Pool, planned: &[WorkItem]) -> Result<Vec<RunResult>, CliError> {
+    let mut queue: std::collections::VecDeque<WorkItem> = planned.iter().cloned().collect();
+    let mut failed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut gathered = Vec::with_capacity(planned.len());
+    let mut in_flight = 0usize;
+    loop {
+        // Every idle worker is handed the next item, so no worker waits while there is work.
+        while let Some(slot) = pool.idle() {
+            let Some(item) = queue.pop_front() else { break };
+            pool.hand(slot, item)?;
+            in_flight += 1;
+        }
+        if in_flight == 0 {
+            break;
+        }
+        let (slot, answer) = pool.next_answer()?;
+        in_flight -= 1;
+        match answer {
+            Ok(results) => gathered.extend(results),
+            Err((item, why)) => {
+                eprintln!("  a worker stopped: {why}; its run will be reissued");
+                if !failed.insert(item.index) {
+                    return Err(CliError::Internal(format!(
+                        "BOHR-3006: run {} never came back, twice; the campaign cannot be \
+                         repeated from here. The worker's own error is above and says what \
+                         stopped it — a worker that will not start twice has usually been refused \
+                         something by the host rather than defeated by the search.",
+                        item.index
+                    )));
+                }
+                pool.restart(slot)?;
+                queue.push_front(item);
+            }
+        }
     }
     Ok(gathered)
 }
 
-/// Spawns one worker per slice and reads back what each wrote.
-fn run_slices(
-    request: &Request,
-    planned: &[WorkItem],
-    jobs: usize,
-    scratch: &Path,
-    attempt: u32,
-) -> Result<Vec<RunResult>, CliError> {
-    let per = planned.len().div_ceil(jobs.max(1));
-    let mut children = Vec::new();
+/// What one worker answered for one item: its results, or the item back with why it was not run.
+type Answer = Result<Vec<RunResult>, (WorkItem, String)>;
 
-    for (slice, items) in planned.chunks(per.max(1)).enumerate() {
-        let work = scratch.join(format!("work-{attempt}-{slice}.bin"));
-        let results = scratch.join(format!("results-{attempt}-{slice}.bin"));
-        std::fs::write(&work, wire::encode_work(items))
-            .map_err(|e| CliError::Internal(format!("BOHR-3006: cannot hand over work: {e}")))?;
-        // Removed rather than left to be overwritten. These names are reused by every generation,
-        // and a worker that dies before writing would otherwise leave the previous generation's
-        // file to be read as this one's answer: the indices are the same 0..n, so results from
-        // tapes nobody ran would be folded into the corpus without a word.
-        if let Err(e) = std::fs::remove_file(&results)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(CliError::Internal(format!(
-                "BOHR-3006: cannot clear {}: {e}",
-                results.display()
-            )));
+/// Workers that live for the whole campaign, each handed the next item as it finishes the last.
+///
+/// A generation ends when its last item does, so an item goes to whichever worker is free. Items go
+/// in on a worker's stdin and results come back on its stdout, read by a thread per worker.
+struct Pool {
+    request_args: Vec<String>,
+    workers: Vec<Worker>,
+    answers: std::sync::mpsc::Receiver<(usize, u64, Option<Vec<u8>>)>,
+    sender: std::sync::mpsc::Sender<(usize, u64, Option<Vec<u8>>)>,
+}
+
+/// One worker process and the item it is carrying out.
+struct Worker {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    busy: Option<WorkItem>,
+    /// Which life of this slot the process is, so a message from one that was replaced is known
+    /// for what it is.
+    life: u64,
+}
+
+impl Pool {
+    fn start(request: &Request, jobs: usize) -> Result<Self, CliError> {
+        let mut args = vec!["explore-worker".to_owned(), "--serve".to_owned()];
+        // Before the subject, always. Everything after `--` belongs to the guest, so a flag placed
+        // after it is not a flag at all — it is an argument the guest ignores, and the worker then
+        // runs the wrong world without either side saying so.
+        if let Some(path) = &request.scenario_path {
+            args.push("--config".to_owned());
+            args.push(path.to_string_lossy().into_owned());
         }
+        args.extend(request.subject.as_args());
+        let (sender, answers) = std::sync::mpsc::channel();
+        let mut pool = Self { request_args: args, workers: Vec::new(), answers, sender };
+        for slot in 0..jobs.max(1) {
+            let worker = pool.spawn(slot, 0)?;
+            pool.workers.push(worker);
+        }
+        Ok(pool)
+    }
 
+    fn spawn(&self, slot: usize, life: u64) -> Result<Worker, CliError> {
         let mut command =
             Command::new(std::env::current_exe().map_err(|e| {
                 CliError::Internal(format!("BOHR-3006: cannot find this binary: {e}"))
             })?);
-        command.arg("explore-worker").arg("--work").arg(&work).arg("--results").arg(&results);
+        command.args(&self.request_args);
+        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
         // A core of its own per worker, its supervisor and its guests together on it: the guest
         // and its supervisor share a core because a stop between cores is a cross-core wake-up,
         // and workers do not share one because eight of them on one core is one of them. The
         // position is taken among the cores this process may use, by the backend.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        command.env(bohr_backend_ptrace::CORE_VARIABLE, slice.to_string());
-        // Told which world to run in, rather than handed the parsed form: parsing it there is what
-        // keeps the two sides reading one file rather than two copies of an idea of it.
-        //
-        // Before the subject, always. Everything after `--` belongs to the guest, so a flag placed
-        // after it is not a flag at all — it is an argument the guest ignores, and the worker then
-        // runs the wrong world without either side saying so.
-        if let Some(path) = &request.scenario_path {
-            command.arg("--config").arg(path);
-        }
-        command.args(request.subject.as_args());
-
-        let child = command
+        command.env(bohr_backend_ptrace::CORE_VARIABLE, slot.to_string());
+        let mut child = command
             .spawn()
             .map_err(|e| CliError::Internal(format!("BOHR-3006: cannot start a worker: {e}")))?;
-        children.push((child, results));
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let Some(mut stdout) = stdout else {
+                let _ = sender.send((slot, life, None));
+                return;
+            };
+            loop {
+                let frame = read_frame(&mut stdout);
+                let stop = frame.is_none();
+                if sender.send((slot, life, frame)).is_err() || stop {
+                    return;
+                }
+            }
+        });
+        Ok(Worker { child, stdin, busy: None, life })
     }
 
-    let mut gathered = Vec::new();
-    for (mut child, results) in children {
-        // A worker that died is not an error here: its items come back missing and are reissued.
-        // How it died is said out loud, though — a campaign that reports only "the runs did not
-        // come back" sends whoever reads it looking for a defect in the search, when the answer is
-        // usually that the machine could not start another process.
-        match child.wait() {
-            Ok(status) if !status.success() => {
-                eprintln!("  a worker exited {status}; its runs will be reissued");
+    /// A worker with nothing to do, if there is one.
+    fn idle(&self) -> Option<usize> {
+        self.workers.iter().position(|w| w.busy.is_none())
+    }
+
+    /// Hands one item to a worker, starting it again first where it has gone.
+    ///
+    /// A worker that died idle is not the item's failure: the write that finds it gone starts a
+    /// new one and writes again, and only a worker that dies holding the item charges it.
+    fn hand(&mut self, slot: usize, item: WorkItem) -> Result<(), CliError> {
+        let frame = framed(&wire::encode_work(std::slice::from_ref(&item)));
+        for _ in 0..2 {
+            let written = self.workers[slot]
+                .stdin
+                .as_mut()
+                .is_some_and(|stdin| std::io::Write::write_all(stdin, &frame).is_ok());
+            if written {
+                self.workers[slot].busy = Some(item);
+                return Ok(());
             }
-            Err(e) => eprintln!("  a worker could not be waited for: {e}"),
-            Ok(_) => {}
+            self.restart(slot)?;
         }
-        // A worker killed between two runs leaves a file that ends on a record boundary, and every
-        // result in it counts. One killed inside a write leaves a record cut in half: that file is
-        // reissued whole rather than half-read, because a partial result folded in would enter the
-        // corpus as a run that covered less than it did.
-        if let Ok(bytes) = std::fs::read(&results) {
-            match wire::decode_results(&bytes) {
-                Ok(results) => gathered.extend(results),
-                Err(e) => eprintln!("  {e}; those runs will be reissued"),
+        Err(CliError::Internal(format!(
+            "BOHR-3006: worker {slot} would not take work twice in a row; the host is refusing \
+             to start it"
+        )))
+    }
+
+    /// The next answer any worker gives, with the slot it came from.
+    fn next_answer(&mut self) -> Result<(usize, Answer), CliError> {
+        loop {
+            let (slot, life, frame) = self.answers.recv().map_err(|_| {
+                CliError::Internal("BOHR-3006: every worker's reader has gone".to_owned())
+            })?;
+            let Some(worker) = self.workers.get_mut(slot) else { continue };
+            // A message from a process this slot has since replaced answers nothing.
+            if life != worker.life {
+                continue;
             }
+            let Some(item) = worker.busy.take() else {
+                // A worker that spoke unasked, or ended while idle; an idle one ending is
+                // restarted when it is next handed work.
+                if frame.is_none() {
+                    worker.stdin = None;
+                }
+                continue;
+            };
+            let answer = match frame {
+                Some(bytes) => match wire::decode_results(&bytes) {
+                    Ok(results) if results.iter().any(|r| r.index == item.index) => Ok(results),
+                    Ok(_) => Err((item, "it answered for another run".to_owned())),
+                    Err(e) => Err((item, e.to_string())),
+                },
+                None => {
+                    let status =
+                        worker.child.wait().map_or_else(|e| e.to_string(), |s| s.to_string());
+                    worker.stdin = None;
+                    Err((item, format!("it exited {status}")))
+                }
+            };
+            return Ok((slot, answer));
         }
     }
-    Ok(gathered)
+
+    /// Replaces a worker that failed, in the same slot and so on the same core.
+    fn restart(&mut self, slot: usize) -> Result<(), CliError> {
+        let life = self.workers[slot].life + 1;
+        let old = &mut self.workers[slot];
+        old.stdin = None;
+        let _ = old.child.kill();
+        let _ = old.child.wait();
+        self.workers[slot] = self.spawn(slot, life)?;
+        Ok(())
+    }
 }
 
-/// Carries out the work in a file. The other half of a worker's life.
+impl Drop for Pool {
+    /// An idle worker is told the campaign is over by its stdin closing; a busy one is killed,
+    /// since a pool dropped mid-generation is one whose campaign has already failed.
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            worker.stdin = None;
+            if worker.busy.is_some() {
+                let _ = worker.child.kill();
+            }
+        }
+        for worker in &mut self.workers {
+            let _ = worker.child.wait();
+        }
+    }
+}
+
+/// A frame: its length, then its bytes.
+fn framed(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Reads one frame, or nothing at the end of the stream or on a broken one.
+fn read_frame(from: &mut impl std::io::Read) -> Option<Vec<u8>> {
+    let mut length = [0u8; 8];
+    from.read_exact(&mut length).ok()?;
+    let length = usize::try_from(u64::from_le_bytes(length)).ok()?;
+    // A result is a coverage map and a journal; a frame larger than this is a broken stream.
+    if length > 1 << 30 {
+        return None;
+    }
+    let mut bytes = vec![0u8; length];
+    from.read_exact(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Serves items from stdin until it closes: the other half of a pooled worker's life.
 ///
-/// Each result is written as it is earned rather than the slice at the end. A worker is killed by
-/// the same things its guests are, and the runs it did complete before that are exactly the ones
-/// the campaign would otherwise have to carry out again.
-pub(crate) fn work(work_file: &str, results_file: &str, request: &Request) -> Result<u8, CliError> {
+/// Each item's result is written and flushed before the next is read, so the campaign hears of
+/// every run the moment it ends and a worker killed between two runs has answered for all it ran.
+pub(crate) fn serve(request: &Request) -> Result<u8, CliError> {
     use std::io::Write as _;
 
-    let bytes = std::fs::read(work_file)
-        .map_err(|e| CliError::Internal(format!("BOHR-3006: cannot read the work: {e}")))?;
-    let items = wire::decode_work(&bytes)?;
-
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
     let cannot_write =
-        |e: std::io::Error| CliError::Internal(format!("BOHR-3006: cannot write the results: {e}"));
-    let mut out = std::fs::File::create(results_file).map_err(cannot_write)?;
-    out.write_all(&wire::results_header()).map_err(cannot_write)?;
-    for item in &items {
-        let result = carry_out_one(request, item)?;
-        out.write_all(&wire::encode_result(&result)).map_err(cannot_write)?;
+        |e: std::io::Error| CliError::Internal(format!("BOHR-3006: cannot write a result: {e}"));
+    while let Some(frame) = read_frame(&mut input) {
+        let mut answer = wire::results_header();
+        for item in wire::decode_work(&frame)? {
+            answer.extend_from_slice(&wire::encode_result(&carry_out_one(request, &item)?));
+        }
+        output.write_all(&framed(&answer)).map_err(cannot_write)?;
+        output.flush().map_err(cannot_write)?;
     }
     Ok(crate::exit::CLEAN)
 }
@@ -448,7 +552,7 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
             // -- a different program, silently: the findings it saved carried the same truncated
             // target, so nothing ever disagreed and said so.
             let loaded = request.scenario.as_ref().map(|(loaded, _)| loaded);
-            Ok(execute::Target::Program(crate::specs_for(argv.clone(), loaded, None)))
+            Ok(execute::Target::Program(crate::specs_for(argv.clone(), loaded, None)?))
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         Subject::Program(_) => Err(CliError::Usage(

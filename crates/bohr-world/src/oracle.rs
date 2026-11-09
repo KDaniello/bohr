@@ -104,6 +104,29 @@ impl Oracle for DurabilityOracle {
     }
 }
 
+/// Reports a property a probe's answers broke.
+///
+/// One per property, reading the code the world raised when the answers broke it: the probe asked,
+/// the world compared, and this decides the fact is a finding.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeOracle(pub crate::Property);
+
+impl Oracle for ProbeOracle {
+    fn identity(&self) -> OracleId {
+        OracleId::new(self.0.as_str(), 1)
+    }
+
+    fn judge(&mut self, run: &RunOutcome) -> Verdict {
+        let code = self.0.code();
+        let broken: Vec<&str> =
+            run.diagnostics.iter().filter(|d| d.code == code).map(|d| d.message.as_str()).collect();
+        if broken.is_empty() {
+            return Verdict::Clean;
+        }
+        Verdict::Finding(Outcome::ProbeViolated(format!("{code}: {}", broken.join("; "))))
+    }
+}
+
 /// Reports implementations of one specification that did not produce the same thing.
 ///
 /// Judges a *group*, which is the one oracle here that does: `judge` has no opinion about a single
@@ -248,6 +271,24 @@ pub struct Watching {
     pub liveness: bool,
     /// Whether an answer given before a sync and lost to a crash is a finding.
     pub durability: bool,
+    /// Which properties the scenario's probes hold the answers to.
+    pub probed: Probed,
+}
+
+/// The properties some probe of a scenario holds, each judged by its own oracle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // one flag per property, read independently
+pub struct Probed {
+    /// `never-reverts`, `BOHR-2040`.
+    pub never_reverts: bool,
+    /// `monotonic`, `BOHR-2044`.
+    pub monotonic: bool,
+    /// `agrees`, `BOHR-2041`.
+    pub agrees: bool,
+    /// `advances`, `BOHR-2042`.
+    pub advances: bool,
+    /// `unique`, `BOHR-2043`.
+    pub unique: bool,
 }
 
 /// The oracles a scenario asks for, in the order they are asked.
@@ -265,6 +306,21 @@ pub fn panel(watching: Watching) -> Panel {
     // a cluster that went quiet, and a cluster whose node lost data is usually both.
     if watching.durability {
         rest.push(Box::new(DurabilityOracle));
+    }
+    // What a node said about itself, sharpest first: two votes from one key, then a finalised
+    // value taken back, then two nodes apart, then a number going down, then a value standing
+    // still — the last is what most of the others look like from far enough away.
+    let probed = watching.probed;
+    for (on, property) in [
+        (probed.unique, crate::Property::Unique),
+        (probed.never_reverts, crate::Property::NeverReverts),
+        (probed.agrees, crate::Property::Agrees),
+        (probed.monotonic, crate::Property::Monotonic),
+        (probed.advances, crate::Property::Advances),
+    ] {
+        if on {
+            rest.push(Box::new(ProbeOracle(property)));
+        }
     }
     if watching.liveness {
         rest.push(Box::new(LivenessOracle));

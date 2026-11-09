@@ -19,7 +19,7 @@ fn refused(text: String) -> CliError {
 }
 
 /// The ELF interpreter a binary names, where it names one: a dynamic binary's loader.
-fn interpreter(bytes: &[u8]) -> Option<String> {
+pub(crate) fn interpreter(bytes: &[u8]) -> Option<String> {
     let word = |at: usize, n: usize| -> Option<u64> {
         let raw = bytes.get(at..at.checked_add(n)?)?;
         let mut out = [0u8; 8];

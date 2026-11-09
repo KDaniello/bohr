@@ -326,6 +326,12 @@ impl Network {
 
     fn linked(&self, a: NodeId, b: NodeId) -> bool {
         let n = self.config.nodes.max(1);
+        // A node past the cluster's count is the probe, which is outside the layout as it is
+        // outside the fault model: it reaches every node, so what it reports is the node's state
+        // and not the topology's.
+        if a.get() >= n || b.get() >= n {
+            return true;
+        }
         match self.config.topology {
             Topology::Full => true,
             Topology::Ring => {

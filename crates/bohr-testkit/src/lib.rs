@@ -524,6 +524,7 @@ pub fn judge_scenario(
     let watching = bohr_world::Watching {
         liveness: scenario.liveness.is_some(),
         durability: scenario.durability.is_some(),
+        probed: bohr_world::Probed::default(),
     };
     if let Some(liveness) = scenario.liveness {
         world = world.with_liveness(liveness);

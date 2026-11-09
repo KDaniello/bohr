@@ -178,6 +178,11 @@ pub struct GuestSpec {
     /// Built from configuration rather than inherited: an inherited environment carries host
     /// details such as `PWD` and `HOSTNAME` straight into the run.
     pub env: Vec<(String, String)>,
+    /// The file executed, where it is not `argv[0]`.
+    ///
+    /// For a program the tool supplies: the guest is shown a fixed `argv[0]`, and where this host
+    /// keeps the file stays out of the run.
+    pub executable: Option<String>,
 }
 
 /// A task has stopped, and why.

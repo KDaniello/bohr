@@ -43,12 +43,20 @@ guests: ## Build the test guest programs
 example-split-brain: ## Build the raft-rs cluster scenario (docs/ROADMAP.md M2 gate)
 	scripts/build-example.sh split-brain
 
+.PHONY: probe
+probe: ## Build the probe guest statically, where bohr looks for it (docs/API.md 5.9)
+	scripts/build-probe.sh
+
+.PHONY: example-chain-toy
+example-chain-toy: ## Build the seeded blockchain defects (docs/TESTING.md 8)
+	scripts/build-example.sh chain-toy
+
 .PHONY: example-raft-toy
 example-raft-toy: ## Build the seeded consensus defect (docs/TESTING.md 8)
 	scripts/build-example.sh raft-toy
 
 .PHONY: test-hunting
-test-hunting: build-debug example-raft-toy ## Does the search still reach the seeded defects (8)
+test-hunting: build-debug example-raft-toy example-chain-toy probe ## Does the search still reach the seeded defects (8)
 	$(CARGO) test --test hunting -- --ignored --nocapture
 
 ##@ Test

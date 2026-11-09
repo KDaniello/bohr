@@ -13,4 +13,4 @@ blake3 = "47d8e0ee44991aaaa51baf129f86f0e950492979f5924382bf08c6bd452b7c3c"
 scenario = "targets/reth/scenario.toml"
 
 [judge]
-oracle = "crash"
+oracle = "chain"

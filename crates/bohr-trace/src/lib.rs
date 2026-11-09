@@ -30,8 +30,10 @@ pub use bundle::{
     derive_run_id, frame_streams, group_digest, manifest_for, now_utc, read_streams,
 };
 pub use event::{
-    AssertionKind, DURABILITY_CODE, DiskOpKind, Endpoint, Event, EventKind, ExitStatus, FaultKind,
-    FaultTarget, LIVENESS_CODE, NodeState, PacketFate, SwitchReason, short_digest,
+    ADVANCES_CODE, AGREES_CODE, AssertionKind, DURABILITY_CODE, DiskOpKind, Endpoint, Event,
+    EventKind, ExitStatus, FaultKind, FaultTarget, LIVENESS_CODE, MONOTONIC_CODE,
+    NEVER_REVERTS_CODE, NodeState, PROBE_CODES, PacketFate, SwitchReason, UNIQUE_CODE,
+    short_digest,
 };
 pub use log::{TraceWriter, digest_of, read_events, read_events_lossy};
 pub use redact::redact;
