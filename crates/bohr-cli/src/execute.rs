@@ -2,7 +2,9 @@
 
 use bohr_backend::{CoverageMap, DeterminismBackend, GuestSpec};
 use bohr_backend_null::{NullBackend, NullProgram};
-use bohr_kernel::{PctPolicy, RandomPolicy, RunConfig, RunInputs, RunReport, SchedulePolicy, run};
+use bohr_kernel::{
+    FairPolicy, PctPolicy, RandomPolicy, RunConfig, RunInputs, RunReport, SchedulePolicy, run,
+};
 use bohr_tape::Tape;
 use bohr_trace::{
     BinaryRecord, BundleWriter, Counters, Event, HostProfile, PolicyRecord, Provenance, SectionId,
@@ -185,6 +187,7 @@ pub(crate) fn policy_named(name: &str) -> Option<Box<dyn SchedulePolicy>> {
     match name {
         "pct" => Some(Box::new(PctPolicy::default())),
         "random" => Some(Box::new(RandomPolicy)),
+        "fair" => Some(Box::new(FairPolicy::default())),
         _ => None,
     }
 }
@@ -343,6 +346,9 @@ fn drive(
             if let Some(durability) = loaded.durability {
                 cluster = cluster.with_durability(durability);
             }
+            if loaded.linux.io_uring == bohr_world::IoUring::Ring {
+                cluster = cluster.with_io_uring();
+            }
             if let Some(state) = loaded.state.clone() {
                 cluster = cluster.from_state(state, loaded.cwd.clone());
             }
@@ -382,6 +388,7 @@ fn drive(
         policy: policy.as_mut(),
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs,
         config,
     })

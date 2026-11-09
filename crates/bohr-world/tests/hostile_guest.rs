@@ -67,6 +67,7 @@ fn outcome(ops: Vec<GuestOp>) -> Result<Vec<i64>, KernelError> {
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: std::slice::from_ref(&GuestSpec::default()),
         config: RunConfig::default(),
     })?;

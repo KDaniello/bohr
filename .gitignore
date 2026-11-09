@@ -29,8 +29,9 @@
 /sdk/**/*.egg-info
 /sdk/**/dist
 
-# Roadmap: internal planning document, deliberately not published in this repository.
-/docs/ROADMAP.md
+# Roadmap: the internal plan to v1.0, deliberately not published in this repository.
+/ROADMAP.md
+/roadmap/
 
 # Product ideas: internal, and about products other than this one.
 /ideas

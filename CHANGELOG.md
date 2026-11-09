@@ -6,6 +6,83 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.2.0 — the engine, honest
+
+Not new reach but five things v0.1 said about itself and did not make true. It is not published.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.2.0` |
+| `tape_abi` | `1` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every stored bundle replays to its digest: nothing here breaks one. Figures are in
+[`benches/baseline.toml`](./benches/baseline.toml) under `[v0_2.*]` and `[walls.*]`.
+
+Gates: `make pr`, `make gate` (12 of 12) and the mutation harness (13 of 13 injections caught) are
+green on the release tree.
+
+### Clocks fail during a run
+
+- **`clock_step` and `clock_drift`**, scheduled or drawn under `[faults] draw`. A step moves wall
+  time (`CLOCK_REALTIME`, `gettimeofday`, `time`) back or forward and never monotonic time; a drift
+  changes a node's rate within ±200 ppm from its moment on. Both kinds the trace format named are
+  now emitted.
+- **A defect only a step reaches**: `testdata/bugs/lease_clock`, a lease measured on the wall clock.
+  Found on 25 seeds of 60 with clock faults drawn, on 0 of 60 without; 1,000 repeats, one digest.
+
+### Files through `io_uring`
+
+- **`[linux] io_uring = "ring"`** opens a ring and carries `READ`, `WRITE`, `OPENAT`, `CLOSE`,
+  `STATX`, `FSYNC` and `UNLINKAT`, each by the route its plain call takes: a write through a ring is
+  marked on the disk, lost to a crash and failed by a drawn `EIO` as `pwrite64` is. Links are
+  honoured; a polled ring is opened with its poller asleep. `testdata/guests/ring_files`: 1,000
+  repeats, one digest, and the same answers as a real kernel.
+- The default stays `"absent"`: `ENOSYS` at setup, as before. Other operations, registered
+  resources and a submission that would wait end the run under `BOHR-2004`.
+
+### Measured as what it is
+
+- **Startup in milliseconds**: 2.77 ms over a native start, against a bound of 5 ms. A guest that
+  lives under 10 ms natively is no longer held to a ratio of two startups. The bench runs guests from
+  the host's own filesystem: from a Windows drive under WSL the same start read 6.8 ms, which was the
+  mount and not the supervisor.
+- **Supervisor stops on every run line** (`N stops`), the number a run costs: 64 writes and a sync
+  through one ring are 15 stops, against 72 for the same work in plain calls.
+- **Interception got no slower**: 200,000 `getpid` calls, v0.1's build and this one alternately on
+  one host, 11.77 s against 11.88 s. Against v0.1's recorded 53.2 µs a call the bound fails, 58.8
+  µs, and v0.1's own binary reads the same on this evening's host.
+- **The run loop tested in its own crate**: 18 tests over a scripted backend, one per `StopReason`
+  and `NodeOp`. They found a killed task whose record the kernel kept for ever, fixed.
+- **One table of walls**: `scripts/walls.sh` records, per target, every call the model could not
+  answer and the refusal or the hang that stopped it.
+
+### Corrected
+
+- **Absolute wall-clock deadlines** — `pthread_cond_timedwait`, `clock_nanosleep` on
+  `CLOCK_REALTIME` — are measured on the wall clock. Before clocks could step the two were equal;
+  after a step of +30 s a one-second wait would have lasted 31.
+
+- **`op-reth` did not run at v0.1.0.** Since `66f43a4` it stops at its first `poll` over a socket,
+  refused by name; v0.1.0's "333,485 events of its node command" was measured before that. The
+  `op-reth` it was measured on, 1.1.5, is the `ethereum-optimism/op-reth` fork, archived since
+  2025-02-18; the target is now `rust/op-reth` in `ethereum-optimism/optimism`.
+- **`bohr survey` ignored a scenario's horizon** and node to end with, and surveyed a longer run
+  than the one it was asked about.
+
+### What it does not do
+
+- **Run a target it could not run before.** The walls are written down, not answered: that is v0.3
+  for `poll` over sockets and v0.5 for the rest.
+- **Preempt a thread that spins without a syscall.** One task runs at a time, until its next
+  syscall; a thread waiting on another in a loop never yields, and the run stops making events. The
+  Solana validator does this. Preemption at an instruction budget is v0.5.
+- **Turn the ring on by default**, or carry sockets, timeouts or registered buffers through it.
+- **Give wall time a date.** It begins at the epoch, so a step back further than the run has lasted
+  holds it there until monotonic time catches up. A realistic epoch changes every stored digest and
+  is v0.6's.
+
 ## v0.1.0 — the foundation
 
 The first named version: what the engine does, fixed in one place. Built with Rust 1.99.1 on

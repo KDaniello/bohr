@@ -182,7 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         eprintln!(
-            "node {id}: acknowledged write {write:?} at index {index} is gone;              the cluster committed past it, to {reached}"
+            "node {id}: acknowledged write {write:?} at index {index} is gone; \
+             the cluster committed past it, to {reached}"
         );
         return Err("an acknowledged write was lost".into());
     }

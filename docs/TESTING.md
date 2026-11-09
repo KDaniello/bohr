@@ -173,6 +173,13 @@ What lives here:
 - **a differential oracle finds a planted disagreement**: two synthetic guests, identical except for
   one branch, are run from one tape and the group verdict reports which event first differed (§5.17).
 
+**The run loop is tested in its own crate, not only from outside.** `crates/bohr-kernel/tests/
+run_loop.rs` drives `run()` with a scripted backend and a world whose answers are named by call
+number, so every `StopReason` and every `NodeOp` has a test that reaches it directly — 18 tests,
+none of which needs the real world or the real backend. The scripted backend reports nothing about
+a task it killed, exactly as the real ones do: a fake that reports the exit hides a kernel that
+keeps a killed task's record for ever.
+
 ---
 
 ## 5. BDD — behaviour specified in Gherkin
@@ -469,6 +476,20 @@ startup and swings by a quarter between runs on one machine. `syscall_storm` the
 **the cost of one intercepted syscall**, with startup measured separately and subtracted. That
 number moves with the interception path and not with the machine, and it is the one a regression
 shows up in first.
+
+**Startup is judged in milliseconds, not as a ratio.** A guest that lives under 10 ms natively has a
+ratio of two startups: `cat` lives about a millisecond and stood at 4.7× against a ceiling of 4.0×,
+red on two toolchains with no change to interception. Such a guest prints its ratio and is not held
+to a ceiling. What judges it is the startup gate:
+`testdata/guests/startup` traced minus native, best of 20 attempts, against `[startup] ceiling_ms`
+in `benches/baseline.toml`. The gate fails when the startup guest is not built, because a gate that
+passes on a missing measurement is not a gate.
+
+**The guests run from the host's own filesystem.** The bench copies them to a temporary directory
+first. From a Windows drive mounted under WSL, starting the same static guest cost 5.38 ms natively
+against 1.09 ms from `/tmp`, and 11.63 ms traced against 4.16 ms, because the supervisor reads the
+binary as well: the startup figure measured the mount, not the supervisor. A timed attempt that
+exits nonzero fails the gate rather than counting as a fast one.
 
 Per-guest thresholds live in `benches/baseline.toml` beside the measurement, and nowhere else. They
 were once written here as well, with different numbers — `syscall_storm` at 8× here against 1000× in

@@ -290,7 +290,8 @@ fn main() {
     // They are named rather than silently skipped, so a run on Windows says what it did not check.
     if !HAS_BACKEND {
         eprintln!(
-            "note: scenarios tagged @linux are not run here -- this build has no interceptor, so              what follows is the half of the suite that needs none"
+            "note: scenarios tagged @linux are not run here -- this build has no interceptor, so \
+             what follows is the half of the suite that needs none"
         );
     }
     futures::executor::block_on(

@@ -9,7 +9,10 @@ use bohr_tape::DrawSite;
 use bohr_trace::{EventKind, short_digest};
 use bohr_types::{GuestAddr, SyncWordId, TaskId, Tick, WorldModelId};
 
-use crate::nums::{errno, sys};
+use crate::{
+    nums::{errno, sys},
+    ring,
+};
 
 /// A file the guest opened, held entirely in supervisor memory.
 ///
@@ -100,7 +103,7 @@ pub(crate) mod futex_op {
 
     /// Set when the word is private to one process, which changes nothing this model does.
     pub(crate) const PRIVATE_FLAG: u32 = 128;
-    /// Set when a timeout is measured against the monotonic clock.
+    /// Set when an absolute timeout is a wall-clock time rather than a monotonic one.
     pub(crate) const CLOCK_REALTIME: u32 = 256;
 
     /// The operation, with the flags that do not change it removed.
@@ -155,6 +158,39 @@ struct PendingMap {
     offset: u64,
     writable: bool,
     fd: i64,
+    /// Which region of a submission ring this is, where it is one rather than a file.
+    ring: Option<u64>,
+}
+
+/// What `io_uring_enter` took from a ring's queue, to be carried out by whichever world routes it.
+pub(crate) struct Taken {
+    /// The ring's descriptor, where the completions go.
+    pub(crate) fd: i64,
+    /// The entries, in the order the guest queued them.
+    pub(crate) submissions: Vec<ring::Submission>,
+}
+
+/// The run's end for a submission this ring does not carry, named by what it asked for.
+pub(crate) fn refuse_submission(ctx: &mut WorldCtx<'_, '_>, what: &str) -> KernelError {
+    ctx.refuse(
+        "BOHR-2004",
+        format_args!("io_uring {what} is not modelled; see docs/PLATFORMS.md §4.1"),
+    )
+}
+
+/// What a submission returned, read off the effects of the plain call that carried it out.
+///
+/// **A submission that would wait, or pass to the host, is refused.** Every completion is posted
+/// before `io_uring_enter` returns, so a call that parks its task has no moment to complete at,
+/// and one the host carries out did work this world did not see.
+pub(crate) fn submission_answer(
+    ctx: &mut WorldCtx<'_, '_>,
+    effects: &Effects,
+) -> Result<i64, KernelError> {
+    match effects.state {
+        bohr_kernel::TaskState::Runnable(Resume::Emulate { ret }) => Ok(ret),
+        _ => Err(refuse_submission(ctx, "a submission that waits or reaches the host")),
+    }
 }
 
 /// The one descriptor number this model never hands out.
@@ -301,6 +337,9 @@ const PRESENTED_VERSION: &str = "#1 SMP bohr";
 
 /// Size of `struct stat` on x86-64.
 const STAT_BYTES: usize = 144;
+
+/// Size of `struct statx`, which is the same on every architecture.
+const STATX_BYTES: usize = 256;
 
 /// Size of `struct rusage` on x86-64: two intervals and fourteen counters.
 const RUSAGE_BYTES: usize = 144;
@@ -481,6 +520,10 @@ pub struct MinimalWorld {
     /// some other name needs before it can be created. A store that keeps its data and its lock
     /// beside each other in a directory it made itself needs exactly that and nothing more.
     directories: BTreeSet<u64>,
+    /// Whether the guest is shown a kernel with `io_uring` (`[linux] io_uring = "ring"`).
+    io_uring: bool,
+    /// Submission rings the guest has open, by the descriptor each was given.
+    rings: BTreeMap<i64, ring::Ring>,
     /// Whether the guest has already been told this kernel has no `io_uring`.
     ///
     /// Once per run rather than once per call: a guest that probes in a loop would otherwise fill
@@ -588,6 +631,8 @@ impl MinimalWorld {
             mappings: BTreeMap::new(),
             mapping: BTreeMap::new(),
             directories: [ROOT_INODE].into_iter().collect(),
+            io_uring: false,
+            rings: BTreeMap::new(),
             declined_ring: false,
             dir_of: BTreeMap::new(),
             program: None,
@@ -690,6 +735,16 @@ impl MinimalWorld {
         self
     }
 
+    /// The same world, showing the guest a kernel that has `io_uring` and `statx`.
+    ///
+    /// One kernel has both, and a ring's entries are carried by the cluster that routes them, which
+    /// is why only a cluster turns this on.
+    #[must_use]
+    pub(crate) fn with_io_uring(mut self) -> Self {
+        self.io_uring = true;
+        self
+    }
+
     /// The same world, told which program it is running, for the calls that ask.
     #[must_use]
     pub fn with_program(mut self, program: String) -> Self {
@@ -767,6 +822,134 @@ impl MinimalWorld {
         Ok(-errno::ENOSYS)
     }
 
+    /// Opens a submission ring, a polled one included.
+    ///
+    /// **A polled queue is accepted with its poller asleep.** The interface says what happens when
+    /// the kernel's thread is not running, and every caller of a polled ring implements it: the
+    /// queue's flag word says the poller must be woken, and waking it is `io_uring_enter`, which
+    /// is the call this world answers.
+    fn open_ring(
+        &mut self,
+        ctx: &mut WorldCtx<'_, '_>,
+        args: [u64; 6],
+    ) -> Result<i64, KernelError> {
+        let mut params = [0u8; 120];
+        ctx.read_mem(GuestAddr(args[1]), &mut params)?;
+        let word = |at: usize| {
+            u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]])
+        };
+        let held = match ring::Ring::from_setup(args[0] as u32, word(8), word(4)) {
+            Ok(held) => held,
+            Err(ring::Setup::Invalid) => return Ok(-errno::EINVAL),
+            Err(ring::Setup::Unsupported(flag)) => return Err(refuse_submission(ctx, flag)),
+        };
+        ctx.write_mem(GuestAddr(args[1]), &held.params())?;
+        let fd =
+            self.attach(OpenFile { inode: None, position: 0, durable: false, appending: false });
+        self.rings.insert(fd, held);
+        ctx.emit(EventKind::Diagnostic {
+            code: "BOHR-2004".to_owned(),
+            message: format!("io_uring of {} entries opened as descriptor {fd}", held.entries),
+        })?;
+        Ok(fd)
+    }
+
+    /// Whether a descriptor is a ring this world opened.
+    pub(crate) fn holds_ring(&self, fd: i64) -> bool {
+        self.rings.contains_key(&fd)
+    }
+
+    /// Takes what the guest has queued for `io_uring_enter`, or the errno the call answers instead.
+    ///
+    /// Never more entries than the guest has completion slots free, which keeps
+    /// `IORING_FEAT_NODROP` true without an overflow list; a full queue is answered `EBUSY`. An
+    /// index naming no slot is counted as dropped and ends the batch, as it does in a kernel.
+    pub(crate) fn take_submissions(
+        &mut self,
+        ctx: &mut WorldCtx<'_, '_>,
+        args: [u64; 6],
+    ) -> Result<Result<Taken, i64>, KernelError> {
+        let fd = args[0] as i64;
+        let Some(held) = self.rings.get(&fd).copied() else {
+            return Ok(Err(errno::EBADF));
+        };
+        if !held.mapped() {
+            return Ok(Err(errno::EINVAL));
+        }
+        let head = Self::read_u32(ctx, held.sq_head_at())?;
+        let tail = Self::read_u32(ctx, held.sq_tail_at())?;
+        let reaped = Self::read_u32(ctx, held.cq_head_at())?;
+        let posted = Self::read_u32(ctx, held.cq_tail_at())?;
+        let free = held.completions().saturating_sub(posted.wrapping_sub(reaped));
+        // A polled queue is drained whole when its poller wakes: the kernel ignores the count the
+        // caller passes, and liburing passes nought.
+        let asked = if held.polled { u32::MAX } else { args[1] as u32 };
+        let wanted = tail.wrapping_sub(head).min(held.entries).min(asked);
+        if wanted > 0 && free == 0 {
+            return Ok(Err(errno::EBUSY));
+        }
+        let taking = wanted.min(free);
+
+        let mut submissions = Vec::with_capacity(taking as usize);
+        let mut dropped = 0u32;
+        for position in 0..taking {
+            let index = Self::read_u32(ctx, held.sq_array_at(head.wrapping_add(position)))?;
+            let Some(at) = held.sqe_at(index) else {
+                dropped = 1;
+                break;
+            };
+            let mut bytes = [0u8; ring::SQE_BYTES as usize];
+            ctx.read_mem(GuestAddr(at), &mut bytes)?;
+            submissions.push(ring::Submission::read(&bytes));
+        }
+        // The dropped entry is consumed with the ones before it; the ones after it wait.
+        let consumed = submissions.len() as u32 + dropped;
+        if let Some(at) = held.sq_head_at() {
+            ctx.write_mem(GuestAddr(at), &head.wrapping_add(consumed).to_le_bytes())?;
+        }
+        if dropped > 0
+            && let Some(at) = held.sq_dropped_at()
+        {
+            let before = Self::read_u32(ctx, Some(at))?;
+            ctx.write_mem(GuestAddr(at), &before.wrapping_add(dropped).to_le_bytes())?;
+        }
+        Ok(Ok(Taken { fd, submissions }))
+    }
+
+    /// Posts completions to a ring's queue and moves its tail past them.
+    pub(crate) fn post_completions(
+        &self,
+        ctx: &mut WorldCtx<'_, '_>,
+        fd: i64,
+        done: &[ring::Completed],
+    ) -> Result<(), KernelError> {
+        // A submission that closed the ring's own descriptor leaves nowhere to post.
+        let Some(held) = self.rings.get(&fd).copied() else {
+            return Ok(());
+        };
+        let mut tail = Self::read_u32(ctx, held.cq_tail_at())?;
+        for (user_data, result) in done {
+            if let Some(at) = held.cqe_at(tail) {
+                ctx.write_mem(GuestAddr(at), &ring::completion(*user_data, *result))?;
+            }
+            tail = tail.wrapping_add(1);
+        }
+        if let Some(at) = held.cq_tail_at() {
+            ctx.write_mem(GuestAddr(at), &tail.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Reads one of the counters the two queues are steered by.
+    fn read_u32(ctx: &mut WorldCtx<'_, '_>, at: Option<u64>) -> Result<u32, KernelError> {
+        let Some(at) = at else {
+            return Ok(0);
+        };
+        let mut bytes = [0u8; 4];
+        ctx.read_mem(GuestAddr(at), &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
     /// Answers the call that opens a ring, and says so on the timeline.
     ///
     /// Declined rather than refused, and the difference is not a softening. The refusal existed
@@ -788,7 +971,8 @@ impl MinimalWorld {
         self.declined_ring = true;
         ctx.emit(EventKind::Diagnostic {
             code: "BOHR-2004".to_owned(),
-            message: "io_uring is declined; the guest runs its fallback path, which is not the                       path it runs where a ring is available"
+            message: "io_uring is declined; the guest runs its fallback path, which is not the \
+                      path it runs where a ring is available"
                 .to_owned(),
         })?;
         Ok(-errno::ENOSYS)
@@ -1185,6 +1369,35 @@ impl MinimalWorld {
 
         const PROT_EXEC: u64 = 0x4;
 
+        // **A ring is not a file.** What the guest asks for here is a window onto the queue it was
+        // given, named by the offset rather than by any content: the interface hands out three of
+        // them and a caller reads where each one is from the block it was handed at setup.
+        if let Some(held) = self.rings.get(&(args[4] as i64)).copied() {
+            let bytes = held.region_bytes(args[5])?;
+            self.mapping.insert(
+                ctx.task(),
+                PendingMap {
+                    len: bytes.max(args[1]),
+                    inode: 0,
+                    offset: args[5],
+                    writable: true,
+                    fd: args[4] as i64,
+                    ring: Some(args[5]),
+                },
+            );
+            return Some(Resume::Rewrite {
+                nr: sys::MMAP,
+                args: [
+                    args[0],
+                    args[1],
+                    PROT_READ_WRITE,
+                    (args[3] & !MAP_SHARED) | MAP_PRIVATE | MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ],
+            });
+        }
+
         let inode = self.open.get(&(args[4] as i64))?.inode?;
         let writable = args[2] & PROT_WRITE != 0 && args[3] & MAP_SHARED != 0;
         // **Executability is the guest's to ask for and not ours to drop.** Rewriting every file
@@ -1196,7 +1409,14 @@ impl MinimalWorld {
         let keep_exec = args[2] & PROT_EXEC;
         self.mapping.insert(
             ctx.task(),
-            PendingMap { len: args[1], inode, offset: args[5], writable, fd: args[4] as i64 },
+            PendingMap {
+                len: args[1],
+                inode,
+                offset: args[5],
+                writable,
+                fd: args[4] as i64,
+                ring: None,
+            },
         );
         Some(Resume::Rewrite {
             nr: sys::MMAP,
@@ -1223,6 +1443,22 @@ impl MinimalWorld {
         // A mapping the host refused is not one to remember. The guest already has the error.
         if ret < 0 {
             return Ok(Effects::go(Resume::Continue, Tick::ZERO));
+        }
+        // A ring's region carries no file. What it carries is a control block the guest reads to
+        // learn the shape of what it was given, and an anonymous mapping arrives as zeroes -- a
+        // mask and a count of nought, which puts every submission in the same slot.
+        if let Some(region) = pending.ring {
+            let at = ret as u64;
+            if let Some(held) = self.rings.get_mut(&pending.fd) {
+                held.placed(region, at);
+                let held = *held;
+                match region {
+                    ring::offset::SQ_RING => ctx.write_mem(GuestAddr(at), &held.sq_control())?,
+                    ring::offset::CQ_RING => ctx.write_mem(GuestAddr(at), &held.cq_control())?,
+                    _ => {}
+                }
+            }
+            return Ok(Effects::go(Resume::Continue, SYSCALL_COST));
         }
         let placed = Mapping {
             at: ret as u64,
@@ -1911,10 +2147,41 @@ impl MinimalWorld {
     /// declines on purpose, `stat` has no older spelling to fall back to, and a program that
     /// cannot ask how big a file is stops.
     fn stat_at(&self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
-        let (fd, addr, flags) = (dirfd_of(args[0]), GuestAddr(args[2]), args[3]);
-        let name = match read_c_string(ctx, GuestAddr(args[1]))? {
+        match self.stat_target(ctx, args[0], args[1], args[3])? {
+            Err(errno) => Ok(errno),
+            Ok((inode, length)) => {
+                ctx.write_mem(GuestAddr(args[2]), &self.stat_of(inode, length))?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Answers `statx`, which a kernel with `io_uring` has: the same facts as `newfstatat`.
+    ///
+    /// The mask asked for is not consulted; every basic field is filled and the mask handed back
+    /// says so, which is what a kernel does for a filesystem that has them all.
+    fn statx_at(&self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+        match self.stat_target(ctx, args[0], args[1], args[2])? {
+            Err(errno) => Ok(errno),
+            Ok((inode, length)) => {
+                ctx.write_mem(GuestAddr(args[4]), &self.statx_of(inode, length))?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// What a path relative to a descriptor names, as the inode and length a stat reports.
+    fn stat_target(
+        &self,
+        ctx: &mut WorldCtx<'_, '_>,
+        dirfd: u64,
+        name_at: u64,
+        flags: u64,
+    ) -> Result<Result<(Option<u64>, u64), i64>, KernelError> {
+        let fd = dirfd_of(dirfd);
+        let name = match read_c_string(ctx, GuestAddr(name_at))? {
             PathArg::Named(name) => name,
-            other => return Ok(other.errno()),
+            other => return Ok(Err(other.errno())),
         };
         // The empty name is the descriptor itself, and asking where it sits would answer about
         // the directory it is under instead.
@@ -1923,26 +2190,26 @@ impl MinimalWorld {
         } else {
             match self.under(fd, &name) {
                 Ok(path) => self.resolve(&path),
-                Err(errno) => return Ok(errno),
+                Err(errno) => return Ok(Err(errno)),
             }
         };
         if path.is_empty() {
-            return if flags & AT_EMPTY_PATH == 0 {
-                Ok(-errno::ENOENT)
-            } else {
-                self.write_stat(ctx, fd, addr)
+            if flags & AT_EMPTY_PATH == 0 {
+                return Ok(Err(-errno::ENOENT));
+            }
+            let Some(length) = self.length_of(fd) else {
+                return Ok(Err(-errno::EBADF));
             };
+            return Ok(Ok((self.open.get(&fd).and_then(|f| f.inode), length)));
         }
         if RANDOM_PATHS.contains(&path.as_str()) {
-            ctx.write_mem(addr, &self.stat_of(None, 0))?;
-            return Ok(0);
+            return Ok(Ok((None, 0)));
         }
         let Some(inode) = self.names.get(&path).copied() else {
-            return Ok(-errno::ENOENT);
+            return Ok(Err(-errno::ENOENT));
         };
         let length = self.content.get(&inode).map_or(0, |c| c.len()) as u64;
-        ctx.write_mem(addr, &self.stat_of(Some(inode), length))?;
-        Ok(0)
+        Ok(Ok((Some(inode), length)))
     }
 
     /// Answers `statfs` and `fstatfs`: what the filesystem says about itself.
@@ -1983,6 +2250,33 @@ impl MinimalWorld {
         put(&mut buf, 72, &stat::BLOCK_SIZE.to_le_bytes());
         ctx.write_mem(addr, &buf)?;
         Ok(0)
+    }
+
+    /// The `struct statx` for one object: the same facts as [`Self::stat_of`], in its layout.
+    fn statx_of(&self, inode: Option<u64>, length: u64) -> [u8; STATX_BYTES] {
+        /// `STATX_BASIC_STATS`: type, mode, links, owner, times, inode, size and blocks.
+        const BASIC_STATS: u32 = 0x7ff;
+        let mode = match inode {
+            Some(inode) if self.directories.contains(&inode) => stat::DIRECTORY_MODE,
+            Some(_) => stat::REGULAR_MODE,
+            None => stat::CHAR_MODE,
+        };
+        let length = if mode == stat::DIRECTORY_MODE { 0 } else { length };
+
+        // Field offsets are those of `struct statx`; the device is split the way `makedev` packs
+        // it.
+        let mut buf = [0u8; STATX_BYTES];
+        put(&mut buf, 0, &BASIC_STATS.to_le_bytes());
+        put(&mut buf, 4, &(stat::BLOCK_SIZE as u32).to_le_bytes());
+        put(&mut buf, 16, &1u32.to_le_bytes());
+        put(&mut buf, 28, &(mode as u16).to_le_bytes());
+        put(&mut buf, 32, &inode.unwrap_or(0).to_le_bytes());
+        put(&mut buf, 40, &length.to_le_bytes());
+        put(&mut buf, 48, &length.div_ceil(512).to_le_bytes());
+        let (major, minor) = ((stat::DEVICE >> 8) & 0xfff, stat::DEVICE & 0xff);
+        put(&mut buf, 136, &(major as u32).to_le_bytes());
+        put(&mut buf, 140, &(minor as u32).to_le_bytes());
+        buf
     }
 
     /// The `struct stat` for one object, as the guest's C library expects to read it.
@@ -2299,6 +2593,31 @@ impl MinimalWorld {
         ctx.now()
     }
 
+    /// What the guest is told the wall time is: the same reading until the node's clock is
+    /// stepped, after which it can move back while [`Self::presented_now`] never does.
+    pub(crate) fn presented_wall(ctx: &WorldCtx<'_, '_>) -> Tick {
+        #[cfg(feature = "chaos-node-clock-shared")]
+        return crate::chaos::shared_now(ctx);
+        #[cfg(not(feature = "chaos-node-clock-shared"))]
+        ctx.wall_now()
+    }
+
+    /// Whether a `clock_gettime` clock id reads wall time rather than monotonic time.
+    ///
+    /// `CLOCK_REALTIME`, its coarse and alarm forms, and `CLOCK_TAI` follow the wall clock and are
+    /// what `settimeofday` moves; every other id counts elapsed time and never goes back.
+    pub(crate) const fn reads_wall(clock_id: u64) -> bool {
+        matches!(clock_id, 0 | 5 | 8 | 11)
+    }
+
+    /// The clock an absolute deadline is measured against: the wall one where the caller named it.
+    ///
+    /// `pthread_cond_timedwait` and `clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME)` pass wall
+    /// times, and measuring one against monotonic time is off by every step the clock has taken.
+    pub(crate) fn deadline_clock(ctx: &WorldCtx<'_, '_>, wall: bool) -> Tick {
+        if wall { Self::presented_wall(ctx) } else { Self::presented_now(ctx) }
+    }
+
     /// Removes `task` from `word`'s queue. True when it was actually waiting; a timeout whose
     /// waiter was already woken fires into nothing.
     pub(crate) fn cancel_wait(&mut self, task: TaskId, word: u64) -> bool {
@@ -2382,11 +2701,18 @@ impl MinimalWorld {
     }
 
     /// Writes a `timespec` derived from virtual time, and reports what was written.
-    fn write_timespec(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<[u8; 8], KernelError> {
+    fn write_timespec(
+        ctx: &mut WorldCtx<'_, '_>,
+        addr: GuestAddr,
+        presented: Tick,
+    ) -> Result<[u8; 8], KernelError> {
         #[cfg(feature = "chaos-syscall-passthru")]
-        let now = crate::chaos::host_nanos();
+        let now = {
+            let _ = presented;
+            crate::chaos::host_nanos()
+        };
         #[cfg(not(feature = "chaos-syscall-passthru"))]
-        let now = Self::presented_now(ctx).get();
+        let now = presented.get();
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&(now / Tick::SECOND.get()).to_le_bytes());
         buf[8..].copy_from_slice(&(now % Tick::SECOND.get()).to_le_bytes());
@@ -2396,7 +2722,7 @@ impl MinimalWorld {
 
     /// Writes a `timeval`, which is the same instant at microsecond resolution.
     fn write_timeval(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<[u8; 8], KernelError> {
-        let now = Self::presented_now(ctx).get();
+        let now = Self::presented_wall(ctx).get();
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&(now / Tick::SECOND.get()).to_le_bytes());
         let micros = (now % Tick::SECOND.get()) / Tick::MICROSECOND.get();
@@ -2454,8 +2780,12 @@ impl MinimalWorld {
 
         let (ret, resume, data_digest) = match nr {
             sys::CLOCK_GETTIME => {
-                let d = Self::write_timespec(ctx, GuestAddr(args[1]))?;
-                let presented = Self::presented_now(ctx);
+                let presented = if Self::reads_wall(args[0]) {
+                    Self::presented_wall(ctx)
+                } else {
+                    Self::presented_now(ctx)
+                };
+                let d = Self::write_timespec(ctx, GuestAddr(args[1]), presented)?;
                 ctx.emit(EventKind::ClockRead { presented })?;
                 (0, Resume::Emulate { ret: 0 }, Some(d))
             }
@@ -2463,7 +2793,7 @@ impl MinimalWorld {
             // optionally written through a pointer. Read as a clock like the others, so a run that
             // asks the time this way is as recorded as one that asks it any other.
             sys::TIME => {
-                let seconds = (Self::presented_now(ctx).get() / Tick::SECOND.get()) as i64;
+                let seconds = (Self::presented_wall(ctx).get() / Tick::SECOND.get()) as i64;
                 let digest = if args[0] == 0 {
                     None
                 } else {
@@ -2471,13 +2801,13 @@ impl MinimalWorld {
                     ctx.write_mem(GuestAddr(args[0]), &buf)?;
                     Some(short_digest(&buf))
                 };
-                let presented = Self::presented_now(ctx);
+                let presented = Self::presented_wall(ctx);
                 ctx.emit(EventKind::ClockRead { presented })?;
                 (seconds, Resume::Emulate { ret: seconds }, digest)
             }
             sys::GETTIMEOFDAY => {
                 let d = Self::write_timeval(ctx, GuestAddr(args[0]))?;
-                let presented = Self::presented_now(ctx);
+                let presented = Self::presented_wall(ctx);
                 ctx.emit(EventKind::ClockRead { presented })?;
                 (0, Resume::Emulate { ret: 0 }, Some(d))
             }
@@ -2546,6 +2876,7 @@ impl MinimalWorld {
             }
             sys::CLOSE => {
                 self.dir_of.remove(&(args[0] as i64));
+                self.rings.remove(&(args[0] as i64));
                 let ret = match self.open.remove(&(args[0] as i64)) {
                     Some(file) => {
                         if let Some(inode) = file.inode {
@@ -2844,7 +3175,7 @@ impl MinimalWorld {
                 let absolute = nr == sys::CLOCK_NANOSLEEP && args[1] & TIMER_ABSTIME != 0;
                 let until = Self::read_timespec(ctx, GuestAddr(request))?;
                 let ahead = if absolute {
-                    until.saturating_sub(Self::presented_now(ctx).get())
+                    until.saturating_sub(Self::deadline_clock(ctx, Self::reads_wall(args[0])).get())
                 } else {
                     until
                 };
@@ -2869,10 +3200,55 @@ impl MinimalWorld {
                 })?;
                 return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST).yielding());
             }
-            // Names are not modelled, and neither is the version of the kernel the guest is not
-            // running on. Reported as unimplemented so callers take their fallback path.
+            // A ring under `[linux] io_uring = "ring"`; otherwise a kernel without one, answered
+            // `ENOSYS` so the guest takes the fallback it keeps for that kernel.
+            sys::IO_URING_SETUP if self.io_uring => {
+                let ret = self.open_ring(ctx, args)?;
+                (ret, Resume::Emulate { ret }, None)
+            }
             sys::IO_URING_SETUP => {
                 let ret = self.decline_ring(ctx)?;
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // Registering with a ring is an optimisation and nothing else: files and buffers
+            // handed over once so later submissions can name them by index. A caller told no takes
+            // the ordinary path, which is the path this world models, and every caller keeps that
+            // path because registration is refused by kernels that limit locked memory.
+            sys::IO_URING_REGISTER if self.io_uring => {
+                let ret = -errno::EINVAL;
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // A ring this world opened is entered through the cluster, which carries its entries
+            // by the route each takes; reaching here, the descriptor is not a ring.
+            sys::IO_URING_ENTER if self.io_uring => {
+                (-errno::EBADF, Resume::Emulate { ret: -errno::EBADF }, None)
+            }
+            // With no ring to have opened, reaching either call is a state this model cannot
+            // account for, and it ends the run under the ring's own code.
+            sys::IO_URING_ENTER | sys::IO_URING_REGISTER => {
+                let ret = self.unmodelled(ctx, nr, args)?;
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // Scheduling niceness, which this world does not have: one task runs at a time and the
+            // order is the tape's. Answered as the middling value the call reports for a process
+            // nobody has reniced -- the raw call returns twenty less the niceness, so twenty is
+            // none of it, and a guest reading its own priority sees what it would have on a
+            // machine where nothing had touched it.
+            sys::GETPRIORITY => (20, Resume::Emulate { ret: 20 }, None),
+            // And setting it is accepted and has no effect, which is the truth rather than a
+            // convenience: what a task is worth to the scheduler is drawn from the tape here, and
+            // a niceness the world honoured would be a second scheduler quietly disagreeing with
+            // the first. A caller that reads its priority back gets the same answer as before,
+            // because that is what this world's scheduling is.
+            sys::SETPRIORITY => (0, Resume::Emulate { ret: 0 }, None),
+            // A hint about what will be wanted soon. Nothing here reads ahead, and a hint acted on
+            // by nobody is answered exactly as a kernel that declined to act on it would.
+            sys::READAHEAD => {
+                let ret = if self.is_file(args[0] as i64) { 0 } else { -errno::EBADF };
+                (ret, Resume::Emulate { ret }, None)
+            }
+            sys::STATX if self.io_uring => {
+                let ret = self.statx_at(ctx, args)?;
                 (ret, Resume::Emulate { ret }, None)
             }
             sys::PRCTL | sys::STATX => {

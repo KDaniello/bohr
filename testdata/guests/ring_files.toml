@@ -1,0 +1,6 @@
+# The world ring_files.c needs: a kernel with io_uring.
+#
+# Nothing else is asked for, so what the run shows is the ring and not the faults around it.
+
+[linux]
+io_uring = "ring"

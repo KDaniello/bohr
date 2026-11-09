@@ -39,6 +39,13 @@ pub trait WorldModel {
     /// Faults this model can inject.
     fn fault_catalog(&self) -> &FaultCatalog;
 
+    /// An independent copy in the same state, for a run that branches from a checkpoint.
+    ///
+    /// `None` where the model cannot be copied; a run then cannot branch while it is in use.
+    fn fork(&self) -> Option<Box<dyn WorldModel>> {
+        None
+    }
+
     /// Earliest armed timer, if any.
     fn next_deadline(&self) -> Option<Tick> {
         None
@@ -317,6 +324,28 @@ pub enum Verdict {
     Skipped,
 }
 
+/// Watches a run as it goes, for whoever shows progress. Never part of what the run is.
+///
+/// Called by the loop between stops with a copy of where the run stands; nothing it does is read
+/// back, so an observer cannot change a run.
+pub trait Observer {
+    /// The run so far: every [`crate::PROGRESS_EVERY`] events, and once more when it ends.
+    fn progress(&mut self, progress: &Progress);
+}
+
+/// Where a run stands, as an [`Observer`] is shown it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Progress {
+    /// Events recorded so far.
+    pub events: u64,
+    /// The world clock.
+    pub ticks: Tick,
+    /// Scheduling decisions made so far.
+    pub decisions: u64,
+    /// Whether this is the report the run ends with.
+    pub finished: bool,
+}
+
 /// Where recorded events go.
 pub trait EventSink {
     /// Appends one event.
@@ -408,6 +437,30 @@ impl<'a, 't> WorldCtx<'a, 't> {
     #[must_use]
     pub fn now_on(&self, node: NodeId) -> Tick {
         self.clock.now_on(node)
+    }
+
+    /// What the node this stop happened on reads for wall time (`CLOCK_REALTIME`).
+    ///
+    /// The same as [`Self::now`] until the node's clock is stepped; after a step back it can read
+    /// earlier than before, as a wall clock can.
+    ///
+    /// # Panics
+    /// On a detached context; use [`Self::wall_on`] there.
+    #[must_use]
+    pub fn wall_now(&self) -> Tick {
+        self.clock.wall_on(self.origin().0)
+    }
+
+    /// What a named node reads for wall time.
+    #[must_use]
+    pub fn wall_on(&self, node: NodeId) -> Tick {
+        self.clock.wall_on(node)
+    }
+
+    /// The clock a named node reads by, so a fault can be built from it.
+    #[must_use]
+    pub fn node_clock(&self, node: NodeId) -> Option<NodeClock> {
+        self.clock.node_clock(node)
     }
 
     /// The world clock, which the run is ordered by.

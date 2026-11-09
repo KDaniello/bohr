@@ -1,4 +1,5 @@
-//! Logical time.
+//! Logical time: the world clock the run is ordered by, and each node's two readings of it.
+//! No host clock is read here; time moves only when the run loop advances it.
 
 use std::collections::BTreeMap;
 
@@ -11,16 +12,18 @@ use bohr_types::{NodeId, Tick};
 /// hour ahead is a different test from a node a microsecond ahead, and both are reachable.
 pub const MAX_DRIFT_PPM: u32 = 200;
 
-/// How one node sees the world clock.
+/// How one node sees the world clock, as two readings: monotonic, and wall.
 ///
-/// The offset is how far ahead of the world clock this node reads, and it is never negative: what
-/// matters is that two nodes disagree, and a clock that could read before the run began would have
-/// to be clamped, which would make it stand still at the start instead of running.
+/// The monotonic reading is the offset plus drift and never goes back. The wall reading is the same
+/// plus a signed step, so a clock set back moves wall time back while monotonic time keeps rising,
+/// as `settimeofday` does on Linux.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NodeClock {
     offset: u64,
     /// Rate difference in parts per million, positive for a clock that runs fast.
     drift_ppm: i32,
+    /// How far the wall reading has been stepped from the monotonic one.
+    wall_step: i64,
 }
 
 impl NodeClock {
@@ -33,7 +36,7 @@ impl NodeClock {
     #[must_use]
     pub const fn new(offset: u64, drift_ppm: i32) -> Self {
         assert_drift_in_bounds(drift_ppm);
-        Self { offset, drift_ppm }
+        Self { offset, drift_ppm, wall_step: 0 }
     }
 
     /// The same reading at `at`, drifting at `drift_ppm` from there on.
@@ -53,10 +56,31 @@ impl NodeClock {
         let elapsed = i128::from(at.get());
         let drifted = elapsed + (elapsed * i128::from(drift_ppm)) / 1_000_000;
         let offset = u64::try_from((reading - drifted).max(0)).unwrap_or(u64::MAX);
-        Self { offset, drift_ppm }
+        Self { offset, drift_ppm, wall_step: self.wall_step }
     }
 
-    /// What this node reads when the world clock says `now`.
+    /// The same clock with its wall reading stepped by `by` ticks, back where `by` is negative.
+    ///
+    /// The monotonic reading is untouched; the wall reading never goes below zero.
+    #[must_use]
+    pub const fn stepped(self, by: i64) -> Self {
+        Self { wall_step: self.wall_step.saturating_add(by), ..self }
+    }
+
+    /// What this node's wall clock (`CLOCK_REALTIME`) reads when the world clock says `now`.
+    #[must_use]
+    pub const fn read_wall(self, now: Tick) -> Tick {
+        let stepped = self.read(now).get() as i128 + self.wall_step as i128;
+        if stepped <= 0 {
+            Tick::ZERO
+        } else if stepped > u64::MAX as i128 {
+            Tick(u64::MAX)
+        } else {
+            Tick(stepped as u64)
+        }
+    }
+
+    /// What this node's monotonic clock reads when the world clock says `now`.
     ///
     /// Drift accumulates with elapsed time, which is what makes two nodes diverge the longer a run
     /// goes on rather than sitting at a fixed distance apart.
@@ -116,6 +140,18 @@ impl Clock {
     #[must_use]
     pub fn now_on(&self, node: NodeId) -> Tick {
         self.nodes.get(&node).map_or(self.now, |clock| clock.read(self.now))
+    }
+
+    /// What `node`'s wall clock reads: [`Self::now_on`] plus any step it has been given.
+    #[must_use]
+    pub fn wall_on(&self, node: NodeId) -> Tick {
+        self.nodes.get(&node).map_or(self.now, |clock| clock.read_wall(self.now))
+    }
+
+    /// The clock `node` reads by, where it has one of its own.
+    #[must_use]
+    pub fn node_clock(&self, node: NodeId) -> Option<NodeClock> {
+        self.nodes.get(&node).copied()
     }
 
     /// Gives a node a clock of its own.
@@ -188,6 +224,39 @@ mod tests {
         let later = Tick(20 * Tick::SECOND.get());
         assert!(rebased.read(later) < clock.read(later), "the new rate applies after the rebase");
         assert!(rebased.read(later) > rebased.read(at), "and time still moves forward");
+    }
+
+    #[test]
+    fn a_step_back_moves_wall_time_and_never_monotonic_time() {
+        let at = Tick(10 * Tick::SECOND.get());
+        let clock = NodeClock::new(1_000, 0).stepped(-(5 * Tick::SECOND.get() as i64));
+        assert_eq!(clock.read(at), Tick(at.get() + 1_000), "monotonic time is untouched");
+        assert_eq!(clock.read_wall(at), Tick(at.get() + 1_000 - 5 * Tick::SECOND.get()));
+        let later = Tick(at.get() + Tick::MILLISECOND.get());
+        assert!(clock.read(later) > clock.read(at), "and keeps rising");
+    }
+
+    #[test]
+    fn a_wall_clock_set_before_zero_reads_zero() {
+        let clock = NodeClock::new(0, 0).stepped(i64::MIN);
+        assert_eq!(clock.read_wall(Tick::SECOND), Tick::ZERO);
+    }
+
+    #[test]
+    fn a_rebase_keeps_the_step() {
+        let clock = NodeClock::new(0, 0).stepped(7);
+        let rebased = clock.rebased(Tick::SECOND, 100);
+        let later = Tick(2 * Tick::SECOND.get());
+        assert_eq!(rebased.read_wall(later).get() - rebased.read(later).get(), 7);
+    }
+
+    #[test]
+    fn an_unstepped_clock_reads_the_same_on_both() {
+        let mut c = Clock::new();
+        c.set_node_clock(NodeId(1), NodeClock::new(1_234, -50));
+        c.advance(Tick(42 * Tick::SECOND.get()));
+        assert_eq!(c.wall_on(NodeId(1)), c.now_on(NodeId(1)));
+        assert_eq!(c.wall_on(NodeId(9)), c.now(), "a node without a clock reads the world");
     }
 
     #[test]

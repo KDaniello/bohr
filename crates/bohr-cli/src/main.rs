@@ -51,7 +51,7 @@ const SELFTEST_SCHEDULER: &str = "random";
 ///
 /// A policy named here but absent from the binary would silently run something else, so the list is
 /// the set of policies that exist rather than the set that is planned.
-const SCHEDULERS: [&str; 2] = ["pct", "random"];
+const SCHEDULERS: [&str; 3] = ["pct", "random", "fair"];
 
 /// Failures that stop a command before it produces a verdict.
 #[derive(Debug)]
@@ -242,6 +242,9 @@ enum Command {
         /// World configuration file, where the program is a cluster.
         #[arg(long, value_name = "FILE")]
         config: Option<String>,
+        /// Make the processor identification instruction fault, as `bohr run` does.
+        #[arg(long)]
+        patch_cpuid: bool,
         /// Abandon the survey after this many events.
         #[arg(long, value_name = "N")]
         max_events: Option<u64>,
@@ -597,9 +600,10 @@ fn dispatch() -> Result<u8, CliError> {
                     }
                     None => {
                         return Err(CliError::Usage(
-                            "BOHR-1001: --patch-rdrand rewrites the prepared files, and this                              scenario prepares none; see [state] in docs/API.md §3"
+                            "BOHR-1001: --patch-rdrand rewrites the prepared files, and this \
+                             scenario prepares none; see [state] in docs/API.md §3"
                                 .to_owned(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -683,7 +687,8 @@ fn dispatch() -> Result<u8, CliError> {
             let scenario = read_scenario(config.as_deref())?;
             if time.is_none() && runs.is_none() {
                 return Err(CliError::Usage(
-                    "BOHR-1001: a campaign needs a budget: --runs for one that reproduces,                      --time for one that does not"
+                    "BOHR-1001: a campaign needs a budget: --runs for one that reproduces, \
+                     --time for one that does not"
                         .to_owned(),
                 ));
             }
@@ -723,13 +728,27 @@ fn dispatch() -> Result<u8, CliError> {
             reduce::reduce(&bundle, &out, budget, &keep, binaries.as_deref())
         }
         Command::Report { bundle, out, redact } => report(&bundle, &out, redact),
-        Command::Survey { seed, config, max_events, program } => {
+        Command::Survey { seed, config, max_events, patch_cpuid, program } => {
             if program.is_empty() {
                 return Err(CliError::Usage(
                     "BOHR-1002: a survey needs a program, after `--`".to_owned(),
                 ));
             }
-            survey::run(program, seed, config.as_deref(), max_events)
+            // The same preparation a run makes, because a survey of a program prepared differently
+            // is a survey of a different program.
+            let program = if patch_cpuid {
+                let mut program = program;
+                if let Some(first) = program.first().cloned() {
+                    let copy = trapped_copy(&first)?;
+                    if let Some(slot) = program.first_mut() {
+                        *slot = copy;
+                    }
+                }
+                program
+            } else {
+                program
+            };
+            survey::run(program, seed, config.as_deref(), max_events, patch_cpuid)
         }
         Command::Note { bundle, text } => note(&bundle, &text),
         Command::Trace { bundle, format } => trace(&bundle, &format),
@@ -970,13 +989,15 @@ fn run_program(
         // somebody who asked for a bundle got a clean exit and no file, and learned it later.
         if save.is_some() {
             return Err(CliError::Usage(
-                "BOHR-1002: --save has nothing to write for a differential run, which produces a                  group of executions rather than one"
+                "BOHR-1002: --save has nothing to write for a differential run, which produces a \
+                 group of executions rather than one"
                     .to_owned(),
             ));
         }
         if repeat != 1 {
             return Err(CliError::Usage(
-                "BOHR-1002: --repeat is not carried out for a differential run; the comparison                  between implementations is what such a run repeats"
+                "BOHR-1002: --repeat is not carried out for a differential run; the comparison \
+                 between implementations is what such a run repeats"
                     .to_owned(),
             ));
         }
@@ -1068,9 +1089,13 @@ fn report_run(label: &str, repeat: usize, completed: &execute::Completed, armed:
     let outcome = &completed.report.outcome;
     let status = if matches!(outcome, Outcome::Clean) { "ok" } else { "finding" };
     let (syscalls, busiest) = execute::syscall_profile(&completed.log, 5);
+    // `stops` is how many times the guest crossed into the supervisor, which is what a run costs;
+    // `syscalls` counts what the trace records, where one ring entry is a call of its own.
     eprintln!(
-        "{label:<18} {status:<8} {repeat} runs · {} events · {syscalls} syscalls · {} draws · {}",
+        "{label:<18} {status:<8} {repeat} runs · {} events · {syscalls} syscalls · {} stops · {} \
+         draws · {}",
         completed.report.events,
+        completed.report.metrics.stops,
         completed.report.journal.len(),
         completed.report.digest
     );

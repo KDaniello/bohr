@@ -84,6 +84,7 @@ fn execute_with_memory(
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: std::slice::from_ref(&spec),
         config: RunConfig::default(),
     })
@@ -127,6 +128,7 @@ fn execute_cluster(programs: Vec<NullProgram>, seed: u64) -> Result<(Digest, Vec
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: &specs,
         config: RunConfig::default(),
     })
@@ -303,6 +305,7 @@ fn a_guest_that_never_ends_is_stopped_by_the_tick_budget() {
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: std::slice::from_ref(&spec),
         // One millisecond of virtual time buys a thousand syscalls at the model's cost.
         config: RunConfig { max_ticks: bohr_types::Tick::MILLISECOND, ..RunConfig::default() },

@@ -137,6 +137,7 @@ fn execute(programs: Vec<NullProgram>, seed: u64) -> RunReport {
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: &specs,
         config: RunConfig::default(),
     })

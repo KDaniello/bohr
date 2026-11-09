@@ -258,6 +258,7 @@ fn drive_one(fixture: Fixture, tape: &Tape) -> (RunReport, NullBackend) {
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: std::slice::from_ref(&GuestSpec::default()),
         config: RunConfig::default(),
     })
@@ -461,6 +462,7 @@ pub fn refusable_scenario(
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: &specs,
         config: RunConfig::default(),
     })?;
@@ -546,6 +548,7 @@ pub fn judge_scenario(
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: &specs,
         config,
     })

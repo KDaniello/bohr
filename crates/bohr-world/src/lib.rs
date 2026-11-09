@@ -24,9 +24,12 @@ mod minimal;
 mod nums;
 mod oracle;
 mod projection;
+mod ring;
 mod state;
 
-pub use config::{Cluster, ConfigError, Differential, Implementation, LoadedConfig};
+pub use config::{
+    Cluster, ConfigError, Differential, Implementation, IoUring, LinuxConfig, LoadedConfig,
+};
 pub use distributed::{
     DiskConfig, DistributedWorld, DrawnFaults, DurabilityConfig, FaultPolicy, GreyWindow,
     LivenessConfig, NetworkConfig, NodeFaultKind, ScheduledNodeFault, ScheduledPartition,

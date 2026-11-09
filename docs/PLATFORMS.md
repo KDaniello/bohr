@@ -121,14 +121,14 @@ not buried here.
 
 | | Status |
 |---|:---:|
-| dynamically linked ELF, glibc | supported |
-| dynamically linked ELF, musl | supported |
+| dynamically linked ELF, glibc | supported, with the libraries its loader opens in the prepared state (`[state]`, [`API.md`](./API.md) §5.7): the loader is mapped by the host kernel, and every later `openat` is answered from the world |
+| dynamically linked ELF, musl | supported, on the same terms as glibc |
 | statically linked ELF | supported |
 | PIE and non-PIE | supported |
 | `setuid` binaries | refused — we cannot trace them without privilege, and doing so would be a security claim we do not make |
 | interpreted programs (`#!` scripts) | supported; the interpreter is the guest |
 | JIT-compiled runtimes (JVM, .NET, V8) | **partial** — they work, but they use `RDRAND`, `mmap`-heavy layouts and their own thread pools. Expect degraded determinism until measured per runtime |
-| programs using `io_uring` | **supported through their fallback.** Opening a ring is answered `ENOSYS`, which is a kernel built without the option and is what every such program keeps a path for; entering or registering one is refused, `BOHR-2004` ([`DETERMINISM.md`](./DETERMINISM.md) §2.8). The run is not the one production takes, and every run says so on its own timeline. `bohr doctor --target` warns where the name appears in the binary; `bohr survey` says whether it is called |
+| programs using `io_uring` | **supported for files under `[linux] io_uring = "ring"`; through their fallback otherwise.** With the key, a ring carries `READ`, `WRITE`, `OPENAT`, `CLOSE`, `STATX`, `FSYNC` and `UNLINKAT`, each by the route of its plain call, and refuses any other operation under `BOHR-2004` ([API](./API.md) §5.1). Without it, opening a ring is answered `ENOSYS`, as a kernel built without the option answers, and the run is not the one production takes — every such run says so on its own timeline ([`DETERMINISM.md`](./DETERMINISM.md) §2.8). `bohr doctor --target` warns where the name appears in the binary; `bohr survey` says whether it is called |
 | programs that `ptrace` others | refused |
 | killing a node that has more than one task | supported — the reproducer that defined this row no longer reproduces; see below |
 
@@ -187,7 +187,7 @@ the seccomp filter and the handler dispatch — the two cannot disagree
 | **virtualised** | translated, then executed against a private host resource | anonymous `mmap`, `mprotect`, `brk` |
 | **admitted** | passed through because it cannot affect determinism | `mprotect`, `munmap`, `mremap`, `brk`, the signal mask, and `clone`, whose new task is announced by a trace event instead |
 | **admitted by argument** | passed through only in the shapes that cannot reach a file | `mmap` alone: an anonymous mapping, and this engine's own coverage channel. Any other mapping names a descriptor rather than a page, so it is traced and refused |
-| **refused** | `BOHR-2001` or a specific code | `io_uring_enter`, `io_uring_register`, `ptrace`, `kexec_load`, `bpf` |
+| **refused** | `BOHR-2001` or a specific code | `io_uring_enter` and `io_uring_register` under `[linux] io_uring = "absent"`, `ptrace`, `kexec_load`, `bpf` |
 | **unknown** | `BOHR-2001`, naming the syscall number and the task | anything not in the table |
 
 **A lock whose word names its holder** — `FUTEX_LOCK_PI`, `FUTEX_TRYLOCK_PI`, `FUTEX_UNLOCK_PI` —

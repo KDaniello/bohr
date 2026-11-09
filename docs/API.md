@@ -313,9 +313,21 @@ pub trait DeterminismBackend: Send {
     /// Executable and writable mappings, used by the RDRAND scan and by coverage.
     fn mappings(&mut self, task: TaskId) -> Result<Vec<Mapping>, BackendError>;
 
+    /// Ends a task. Nothing more is reported about it afterwards, its exit included.
     fn kill(&mut self, task: TaskId) -> Result<(), BackendError>;
+
+    /// Holds every guest as it stands, between two picks, so the run can go on from here more
+    /// than once. `Ok(None)` from a backend whose capabilities say `checkpoints: false`.
+    fn checkpoint(&mut self) -> Result<Option<CheckpointId>, BackendError> { Ok(None) }
+
+    /// Puts every guest back as it stood at `id`, keeping the checkpoint. `Ok(false)` if it cannot.
+    fn restore(&mut self, id: CheckpointId) -> Result<bool, BackendError> { Ok(false) }
 }
 ```
+
+`checkpoint` and `restore` are what branching a run from a prefix needs: a reduction or a campaign
+replays a shared prefix once and goes on from it many times. Both backends in this tree answer with
+the default, and `capabilities()` says so before anyone asks.
 
 `set_regs` writes back every field `regs` hands out, arguments included: a boundary that exposes a
 field and then drops it on the way in loses a change without reporting it.
@@ -683,7 +695,7 @@ validated at startup, written into the bundle verbatim after merging.
 ```toml
 [run]
 seed = 0                        # 0 = derive from the campaign master seed
-scheduler = "pct"               # random | pct | adversarial | replay
+scheduler = "pct"               # random | pct | fair | adversarial | replay
 pct_depth = 3
 switch_points = ["syscall", "futex", "budget"]
 budget_branches = 10_000
@@ -729,8 +741,12 @@ budget_per_run = 8              # hard cap on drawn faults in one run
 kill_probability = "1/1000"     # odds a drawn node kill fires at a moment it may fire at
 restart_after_ticks = 3_000_000 # 0 leaves a killed node dead, a cut standing, a link bad
 arm_after_ticks = 300_000_000   # nothing is drawn before here; 0 arms from the first instruction
-draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade", "recover_from_snapshot"]
+draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade", "recover_from_snapshot",
+        "clock_step", "clock_drift"]
 targeting = "guided"            # uniform | guided — guided prefers dangerous moments
+
+[linux]
+io_uring = "absent"             # absent | ring — the kernel the guest is shown
 
 [clock]
 skew_max_ticks = 50_000_000
@@ -746,7 +762,8 @@ shm_size = 65536
 does not implement is refused by the same rule. Accepted today: `[cluster]`, `[network]`, `[disk]`,
 `[[partition]]`, `[[grey]]`, `[[fault]]`, under `[faults]` the six keys `kill_probability`,
 `targeting`, `restart_after_ticks`, `arm_after_ticks`, `budget_per_run` and `draw`, and under
-`[run]` the four in §5.6, and under `[coverage]` the key `shm_size`. Everything else above —
+`[run]` the four in §5.6, under `[coverage]` the key `shm_size`, and under `[linux]` the key
+`io_uring`. Everything else above —
 `[clock]`, `coverage.mode`, `faults.enabled` — is refused where it appears; what those describe is
 set by flags and by the defaults in §4.2 and §5.5. Reserved keys are named in refusals rather than
 accepted and ignored, for the reason `sync_semantics = "lenient"` is: a configuration that is read
@@ -804,6 +821,25 @@ completed sync joins a ring of `snapshot_depth` whole-disk images, which is what
 `Syscall` row that answered it: the syscall row says what the guest was told, the disk row what the
 disk did. `sync_semantics = "lenient"` is reserved and refused until it ships.
 
+**`[linux] io_uring` decides whether the guest has a ring.** `"absent"`, the default, is a kernel
+built without one: `io_uring_setup` answers `ENOSYS`, the guest takes the fallback every such
+program keeps, and entering or registering a ring ends the run under `BOHR-2004`. `"ring"` opens a
+ring — a polled one with its poller asleep — and carries seven operations: `READ`, `WRITE`,
+`OPENAT`, `CLOSE`, `STATX`, `FSYNC` and `UNLINKAT`, plus `NOP`. Each is carried out as the plain
+call it stands for, by the route that call takes, so a write through a ring is marked on the disk,
+lost to a crash and failed by a drawn `EIO` exactly as `pwrite64` is. Entries run in queue order,
+links are honoured, and every completion is posted before `io_uring_enter` returns. A kernel with
+the ring also answers `statx`, which `"absent"` leaves `ENOSYS`.
+
+**Not carried**, each ending the run under `BOHR-2004` by name: any other operation, an operation
+on a descriptor that is not a file (a socket, a counter), read and write flags (`RWF_*`), the setup
+flags `IOPOLL`, `R_DISABLED`, `SQE128`, `CQE32`, `NO_MMAP`, `REGISTERED_FD_ONLY` and `NO_SQARRAY`,
+registered files and buffers (`io_uring_register` answers `EINVAL`, so a caller takes the
+unregistered path), buffer selection, and a submission that would wait. Setup hands its flags back,
+honours `CQSIZE` and `CLAMP`, and answers `EINVAL` to a size of nought or past 32,768. `"ring"` together with
+`disk.stall_probability` above zero is refused at load (`BOHR-1002`): a sync stalled inside a
+submission has no moment to complete.
+
 ### 5.2 Probabilities are rationals
 
 `"1/1000"`, never `0.001`. Parsed into `(num, den)` and fed to `draw_bool` (§2.4). This is rule 2 of
@@ -828,6 +864,11 @@ links up and makes them bad — slow, lossy, or both, drawn over three rungs. Bo
 `restart_after_ticks`, and both are raised through the same code a scenario reaches with
 `[[partition]]` and `[[grey]]`. A scenario that wants one link of one pair writes it down; these are
 the whole-node cases, which is what a search wants and what nothing before this could draw.
+
+Two more are about a node's clock. A drawn `clock_step` moves its wall clock by a drawn amount within
+a minute either way; a drawn `clock_drift` sets its rate to a drawn value within ±200 parts per
+million. The size is drawn after the kind, from the `ClockSkew` site, so a scenario that does not
+draw clocks lays its tape out as it did. Neither recovers: a clock that was moved stays moved.
 
 **`budget_per_run` is a ceiling on fires, not on faults narrated.** Odds say when a fault fires and
 never how many: at one part in a thousand per eligible call, a guest making millions of them is
@@ -940,12 +981,29 @@ kill-and-recover shapes replay as regression tests.
 ```toml
 [[fault]]
 kind = "node_kill"                # node_kill | node_freeze | node_thaw | node_restart |
-                                  # node_restart_from_snapshot | chain_reorg
+                                  # node_restart_from_snapshot | chain_reorg |
+                                  # clock_step | clock_drift
 node = 1                          # the node it acts on; a cluster-wide fault names none
 at_tick = 3_000_000_000
 snapshot_back = 1                 # syncs to step back from newest, for the two that rewind
 nodes = [0, 1, 2]                 # chain_reorg only, and optional: absent means every node
+step_ticks = -3_000_000_000       # clock_step only: the wall clock moves by this, back if negative
+drift_ppm = 150                   # clock_drift only: the new rate, within ±200
 ```
+
+**A clock step moves wall time and never monotonic time.** `CLOCK_REALTIME` and its coarse, alarm
+and TAI forms, `gettimeofday` and `time` read the stepped clock; every other clock id reads the
+monotonic one, which keeps rising through a step back. A `clock_drift` changes both readings' rate
+from its moment on and leaves earlier readings as they were. A `drift_ppm` outside ±200 is refused at
+load, and either key on another kind of fault is refused too.
+
+An absolute deadline is measured on the clock it names: `clock_nanosleep` on a wall clock and a
+futex wait carrying `FUTEX_CLOCK_REALTIME` wait for wall time, every other one for monotonic time. A
+step does not move a wait already armed; it moves the deadlines set after it.
+
+**Not modelled: a realistic wall date.** Wall time begins at the epoch, as monotonic time does, so a
+step back further than the run has lasted holds wall time at the epoch until monotonic time catches
+up, rather than going below it.
 
 **`chain_reorg` is the node-level rewind lifted to the cluster.** Every node in the set goes back to
 a common older synced image at one moment, the history after that point is **discarded**, and what
@@ -1445,7 +1503,7 @@ bohr run [OPTIONS] -- <program> [args...]
   --tape <file>           use this tape instead of deriving from a seed
   --repeat <n>            run n times and assert all trace digests are identical
   --save <file.bohr>      write a bundle even for a clean run
-  --scheduler <policy>    interleaving policy [default: pct]
+  --scheduler <policy>    interleaving policy: pct, random or fair [default: pct]
   --strict-determinism    exit 4 if the run could not be fully guaranteed
 ```
 
@@ -1685,7 +1743,7 @@ to do.
 | `BOHR-2001` | **unsupported syscall** — the syscall number, task, and a link to the support table |
 | `BOHR-2002` | unsupported syscall argument shape on a supported syscall |
 | `BOHR-2003` | `RDRAND`/`RDSEED` found in a mapped executable page and not neutralised |
-| `BOHR-2004` | guest used `io_uring` (`io_uring_setup`, `io_uring_enter`, `io_uring_register`); unsupported in v1 |
+| `BOHR-2004` | `io_uring`: a ring opened or declined (diagnostic), or an operation, flag or call the ring does not carry (refusal) — §5.1 |
 | `BOHR-2005` | branch counter unavailable; falling back to syscall-granularity progress |
 | `BOHR-2006` | guest read a clock in a tight loop with no other syscall — likely a wall-clock spin |
 | `BOHR-2007` | processor identification answered from the presented profile rather than the host |

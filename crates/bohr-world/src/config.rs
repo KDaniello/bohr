@@ -74,6 +74,30 @@ pub struct LoadedConfig {
     pub differential: Option<Differential>,
     /// Counters in the coverage map, where the scenario sizes one.
     pub coverage_bytes: Option<usize>,
+    /// The kernel the guest is shown, where the scenario names one other than the default.
+    pub linux: LinuxConfig,
+}
+
+/// The `[linux]` section: which kernel facilities the guest is told exist.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LinuxConfig {
+    /// Whether opening a submission ring succeeds.
+    pub io_uring: IoUring,
+}
+
+/// What `io_uring_setup` is answered.
+///
+/// `Absent` is the default and not a fallback: a kernel built without the option, or one with
+/// `kernel.io_uring_disabled=2`, answers `ENOSYS`, and every program that opens a ring keeps a path
+/// for that reply. `Ring` opens one whose file operations are carried through the same model as the
+/// plain calls, and whose other operations end the run by name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum IoUring {
+    /// `ENOSYS` at setup; entering or registering a ring ends the run under `BOHR-2004`.
+    #[default]
+    Absent,
+    /// A ring, a polled one with its poller asleep, carrying the file operations in API.md §5.1.
+    Ring,
 }
 
 /// One tape, several implementations, and the values they must agree on.
@@ -218,6 +242,7 @@ struct RawConfig {
     disk: Option<RawDisk>,
     faults: Option<RawFaults>,
     coverage: Option<RawCoverage>,
+    linux: Option<RawLinux>,
     #[serde(default)]
     partition: Vec<RawPartition>,
     #[serde(default)]
@@ -339,6 +364,12 @@ struct RawNetwork {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawLinux {
+    io_uring: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawDisk {
     sync_semantics: Option<String>,
     stall_probability: Option<String>,
@@ -392,6 +423,10 @@ struct RawFault {
     snapshot_back: Option<usize>,
     /// The nodes a cluster-wide fault rewinds. Absent means every node.
     nodes: Option<Vec<u32>>,
+    /// How far a `clock_step` moves the wall clock, in ticks; negative steps it back.
+    step_ticks: Option<i64>,
+    /// The rate a `clock_drift` sets, in parts per million.
+    drift_ppm: Option<i32>,
 }
 
 /// Parses and validates a configuration file's text.
@@ -522,6 +557,8 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 isolate: false,
                 degrade: false,
                 recover_from_snapshot: false,
+                clock_step: false,
+                clock_drift: false,
             };
             for name in named {
                 match name.as_str() {
@@ -532,18 +569,26 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     // Named as a recovery rather than as a kind, because that is what it is: the
                     // fault is still the kill and what changes is the disk the node comes back on.
                     "recover_from_snapshot" => kinds.recover_from_snapshot = true,
+                    "clock_step" => kinds.clock_step = true,
+                    "clock_drift" => kinds.clock_drift = true,
                     other => {
                         return Err(ConfigError::Refused(format!(
                             "BOHR-1002: faults.draw has nothing named {other:?}; this build \
-                             draws node_kill, node_freeze, node_isolate and node_degrade, and \
-                             takes recover_from_snapshot for what a killed node comes back on. \
+                             draws node_kill, node_freeze, node_isolate, node_degrade, \
+                             clock_step and clock_drift, and takes recover_from_snapshot for what a killed node comes back on. \
                              A thaw, a heal or a restart is not drawn: it is how a node comes \
                              back from the fault that took it away"
                         )));
                     }
                 }
             }
-            if !kinds.kill && !kinds.freeze && !kinds.isolate && !kinds.degrade {
+            if !kinds.kill
+                && !kinds.freeze
+                && !kinds.isolate
+                && !kinds.degrade
+                && !kinds.clock_step
+                && !kinds.clock_drift
+            {
                 return Err(ConfigError::Refused(
                     "BOHR-1002: faults.draw names no kind to draw, so the policy could do nothing"
                         .to_owned(),
@@ -580,12 +625,46 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 })?,
                 nodes: fault.nodes.clone().unwrap_or_default().into_iter().map(NodeId).collect(),
             },
+            "clock_step" => NodeFaultKind::ClockStep {
+                by_ticks: fault.step_ticks.ok_or_else(|| {
+                    ConfigError::Refused(
+                        "BOHR-1002: clock_step needs step_ticks, negative to step back".to_owned(),
+                    )
+                })?,
+            },
+            "clock_drift" => {
+                let ppm = fault.drift_ppm.ok_or_else(|| {
+                    ConfigError::Refused("BOHR-1002: clock_drift needs drift_ppm".to_owned())
+                })?;
+                // Refused here rather than by the clock's own assertion: a scenario with a typo
+                // in it is a refusal at load, not a run that panics at the fault.
+                if ppm.unsigned_abs() > bohr_kernel::MAX_DRIFT_PPM {
+                    return Err(ConfigError::Refused(format!(
+                        "BOHR-1002: clock_drift's drift_ppm is {ppm}, and a clock may drift at \
+                         most {} parts per million either way",
+                        bohr_kernel::MAX_DRIFT_PPM
+                    )));
+                }
+                NodeFaultKind::ClockDrift { ppm }
+            }
             other => {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: fault.kind has no fault named {other:?}"
                 )));
             }
         };
+        // A clock's key on another kind would be read as meaning something, and it means nothing.
+        let stray = match kind {
+            NodeFaultKind::ClockStep { .. } => fault.drift_ppm.map(|_| "drift_ppm"),
+            NodeFaultKind::ClockDrift { .. } => fault.step_ticks.map(|_| "step_ticks"),
+            _ => fault.step_ticks.map(|_| "step_ticks").or(fault.drift_ppm.map(|_| "drift_ppm")),
+        };
+        if let Some(key) = stray {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: fault.{key} does nothing on a {} fault",
+                fault.kind
+            )));
+        }
         // A cluster-wide fault names no node, and a node fault must: a `node` on a reorg would be
         // read as meaning something, and it means nothing.
         let cluster_wide = matches!(kind, NodeFaultKind::ChainReorg { .. });
@@ -685,7 +764,34 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         cwd,
         differential,
         coverage_bytes: coverage(raw.coverage.as_ref())?,
+        linux: linux(raw.linux.as_ref(), &disk)?,
     })
+}
+
+/// Reads `[linux]`, refusing a ring the disk model could not keep its promises through.
+///
+/// **A stalled sync inside a ring has no moment to finish.** A plain `fsync` that stalls parks its
+/// task and is released by a timer; a submission is carried out inside one `io_uring_enter` that
+/// returns with every completion posted, so a drawn stall there would have to be dropped or turned
+/// into a refusal at a seed nobody chose. Refused here instead, once, before anything runs.
+fn linux(raw: Option<&RawLinux>, disk: &DiskConfig) -> Result<LinuxConfig, ConfigError> {
+    let io_uring = match raw.and_then(|l| l.io_uring.as_deref()) {
+        None | Some("absent") => IoUring::Absent,
+        Some("ring") => IoUring::Ring,
+        Some(other) => {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: linux.io_uring {other:?} is neither absent nor ring"
+            )));
+        }
+    };
+    if io_uring == IoUring::Ring && disk.stall_probability.0 > 0 {
+        return Err(ConfigError::Refused(
+            "BOHR-1002: linux.io_uring = \"ring\" with disk.stall_probability above zero is not \
+             modelled: a sync stalled inside a submission has no moment to complete"
+                .to_owned(),
+        ));
+    }
+    Ok(LinuxConfig { io_uring })
 }
 
 /// Reads `[coverage]`, refusing a map that could not tell anything apart or could not be held.
@@ -699,7 +805,9 @@ fn coverage(raw: Option<&RawCoverage>) -> Result<Option<usize>, ConfigError> {
     };
     if !(MIN_COVERAGE_BYTES..=MAX_COVERAGE_BYTES).contains(&size) {
         return Err(ConfigError::Refused(format!(
-            "BOHR-1002: coverage.shm_size is {size}, and this build holds between              {MIN_COVERAGE_BYTES} and {MAX_COVERAGE_BYTES} counters. A map is copied once per run              and held once per worker, so its size is a cost the whole campaign pays"
+            "BOHR-1002: coverage.shm_size is {size}, and this build holds between \
+             {MIN_COVERAGE_BYTES} and {MAX_COVERAGE_BYTES} counters. A map is copied once per run \
+             and held once per worker, so its size is a cost the whole campaign pays"
         )));
     }
     Ok(Some(size))
@@ -957,7 +1065,8 @@ fn run_limits(raw: Option<&RawRun>, nodes: Option<u32>) -> Result<RunLimits, Con
     ] {
         if flag {
             return Err(ConfigError::Refused(format!(
-                "BOHR-1002: run.{key} is not read from a scenario;                  it belongs to the invocation, so a file setting it would be a file that lies"
+                "BOHR-1002: run.{key} is not read from a scenario; \
+                 it belongs to the invocation, so a file setting it would be a file that lies"
             )));
         }
     }
@@ -1135,6 +1244,28 @@ mode = \"shm\"
     fn lenient_disk_semantics_are_refused_until_they_exist() {
         let err = load("[disk]\nsync_semantics = \"lenient\"\n").expect_err("refused");
         assert!(err.to_string().contains("strict"));
+    }
+
+    /// The ring is asked for by name, absent by default, and a third value is a typo.
+    #[test]
+    fn a_ring_is_named_or_absent() {
+        assert_eq!(load("").unwrap().linux.io_uring, IoUring::Absent);
+        assert_eq!(
+            load("[linux]\nio_uring = \"absent\"\n").unwrap().linux.io_uring,
+            IoUring::Absent
+        );
+        assert_eq!(load("[linux]\nio_uring = \"ring\"\n").unwrap().linux.io_uring, IoUring::Ring);
+        let err = load("[linux]\nio_uring = \"sqpoll\"\n").expect_err("refused");
+        assert!(err.to_string().contains("BOHR-1002"), "{err}");
+    }
+
+    /// A stalled sync inside a ring has no moment to finish, so the pair is refused before the run.
+    #[test]
+    fn a_ring_with_stalling_syncs_is_refused() {
+        let err = load("[linux]\nio_uring = \"ring\"\n[disk]\nstall_probability = \"1/10\"\n")
+            .expect_err("refused");
+        assert!(err.to_string().contains("stall"), "{err}");
+        assert!(load("[disk]\nstall_probability = \"1/10\"\n").is_ok(), "without a ring it runs");
     }
 
     /// An implementation stands in for one node of the cluster, and which one is part of the

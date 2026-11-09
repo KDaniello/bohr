@@ -1,0 +1,10 @@
+# The wall clock moved thirty seconds forward before wall_deadline.c sets its deadline.
+
+[cluster]
+nodes = 1
+
+[[fault]]
+kind = "clock_step"
+node = 0
+at_tick = 50_000_000
+step_ticks = 30_000_000_000
