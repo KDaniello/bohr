@@ -1,9 +1,10 @@
-//! The run loop.
+//! The run loop: one guest driven from its first instruction to the ending the run is judged on.
+//! It owns task bookkeeping and the order of everything; what a stop means belongs to the world.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use bohr_backend::{DeterminismBackend, GuestExit, GuestSpec, Resume, StopKind};
-use bohr_tape::{DrawSite, Journal, Tape};
+use bohr_backend::{DeterminismBackend, GuestExit, GuestSpec, Resume, Stop, StopKind};
+use bohr_tape::{DrawSite, Journal, Tape, TapeCursor};
 use bohr_trace::{EventKind, ExitStatus, Outcome, SwitchReason};
 use bohr_types::{Digest, EventId, NodeId, TaskId, Tick};
 
@@ -11,8 +12,8 @@ use crate::{
     KernelError, StopReason,
     clock::{Clock, MAX_DRIFT_PPM, NodeClock},
     ports::{
-        DueEffects, EventSink, NodeOp, Oracle, Recorded, RunOutcome, TaskState, Verdict, Wake,
-        WorldCtx, WorldModel,
+        DueEffects, EventSink, NodeOp, Observer, Oracle, Progress, Recorded, RunOutcome, TaskState,
+        Verdict, Wake, WorldCtx, WorldModel,
     },
     schedule::SchedulePolicy,
 };
@@ -58,6 +59,12 @@ pub struct RunConfig {
     /// `None` for every scenario that does not name one, which is what keeps stored bundles
     /// replaying to the digest they recorded.
     pub ends_with: Option<NodeId>,
+    /// Virtual time one unit of the guest's own computation costs, where the backend counts it.
+    ///
+    /// `None` keeps time moving only on what the world answers. With a rate, a stop on an
+    /// exhausted budget also advances the clock by the units the guest consumed
+    /// (`docs/ARCHITECTURE.md` §4.2).
+    pub ticks_per_progress_unit: Option<u64>,
 }
 
 impl Default for RunConfig {
@@ -69,6 +76,7 @@ impl Default for RunConfig {
             break_at: None,
             horizon: None,
             ends_with: None,
+            ticks_per_progress_unit: None,
         }
     }
 }
@@ -80,6 +88,9 @@ impl Default for RunConfig {
 /// without end; a guest spinning without syscalls advances no virtual time at all and is caught by
 /// the event budget instead.
 const DEFAULT_MAX_HOURS: u64 = 25;
+
+/// Events between two progress reports to an [`Observer`].
+pub const PROGRESS_EVERY: u64 = 4096;
 
 /// Everything one run needs.
 #[allow(missing_debug_implementations)] // trait objects, none of which are Debug
@@ -96,6 +107,8 @@ pub struct RunInputs<'a, 't> {
     pub oracle: &'a mut dyn Oracle,
     /// Where events are recorded.
     pub sink: &'a mut dyn EventSink,
+    /// Who is shown the run's progress as it goes, if anyone. Never part of what the run is.
+    pub observer: Option<&'a mut dyn Observer>,
     /// What to run: one spec per node, `NodeId(i)` running `specs[i]`.
     ///
     /// A slice rather than a map: node identity is dense and ordered by construction, which is
@@ -131,6 +144,21 @@ pub struct RunReport {
     /// Reported because a campaign that injected nothing is indistinguishable from one that
     /// injected plenty and found nothing, and only this number separates them.
     pub adversity: u32,
+    /// What the loop did, counted. Read for progress and comparison, never for a verdict.
+    pub metrics: RunMetrics,
+}
+
+/// What the loop did, counted as it went.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RunMetrics {
+    /// Scheduling decisions made.
+    pub decisions: u64,
+    /// Times the running task changed.
+    pub switches: u64,
+    /// Stops the world answered.
+    pub stops: u64,
+    /// Virtual time each task's stops moved the world clock by.
+    pub ticks_by_task: BTreeMap<TaskId, Tick>,
 }
 
 /// Whether a node's tasks may be offered to the scheduler.
@@ -144,46 +172,61 @@ enum NodeLifecycle {
     Dead,
 }
 
-/// Everything the loop tracks about tasks and nodes, gathered so the node-op executor can borrow
-/// it as one thing.
+/// Where a task stands between two picks. One slot per task, so it cannot be waiting and ready at
+/// once.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Slot {
+    /// Stopped, holding the action it resumes with when the scheduler next picks it.
+    Pending(Resume),
+    /// Waiting on the world. Not a scheduling candidate; every task here with nothing armed is a
+    /// deadlock rather than a finish.
+    Blocked,
+    /// Neither: executing, or killed and awaiting the exit the backend still reports.
+    Out,
+}
+
+/// Everything the loop knows about one task.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct TaskEntry {
+    /// The node it belongs to; `None` once it was retired with its node.
+    node: Option<NodeId>,
+    slot: Slot,
+    /// The signal it last stopped on. A task the world ends after a fault is killed by us, so the
+    /// status the host reports names our signal rather than the one the guest died of.
+    faulted_on: Option<u32>,
+    /// Taken off the books when its node ended. The backend still reports its exit afterwards, and
+    /// that exit is expected rather than refused.
+    retired: bool,
+}
+
+/// The loop's books: one entry per task the run knows, and what it knows about each node.
+#[derive(Clone, Default)]
 struct Tasks {
-    /// A stopped task and the action it will resume with. The action is decided when the task
-    /// stops, and applied when the scheduler next chooses it.
-    pending: BTreeMap<TaskId, Resume>,
-    /// Tasks waiting on the world. They are not scheduling candidates, and a run where every
-    /// remaining task is here with nothing armed has deadlocked rather than finished.
-    blocked: BTreeSet<TaskId>,
-    node_of: BTreeMap<TaskId, NodeId>,
+    entries: BTreeMap<TaskId, TaskEntry>,
+    /// Entries that name each node, so "does this node still have tasks" is a lookup.
+    per_node: BTreeMap<NodeId, usize>,
     node_state: BTreeMap<NodeId, NodeLifecycle>,
-    /// The signal a task last stopped on. A task the world ends after a fault is killed by us, so
-    /// the status the host reports names our signal rather than the one the guest died of.
-    faulted_on: BTreeMap<TaskId, u32>,
-    /// Tasks taken off the books when their node ended, whose own exits are still to come.
-    ///
-    /// The backend reports every thread's exit whatever the world decided about the node, and
-    /// those reports arrive after the node is gone. Without this they are indistinguishable from
-    /// an exit for a task nobody ever created, which is a defect in the tool and is refused as
-    /// one -- so an ordinary threaded guest exiting ended the run with an internal error.
-    retired: BTreeSet<TaskId>,
-    /// Tasks this loop killed to carry out a node fault.
-    ///
-    /// Their exit arrives as an ordinary signalled exit, and without knowing better the run would
-    /// be judged a crash — so a campaign injecting faults would report every one of its own faults
-    /// back to itself as a finding. The timeline still records the signal, because it happened;
-    /// what it does not do is decide the verdict.
-    killed_by_us: BTreeSet<TaskId>,
     last_run: Option<TaskId>,
 }
 
 impl Tasks {
+    /// Enters a task the run has just learned of.
+    fn add(&mut self, task: TaskId, node: NodeId, slot: Slot) {
+        *self.per_node.entry(node).or_default() += 1;
+        self.entries
+            .insert(task, TaskEntry { node: Some(node), slot, faulted_on: None, retired: false });
+    }
+
     /// The node a task belongs to, where this run still knows.
     ///
-    /// **An option rather than node nought.** The fallback put the exits of fault-killed tasks and
-    /// the spawns of their children on node nought's timeline: deterministic, so no digest gate
-    /// ever saw it, and wrong in the way §8 rule 2 calls worse than a crash. A task whose node
-    /// this run has forgotten is a task nothing should be filed under.
+    /// **An option rather than node nought**: a task whose node this run has forgotten is a task
+    /// nothing should be filed under (§8 rule 2).
     fn node_for(&self, task: TaskId) -> Option<NodeId> {
-        self.node_of.get(&task).copied()
+        self.entries.get(&task).and_then(|e| e.node)
+    }
+
+    fn has_tasks(&self, node: NodeId) -> bool {
+        self.per_node.get(&node).is_some_and(|n| *n > 0)
     }
 
     /// Hands each released task the value its blocking call returns.
@@ -193,599 +236,697 @@ impl Tasks {
     /// has ended would put back a task the backend no longer has.
     fn release(&mut self, wakes: impl IntoIterator<Item = Wake>) {
         for released in wakes {
-            if self.blocked.remove(&released.task) {
-                self.pending.insert(released.task, Resume::Emulate { ret: released.ret });
+            if let Some(entry) = self.entries.get_mut(&released.task)
+                && entry.slot == Slot::Blocked
+            {
+                entry.slot = Slot::Pending(Resume::Emulate { ret: released.ret });
             }
         }
     }
 
+    fn set_slot(&mut self, task: TaskId, slot: Slot) {
+        if let Some(entry) = self.entries.get_mut(&task) {
+            entry.slot = slot;
+        }
+    }
+
+    /// Takes the action a pending task resumes with, leaving it out of both queues.
+    fn take_pending(&mut self, task: TaskId) -> Option<Resume> {
+        let entry = self.entries.get_mut(&task)?;
+        match std::mem::replace(&mut entry.slot, Slot::Out) {
+            Slot::Pending(resume) => Some(resume),
+            other => {
+                entry.slot = other;
+                None
+            }
+        }
+    }
+
+    fn unblock(&mut self, task: TaskId) {
+        if let Some(entry) = self.entries.get_mut(&task)
+            && entry.slot == Slot::Blocked
+        {
+            entry.slot = Slot::Out;
+        }
+    }
+
+    fn take_faulted(&mut self, task: TaskId) -> Option<u32> {
+        self.entries.get_mut(&task).and_then(|e| e.faulted_on.take())
+    }
+
+    fn is_retired(&self, task: TaskId) -> bool {
+        self.entries.get(&task).is_some_and(|e| e.retired && e.node.is_none())
+    }
+
+    /// Whether anything is still owed a turn: a task ready, or one waiting on the world.
+    fn anything_outstanding(&self) -> bool {
+        self.entries.values().any(|e| matches!(e.slot, Slot::Pending(_) | Slot::Blocked))
+    }
+
     fn schedulable(&self, task: TaskId) -> bool {
+        // A task whose node is gone is not a task to run, and the state of node nought is not an
+        // answer about it.
         let Some(node) = self.node_for(task) else {
-            // A task whose node is gone is not a task to run. It cannot be scheduled onto a node
-            // that no longer exists, and the state of node nought is not an answer about it.
             return false;
         };
         matches!(self.node_state.get(&node), Some(NodeLifecycle::Running))
     }
 
-    /// Marks a node dead once its last task is gone, so a later `Restart` composes with a clean
-    /// exit as well as with a kill.
-    fn note_task_gone(&mut self, task: TaskId) {
-        if let Some(node) = self.node_of.remove(&task)
-            && !self.node_of.values().any(|n| *n == node)
+    /// The pending tasks a scheduler may choose from, in identifier order.
+    fn runnable_into(&self, out: &mut Vec<TaskId>) {
+        out.clear();
+        out.extend(
+            self.entries
+                .iter()
+                .filter(|(_, e)| matches!(e.slot, Slot::Pending(_)))
+                .map(|(t, _)| *t)
+                .filter(|t| self.schedulable(*t)),
+        );
+    }
+
+    /// The tasks of a node, in identifier order.
+    fn of_node(&self, node: NodeId) -> impl Iterator<Item = (TaskId, &TaskEntry)> {
+        self.entries.iter().filter(move |(_, e)| e.node == Some(node)).map(|(t, e)| (*t, e))
+    }
+
+    /// Takes a task off its node's books for good, as when its node ended around it.
+    fn retire(&mut self, task: TaskId) {
+        let Some(entry) = self.entries.get_mut(&task) else {
+            return;
+        };
+        if let Some(node) = entry.node.take()
+            && let Some(n) = self.per_node.get_mut(&node)
         {
-            self.node_state.insert(node, NodeLifecycle::Dead);
+            *n -= 1;
         }
-        // Both queues, because a task can be in either when it ends. One released by the world and
-        // ending before the scheduler ever picked it sits in `pending` holding a resume nobody can
-        // carry out: the backend has already reaped it, so the pick that follows names a task that
-        // no longer exists. A process whose threads exit together is where this happens, because a
-        // delivery can land on one of them in the same breath as the exit that takes it.
-        self.pending.remove(&task);
-        self.blocked.remove(&task);
-        self.faulted_on.remove(&task);
-        self.killed_by_us.remove(&task);
+        entry.slot = Slot::Out;
+        entry.faulted_on = None;
+        entry.retired = true;
+    }
+
+    /// Forgets a task that has ended, and marks its node dead once its last task is gone, so a
+    /// later `Restart` composes with a clean exit as well as with a kill.
+    fn note_task_gone(&mut self, task: TaskId) {
+        let Some(entry) = self.entries.remove(&task) else {
+            return;
+        };
+        if let Some(node) = entry.node
+            && let Some(n) = self.per_node.get_mut(&node)
+        {
+            *n -= 1;
+            if *n == 0 {
+                self.node_state.insert(node, NodeLifecycle::Dead);
+            }
+        }
     }
 }
 
 /// Drives one guest to completion.
-#[cfg_attr(feature = "chaos-delivery-tie", allow(unused_variables))]
 pub fn run(inputs: RunInputs<'_, '_>) -> Result<RunReport, KernelError> {
-    let RunInputs { tape, backend, world, policy, oracle, sink, specs, config } = inputs;
-    // Refused here rather than never satisfied: a run told to end with node five in a cluster of
-    // three would otherwise fall back to the horizon, and a scenario with a typo in it would look
-    // like one whose node never finished. §8 rule 6: the boundary is where this is caught.
-    if let Some(node) = config.ends_with
-        && node.get() as usize >= specs.len()
-    {
-        return Err(KernelError::Invariant("ends_with names a node this run does not have"));
-    }
-    if specs.is_empty() {
-        return Err(KernelError::Invariant("a run needs at least one node"));
-    }
-
-    let mut clock = Clock::new();
-    let mut cursor = tape.cursor();
-    let mut next_event = EventId::ZERO;
-    let mut recorded = Recorded::new();
-
-    let mut tasks = Tasks {
-        pending: BTreeMap::new(),
-        blocked: BTreeSet::new(),
-        node_of: BTreeMap::new(),
-        node_state: BTreeMap::new(),
-        faulted_on: BTreeMap::new(),
-        retired: BTreeSet::new(),
-        killed_by_us: BTreeSet::new(),
-        last_run: None,
+    let RunInputs { tape, backend, world, policy, oracle, sink, observer, specs, config } = inputs;
+    let mut run = Run {
+        backend,
+        world,
+        policy,
+        oracle,
+        sink,
+        observer,
+        specs,
+        config,
+        clock: Clock::new(),
+        cursor: tape.cursor(),
+        next_event: EventId::ZERO,
+        recorded: Recorded::new(),
+        tasks: Tasks::default(),
+        last_exit: None,
+        killed_by: None,
+        last_reason: SwitchReason::SyscallBoundary,
+        runnable: Vec::new(),
+        metrics: RunMetrics::default(),
+        reported_at: 0,
+        handling: None,
     };
-    let mut last_exit: Option<i32> = None;
-    let mut killed_by: Option<u32> = None;
-    // Why the previous running task's turn ended; stamped on the next switch event.
-    let mut last_reason = SwitchReason::SyscallBoundary;
-    // Rebuilt from `pending` each iteration and kept across them: the set changes by one or two
-    // entries per stop, and a fresh allocation per stop is a per-syscall cost.
-    let mut runnable: Vec<TaskId> = Vec::new();
+    let ended = run.start().and_then(|()| run.drive());
+    match ended {
+        Ok(stop_reason) => Ok(run.finish(stop_reason)),
+        Err(KernelError::Invariant(what)) => Err(run.locate(what)),
+        Err(other) => Err(other),
+    }
+}
 
-    // Every node gets a clock of its own before anything runs. Two machines never agree on the
-    // time, and a run where they did would never reach the bugs that depend on them disagreeing.
-    for (index, spec) in specs.iter().enumerate() {
-        let node = NodeId(index as u32);
-        clock.set_node_clock(node, draw_node_clock(&mut cursor, config.max_clock_skew)?);
-        let first = backend.spawn(node, spec)?;
-        tasks.pending.insert(first, Resume::Continue);
-        tasks.node_of.insert(first, node);
-        tasks.node_state.insert(node, NodeLifecycle::Running);
+/// One run in progress: the ports it drives and the state the loop keeps between stops.
+struct Run<'a, 't> {
+    backend: &'a mut dyn DeterminismBackend,
+    world: &'a mut dyn WorldModel,
+    policy: &'a mut dyn SchedulePolicy,
+    oracle: &'a mut dyn Oracle,
+    sink: &'a mut dyn EventSink,
+    observer: Option<&'a mut dyn Observer>,
+    specs: &'a [GuestSpec],
+    config: RunConfig,
+    clock: Clock,
+    cursor: TapeCursor<'t>,
+    next_event: EventId,
+    recorded: Recorded,
+    tasks: Tasks,
+    /// The exit status the run is judged on: the first failure, else the first exit.
+    last_exit: Option<i32>,
+    killed_by: Option<u32>,
+    /// Why the previous running task's turn ended; stamped on the next switch event.
+    last_reason: SwitchReason,
+    /// Rebuilt from the books each iteration and kept across them: a fresh allocation per stop is
+    /// a per-syscall cost.
+    runnable: Vec<TaskId>,
+    metrics: RunMetrics,
+    /// The event count at the last progress report.
+    reported_at: u64,
+    /// The task whose stop is being handled, for saying where an invariant failed.
+    handling: Option<TaskId>,
+}
+
+/// What the loop does when nothing is runnable.
+enum Idle {
+    /// Time moved to the next deadline; go round again.
+    Advanced,
+    /// The run is over.
+    Ended(StopReason),
+}
+
+impl Run<'_, '_> {
+    /// Refuses a run that cannot be carried out, then gives every node its clock and first task.
+    fn start(&mut self) -> Result<(), KernelError> {
+        // Refused here rather than never satisfied: a run told to end with node five in a cluster
+        // of three would otherwise fall back to the horizon, and a scenario with a typo in it would
+        // look like one whose node never finished. §8 rule 6: the boundary is where this is caught.
+        if let Some(node) = self.config.ends_with
+            && node.get() as usize >= self.specs.len()
+        {
+            return Err(KernelError::Invariant("ends_with names a node this run does not have"));
+        }
+        if self.specs.is_empty() {
+            return Err(KernelError::Invariant("a run needs at least one node"));
+        }
+        // Every node gets a clock of its own before anything runs. Two machines never agree on the
+        // time, and a run where they did would never reach the bugs that depend on them
+        // disagreeing.
+        for (index, spec) in self.specs.iter().enumerate() {
+            let node = NodeId(index as u32);
+            let node_clock = draw_node_clock(&mut self.cursor, self.config.max_clock_skew)?;
+            self.clock.set_node_clock(node, node_clock);
+            let first = self.backend.spawn(node, spec)?;
+            self.tasks.add(first, node, Slot::Pending(Resume::Continue));
+            self.tasks.node_state.insert(node, NodeLifecycle::Running);
+        }
+        Ok(())
     }
 
-    let stop_reason = loop {
-        // Deadlines first: what was armed for this tick happens before anything at this tick is
-        // scheduled, which is the only order a replay can reconstruct without guessing.
-        if world.next_deadline().is_some_and(|t| t <= clock.now()) {
-            let due = {
-                let mut ctx = WorldCtx::detached(
-                    &mut clock,
-                    &mut cursor,
-                    backend,
-                    sink,
-                    &mut next_event,
-                    &mut recorded,
-                );
-                world.on_deadline(&mut ctx)?
+    /// The loop: fire what is due, check every ending, pick, run, and answer the stop.
+    fn drive(&mut self) -> Result<StopReason, KernelError> {
+        loop {
+            self.fire_due()?;
+            if let Some(ending) = self.ending() {
+                return Ok(ending);
+            }
+            self.tasks.runnable_into(&mut self.runnable);
+            if self.runnable.is_empty() {
+                match self.when_idle() {
+                    Idle::Advanced => continue,
+                    Idle::Ended(reason) => return Ok(reason),
+                }
+            }
+            let Some(stop) = self.dispatch()? else {
+                // A backend answering `None` with work still outstanding turns a half-finished run
+                // into a clean verdict, and the oracle then judges a prefix as the whole execution.
+                if self.tasks.anything_outstanding() {
+                    return Err(KernelError::Invariant(
+                        "the backend reported every task finished while tasks were still to run",
+                    ));
+                }
+                return Ok(StopReason::GuestFinished);
             };
-            apply_due(due, &mut tasks, backend, policy, specs)?;
-            // The contract is "fire everything due"; a due entry surviving the call would spin
-            // this loop forever, so it is an invariant rather than a retry.
-            if world.next_deadline().is_some_and(|t| t <= clock.now()) {
-                return Err(KernelError::Invariant("a due deadline survived on_deadline"));
+            self.handling = Some(stop.task);
+            self.on_stop(&stop)?;
+            self.handling = None;
+            self.report_progress(false);
+        }
+    }
+
+    /// Fires every deadline at or before now: what was armed for this tick happens before anything
+    /// at this tick is scheduled, which is the only order a replay can reconstruct without
+    /// guessing.
+    fn fire_due(&mut self) -> Result<(), KernelError> {
+        if !self.world.next_deadline().is_some_and(|t| t <= self.clock.now()) {
+            return Ok(());
+        }
+        let due = {
+            let mut ctx = WorldCtx::detached(
+                &mut self.clock,
+                &mut self.cursor,
+                &mut *self.backend,
+                &mut *self.sink,
+                &mut self.next_event,
+                &mut self.recorded,
+            );
+            self.world.on_deadline(&mut ctx)?
+        };
+        self.apply_due(due)?;
+        // The contract is "fire everything due"; a due entry surviving the call would spin this
+        // loop forever, so it is an invariant rather than a retry.
+        if self.world.next_deadline().is_some_and(|t| t <= self.clock.now()) {
+            return Err(KernelError::Invariant("a due deadline survived on_deadline"));
+        }
+        Ok(())
+    }
+
+    /// The ending the run has reached, checked in order: a named node, the horizon, the budgets,
+    /// then a requested break.
+    fn ending(&self) -> Option<StopReason> {
+        // Before the horizon, so a scenario that named the ending it wanted is answered with that
+        // ending. A node with no tasks left is done whether it ended or was ended.
+        if self.config.ends_with.is_some_and(|node| {
+            matches!(self.tasks.node_state.get(&node), Some(NodeLifecycle::Dead))
+        }) {
+            return Some(StopReason::NodeFinished);
+        }
+        // Before the budget, so a horizon can never be shadowed by a bound it sits under.
+        if self.config.horizon.is_some_and(|at| self.clock.now() >= at) {
+            return Some(StopReason::HorizonReached);
+        }
+        if self.clock.now() >= self.config.max_ticks {
+            return Some(StopReason::TickBudget);
+        }
+        if self.next_event.get() >= self.config.max_events {
+            return Some(StopReason::EventBudget);
+        }
+        // After the deadlines and before the scheduler picks: the one place in the loop where
+        // every task is stopped and none is part-way through being answered.
+        if self.config.break_at.is_some_and(|at| self.next_event >= at) {
+            return Some(StopReason::BreakRequested);
+        }
+        None
+    }
+
+    /// Nothing is runnable: move time to the next deadline, or end the run.
+    fn when_idle(&mut self) -> Idle {
+        // An armed deadline outranks both endings: blocked and frozen tasks are waiting for it, and
+        // even an empty cluster may owe a restart to a timer. A deadline at or past the tick budget
+        // is one the run will never live to see, and chasing it would make every far-future timer
+        // a hang.
+        let ceiling =
+            self.config.horizon.unwrap_or(self.config.max_ticks).min(self.config.max_ticks);
+        match self.world.next_deadline() {
+            Some(due) if due < ceiling => {
+                self.clock.advance(Tick(due.get().saturating_sub(self.clock.now().get())));
+                Idle::Advanced
             }
+            // A cluster whose next timer is past the horizon has reached the horizon. Advancing to
+            // it first makes the recorded tick count the span the scenario asked for, which is
+            // what an oracle reasoning about a span of silence measures against.
+            //
+            // With **nothing** armed, no horizon saves it: nothing can ever happen again, and a
+            // clean ending there would hide exactly the defect the deadlock check exists to find.
+            Some(_) if self.config.horizon.is_some_and(|at| at <= self.config.max_ticks) => {
+                let at = self.config.horizon.unwrap_or(self.clock.now());
+                self.clock.advance(Tick(at.get().saturating_sub(self.clock.now().get())));
+                Idle::Ended(StopReason::HorizonReached)
+            }
+            _ => Idle::Ended(if self.tasks.anything_outstanding() {
+                StopReason::Deadlock
+            } else {
+                StopReason::GuestFinished
+            }),
         }
+    }
 
-        // Before the horizon for the reason the horizon is before the budget: a scenario that named
-        // the ending it wanted should be answered with that ending rather than with whichever
-        // ceiling happened to arrive. A node with no tasks left is done whether it ended or was
-        // ended — there is nothing there to drive anything, and waiting out the horizon around it
-        // would measure a server talking to nobody.
-        if config
-            .ends_with
-            .is_some_and(|node| matches!(tasks.node_state.get(&node), Some(NodeLifecycle::Dead)))
-        {
-            break StopReason::NodeFinished;
-        }
-        // Before the budget, so a horizon can never be shadowed by a bound it sits under. A run
-        // asked to reach a moment and stopped one tick short of it by an unrelated ceiling would
-        // be judged on an execution nobody asked for.
-        if config.horizon.is_some_and(|at| clock.now() >= at) {
-            break StopReason::HorizonReached;
-        }
-        if clock.now() >= config.max_ticks {
-            break StopReason::TickBudget;
-        }
-        if next_event.get() >= config.max_events {
-            break StopReason::EventBudget;
-        }
-        // After the deadlines and before the scheduler picks, which is the one place in the loop
-        // where every task is stopped and none is part-way through being answered.
-        if config.break_at.is_some_and(|at| next_event >= at) {
-            break StopReason::BreakRequested;
-        }
-
-        runnable.clear();
-        runnable.extend(tasks.pending.keys().copied().filter(|t| tasks.schedulable(*t)));
+    /// Picks a runnable task, narrates the switch if there is one, and runs it to its next stop.
+    fn dispatch(&mut self) -> Result<Option<Stop>, KernelError> {
         #[cfg(feature = "chaos-hash-iteration")]
-        let runnable = crate::chaos::in_hash_order(&runnable);
-
-        if runnable.is_empty() {
-            // An armed deadline outranks both endings: blocked and frozen tasks are waiting for
-            // it, and even an empty cluster may owe a restart to a timer. Time jumps there and
-            // the loop top fires it. A deadline at or past the tick budget is a deadline the run
-            // will never live to see, and chasing it would turn every far-future scenario timer
-            // into a hang.
-            let ceiling = config.horizon.unwrap_or(config.max_ticks).min(config.max_ticks);
-            match world.next_deadline() {
-                Some(due) if due < ceiling => {
-                    clock.advance(Tick(due.get().saturating_sub(clock.now().get())));
-                    continue;
-                }
-                // A cluster whose next timer is past the horizon has reached the horizon: time is
-                // the thing it was waiting for, and it would have gone on waiting. Advancing to
-                // the horizon before ending is what makes the recorded tick count the span the
-                // scenario asked for rather than the moment everything went quiet — which is what
-                // an oracle reasoning about a span of silence has to measure against.
-                //
-                // With **nothing** armed, no horizon saves it: nothing can ever happen again, and
-                // a horizon that turned that into a clean ending would hide exactly the defect
-                // the deadlock check exists to find.
-                Some(_) if config.horizon.is_some_and(|at| at <= config.max_ticks) => {
-                    let at = config.horizon.unwrap_or(clock.now());
-                    clock.advance(Tick(at.get().saturating_sub(clock.now().get())));
-                    break StopReason::HorizonReached;
-                }
-                _ => {
-                    break if tasks.pending.is_empty() && tasks.blocked.is_empty() {
-                        StopReason::GuestFinished
-                    } else {
-                        StopReason::Deadlock
-                    };
-                }
-            }
+        {
+            self.runnable = crate::chaos::in_hash_order(&self.runnable);
         }
-
         // Draws made while choosing belong to the event that switch produces.
-        cursor.set_event(next_event);
-
+        self.cursor.set_event(self.next_event);
         #[cfg(feature = "chaos-delivery-tie")]
-        let chosen = crate::chaos::first_to_arrive(&runnable);
+        let chosen = crate::chaos::first_to_arrive(&self.runnable);
         #[cfg(not(feature = "chaos-delivery-tie"))]
-        let chosen = policy.pick(&runnable, &mut cursor)?;
-        let action = tasks
-            .pending
-            .remove(&chosen)
+        let chosen = self.policy.pick(&self.runnable, &mut self.cursor)?;
+        self.metrics.decisions += 1;
+        let action = self
+            .tasks
+            .take_pending(chosen)
             .ok_or(KernelError::Invariant("scheduler chose a task that is not stopped"))?;
 
-        if tasks.last_run != Some(chosen) {
+        if self.tasks.last_run != Some(chosen) {
             // The first dispatch of a run moves execution from nowhere and is not a switch; every
             // later change of the running task is one, including the change after an exit.
-            if let Some(from) = tasks.last_run {
-                let node = tasks
+            if let Some(from) = self.tasks.last_run {
+                let node = self
+                    .tasks
                     .node_for(chosen)
                     .ok_or(KernelError::Invariant("scheduled a task with no node"))?;
-                emit(
-                    sink,
-                    &mut next_event,
-                    &clock,
-                    node,
-                    chosen,
-                    EventKind::Schedule { from, to: chosen, reason: last_reason },
-                )?;
+                let reason = self.last_reason;
+                self.emit(node, chosen, EventKind::Schedule { from, to: chosen, reason })?;
+                self.metrics.switches += 1;
             }
-            tasks.last_run = Some(chosen);
+            self.tasks.last_run = Some(chosen);
         }
-        last_reason = SwitchReason::SyscallBoundary;
+        self.last_reason = SwitchReason::SyscallBoundary;
 
-        backend.resume(chosen, action)?;
-        let Some(stop) = backend.next_stop()? else {
-            // Checked here as at the other place a run can end this way. A backend answering
-            // `None` with work still outstanding turns a half-finished run into a clean verdict,
-            // and the oracle then judges a prefix as though it were the whole execution.
-            if !tasks.pending.is_empty() || !tasks.blocked.is_empty() {
-                return Err(KernelError::Invariant(
-                    "the backend reported every task finished while tasks were still to run",
-                ));
-            }
-            break StopReason::GuestFinished;
-        };
+        self.backend.resume(chosen, action)?;
+        Ok(self.backend.next_stop()?)
+    }
 
-        // Structural bookkeeping belongs to the kernel; interpretation belongs to the world.
+    /// Answers one stop: the kernel's own bookkeeping first, then the world's interpretation.
+    fn on_stop(&mut self, stop: &Stop) -> Result<(), KernelError> {
         match &stop.kind {
-            StopKind::TaskCreated { parent, .. } => {
-                // A new task belongs to the node that created it, and so does the event announcing
-                // it: reading the node from the task that does not exist yet would file every
-                // spawn under node zero.
-                let node = tasks.node_for(*parent).ok_or(KernelError::Invariant(
-                    "a task was created by one this run has no node for",
-                ))?;
-                tasks.node_of.insert(stop.task, node);
-                world.task_created(stop.task, *parent);
-                tasks.pending.insert(stop.task, Resume::Continue);
-                emit(
-                    sink,
-                    &mut next_event,
-                    &clock,
-                    node,
-                    stop.task,
-                    EventKind::TaskSpawned { parent: *parent },
-                )?;
-                tasks.pending.insert(*parent, Resume::Continue);
-                continue;
-            }
-            StopKind::TaskExited { status } => {
-                tasks.blocked.remove(&stop.task);
-                tasks.release(world.task_exited(stop.task));
-                let node = tasks.node_for(stop.task);
-                // A task retired with its node has been accounted for already, and deliberately
-                // without an exit event: the node was declared gone by the task that ended it and
-                // the rest were taken off the books there. Its own exit still arrives from the
-                // backend afterwards, and filing it would report a task the run has finished with
-                // twice over.
-                if node.is_none() && tasks.retired.remove(&stop.task) {
-                    tasks.note_task_gone(stop.task);
-                    policy.forget(stop.task);
-                    continue;
+            StopKind::TaskCreated { parent, .. } => return self.on_created(stop.task, *parent),
+            StopKind::TaskExited { status } => return self.on_exited(stop.task, status),
+            StopKind::Signal { signal } => {
+                if let Some(entry) = self.tasks.entries.get_mut(&stop.task) {
+                    entry.faulted_on = Some(*signal);
                 }
-                let converted = match status {
-                    GuestExit::Exited(c) => {
-                        // A guest that failed is a finding whoever exits after it. A cluster's
-                        // caller routinely outlives the node it was driving, so keeping the last
-                        // status would let a node that died report the caller's success as the
-                        // run's — and a campaign would count its worst outcome as its best.
-                        if *c != 0 || last_exit.is_none() {
-                            last_exit = Some(*c);
-                        }
-                        ExitStatus::Exited(*c)
-                    }
-                    GuestExit::Signalled(s) => {
-                        let signal = tasks.faulted_on.remove(&stop.task).unwrap_or(*s);
-                        if !tasks.killed_by_us.contains(&stop.task) {
-                            killed_by = Some(signal);
-                        }
-                        ExitStatus::Signalled(signal)
-                    }
-                };
-                let node =
-                    node.ok_or(KernelError::Invariant("a task exited with no node to file it on"))?;
-                emit(
-                    sink,
-                    &mut next_event,
-                    &clock,
-                    node,
-                    stop.task,
-                    EventKind::TaskExited { status: converted },
-                )?;
-                if tasks.last_run == Some(stop.task) {
-                    last_reason = SwitchReason::TaskExit;
-                }
-                tasks.note_task_gone(stop.task);
-                policy.forget(stop.task);
-                continue;
             }
             _ => {}
         }
 
-        if let StopKind::Signal { signal } = stop.kind {
-            tasks.faulted_on.insert(stop.task, signal);
-        }
-
-        let node = tasks
+        let node = self
+            .tasks
             .node_for(stop.task)
             .ok_or(KernelError::Invariant("a stop arrived for a task with no node"))?;
         let effects = {
             let mut ctx = WorldCtx::new(
-                &mut clock,
-                &mut cursor,
-                backend,
-                sink,
-                &mut next_event,
+                &mut self.clock,
+                &mut self.cursor,
+                &mut *self.backend,
+                &mut *self.sink,
+                &mut self.next_event,
                 node,
                 stop.task,
-                &mut recorded,
+                &mut self.recorded,
             );
-            world.handle(&stop, &mut ctx)?
+            self.world.handle(stop, &mut ctx)?
         };
+        self.metrics.stops += 1;
 
-        clock.advance(effects.advance);
+        let mut advance = effects.advance;
+        if let (StopKind::BudgetExhausted { consumed }, Some(rate)) =
+            (&stop.kind, self.config.ticks_per_progress_unit)
+        {
+            advance = advance.saturating_add(Tick(consumed.saturating_mul(rate)));
+        }
+        self.clock.advance(advance);
+        let spent = self.metrics.ticks_by_task.entry(stop.task).or_insert(Tick::ZERO);
+        *spent = spent.saturating_add(advance);
+
         if effects.yielded {
-            policy.yielded(stop.task);
-            if tasks.last_run == Some(stop.task) {
-                last_reason = SwitchReason::Yield;
+            self.policy.yielded(stop.task);
+            if self.tasks.last_run == Some(stop.task) {
+                self.last_reason = SwitchReason::Yield;
             }
         }
-        tasks.release(effects.wake);
+        self.tasks.release(effects.wake);
         match effects.state {
-            // Ending a task is carried out here rather than left for the scheduler to pick up: the
-            // task is gone once the backend has been told, and the record of how it ended has to be
-            // written while what ended it is still known.
+            // Ending a task is carried out here rather than left for the scheduler: the task is
+            // gone once the backend has been told, and how it ended is written while still known.
             TaskState::Runnable(Resume::Terminate { signal }) => {
-                backend.resume(stop.task, Resume::Terminate { signal })?;
-                // What the world named, and what the kernel saw where it named nothing. A task
-                // that asked to die stops on no signal, so `faulted_on` is empty for it and only
-                // the world can say what took it.
-                let died_of = signal.or_else(|| tasks.faulted_on.remove(&stop.task));
+                self.backend.resume(stop.task, Resume::Terminate { signal })?;
+                // A task that asked to die stops on no signal, so only the world can say what
+                // took it.
+                let died_of = signal.or_else(|| self.tasks.take_faulted(stop.task));
                 let status = match died_of {
                     Some(signal) => {
-                        killed_by = Some(signal);
+                        self.killed_by = Some(signal);
                         ExitStatus::Signalled(signal)
                     }
                     None => ExitStatus::Exited(0),
                 };
-                emit(
-                    sink,
-                    &mut next_event,
-                    &clock,
-                    node,
-                    stop.task,
-                    EventKind::TaskExited { status },
-                )?;
-                if tasks.last_run == Some(stop.task) {
-                    last_reason = SwitchReason::TaskExit;
+                self.emit(node, stop.task, EventKind::TaskExited { status })?;
+                if self.tasks.last_run == Some(stop.task) {
+                    self.last_reason = SwitchReason::TaskExit;
                 }
-                tasks.note_task_gone(stop.task);
-                policy.forget(stop.task);
-                tasks.release(world.task_exited(stop.task));
+                self.tasks.note_task_gone(stop.task);
+                self.policy.forget(stop.task);
+                self.tasks.release(self.world.task_exited(stop.task));
             }
             TaskState::Runnable(resume) => {
                 if matches!(stop.kind, StopKind::BudgetExhausted { .. })
-                    && tasks.last_run == Some(stop.task)
+                    && self.tasks.last_run == Some(stop.task)
                 {
-                    last_reason = SwitchReason::BudgetExhausted;
+                    self.last_reason = SwitchReason::BudgetExhausted;
                 }
-                tasks.pending.insert(stop.task, resume);
+                self.tasks.set_slot(stop.task, Slot::Pending(resume));
             }
             TaskState::Blocked => {
-                if tasks.last_run == Some(stop.task) {
-                    last_reason = SwitchReason::Blocked;
+                if self.tasks.last_run == Some(stop.task) {
+                    self.last_reason = SwitchReason::Blocked;
                 }
-                tasks.blocked.insert(stop.task);
+                self.tasks.set_slot(stop.task, Slot::Blocked);
             }
         }
-        apply_node_ops(&effects.node_ops, &mut tasks, backend, policy, specs)?;
-    };
+        self.apply_node_ops(&effects.node_ops)
+    }
 
-    let digest = sink.digest();
-    let outcome = judge(
-        oracle,
-        &clock,
-        next_event,
-        digest,
-        last_exit,
-        killed_by,
-        &recorded,
-        stop_reason,
-        config.horizon,
-    );
+    /// A task appeared: it belongs to the node that created it, and so does the event announcing
+    /// it — reading the node from a task that does not exist yet would file every spawn under node
+    /// zero.
+    fn on_created(&mut self, task: TaskId, parent: TaskId) -> Result<(), KernelError> {
+        let node = self
+            .tasks
+            .node_for(parent)
+            .ok_or(KernelError::Invariant("a task was created by one this run has no node for"))?;
+        self.tasks.add(task, node, Slot::Pending(Resume::Continue));
+        self.world.task_created(task, parent);
+        self.emit(node, task, EventKind::TaskSpawned { parent })?;
+        self.tasks.set_slot(parent, Slot::Pending(Resume::Continue));
+        Ok(())
+    }
 
-    Ok(RunReport {
-        digest,
-        events: next_event.get(),
-        ticks: clock.now(),
-        stop_reason,
-        outcome,
-        violation_event: recorded.violation_event(),
-        adversity: recorded.adversity(),
-        journal: cursor.into_journal(),
-    })
-}
-
-/// Applies what firing deadlines produced.
-fn apply_due(
-    due: DueEffects,
-    tasks: &mut Tasks,
-    backend: &mut dyn DeterminismBackend,
-    policy: &mut dyn SchedulePolicy,
-    specs: &[GuestSpec],
-) -> Result<(), KernelError> {
-    tasks.release(due.wake);
-    apply_node_ops(&due.node_ops, tasks, backend, policy, specs)
-}
-
-/// Executes the world's node decisions: the task bookkeeping and backend calls only the kernel
-/// can make. The narrating events were already emitted by the world.
-fn apply_node_ops(
-    ops: &[NodeOp],
-    tasks: &mut Tasks,
-    backend: &mut dyn DeterminismBackend,
-    policy: &mut dyn SchedulePolicy,
-    specs: &[GuestSpec],
-) -> Result<(), KernelError> {
-    for op in ops {
-        match *op {
-            // The host has already ended them; what is left is to stop expecting them. Nothing is
-            // killed and nothing is narrated: the program said it was done, and a task still
-            // parked in a call it will never return from is not a task that is waiting.
-            NodeOp::Ended { node, by } => {
-                let gone: Vec<TaskId> = tasks
-                    .node_of
-                    .iter()
-                    .filter(|(task, n)| **n == node && **task != by)
-                    .map(|(t, _)| *t)
-                    .collect();
-                for task in gone {
-                    tasks.pending.remove(&task);
-                    tasks.blocked.remove(&task);
-                    tasks.faulted_on.remove(&task);
-                    // Also the node it belonged to. Left behind, these entries answered "does this
-                    // node still have tasks" with yes for ever: the node never reached `Dead`, so
-                    // `ends_with` never fired for a program that exited with more than one thread
-                    // -- which is the Go case this variant exists for -- and a later `Restart`
-                    // failed the invariant that a node being restarted is dead.
-                    tasks.node_of.remove(&task);
-                    tasks.retired.insert(task);
-                    policy.forget(task);
+    /// A task's exit, as the backend reports it.
+    fn on_exited(&mut self, task: TaskId, status: &GuestExit) -> Result<(), KernelError> {
+        self.tasks.unblock(task);
+        self.tasks.release(self.world.task_exited(task));
+        // A task retired with its node was accounted for there, deliberately without an exit
+        // event; its own exit still arrives from the backend, and filing it would report a task the
+        // run has finished with twice over.
+        if self.tasks.is_retired(task) {
+            self.tasks.note_task_gone(task);
+            self.policy.forget(task);
+            return Ok(());
+        }
+        let node = self.tasks.node_for(task);
+        let converted = match status {
+            GuestExit::Exited(c) => {
+                // A guest that failed is a finding whoever exits after it: a cluster's caller
+                // routinely outlives the node it drove, and keeping the last status would let it
+                // report its success as the run's.
+                if *c != 0 || self.last_exit.is_none() {
+                    self.last_exit = Some(*c);
                 }
-                // The spared task carries on and will be noticed when it goes, so the node is
-                // marked from here only if nothing of it is left already.
-                if !tasks.node_of.values().any(|n| *n == node) {
-                    tasks.node_state.insert(node, NodeLifecycle::Dead);
-                }
+                ExitStatus::Exited(*c)
             }
-            NodeOp::Kill(node) => {
-                if tasks.node_state.get(&node) != Some(&NodeLifecycle::Running)
-                    && tasks.node_state.get(&node) != Some(&NodeLifecycle::Frozen)
-                {
-                    return Err(KernelError::Invariant("killing a node that is not alive"));
-                }
-                // Tasks already killed are left alone: their entries are kept so their exits can
-                // still be filed on the node they belonged to, and asking the backend to kill one
-                // twice names a task it has already let go.
-                let doomed: Vec<TaskId> = tasks
-                    .node_of
-                    .iter()
-                    .filter(|(task, n)| **n == node && !tasks.killed_by_us.contains(task))
-                    .map(|(t, _)| *t)
-                    .collect();
-                for task in doomed {
-                    backend.kill(task)?;
-                    tasks.killed_by_us.insert(task);
-                    tasks.pending.remove(&task);
-                    tasks.blocked.remove(&task);
-                    // `node_of` is deliberately kept. A backend that ends a task by signalling it
-                    // still reports the exit afterwards, and a task whose node had already been
-                    // forgotten had that exit filed under the first node of the cluster. The
-                    // restart path inserts its new tasks before any stale exit could re-mark the
-                    // node, so holding the entry until `note_task_gone` is safe.
-                    tasks.faulted_on.remove(&task);
-                    policy.forget(task);
-                    // No switch event follows a kill: the world's NodeState narration already
-                    // explains why execution moved, and the killed task is not a `from`.
-                    if tasks.last_run == Some(task) {
-                        tasks.last_run = None;
+            GuestExit::Signalled(s) => {
+                // Never a task this loop killed: those leave the books when they are killed, and a
+                // backend reports nothing more about them.
+                let signal = self.tasks.take_faulted(task).unwrap_or(*s);
+                self.killed_by = Some(signal);
+                ExitStatus::Signalled(signal)
+            }
+        };
+        let node =
+            node.ok_or(KernelError::Invariant("a task exited with no node to file it on"))?;
+        self.emit(node, task, EventKind::TaskExited { status: converted })?;
+        if self.tasks.last_run == Some(task) {
+            self.last_reason = SwitchReason::TaskExit;
+        }
+        self.tasks.note_task_gone(task);
+        self.policy.forget(task);
+        Ok(())
+    }
+
+    /// Applies what firing deadlines produced.
+    fn apply_due(&mut self, due: DueEffects) -> Result<(), KernelError> {
+        self.tasks.release(due.wake);
+        self.apply_node_ops(&due.node_ops)
+    }
+
+    /// Carries out the world's node decisions: the task bookkeeping and backend calls only the
+    /// kernel can make. The narrating events were already emitted by the world.
+    fn apply_node_ops(&mut self, ops: &[NodeOp]) -> Result<(), KernelError> {
+        for op in ops {
+            match *op {
+                // The host has already ended them; what is left is to stop expecting them. Nothing
+                // is killed or narrated: the program said it was done.
+                NodeOp::Ended { node, by } => {
+                    let gone: Vec<TaskId> =
+                        self.tasks.of_node(node).map(|(t, _)| t).filter(|t| *t != by).collect();
+                    for task in gone {
+                        // Off the node's books, so "does this node still have tasks" can answer
+                        // no and the node reaches `Dead` once the spared task goes.
+                        self.tasks.retire(task);
+                        self.policy.forget(task);
+                    }
+                    if !self.tasks.has_tasks(node) {
+                        self.tasks.node_state.insert(node, NodeLifecycle::Dead);
                     }
                 }
-                // Deliberately not recorded as the guest being killed. The signal came from the
-                // fault injector, and a run reported as a crash because we pulled the plug would
-                // make every fault-injected run a finding — which is a search that reports its own
-                // faults back to itself. What the node was killed *by* is on the timeline as
-                // `NodeState::Dead`, and what it does about it is the verdict.
-                tasks.node_state.insert(node, NodeLifecycle::Dead);
-            }
-            NodeOp::Freeze(node) => {
-                if tasks.node_state.get(&node) != Some(&NodeLifecycle::Running) {
-                    return Err(KernelError::Invariant("freezing a node that is not running"));
+                NodeOp::Kill(node) => {
+                    if !matches!(
+                        self.tasks.node_state.get(&node),
+                        Some(NodeLifecycle::Running | NodeLifecycle::Frozen)
+                    ) {
+                        return Err(KernelError::Invariant("killing a node that is not alive"));
+                    }
+                    let doomed: Vec<TaskId> = self.tasks.of_node(node).map(|(t, _)| t).collect();
+                    for task in doomed {
+                        self.backend.kill(task)?;
+                        // Off the books now: a backend reports nothing more about a task it was
+                        // told to kill, so a record kept for its exit would count against the node
+                        // for ever and a restarted node could never end.
+                        self.tasks.note_task_gone(task);
+                        self.policy.forget(task);
+                        // No switch event follows a kill: the world's NodeState narration already
+                        // explains why execution moved, and the killed task is not a `from`.
+                        if self.tasks.last_run == Some(task) {
+                            self.tasks.last_run = None;
+                        }
+                    }
+                    // Not recorded as the guest being killed: the signal came from the fault
+                    // injector, and what the node was killed by is on the timeline as
+                    // `NodeState::Dead`.
+                    self.tasks.node_state.insert(node, NodeLifecycle::Dead);
                 }
-                tasks.node_state.insert(node, NodeLifecycle::Frozen);
-            }
-            NodeOp::Thaw(node) => {
-                if tasks.node_state.get(&node) != Some(&NodeLifecycle::Frozen) {
-                    return Err(KernelError::Invariant("thawing a node that is not frozen"));
+                NodeOp::Freeze(node) => {
+                    if self.tasks.node_state.get(&node) != Some(&NodeLifecycle::Running) {
+                        return Err(KernelError::Invariant("freezing a node that is not running"));
+                    }
+                    self.tasks.node_state.insert(node, NodeLifecycle::Frozen);
                 }
-                tasks.node_state.insert(node, NodeLifecycle::Running);
-            }
-            NodeOp::Restart(node) => {
-                if tasks.node_state.get(&node) != Some(&NodeLifecycle::Dead) {
-                    return Err(KernelError::Invariant("restarting a node that is not dead"));
+                NodeOp::Thaw(node) => {
+                    if self.tasks.node_state.get(&node) != Some(&NodeLifecycle::Frozen) {
+                        return Err(KernelError::Invariant("thawing a node that is not frozen"));
+                    }
+                    self.tasks.node_state.insert(node, NodeLifecycle::Running);
                 }
-                let spec = specs
-                    .get(node.get() as usize)
-                    .ok_or(KernelError::Invariant("restarting a node that was never started"))?;
-                let first = backend.spawn(node, spec)?;
-                tasks.pending.insert(first, Resume::Continue);
-                tasks.node_of.insert(first, node);
-                tasks.node_state.insert(node, NodeLifecycle::Running);
+                NodeOp::Restart(node) => {
+                    if self.tasks.node_state.get(&node) != Some(&NodeLifecycle::Dead) {
+                        return Err(KernelError::Invariant("restarting a node that is not dead"));
+                    }
+                    let spec = self.specs.get(node.get() as usize).ok_or(
+                        KernelError::Invariant("restarting a node that was never started"),
+                    )?;
+                    let first = self.backend.spawn(node, spec)?;
+                    self.tasks.add(first, node, Slot::Pending(Resume::Continue));
+                    self.tasks.node_state.insert(node, NodeLifecycle::Running);
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
-}
 
-/// Turns the oracle's verdict into the outcome recorded in a bundle.
-///
-/// A run cut short by a budget is a hang whatever the oracle thought, because the oracle only ever
-/// saw a prefix of the execution. A run that reached its horizon is the opposite case and the
-/// reason the horizon exists: the execution the scenario asked for happened in full, and refusing
-/// to judge it would mean a guest that never exits can never be judged at all — which is every
-/// guest this engine now exists to be pointed at.
-#[allow(clippy::too_many_arguments)]
-fn judge(
-    oracle: &mut dyn Oracle,
-    clock: &Clock,
-    next_event: EventId,
-    digest: Digest,
-    exit: Option<i32>,
-    killed_by: Option<u32>,
-    recorded: &Recorded,
-    stop_reason: StopReason,
-    horizon: Option<Tick>,
-) -> Outcome {
-    let outcome = RunOutcome {
-        digest,
-        events: next_event.get(),
-        ticks: clock.now(),
-        exit,
-        killed_by,
-        diagnostics: recorded.diagnostics().to_vec(),
-        // Read after the run, by whoever holds the world; the kernel never sees one.
-        projections: Vec::new(),
-    };
-    match stop_reason {
-        StopReason::TickBudget => {
-            return Outcome::GuestHung(format!("no progress by tick {}", clock.now().get()));
+    fn emit(&mut self, node: NodeId, task: TaskId, kind: EventKind) -> Result<(), KernelError> {
+        let event =
+            bohr_trace::Event { id: self.next_event, tick: self.clock.now(), node, task, kind };
+        self.sink.emit(&event)?;
+        self.next_event = EventId(self.next_event.get() + 1);
+        Ok(())
+    }
+
+    /// Offers the observer the run so far, every [`PROGRESS_EVERY`] events and once at the end.
+    fn report_progress(&mut self, last: bool) {
+        let events = self.next_event.get();
+        if !last && events < self.reported_at.saturating_add(PROGRESS_EVERY) {
+            return;
         }
-        // The budget names the horizon when there was one, because that is the first wall a
-        // long-running guest hits: ten million events go by long before twenty-five virtual
-        // hours, and without this the message sends a reader to doubt the oracle instead of
-        // raising the budget.
-        StopReason::EventBudget => {
-            return Outcome::GuestHung(match horizon {
-                Some(at) => format!(
-                    "event budget reached at {}, short of the horizon at tick {}",
-                    next_event.get(),
-                    at.get()
-                ),
-                None => format!("event budget reached at {}", next_event.get()),
+        self.reported_at = events;
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.progress(&Progress {
+                events,
+                ticks: self.clock.now(),
+                decisions: self.metrics.decisions,
+                finished: last,
             });
         }
-        // Every task waiting with nothing left to release any of them is the guest's own defect,
-        // and one the oracle never gets to see: there is no further execution to judge.
-        StopReason::Deadlock => {
-            return Outcome::GuestHung(format!(
-                "every task is waiting at tick {}",
-                clock.now().get()
-            ));
-        }
-        // Asked to stop is neither a hang nor a clean finish. The oracle saw a prefix, exactly as
-        // with a budget — but nothing about the guest went wrong, and reporting it as a hang would
-        // put a finding in a log for a command somebody ran to look at something.
-        StopReason::BreakRequested => {
-            return Outcome::StoppedOnRequest(format!("stopped at event {}", next_event.get()));
-        }
-        // A node the scenario named as the run's ending has ended, which is the ending it asked
-        // for. Judged like a horizon and for the same reason: the execution that was wanted is the
-        // one that happened, so the oracle is asked about it rather than told it was abandoned.
-        StopReason::GuestFinished | StopReason::HorizonReached | StopReason::NodeFinished => {}
     }
-    match oracle.judge(&outcome) {
-        Verdict::Finding(o) => o,
-        Verdict::Clean | Verdict::Agree | Verdict::Skipped => Outcome::Clean,
+
+    /// Judges the run and hands back what it produced.
+    fn finish(mut self, stop_reason: StopReason) -> RunReport {
+        self.report_progress(true);
+        let digest = self.sink.digest();
+        let outcome = self.judge(digest, stop_reason);
+        RunReport {
+            digest,
+            events: self.next_event.get(),
+            ticks: self.clock.now(),
+            stop_reason,
+            outcome,
+            violation_event: self.recorded.violation_event(),
+            adversity: self.recorded.adversity(),
+            journal: self.cursor.into_journal(),
+            metrics: self.metrics,
+        }
+    }
+
+    /// Turns the oracle's verdict into the outcome recorded in a bundle.
+    ///
+    /// A run cut short by a budget is a hang whatever the oracle thought: it only ever saw a
+    /// prefix. A run that reached its horizon or its named node is judged in full.
+    fn judge(&mut self, digest: Digest, stop_reason: StopReason) -> Outcome {
+        let now = self.clock.now().get();
+        let events = self.next_event.get();
+        match stop_reason {
+            StopReason::TickBudget => {
+                return Outcome::GuestHung(format!("no progress by tick {now}"));
+            }
+            // The budget names the horizon when there was one: ten million events go by long
+            // before twenty-five virtual hours, and the message should send a reader to the budget.
+            StopReason::EventBudget => {
+                return Outcome::GuestHung(match self.config.horizon {
+                    Some(at) => format!(
+                        "event budget reached at {events}, short of the horizon at tick {}",
+                        at.get()
+                    ),
+                    None => format!("event budget reached at {events}"),
+                });
+            }
+            // Every task waiting with nothing left to release any of them is the guest's own
+            // defect, and one the oracle never gets to see.
+            StopReason::Deadlock => {
+                return Outcome::GuestHung(format!("every task is waiting at tick {now}"));
+            }
+            // Asked to stop is neither a hang nor a clean finish.
+            StopReason::BreakRequested => {
+                return Outcome::StoppedOnRequest(format!("stopped at event {events}"));
+            }
+            StopReason::GuestFinished | StopReason::HorizonReached | StopReason::NodeFinished => {}
+        }
+        let outcome = RunOutcome {
+            digest,
+            events,
+            ticks: self.clock.now(),
+            exit: self.last_exit,
+            killed_by: self.killed_by,
+            diagnostics: self.recorded.diagnostics().to_vec(),
+            // Read after the run, by whoever holds the world; the kernel never sees one.
+            projections: Vec::new(),
+        };
+        match self.oracle.judge(&outcome) {
+            Verdict::Finding(o) => o,
+            Verdict::Clean | Verdict::Agree | Verdict::Skipped => Outcome::Clean,
+        }
+    }
+
+    /// An invariant failure, with where in the run it happened.
+    fn locate(&self, what: &'static str) -> KernelError {
+        let task = match self.handling.or(self.tasks.last_run) {
+            Some(task) => format!("task {}", task.get()),
+            None => "no task running".to_owned(),
+        };
+        KernelError::InvariantAt {
+            what,
+            event: self.next_event.get(),
+            tick: self.clock.now().get(),
+            task,
+        }
     }
 }
 
@@ -793,28 +934,11 @@ fn judge(
 ///
 /// Both come from the tape, so a seed selects how far apart the machines in a run are, and a
 /// mutation of those bytes moves them without disturbing any other decision.
-fn draw_node_clock(
-    cursor: &mut bohr_tape::TapeCursor<'_>,
-    max_skew: Tick,
-) -> Result<NodeClock, KernelError> {
+fn draw_node_clock(cursor: &mut TapeCursor<'_>, max_skew: Tick) -> Result<NodeClock, KernelError> {
     let offset = cursor.draw_range(max_skew.get().saturating_add(1), DrawSite::ClockSkew)?;
 
     let drift_span = u64::from(MAX_DRIFT_PPM) * 2 + 1;
     let drift = cursor.draw_range(drift_span, DrawSite::ClockSkew)? as i32 - MAX_DRIFT_PPM as i32;
 
     Ok(NodeClock::new(offset, drift))
-}
-
-fn emit(
-    sink: &mut dyn EventSink,
-    next_event: &mut EventId,
-    clock: &Clock,
-    node: NodeId,
-    task: TaskId,
-    kind: EventKind,
-) -> Result<(), KernelError> {
-    let event = bohr_trace::Event { id: *next_event, tick: clock.now(), node, task, kind };
-    sink.emit(&event)?;
-    *next_event = EventId(next_event.get() + 1);
-    Ok(())
 }

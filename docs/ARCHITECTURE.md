@@ -357,11 +357,13 @@ The catalog is closed; adding a variant is a bundle-format minor version.
 One-directional partition is called out explicitly because it is the case teams most often fail to
 test and the one that breaks consensus implementations most reliably.
 
-**Clocks are skewed, not faulted.** Every node draws an offset and a drift rate before anything runs
-(§4.2), so two nodes never agree on the time and a run where they did would not reach the defects
-that depend on them disagreeing. What does not exist is a fault that steps or re-drifts a clock
-*during* a run, and it is named here as absent rather than left to be discovered by a scenario that
-cannot ask for it.
+**Clocks are skewed from the start and faulted during the run.** Every node draws an offset and a
+drift rate before anything runs (§4.2), so two nodes never agree on the time. During the run a
+`clock_step` moves a node's wall clock — back as well as forward, as `settimeofday` does — and a
+`clock_drift` changes how fast its clock runs from that moment on. A node has two readings: wall
+time (`CLOCK_REALTIME`, `gettimeofday`, `time`), which a step moves, and monotonic time, which never
+goes back. A defect that trusts wall time to measure elapsed time is reachable only through the step,
+which is why both readings exist.
 
 **A catalogue is a promise, and it is held to the code.** Each model declares the faults it can
 inject, and `scripts/lint-rules.sh` compares that declaration against every fault the model actually
@@ -901,6 +903,7 @@ report says which was used.
 |---|---|---|
 | `random` | uniform over runnable tasks | baseline, and the fallback when nothing better applies |
 | `pct` | PCT (ASPLOS 2010): `d−1` random priority-change points, otherwise fixed priorities. For `n` tasks and `k` steps, a depth-`d` bug is found with probability ≥ `1/(n·k^(d−1))` per run | default for exploration; most real bugs have depth 1–3 |
+| `fair` | uniform, with starvation bounded: a task passed over 64 picks in a row runs next without a draw, so with `n` runnable tasks none waits more than `63 + n` picks | liveness checks, where PCT's long stretches would read as a hang the program does not have |
 | `replay` | decisions re-derived from the recorded tape | `bohr replay`, and every reduction step |
 | `adversarial` | biases switches toward suspicious sites (around locks, around network operations, right after a write) | after the explorer has localised a suspect region |
 
@@ -1405,7 +1408,7 @@ What Bohr does not do, and why each is a property of the design rather than an o
 | Architectures other than x86-64 | `RDTSC`/`CPUID` handling and the branch counter are architecture-specific |
 | A graphical interface | The report is a static HTML file (§5.13); a desktop or web interface is a separate product |
 | True multi-core execution | One task runs at a time, by construction (§5.4) |
-| `io_uring` | A second, asynchronous syscall path submitting work without a syscall per operation, so a guest holding a ring is unobserved rather than partly modelled. Refused by name under `BOHR-2004` |
+| `io_uring` beyond files | A ring is observable at `io_uring_enter` once its poller is asleep, and its file operations are carried there (`[linux] io_uring = "ring"`); sockets, timeouts, registered resources and operations that complete later are not, and end the run by name under `BOHR-2004` |
 | Direct device access and DMA | Not reachable from above a hypervisor |
 | A security sandbox | Not the problem statement, and claiming it would be untrue (§11) |
 | Replacing ordinary tests | Bohr complements them; a project with no unit tests gains little from it |

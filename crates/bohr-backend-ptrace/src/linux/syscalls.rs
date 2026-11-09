@@ -134,6 +134,11 @@ pub(crate) const TABLE: &[Entry] = &[
     trace(83, "mkdir"),
     trace(264, "renameat"),
     trace(425, "io_uring_setup"),
+    trace(426, "io_uring_enter"),
+    trace(427, "io_uring_register"),
+    trace(187, "readahead"),
+    trace(140, "getpriority"),
+    trace(141, "setpriority"),
     trace(84, "rmdir"),
     trace(32, "dup"),
     trace(33, "dup2"),
@@ -244,8 +249,9 @@ const UNMODELLED: &[(u32, &str)] = &[
     (277, "sync_file_range"),
     (101, "ptrace"),
     (321, "bpf"),
-    (426, "io_uring_enter"),
-    (427, "io_uring_register"),
+    (294, "inotify_init1"),
+    (254, "inotify_add_watch"),
+    (255, "inotify_rm_watch"),
 ];
 
 /// Name of a syscall this build does not model, where one is known.
@@ -378,12 +384,10 @@ mod tests {
         assert_eq!(name_of(228), Some("clock_gettime"));
         assert_eq!(name_of(318), Some("getrandom"));
         assert_eq!(name_of(41), Some("socket"));
-        // Opening a ring is listed, because the world now answers it rather than refusing the
-        // run: a kernel without `io_uring` is a world a guest meets, and no ring means nothing
-        // submits work past the interception. Entering one stays unlisted and refused by name --
-        // this table decides what the filter admits, and a call that must reach the supervisor to
-        // be refused belongs in neither list, which the default action already arranges.
+        // The three ring calls are listed: the world answers each of them, a ring or its absence
+        // depending on the scenario, and a survey names them from here.
         assert_eq!(name_of(425), Some("io_uring_setup"));
-        assert_eq!(name_of(426), None, "an unlisted syscall has no name to report");
+        assert_eq!(name_of(426), Some("io_uring_enter"));
+        assert_eq!(name_of(9999), None, "an unlisted syscall has no name to report");
     }
 }

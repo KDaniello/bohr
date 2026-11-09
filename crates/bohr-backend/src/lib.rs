@@ -58,6 +58,9 @@ pub trait DeterminismBackend {
     fn mappings(&mut self, task: TaskId) -> Result<Vec<Mapping>, BackendError>;
 
     /// Ends a task without letting it run again.
+    ///
+    /// Nothing more is reported about the task afterwards, its exit included: it is forgotten
+    /// here, and the caller takes it off its own books when it asks.
     fn kill(&mut self, task: TaskId) -> Result<(), BackendError>;
 
     /// What the guest executed, where this implementation can observe it.
@@ -105,6 +108,21 @@ pub trait DeterminismBackend {
     /// guests it got to, which is why the failure names one rather than being silent.
     fn hand_over(&mut self) -> Result<Vec<DebuggerTarget>, BackendError> {
         Ok(Vec::new())
+    }
+
+    /// Holds every guest as it stands, so the run can later go on from here more than once.
+    ///
+    /// Taken with every task stopped, between two picks. `Ok(None)` from a backend that cannot,
+    /// which [`BackendCapabilities::checkpoints`] says in advance.
+    fn checkpoint(&mut self) -> Result<Option<CheckpointId>, BackendError> {
+        Ok(None)
+    }
+
+    /// Puts every guest back as it stood at `id`, keeping the checkpoint for another restore.
+    ///
+    /// `Ok(false)` from a backend that cannot, or for an id it does not hold.
+    fn restore(&mut self, _id: CheckpointId) -> Result<bool, BackendError> {
+        Ok(false)
     }
 }
 
@@ -309,7 +327,14 @@ pub struct BackendCapabilities {
     pub hands_over_to_debugger: bool,
     /// Largest number of concurrent tasks.
     pub max_tasks: u32,
+    /// Whether every guest can be held at a point and resumed from it again
+    /// ([`DeterminismBackend::checkpoint`]).
+    pub checkpoints: bool,
 }
+
+/// A held point of a whole run's guests, named by the backend that holds it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct CheckpointId(pub u64);
 
 /// The x86-64 register file, as far as interception needs it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

@@ -284,6 +284,7 @@ impl DeterminismBackend for NullBackend {
             // debugger to attach to, which is a different fact from a guest it could not reach.
             hands_over_to_debugger: false,
             max_tasks: 1024,
+            checkpoints: false,
         }
     }
 

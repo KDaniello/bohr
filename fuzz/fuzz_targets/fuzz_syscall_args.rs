@@ -78,6 +78,7 @@ fuzz_target!(|data: &[u8]| {
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: &specs,
         config: RunConfig::default(),
     });

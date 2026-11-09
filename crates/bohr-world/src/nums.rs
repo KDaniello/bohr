@@ -148,14 +148,20 @@ pub(crate) mod sys {
     pub(crate) const SYMLINKAT: u32 = 266;
     pub(crate) const READLINKAT: u32 = 267;
 
-    /// `io_uring_setup`, `io_uring_enter`, `io_uring_register`.
-    ///
-    /// Named in order to be refused by name. They are not in the interceptor's table and never
-    /// will be while the ring is out of scope — the table drives the filter, and these reach the
-    /// supervisor through its default action like anything else it does not list.
-    /// Opening a ring, which is declined rather than refused: see `MinimalWorld::decline_ring`.
+    /// `io_uring_setup`: opened under `[linux] io_uring = "ring"`, declined `ENOSYS` otherwise.
     pub(crate) const IO_URING_SETUP: u32 = 425;
+    /// `io_uring_enter`: carries a ring's submissions; with no ring, ends the run by name.
+    pub(crate) const IO_URING_ENTER: u32 = 426;
+    /// `io_uring_register`: answered `EINVAL`, so a caller takes the unregistered path.
+    pub(crate) const IO_URING_REGISTER: u32 = 427;
+    /// The three ring calls, which a refusal names under `BOHR-2004` rather than `BOHR-2001`.
     pub(crate) const IO_URING: [u32; 3] = [425, 426, 427];
+    /// `readahead`, a hint nothing here acts on.
+    pub(crate) const READAHEAD: u32 = 187;
+    /// `getpriority`, answered as a process nobody has reniced.
+    pub(crate) const GETPRIORITY: u32 = 140;
+    /// `setpriority`, accepted and without effect: the tape is the scheduler.
+    pub(crate) const SETPRIORITY: u32 = 141;
 
     /// `mmap`, which reaches here only where it named a file: the filter admits an anonymous
     /// mapping, which shapes the guest's own address space and nothing this model holds.
@@ -174,6 +180,8 @@ pub(crate) mod errno {
     pub(crate) const EBADF: i64 = 9;
     /// Try again: the value a wait was predicated on had already changed.
     pub(crate) const EAGAIN: i64 = 11;
+    /// Busy: a ring's completion queue has no room for what would be submitted.
+    pub(crate) const EBUSY: i64 = 16;
     /// Not permitted for this operation.
     pub(crate) const EINVAL: i64 = 22;
     /// File name too long.

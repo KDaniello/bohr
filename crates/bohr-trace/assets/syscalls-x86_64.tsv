@@ -97,12 +97,15 @@
 131	sigaltstack	pp
 137	statfs	pp
 138	fstatfs	sp
+140	getpriority	ss
+141	setpriority	sss
 143	sched_getparam	sp
 145	sched_getscheduler	s
 157	prctl	sssss
 158	arch_prctl	ss
 160	setrlimit	sp
 186	gettid	-
+187	readahead	sss
 201	time	p
 202	futex	psspps
 204	sched_getaffinity	ssp
@@ -136,5 +139,7 @@
 332	statx	spssp
 334	rseq	psss
 425	io_uring_setup	sps
+426	io_uring_enter	sssssp
+427	io_uring_register	sssp
 435	clone3	ps
 439	faccessat2	spss

@@ -1,0 +1,13 @@
+# A lease held on the wall clock, and the wall clock set back while it is held.
+#
+# One node is enough: the defect is between two clocks of one machine, not between machines.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/lease_clock"]
+
+[[fault]]
+kind = "clock_step"
+node = 0
+at_tick = 5_000_000_000          # 5 s into a 10 s lease
+step_ticks = -3_000_000_000      # back 3 s: the lease is believed held 3 s past its term

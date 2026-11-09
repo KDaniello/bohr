@@ -1,0 +1,5 @@
+# The same world with no clock fault: the lease runs out on time, and the run is clean.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/lease_clock"]

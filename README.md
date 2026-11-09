@@ -85,7 +85,7 @@ Bohr is an open implementation at the syscall level: no code changes, no rebuild
 
 ## Status
 
-**v0.1.0, the foundation — not published.** What it does and does not do is fixed in the
+**v0.2.0, the engine, honest — not published.** What it does and does not do is fixed in the
 [changelog](./CHANGELOG.md). There is one public release, v1.0, and it ships after findings in real
 projects are confirmed by their maintainers. Until then the tape ABI, the bundle format and the
 command line all change.

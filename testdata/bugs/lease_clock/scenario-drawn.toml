@@ -1,0 +1,13 @@
+# Clock faults drawn from the tape: the seeds that draw a step back reach the defect.
+#
+# Three fires at most, each a step or a drift with its size drawn after it, so a seed reaches the
+# defect when one of its fires is a step back during the lease.
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/lease_clock"]
+
+[faults]
+kill_probability = "1/20"
+draw = ["clock_step", "clock_drift"]
+budget_per_run = 3

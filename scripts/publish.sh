@@ -10,8 +10,10 @@
 # The public history is its own: each publication is one commit naming the private commit it was
 # made from. Without --push the tree is prepared, checked and summarised, and nothing leaves.
 #
-#   scripts/publish.sh                     prepare and check
-#   scripts/publish.sh --push -m "<msg>"   prepare, check, commit and push
+#   scripts/publish.sh                                 prepare and check
+#   scripts/publish.sh --push -m "<msg>"               prepare, check, commit and push to main
+#   scripts/publish.sh --push -m "<msg>" --branch <b>  the same onto branch <b>, cut from main,
+#                                                      for a pull request into main
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,10 +21,12 @@ REMOTE=${BOHR_PUBLIC_REMOTE:-https://github.com/KDaniello/bohr.git}
 CONF=${BOHR_PUBLISH_CONF:-$PWD/findings/publish.conf}
 push=0
 message=""
+branch=""
 while [ $# -gt 0 ]; do
   case $1 in
     --push) push=1 ;;
     -m) message=$2; shift ;;
+    --branch) branch=$2; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -96,8 +100,9 @@ echo "markers checked: $(rules | grep -c '^marker')"
 
 if [ "$push" = 1 ]; then
   git commit -q -m "$message" -m "Published from private $rev."
-  git push -q origin HEAD:main
-  echo "published $(git rev-parse --short HEAD) from private $rev"
+  # A branch is cut from public main, so the pull request it backs carries this publication alone.
+  git push -q origin "HEAD:${branch:-main}"
+  echo "published $(git rev-parse --short HEAD) from private $rev to ${branch:-main}"
 else
   echo "prepared, not pushed: rerun with --push -m \"<message>\""
 fi

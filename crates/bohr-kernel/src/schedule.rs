@@ -34,6 +34,13 @@ pub trait SchedulePolicy {
     /// Identifiers are never reused, so anything a policy remembers about one is dead weight from
     /// here on: a guest that creates threads in a loop would otherwise grow the policy without end.
     fn forget(&mut self, _task: TaskId) {}
+
+    /// An independent copy in the same state, for a run that branches from a checkpoint.
+    ///
+    /// `None` where the policy cannot be copied; a run then cannot branch while it is in use.
+    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
+        None
+    }
 }
 
 /// Uniform choice among runnable tasks.
@@ -52,6 +59,10 @@ impl SchedulePolicy for RandomPolicy {
     ) -> Result<TaskId, KernelError> {
         let index = cursor.draw_index(runnable.len(), DrawSite::SchedPick)?;
         runnable.get(index).copied().ok_or(KernelError::Invariant("scheduler drew out of range"))
+    }
+
+    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
+        Some(Box::new(*self))
     }
 }
 
@@ -165,6 +176,10 @@ impl SchedulePolicy for PctPolicy {
         self.priorities.remove(&task);
     }
 
+    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
+        Some(Box::new(self.clone()))
+    }
+
     fn pick(
         &mut self,
         runnable: &[TaskId],
@@ -189,7 +204,7 @@ impl SchedulePolicy for PctPolicy {
             self.change_points.pop();
             // Demoting the task that would run next is what makes the change a reordering: it hands
             // execution to whoever was second, at exactly this step.
-            if let Some(current) = self.highest(runnable) {
+            if let Some(current) = self.highest(runnable, |_| true) {
                 self.priorities.insert(current, self.next_demotion);
                 self.next_demotion = self.next_demotion.saturating_sub(1);
             }
@@ -198,11 +213,9 @@ impl SchedulePolicy for PctPolicy {
         // Whoever gave up its turn is skipped, but only while somebody else can take it: a task
         // standing aside for an empty room would be standing aside for ever.
         let aside = self.stood_aside.take();
-        let waiting: Vec<TaskId> =
-            runnable.iter().copied().filter(|task| Some(*task) != aside).collect();
-        let among = if waiting.is_empty() { runnable } else { &waiting };
-
-        self.highest(among).ok_or(KernelError::Invariant("scheduler was given no tasks"))
+        self.highest(runnable, |task| Some(task) != aside)
+            .or_else(|| self.highest(runnable, |_| true))
+            .ok_or(KernelError::Invariant("scheduler was given no tasks"))
     }
 }
 
@@ -212,11 +225,103 @@ impl PctPolicy {
     /// A tie is broken without a draw on purpose: two tasks share a priority only when the tape
     /// gave them one, and spending entropy to separate them again would change what a mutation
     /// means.
-    fn highest(&self, runnable: &[TaskId]) -> Option<TaskId> {
+    fn highest(&self, runnable: &[TaskId], eligible: impl Fn(TaskId) -> bool) -> Option<TaskId> {
         runnable
             .iter()
             .copied()
+            .filter(|task| eligible(*task))
             .max_by_key(|task| (self.priorities.get(task).copied().unwrap_or(0), task.get()))
+    }
+}
+
+/// Uniform choice, with starvation bounded: with `n` tasks runnable, none is passed over more than
+/// `bound + n - 1` picks in a row.
+///
+/// PCT runs one task in long stretches, which a liveness oracle would read as a hang the program
+/// does not have. A task passed over `bound` times joins the front of the line and runs without a
+/// draw.
+#[derive(Clone, Debug)]
+pub struct FairPolicy {
+    bound: u32,
+    /// Picks each runnable task has been passed over for since it last ran.
+    passed_over: BTreeMap<TaskId, u32>,
+    /// A task that has just given up its turn, passed over once if anyone else can run.
+    stood_aside: Option<TaskId>,
+    /// The tasks a draw chooses among, kept across picks so a pick does not allocate.
+    candidates: Vec<TaskId>,
+}
+
+impl FairPolicy {
+    /// A policy whose tasks join the front of the line after `bound` picks passed over.
+    #[must_use]
+    pub fn new(bound: u32) -> Self {
+        Self {
+            bound: bound.max(1),
+            passed_over: BTreeMap::new(),
+            stood_aside: None,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+impl Default for FairPolicy {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+impl SchedulePolicy for FairPolicy {
+    fn identity(&self) -> &'static str {
+        "fair"
+    }
+
+    fn pick(
+        &mut self,
+        runnable: &[TaskId],
+        cursor: &mut TapeCursor<'_>,
+    ) -> Result<TaskId, KernelError> {
+        // The most starved task at or past the bound runs without a draw; ties go to the lower
+        // identifier, so the choice is a function of the books alone.
+        let starved = runnable
+            .iter()
+            .copied()
+            .filter(|task| self.passed_over.get(task).is_some_and(|n| *n >= self.bound))
+            .max_by_key(|task| (self.passed_over[task], std::cmp::Reverse(task.get())));
+        let aside = self.stood_aside.take();
+        let chosen = match starved {
+            Some(task) => task,
+            None => {
+                self.candidates.clear();
+                self.candidates.extend(runnable.iter().copied().filter(|t| Some(*t) != aside));
+                if self.candidates.is_empty() {
+                    self.candidates.extend_from_slice(runnable);
+                }
+                let index = cursor.draw_index(self.candidates.len(), DrawSite::SchedPick)?;
+                *self
+                    .candidates
+                    .get(index)
+                    .ok_or(KernelError::Invariant("scheduler drew out of range"))?
+            }
+        };
+        for task in runnable {
+            if *task != chosen {
+                *self.passed_over.entry(*task).or_default() += 1;
+            }
+        }
+        self.passed_over.remove(&chosen);
+        Ok(chosen)
+    }
+
+    fn yielded(&mut self, task: TaskId) {
+        self.stood_aside = Some(task);
+    }
+
+    fn forget(&mut self, task: TaskId) {
+        self.passed_over.remove(&task);
+    }
+
+    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
+        Some(Box::new(self.clone()))
     }
 }
 
@@ -360,6 +465,58 @@ mod tests {
             second < first,
             "the task demoted second sits at {second}, not below the first at {first}"
         );
+    }
+
+    #[test]
+    fn fair_passes_no_task_over_more_than_its_bound() {
+        let tasks: Vec<TaskId> = (0..6).map(TaskId).collect();
+        let tape = Tape::from_seed(Seed(11));
+        let mut cursor = tape.cursor();
+        let mut policy = FairPolicy::new(4);
+        let mut since = [0u32; 6];
+        for _ in 0..2_000 {
+            let picked = policy.pick(&tasks, &mut cursor).expect("pick");
+            for (i, n) in since.iter_mut().enumerate() {
+                *n = if i as u32 == picked.get() { 0 } else { *n + 1 };
+                // bound + n - 1, with a bound of 4 and six tasks
+                assert!(*n <= 9, "task {i} was passed over {n} times in a row");
+            }
+        }
+    }
+
+    #[test]
+    fn fair_reproduces_and_costs_nothing_for_one_task() {
+        let tasks: Vec<TaskId> = (0..3).map(TaskId).collect();
+        let schedule = |seed: u64| {
+            let tape = Tape::from_seed(Seed(seed));
+            let mut cursor = tape.cursor();
+            let mut policy = FairPolicy::default();
+            (0..200).map(|_| policy.pick(&tasks, &mut cursor).unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(schedule(5), schedule(5));
+        assert!((0..16).any(|seed| schedule(5) != schedule(seed)), "the seed chooses the schedule");
+
+        let tape = Tape::from_seed(Seed(1));
+        let mut cursor = tape.cursor();
+        assert_eq!(FairPolicy::default().pick(&[TaskId(9)], &mut cursor).unwrap(), TaskId(9));
+        assert_eq!(cursor.position().get(), 0, "one option is not a decision");
+    }
+
+    #[test]
+    fn a_forked_policy_continues_where_its_original_is() {
+        let tasks: Vec<TaskId> = (0..4).map(TaskId).collect();
+        let tape = Tape::from_seed(Seed(3));
+        let mut cursor = tape.cursor();
+        let mut original = PctPolicy::new(3, 50);
+        for _ in 0..20 {
+            original.pick(&tasks, &mut cursor).unwrap();
+        }
+        let mut fork = original.fork().expect("PCT can be copied");
+        let mut a = tape.cursor();
+        let mut b = tape.cursor();
+        let next_a: Vec<_> = (0..30).map(|_| original.pick(&tasks, &mut a).unwrap()).collect();
+        let next_b: Vec<_> = (0..30).map(|_| fork.pick(&tasks, &mut b).unwrap()).collect();
+        assert_eq!(next_a, next_b);
     }
 
     #[test]

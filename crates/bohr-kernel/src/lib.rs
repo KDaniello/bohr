@@ -20,11 +20,11 @@ mod schedule;
 
 pub use clock::{Clock, MAX_DRIFT_PPM, NodeClock};
 pub use ports::{
-    Diagnostic, DueEffects, Effects, EventSink, FaultCatalog, NodeOp, Oracle, RunOutcome,
-    TaskState, Verdict, Wake, WorldCtx, WorldModel,
+    Diagnostic, DueEffects, Effects, EventSink, FaultCatalog, NodeOp, Observer, Oracle, Progress,
+    RunOutcome, TaskState, Verdict, Wake, WorldCtx, WorldModel,
 };
-pub use run::{RunConfig, RunInputs, RunReport, run};
-pub use schedule::{PctPolicy, RandomPolicy, SchedulePolicy};
+pub use run::{PROGRESS_EVERY, RunConfig, RunInputs, RunMetrics, RunReport, run};
+pub use schedule::{FairPolicy, PctPolicy, RandomPolicy, SchedulePolicy};
 
 /// Failures that originate in the kernel.
 #[derive(Debug, thiserror::Error)]
@@ -54,8 +54,24 @@ pub enum KernelError {
     },
 
     /// `BOHR-5001` — the loop reached a state it does not define behaviour for.
+    ///
+    /// Raised by the kernel and by worlds alike; [`crate::run`] hands it back as
+    /// [`Self::InvariantAt`], with where in the run it happened.
     #[error("BOHR-5001: kernel invariant violated: {0}")]
     Invariant(&'static str),
+
+    /// `BOHR-5001` — as [`Self::Invariant`], with the event, tick and task it happened at.
+    #[error("BOHR-5001: kernel invariant violated: {what} (event {event}, tick {tick}, {task})")]
+    InvariantAt {
+        /// What was violated.
+        what: &'static str,
+        /// The next event the run would have recorded.
+        event: u64,
+        /// The world clock.
+        tick: u64,
+        /// The task being handled, or the one that last ran.
+        task: String,
+    },
 }
 
 /// Why a run stopped short of the guest finishing.

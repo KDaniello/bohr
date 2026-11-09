@@ -341,6 +341,7 @@ impl DeterminismBackend for PtraceBackend {
             progress_unit: ProgressUnit::Syscalls,
             hands_over_to_debugger: true,
             max_tasks: 4096,
+            checkpoints: false,
         }
     }
 
@@ -828,11 +829,15 @@ impl DeterminismBackend for PtraceBackend {
 /// where to attach will find that out by running `continue` and reading nonsense.
 fn limits() -> Vec<String> {
     vec![
-        "the guest cannot be continued: every syscall it attempts returns as though the call did          not exist, because the filter it was started under expects a supervisor that is no          longer there"
+        "the guest cannot be continued: every syscall it attempts returns as though the call did \
+         not exist, because the filter it was started under expects a supervisor that is no \
+         longer there"
             .to_owned(),
-        "reading the clock faults, and so does asking the processor to identify itself: both were          set to trap and stay that way after the hand-over"
+        "reading the clock faults, and so does asking the processor to identify itself: both were \
+         set to trap and stay that way after the hand-over"
             .to_owned(),
-        "the world it was running in — its files, its sockets, its peers — was this process's          bookkeeping and is gone; a debugger sees a process with almost no operating system state"
+        "the world it was running in — its files, its sockets, its peers — was this process's \
+         bookkeeping and is gone; a debugger sees a process with almost no operating system state"
             .to_owned(),
         "determinism ends here: nothing done from now on belongs to the run that was reproduced"
             .to_owned(),

@@ -84,6 +84,7 @@ fn answers(paths: &[&str], ops: Vec<GuestOp>) -> Result<Vec<(u32, i64)>, KernelE
         policy: &mut policy,
         oracle: &mut oracle,
         sink: &mut sink,
+        observer: None,
         specs: std::slice::from_ref(&GuestSpec::default()),
         config: RunConfig::default(),
     })?;

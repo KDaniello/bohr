@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bohr_backend::{Resume, Stop, StopKind};
 use bohr_kernel::{
-    DueEffects, Effects, FaultCatalog, KernelError, NodeOp, TaskState, Wake, WorldCtx, WorldModel,
+    DueEffects, Effects, FaultCatalog, KernelError, MAX_DRIFT_PPM, NodeOp, TaskState, Wake,
+    WorldCtx, WorldModel,
 };
 use bohr_tape::DrawSite;
 use bohr_trace::{DiskOpKind, Endpoint, EventKind, FaultKind, FaultTarget, NodeState};
@@ -34,6 +35,7 @@ pub use watch::{DurabilityConfig, LivenessConfig};
 use crate::{
     minimal::{MinimalWorld, SYSCALL_COST, TIMER_ABSTIME, futex_op},
     nums::{errno, sys},
+    ring,
 };
 
 /// How a drawn node fault picks the moment it fires.
@@ -115,6 +117,10 @@ pub struct DrawnFaults {
     /// depends on what it drew first is a site a mutation cannot edit without moving everything
     /// after it. A scenario wanting deeper writes the tick down.
     pub recover_from_snapshot: bool,
+    /// Step a node's wall clock by a drawn amount, within a minute either way.
+    pub clock_step: bool,
+    /// Set a node's clock drifting at a drawn rate, within ±[`MAX_DRIFT_PPM`].
+    pub clock_drift: bool,
 }
 
 impl Default for DrawnFaults {
@@ -127,6 +133,8 @@ impl Default for DrawnFaults {
             isolate: false,
             degrade: false,
             recover_from_snapshot: false,
+            clock_step: false,
+            clock_drift: false,
         }
     }
 }
@@ -149,6 +157,14 @@ impl DrawnFaults {
         }
         if self.degrade {
             kinds.push(NodeFaultKind::Degrade);
+        }
+        // Carried with a size of nought; the size is drawn once the kind has been, so a scenario
+        // that does not draw clocks never pays for one.
+        if self.clock_step {
+            kinds.push(NodeFaultKind::ClockStep { by_ticks: 0 });
+        }
+        if self.clock_drift {
+            kinds.push(NodeFaultKind::ClockDrift { ppm: 0 });
         }
         kinds
     }
@@ -296,7 +312,23 @@ pub enum NodeFaultKind {
         /// The nodes rewound, in order. Empty means every node the cluster has.
         nodes: Vec<NodeId>,
     },
+    /// Step a node's wall clock by `by_ticks`, back where negative, as `settimeofday` does. Its
+    /// monotonic clock never moves.
+    ClockStep {
+        /// How far the wall clock moves, in ticks.
+        by_ticks: i64,
+    },
+    /// Make a node's clock run `ppm` parts per million fast from now on, slow where negative.
+    /// Readings before the change stay what they were.
+    ClockDrift {
+        /// The new rate, within ±[`MAX_DRIFT_PPM`].
+        ppm: i32,
+    },
 }
+
+/// The furthest a drawn clock step moves a wall clock, either way: a minute, which covers both a
+/// correction an NTP daemon applies and a lease or timeout a guest measures in seconds.
+const MAX_DRAWN_CLOCK_STEP: u64 = 60 * Tick::SECOND.get();
 
 /// Socket-family syscall numbers, kept here because only this model answers them.
 mod socket_sys {
@@ -545,6 +577,9 @@ fn node_shell(template: &NodeTemplate) -> MinimalWorld {
     if template.keep_output {
         world = world.keeping_output();
     }
+    if template.io_uring {
+        world = world.with_io_uring();
+    }
     // Every node of a cluster has its waits timed out from here, so a wait carrying a timeout is
     // one this world may park rather than one it must refuse.
     world.with_timeouts_armed()
@@ -579,6 +614,8 @@ struct NodeTemplate {
     keep_output: bool,
     /// The path a guest is told to write records to, which every node needs somewhere to put.
     sdk_path: Option<String>,
+    /// Whether every node is shown a kernel with `io_uring`.
+    io_uring: bool,
     /// The program each node runs, in node order, for the calls that ask a node where it is.
     ///
     /// Per node rather than one for the cluster: a differential scenario runs a different
@@ -642,6 +679,8 @@ impl DistributedWorld {
                 FaultKind::NodeThaw,
                 FaultKind::NodeRestart,
                 FaultKind::ChainReorg,
+                FaultKind::ClockStep,
+                FaultKind::ClockDrift,
             ]),
         }
     }
@@ -792,6 +831,13 @@ impl DistributedWorld {
     #[must_use]
     pub fn surveying(mut self) -> Self {
         self.template.surveying = true;
+        self
+    }
+
+    /// The same cluster, every node shown a kernel with `io_uring` (`[linux] io_uring = "ring"`).
+    #[must_use]
+    pub fn with_io_uring(mut self) -> Self {
+        self.template.io_uring = true;
         self
     }
 
@@ -1248,6 +1294,22 @@ impl DistributedWorld {
             }
             return Ok(None);
         }
+
+        // A clock fault's size is drawn here, after its kind, and the fault then goes through the
+        // list a scenario writes its own faults in, like a freeze.
+        let kind = match kind {
+            NodeFaultKind::ClockStep { .. } => {
+                let span = MAX_DRAWN_CLOCK_STEP.saturating_mul(2).saturating_add(1);
+                let drawn = ctx.draw_range(span, DrawSite::ClockSkew)?;
+                NodeFaultKind::ClockStep { by_ticks: drawn as i64 - MAX_DRAWN_CLOCK_STEP as i64 }
+            }
+            NodeFaultKind::ClockDrift { .. } => {
+                let span = u64::from(MAX_DRIFT_PPM) * 2 + 1;
+                let drawn = ctx.draw_range(span, DrawSite::ClockSkew)?;
+                NodeFaultKind::ClockDrift { ppm: drawn as i32 - MAX_DRIFT_PPM as i32 }
+            }
+            other => other,
+        };
 
         // A freeze goes through the list a scenario writes its own faults in, so a drawn lifecycle
         // event and a written one are the same code and cannot drift apart — which is what the
@@ -1781,7 +1843,9 @@ impl DistributedWorld {
         let absolute = nr == sys::CLOCK_NANOSLEEP && args[1] & TIMER_ABSTIME != 0;
         let value = MinimalWorld::read_timespec(ctx, GuestAddr(request))?;
         let ahead = if absolute {
-            value.saturating_sub(MinimalWorld::presented_now(ctx).get())
+            value.saturating_sub(
+                MinimalWorld::deadline_clock(ctx, MinimalWorld::reads_wall(args[0])).get(),
+            )
         } else {
             value
         };
@@ -1990,6 +2054,30 @@ impl WorldModel for DistributedWorld {
                             )?;
                             effects.node_ops.push(NodeOp::Freeze(fault.node));
                         }
+                        NodeFaultKind::ClockStep { by_ticks } => {
+                            ctx.emit_for(
+                                fault.node,
+                                TaskId::ZERO,
+                                EventKind::FaultFired {
+                                    fault: FaultKind::ClockStep,
+                                    target: FaultTarget::Node(fault.node),
+                                },
+                            )?;
+                            let clock = ctx.node_clock(fault.node).unwrap_or_default();
+                            ctx.set_node_clock(fault.node, clock.stepped(by_ticks));
+                        }
+                        NodeFaultKind::ClockDrift { ppm } => {
+                            ctx.emit_for(
+                                fault.node,
+                                TaskId::ZERO,
+                                EventKind::FaultFired {
+                                    fault: FaultKind::ClockDrift,
+                                    target: FaultTarget::Node(fault.node),
+                                },
+                            )?;
+                            let clock = ctx.node_clock(fault.node).unwrap_or_default();
+                            ctx.set_node_clock(fault.node, clock.rebased(ctx.world_now(), ppm));
+                        }
                         NodeFaultKind::Thaw => {
                             ctx.emit_for(
                                 fault.node,
@@ -2149,6 +2237,72 @@ impl DistributedWorld {
             if let Some(killed) = self.maybe_kill(node, ctx)? {
                 return Ok(killed);
             }
+            if nr == sys::IO_URING_ENTER && self.node_world(node).holds_ring(args[0] as i64) {
+                return self.enter_ring(node, stop, args, ctx);
+            }
+        }
+        self.route(node, stop, ctx)
+    }
+
+    /// Answers `io_uring_enter` on a node: each entry by the route its plain call takes.
+    ///
+    /// **The route is the point.** A write submitted through a ring goes through [`Self::route`]
+    /// exactly as `pwrite64` does, so the disk marks it, a crash can lose it, and a sync through
+    /// the ring is the same draw a plain `fsync` is. The kill is drawn once, for the call the guest
+    /// made, and not again for each entry it carried.
+    fn enter_ring(
+        &mut self,
+        node: NodeId,
+        stop: &Stop,
+        args: [u64; 6],
+        ctx: &mut WorldCtx<'_, '_>,
+    ) -> Result<Effects, KernelError> {
+        let ret = match self.node_world(node).take_submissions(ctx, args)? {
+            Err(errno) => -errno,
+            Ok(taken) => {
+                let done = ring::carry_all(&taken.submissions, |asked| {
+                    if ring::acts_on_descriptor(asked) && !self.node_world(node).is_file(asked.fd) {
+                        return Err(crate::minimal::refuse_submission(
+                            ctx,
+                            "an operation on a descriptor that is not a file",
+                        ));
+                    }
+                    match ring::plain_call(asked) {
+                        Err(what) => Err(crate::minimal::refuse_submission(ctx, &what)),
+                        Ok(ring::Plain::Nothing) => Ok(0),
+                        Ok(ring::Plain::Call(nr, call)) => {
+                            let plain = Stop {
+                                task: stop.task,
+                                kind: StopKind::SyscallEntry { nr, args: call },
+                            };
+                            let effects = self.route(node, &plain, ctx)?;
+                            self.audit_answer(&plain, &effects, ctx)?;
+                            crate::minimal::submission_answer(ctx, &effects)
+                        }
+                    }
+                })?;
+                self.node_world(node).post_completions(ctx, taken.fd, &done)?;
+                taken.submissions.len() as i64
+            }
+        };
+        ctx.emit(EventKind::Syscall {
+            nr: sys::IO_URING_ENTER,
+            args,
+            ret,
+            emulated: true,
+            data_digest: None,
+        })?;
+        Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST))
+    }
+
+    /// Answers a stop by what it asks for, once the kill has been drawn.
+    fn route(
+        &mut self,
+        node: NodeId,
+        stop: &Stop,
+        ctx: &mut WorldCtx<'_, '_>,
+    ) -> Result<Effects, KernelError> {
+        if let StopKind::SyscallEntry { nr, args } = stop.kind {
             if nr == sys::NANOSLEEP || nr == sys::CLOCK_NANOSLEEP {
                 return self.sleep(node, nr, args, ctx);
             }
@@ -2362,9 +2516,11 @@ impl DistributedWorld {
                 && args[3] != 0;
             if timed_wait {
                 let value = MinimalWorld::read_timespec(ctx, GuestAddr(args[3]))?;
-                // WAIT carries a duration, WAIT_BITSET an absolute deadline on the node's clock.
+                // WAIT carries a duration, WAIT_BITSET an absolute deadline on the node's clock,
+                // its wall clock where the operation carries `FUTEX_CLOCK_REALTIME`.
+                let wall = args[1] as u32 & futex_op::CLOCK_REALTIME != 0;
                 let ahead = if base == futex_op::WAIT_BITSET {
-                    value.saturating_sub(MinimalWorld::presented_now(ctx).get())
+                    value.saturating_sub(MinimalWorld::deadline_clock(ctx, wall).get())
                 } else {
                     value
                 };

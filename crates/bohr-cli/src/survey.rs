@@ -12,7 +12,6 @@
 //! There is no flag on `bohr run` that does this, and there must never be — the moment there is,
 //! somebody's continuous integration has it switched on.
 
-use bohr_kernel::RunConfig;
 use bohr_tape::Tape;
 use bohr_trace::Outcome;
 use bohr_types::Seed;
@@ -26,22 +25,34 @@ pub(crate) fn run(
     seed: u64,
     config_path: Option<&str>,
     max_events: Option<u64>,
+    patch_cpuid: bool,
 ) -> Result<u8, CliError> {
     let config_toml = match config_path {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?,
         None => String::new(),
     };
-    let loaded = match config_path {
+    let mut loaded = match config_path {
         Some(_) => Some(bohr_world::config::load(&config_toml)?),
         None => None,
     };
+    // The libraries a dynamic target loads ask the processor too, so they are trapped as its own
+    // binary is: a survey of a program prepared differently from its run surveys another program.
+    if patch_cpuid
+        && let Some(scenario) = loaded.as_mut()
+        && let Some(state) = scenario.state.take()
+    {
+        let (patched, rewritten) = state.with_processor_questions_trapped();
+        for (path, sites) in &rewritten {
+            eprintln!("trapped {sites} processor question(s) in {path}");
+        }
+        scenario.state = Some(patched);
+    }
 
     let tape = Tape::from_seed(Seed(seed));
-    let mut run_config = RunConfig::default();
-    if let Some(budget) = max_events {
-        run_config.max_events = budget;
-    }
+    // The scenario's horizon and its node to end with reach a survey as they reach a run: a survey
+    // that ignored them ran a different, longer program than the one it was asked about.
+    let run_config = crate::run_config_for(loaded.as_ref(), max_events);
 
     let target = target_for(program, loaded.as_ref())?;
     let completed = execute::survey_with(execute::Execution {

@@ -139,6 +139,8 @@ fn a_campaign_draws_the_kinds_it_was_given() {
         isolate: false,
         degrade: false,
         recover_from_snapshot: true,
+        clock_step: false,
+        clock_drift: false,
     };
     let seen: BTreeSet<String> =
         (1..=8).flat_map(|seed| kinds_fired(&run(everything, seed))).collect();
@@ -162,6 +164,20 @@ fn a_scenario_that_asked_for_one_kind_gets_one_kind() {
     }
 }
 
+/// The clock kinds are drawn like the lifecycle ones, each with its size drawn after it.
+#[test]
+fn a_campaign_draws_clock_faults() {
+    let clocks = only(|kinds| {
+        kinds.clock_step = true;
+        kinds.clock_drift = true;
+    });
+    let seen: BTreeSet<String> = (1..=8).flat_map(|seed| kinds_fired(&run(clocks, seed))).collect();
+    for wanted in [FaultKind::ClockStep, FaultKind::ClockDrift] {
+        let name = format!("{wanted:?}");
+        assert!(seen.contains(&name), "{name} never fired; eight seeds saw {seen:?}");
+    }
+}
+
 /// One kind of link fault and nothing else.
 fn only(kind: fn(&mut DrawnFaults)) -> DrawnFaults {
     let mut kinds = DrawnFaults {
@@ -170,6 +186,8 @@ fn only(kind: fn(&mut DrawnFaults)) -> DrawnFaults {
         isolate: false,
         degrade: false,
         recover_from_snapshot: false,
+        clock_step: false,
+        clock_drift: false,
     };
     kind(&mut kinds);
     kinds
