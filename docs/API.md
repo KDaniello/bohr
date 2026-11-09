@@ -1349,6 +1349,79 @@ alongside a comparison and why a comparison that did not happen exits non-zero.
 | they differed | 1 | `implementations_disagreed`, naming the projections |
 | nothing was compared | 3 | `BOHR-5004`; never 0, or a campaign reports clean runs having checked nothing |
 
+### 5.9 Asking a node what it did: probes and the chain oracles
+
+A blockchain client that is wrong does not crash and does not say so: it finalises a block and later
+reports another at the same height, signs two blocks for one slot, or keeps running and stops
+making progress. What it does offer is its own API, and the judgement is made from that. A *probe*
+is not a hook into the client but a guest the world starts as one more node, after the last one the
+scenario numbers, which calls the nodes' JSON-RPC over the virtual network on a schedule drawn
+from the tape and writes what came back as SDK records (`bohr_probe` events, §6.3). The world reads
+those records from the probe's node and no other, compares the answers, and raises a code when a
+property breaks; an oracle reads the code. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) §5.17.
+
+```toml
+[chain]
+oracles = ["finality", "agreement", "liveness", "double-sign"]
+every_ticks = 100_000_000        # how often each node is asked; each round moves by up to a quarter
+stall_ticks = 1_000_000_000      # liveness: how long a finalised height may stay once the cluster is whole
+votes_rpc = "chain_votes"        # double-sign: the method listing signed votes as signer, height, hash
+nodes = [0, 1, 2]                # optional; every node by default
+port = 8545                      # optional; Ethereum's by default
+
+[[probe]]                        # the same mechanism, written by hand
+name = "head"                    # optional; what findings call it
+node = 0                         # or nodes = [...]; every node by default
+rpc = "eth_blockNumber"
+params = []                      # strings, integers, booleans, arrays and tables
+every_ticks = 50_000_000
+value = "."                      # a field of the result, dotted for nesting; "." is the result itself
+key = []                         # fields naming what a value belongs to; none for a single value
+property = "monotonic"           # never-reverts | monotonic | agrees | advances | unique
+# within_ticks = 1_000_000_000   # advances only, and required there: the span a value may stay
+```
+
+Each chain oracle is a probe written out in advance, so there is one judging path:
+
+| Oracle | Asks | Key → value | Property | Code |
+|---|---|---|---|---|
+| `finality` | `eth_getBlockByNumber("finalized", false)` | `number` → `hash` | `never-reverts`: on one node, a value at a key never changes once seen | `BOHR-2040` |
+| `agreement` | the same | `number` → `hash` | `agrees`: two nodes never answer differently for one key | `BOHR-2041` |
+| `liveness` | the same | → `number` | `advances`: the value changes within `stall_ticks`, timed from when the cluster was last whole | `BOHR-2042` |
+| `double-sign` | `votes_rpc` | `signer`, `height` → `hash` | `unique`: one key carries one value, on any node at any time | `BOHR-2043` |
+| — | any `[[probe]]` | as written | `monotonic`: on one node, a number at a key never goes down | `BOHR-2044` |
+
+**The probe's node is outside the fault model.** It is never killed, never cut off by a partition or
+a drawn isolation, never counted as silent by `[liveness]`, and it reaches every node whatever the
+topology: an instrument the run could break would report its own breakage as the cluster's. A node
+isolated from its peers still answers the probe, which is how a minority's fork is seen while it
+happens. `advances` judges only while nothing is down and nothing is cut, from the latest of the
+value's last change, the node's first answer since it last came up and the moment the cluster last
+became whole: a node that stops answering does not advance, and a node still booting is not judged.
+A value the world itself took back — a `chain_reorg`, a restart from an older snapshot — is
+forgotten rather than held against the node. An answer missing a key field is no observation.
+
+**The probe is found, not written.** It is a static executable — a world holds no dynamic loader —
+named by `BOHR_PROBE`, or beside `bohr`, or where `make probe` builds it,
+`target/x86_64-unknown-linux-gnu/release/bohr-probe`; a dynamic one is passed over, and a scenario
+with probes and no probe is refused (`BOHR-1002`). Inside the run it is always `/bohr/probe`, so a
+bundle replays wherever the file is kept. Requests to one node go as one JSON-RPC batch a round; the
+reply to a round is read in the next, without waiting, so a node that is slow, down or frozen costs
+only its own answers. A probe holds at most 65,536 keys and says so once (`BOHR-2045`) rather than
+growing.
+
+What the probes do not do:
+
+- **Read a client's protocol from its memory, its disk or its wire.** What a node did is asked of
+  its API. A client that exposes no signed votes cannot be judged for double-signing here; reading
+  consensus messages off the network is a probe configuration per client, and none is built in.
+- **Compare what the probe did not see.** Each node is asked for its finalised *tip*, so two nodes
+  are compared at the heights both happened to be at when asked, and a revert between two askings
+  that is undone before the next is not seen. The schedule is drawn, so another seed asks at
+  other moments.
+- **Judge a value it could not parse.** Results are JSON with integer numbers; a reply with a float
+  or a body over 1 MiB is an unanswered request, not a finding.
+
 ---
 
 ## 6. SDK
@@ -1686,7 +1759,7 @@ blake3 = "…"                               # the binary's digest
 scenario = "targets/reth/scenario.toml"
 
 [judge]
-oracle = "crash"                           # crash | durability | liveness | property
+oracle = "crash"                           # crash | durability | liveness | property | chain
 
 [bench]                                    # optional: a workload timed against native
 argv = ["…"]
@@ -1841,6 +1914,12 @@ to do.
 | `BOHR-2021` | gap in the SDK record sequence — records escaped interception |
 | `BOHR-2030` | a healed cluster committed nothing for the span `[liveness]` named (§5.6) |
 | `BOHR-2031` | a node answered with writes that were not durable and came back without them (§5.6) |
+| `BOHR-2040` | a probe saw a value at a key change on one node after it was seen; `finality` (§5.9) |
+| `BOHR-2041` | a probe saw two nodes answer differently for one key; `agreement` (§5.9) |
+| `BOHR-2042` | a probe saw a value stay put for its span while the cluster was whole; `liveness` (§5.9) |
+| `BOHR-2043` | a probe saw one key carry two values anywhere; `double-sign` (§5.9) |
+| `BOHR-2044` | a probe saw a number go down on one node; `monotonic` (§5.9) |
+| `BOHR-2045` | a probe holds 65,536 keys and compares no new ones (§5.9) |
 | `BOHR-3001` | `ptrace` denied; `kernel.yama.ptrace_scope` |
 | `BOHR-3006` | the backend cannot hand a guest to a debugger |
 | `BOHR-3002` | unprivileged user namespaces disabled |

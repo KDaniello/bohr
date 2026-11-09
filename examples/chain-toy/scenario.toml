@@ -1,0 +1,37 @@
+# The chain, correct, under every blockchain oracle: the runs that must report nothing.
+#
+# Faults are drawn, never placed: a node dies or is cut off at a moment the tape chooses, and comes
+# back after a while. The same faults are what each defect flag needs to show, so the scenarios
+# that judge the flags differ from this one by the flag and the oracle and nothing else.
+
+[cluster]
+nodes = 3
+argv = ["examples/chain-toy/build/chain-toy-node", "{node}"]
+
+[run]
+horizon_ticks = 4_000_000_000        # 4 s
+
+[network]
+topology = "full"
+latency_mean_ticks = 2_000_000       # 2 ms
+latency_jitter_ticks = 1_000_000
+drop_probability = "1/200"
+
+[disk]
+sync_semantics = "strict"
+
+[faults]
+kill_probability = "1/200"
+targeting = "uniform"
+draw = ["node_kill", "node_isolate"]
+# Long enough for the others to notice, short enough that the run sees the node come back.
+restart_after_ticks = 400_000_000    # 400 ms
+# After the chain has some height to lose.
+arm_after_ticks = 1_000_000_000      # 1 s
+budget_per_run = 3
+
+[chain]
+oracles = ["finality", "agreement", "liveness", "double-sign"]
+every_ticks = 100_000_000            # 100 ms, about a block and a half
+stall_ticks = 1_000_000_000          # 1 s
+votes_rpc = "chain_votes"

@@ -16,7 +16,9 @@
 use std::collections::BTreeSet;
 
 use bohr_kernel::StopReason;
-use bohr_trace::{DURABILITY_CODE, Event, EventKind, ExitStatus, LIVENESS_CODE, Outcome};
+use bohr_trace::{
+    DURABILITY_CODE, Event, EventKind, ExitStatus, LIVENESS_CODE, Outcome, PROBE_CODES,
+};
 use bohr_types::NodeId;
 
 /// The kind of thing that went wrong, with its message discarded.
@@ -32,6 +34,8 @@ pub enum Class {
     LivenessViolated,
     /// A node answered while what it had written was not durable, and came back without it.
     DurabilityViolated,
+    /// A probe's answers broke the property it watched.
+    ProbeViolated,
     /// The guest asked for something the tool does not model.
     UnsupportedSyscall,
     /// Two implementations of one specification disagreed.
@@ -84,6 +88,11 @@ enum Signature {
     /// forward, so every candidate's window opens somewhere else, and a signature carrying the
     /// tick would match nothing after the first successful move.
     Silent(BTreeSet<NodeId>),
+    /// The properties a probe saw broken, by code, and the node each was seen on.
+    ///
+    /// Never the key or the values: a smaller scenario finalises other blocks, so a signature
+    /// carrying a height or a hash would match nothing after the first move that worked.
+    Probed(BTreeSet<(String, NodeId)>),
     /// The call this build does not model, by name.
     ///
     /// Named rather than left as the class alone: two runs that stop at two different unmodelled
@@ -106,6 +115,7 @@ impl Signature {
             Self::Exits(held) | Self::Lost(held) => held.is_empty(),
             Self::Disagreement(held) => held.is_empty(),
             Self::Silent(held) => held.is_empty(),
+            Self::Probed(held) => held.is_empty(),
             Self::Refused(name) => name.is_empty(),
             Self::NoProgress(_) | Self::ClassAlone => false,
         }
@@ -138,6 +148,7 @@ impl Violation {
             Outcome::GuestHung(_) => Class::GuestHung,
             Outcome::LivenessViolated(_) => Class::LivenessViolated,
             Outcome::DurabilityViolated(_) => Class::DurabilityViolated,
+            Outcome::ProbeViolated(_) => Class::ProbeViolated,
             Outcome::UnsupportedSyscall(_) => Class::UnsupportedSyscall,
             Outcome::ImplementationsDisagreed(_) => Class::ImplementationsDisagreed,
             Outcome::InternalError(_) => Class::InternalError,
@@ -149,6 +160,7 @@ impl Violation {
             Class::GuestHung => Signature::NoProgress(stop_reason),
             Class::LivenessViolated => Signature::Silent(silent_nodes(events)),
             Class::DurabilityViolated => Signature::Lost(lost_writes(events)),
+            Class::ProbeViolated => Signature::Probed(probed_codes(events)),
             // Read from the outcome's own words rather than from the timeline, because a
             // disagreement is not something that happened at an event: it is what several event
             // streams came to when they were compared, and no one of them carries it.
@@ -209,6 +221,7 @@ impl Violation {
             (Signature::Exits(mine), Signature::Exits(theirs)) => mine.is_subset(theirs),
             (Signature::NoProgress(mine), Signature::NoProgress(theirs)) => mine == theirs,
             (Signature::Silent(mine), Signature::Silent(theirs)) => mine.is_subset(theirs),
+            (Signature::Probed(mine), Signature::Probed(theirs)) => mine.is_subset(theirs),
             (Signature::Lost(mine), Signature::Lost(theirs)) => mine.is_subset(theirs),
             (Signature::Disagreement(mine), Signature::Disagreement(theirs)) => {
                 mine.is_subset(theirs)
@@ -268,6 +281,19 @@ fn silent_nodes(events: &[Event]) -> BTreeSet<NodeId> {
         .iter()
         .filter_map(|event| match &event.kind {
             EventKind::Diagnostic { code, .. } if code == LIVENESS_CODE => Some(event.node),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The properties a probe saw broken, by code and node.
+fn probed_codes(events: &[Event]) -> BTreeSet<(String, NodeId)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Diagnostic { code, .. } if PROBE_CODES.contains(&code.as_str()) => {
+                Some((code.clone(), event.node))
+            }
             _ => None,
         })
         .collect()

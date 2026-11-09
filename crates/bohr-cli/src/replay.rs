@@ -198,6 +198,15 @@ fn verify_binaries(bundle: &Bundle, dir: Option<&str>) -> Result<(), CliError> {
         if record.path.starts_with("builtin:") {
             continue;
         }
+        // The probe is found on this host the way a run finds it, and checked against the build
+        // the bundle was judged by.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let path = if record.role == "probe" {
+            crate::probe::program()?
+        } else {
+            relocated(&record.path, dir)
+        };
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let path = relocated(&record.path, dir);
         let bytes = std::fs::read(&path).map_err(|e| {
             CliError::Usage(format!("BOHR-4004: cannot read {path} to check it: {e}"))
@@ -273,7 +282,7 @@ fn program_target(
     // reported BOHR-2011 against the tool that wrote it.
     let mut argv = vec![relocated(&first.path, binaries)];
     argv.extend(first.args.iter().cloned());
-    Ok(execute::Target::Program(crate::specs_for(argv, loaded, None)))
+    Ok(execute::Target::Program(crate::specs_for(argv, loaded, None)?))
 }
 
 /// The same, where nothing can trace a program.

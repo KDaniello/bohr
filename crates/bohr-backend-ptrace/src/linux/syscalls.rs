@@ -139,6 +139,8 @@ pub(crate) const TABLE: &[Entry] = &[
     trace(187, "readahead"),
     trace(140, "getpriority"),
     trace(141, "setpriority"),
+    trace(142, "sched_setparam"),
+    trace(144, "sched_setscheduler"),
     trace(84, "rmdir"),
     trace(32, "dup"),
     trace(33, "dup2"),

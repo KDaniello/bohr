@@ -1,16 +1,29 @@
-# reth as a development chain that mines a block a second, killed where it stands and started again.
+# reth as a development chain that mines two blocks a second, killed where it stands and started
+# again.
 #
-# What is judged is what every run already judges: a node that comes back must come back. A crash
-# that leaves it unable to start, or a restart that dies, is a finding; one whose blocks merely go
-# missing is the chain's business and a block-level oracle's, which this scenario has not.
+# Two things are judged. A node that comes back must come back: a crash that leaves it unable to
+# start, or a restart that dies, is a finding. And what it calls finalised stays finalised: the probe
+# asks its JSON-RPC for the finalised block, and a hash at a height that changes is a finding. The
+# development chain finalises two blocks behind its head rather than its default sixty-four, so a
+# short run has finalised blocks to ask about at all.
+#
+# The database is held under the world's 64 MiB a file: at reth's own geometry its first table
+# grows the data file past it, the world answers EFBIG, and reth shuts down ten seconds in with
+# status zero — a run that judged nothing and reported clean.
+#
+# Fourteen seconds, because reth spends the first ten starting and then polls without pause: past
+# its start it makes about 1.7 million calls a virtual second, and a longer horizon runs into the
+# event budget before it reaches its end.
 
 [run]
-horizon_ticks = 30_000_000_000    # thirty seconds of virtual time
+horizon_ticks = 14_000_000_000    # fourteen seconds of virtual time
 
 [cluster]
 nodes = 1
-argv = ["targets/reth/build/reth", "node", "--dev", "--dev.block-time", "1s",
-        "--datadir", "/data", "--disable-discovery", "--ipcdisable"]
+argv = ["targets/reth/build/reth", "node", "--dev", "--dev.block-time", "500ms",
+        "--dev.finality-depth", "2", "--datadir", "/data", "--disable-discovery", "--ipcdisable",
+        "--db.max-size", "48MB", "--db.growth-step", "1MB",
+        "--http", "--http.addr", "0.0.0.0", "--http.port", "8545", "--http.api", "eth"]
 
 [cluster.env]
 HOME = "/root"
@@ -25,3 +38,9 @@ sync_semantics = "strict"
 kill_probability = "1/2000"
 restart_after_ticks = 500_000_000
 budget_per_run = 3
+
+# One node cannot disagree with itself, so agreement here is the same question asked of every node a
+# larger cluster of this pack would have; finality is the one with something to say.
+[chain]
+oracles = ["finality", "agreement"]
+every_ticks = 250_000_000         # twice a block

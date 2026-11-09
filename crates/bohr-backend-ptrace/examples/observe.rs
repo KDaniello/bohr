@@ -33,7 +33,7 @@ mod linux {
             caps.name, caps.traps_cpuid, caps.traps_rdtsc
         );
 
-        let spec = GuestSpec { argv, env: Vec::new() };
+        let spec = GuestSpec { argv, env: Vec::new(), executable: None };
         let task = match backend.spawn(NodeId::ZERO, &spec) {
             Ok(t) => t,
             Err(e) => {

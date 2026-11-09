@@ -6,6 +6,113 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.4.0 — blockchain oracles
+
+A blockchain client that is wrong does not crash: it finalises a block and later reports another at
+the same height, signs two blocks for one slot, or keeps running and stops making progress. v0.4
+judges those from the client's own JSON-RPC, without changing a line of it. It is not published.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.4.0` |
+| `tape_abi` | `1` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every stored bundle replays to its digest. Figures are under `[v0_4.*]` in
+[`benches/baseline.toml`](./benches/baseline.toml). `make pr`, `make gate` (13 of 13) and the
+mutation harness (13 of 13) are green on Ubuntu 24.04; the four performance gates of this version
+fail as written, and are listed below with what they measured.
+
+### Asking the node
+
+- **The probe** is a guest, not a hook: a static binary (`make probe`) the world starts as one more
+  node, which calls the nodes' JSON-RPC over the virtual network on a schedule drawn from the tape
+  and writes the answers as SDK records. One JSON-RPC batch per node a round; the reply is read the
+  next round, so a node that is slow, down or frozen costs only its own answers. Inside a run it is
+  `/bohr/probe`, its build is fingerprinted in the bundle, and a replay finds it on its own host.
+- **`[chain] oracles = [...]`**: `finality` (a finalised hash at a height that changes,
+  `BOHR-2040`), `agreement` (two nodes with two hashes at one height, `BOHR-2041`), `liveness` (a
+  finalised height that stays put once the cluster is whole, `BOHR-2042`), `double-sign` (two
+  signed votes from one key at one height, `BOHR-2043`). Each is a probe written out in advance.
+- **`[[probe]]`** for anything else a node answers: `never-reverts`, `monotonic` (`BOHR-2044`),
+  `agrees`, `advances`, `unique`, over any method, key and value.
+- **The probe's node is outside the fault model**: never killed, never cut off, never counted as
+  silent, and it reaches every node whatever the topology; a value the world itself took back — a
+  reorg, a restart from an older snapshot — is not held against the node.
+- **`bohr trace` shows what each guest record said**, not only that one was written.
+
+### A chain to break
+
+- **`examples/chain-toy`**: three nodes, a block final on two votes of three, correct without a
+  flag. Each flag adds one defect that the drawn faults bring out, and each oracle catches its own:
+  `--revert-finality` on 35 of seeds 1–60, `--equivocate` on 60, `--fork-on-partition` on 40,
+  `--stall-after-heal` on 54, against a bound of 30. Without a flag, none of the four reports
+  anything on seeds 1–200. 1,000 repeats with every probe, one digest.
+- **The probe costs 7.7% more events** on the same 20 seeds, against a bound of 10%.
+
+### reth, run for real
+
+- **The `reth` pack never ran past its start in v0.3.** reth's database grew its file past the
+  world's 64 MiB a file at the tenth virtual second, was answered `EFBIG`, and shut down with status
+  zero — a run the crash oracle called clean. So v0.3's "620 seeds, nothing found" measured reth
+  starting. The pack now holds the database under the bound, answers `sched_setscheduler` and
+  `sched_setparam` as an unprivileged process is answered, serves JSON-RPC, and is judged by
+  `finality` and `agreement` as well as by crashes.
+- **On reth, clean is clean**: `bohr hunt reth --no-faults` over seeds 1–30 found nothing from
+  `finality` or `agreement`. The gate named 100 seeds; a seed takes about a minute on the test
+  machine, and the gate was restated to 30 before the runs past the eleventh.
+
+### Speed
+
+- **Campaign workers live for the whole campaign** and each takes the next run as it finishes the
+  last, instead of a fixed share of each generation in a process started for it. Against `redb` from
+  the host's own filesystem, v0.3's binary and this one alternately: 416 against 544 runs a minute
+  at one worker, 1,760 against 2,304 at eight — 31% more at both.
+- **Workers take one hardware thread of every physical core before a second of any.** Linux
+  numbers a core's two threads next to each other, so position by number had put eight workers on
+  four of six cores.
+- **Eight workers do 4.56 times the runs of one** against `redb`, where this host computes at most
+  4.89 times as much on eight threads as on one: 93% of what the host can give.
+- **SDK records are one write each**, terminator included, rather than two.
+
+### A run is judged the same on every run
+
+- **A process that fails from a thread other than its first is a finding on every run.** Each
+  thread of a group that exits reports its own end, in an order the host decides, and the run
+  ended on the first report to arrive while the failing thread was still in flight: its status
+  was lost on some runs and kept on others. One seed of geth under drawn kills left ten digests in
+  twenty runs, and a restart that exited 1 read as clean. The run now waits for a task the host is
+  still running before it picks, moves time or ends; `exits_from_a_thread` repeats 100 times to one
+  digest and is found every time; v0.3's binary diverges on that guest at its third repeat.
+- **`bohr hunt --no-faults` runs a durability pack.** The scenario it writes kept `[durability]`
+  with every kill taken out, and a durability oracle with nothing killed is refused at load.
+
+### What it does not do
+
+- **Read a client's protocol from its memory, its disk or its wire.** A client that exposes no
+  signed votes cannot be judged for double-signing.
+- **See what it did not ask.** Each node is asked for its finalised tip at drawn moments; a revert
+  undone between two askings is not seen.
+- **Cost little in time.** Every probe on `chain-toy` costs 26–33% more wall time against a bound
+  of 10% (P4.1 fails): a probe round is a guest's work, and its calls cost what any guest's do.
+- **Reach six times the runs at eight workers** (P4.0 fails as written): the host itself reaches
+  4.89 times, so the bound measured the machine. It is restated for v0.5 as a share of the host's
+  own ceiling.
+- **Judge reth for long.** reth's RPC answers from its tenth virtual second of the pack's fourteen:
+  the probe is answered 14 times of 55, so `finality` and `agreement` see the last few seconds.
+- **Keep the probe's memory flat** (P4.2 fails): over 10,657 blocks every probe adds 140 MB to a
+  `bohr run`, which holds its whole log, and 53 MB to a campaign worker, which holds none — about
+  5 KB a block, growing with the run.
+- **Keep every earlier number** (P4.3 fails): against v0.3's binary on one host, alternately, a
+  campaign worker's peak memory is 50.1 MB against 44.9 MB (+12%) and `make gate` 117–119 s against
+  105 s, a gate that now also repeats the probed chain 100 times. Per call (8.9 µs against 8.8 µs),
+  startup (2.60 ms against 2.59 ms), a 64-run campaign at one worker (+3.4% time) and `make pr`
+  (49–51 s against 50–53 s) hold.
+- **Run reth quickly.** Past its start reth polls without pause, about 1.7 million calls a virtual
+  second, because an `epoll` answer keeps calling a descriptor ready; a run of fourteen virtual
+  seconds takes about a minute.
+
 ## v0.3.0 — one command
 
 A campaign against a real client used to be a scenario file, a binary built by hand at a path on

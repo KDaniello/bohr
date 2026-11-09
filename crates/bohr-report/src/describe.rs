@@ -19,6 +19,7 @@ pub const fn outcome_word(outcome: &Outcome) -> &'static str {
         Outcome::GuestHung(_) => "guest hung",
         Outcome::LivenessViolated(_) => "cluster stopped committing",
         Outcome::DurabilityViolated(_) => "acknowledged write lost",
+        Outcome::ProbeViolated(_) => "a node's own answers broke a property",
         Outcome::UnsupportedSyscall(_) => "unsupported syscall",
         Outcome::ImplementationsDisagreed(_) => "implementations disagreed",
         Outcome::InternalError(_) => "internal error",
@@ -36,6 +37,7 @@ pub fn outcome_detail(outcome: &Outcome) -> Option<&str> {
         | Outcome::GuestHung(detail)
         | Outcome::LivenessViolated(detail)
         | Outcome::DurabilityViolated(detail)
+        | Outcome::ProbeViolated(detail)
         | Outcome::UnsupportedSyscall(detail)
         | Outcome::ImplementationsDisagreed(detail)
         | Outcome::InternalError(detail)

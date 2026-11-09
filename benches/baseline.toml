@@ -1310,6 +1310,37 @@ full_corpus_state = { entries = 4_096, bytes = 2_103_728, decode_ms = 0.74 }   #
 gate_min = 5.4
 pr_min = 2.0
 
+# What v0.4.0 was measured to do, on 2026-11-09. G4.1–G4.3, G4.5 and P4.0–P4.1 on the WSL host the
+# earlier versions name; G4.4, G4.6, P4.2 and P4.3 on the Ubuntu 24.04 VM (four cores, 4 GB), where
+# P4.3's A/B ran v0.3's binary and this one alternately. Each bound was written in roadmap/v0.4.md
+# before its run; G4.4 was restated from 100 seeds to 30 after the eleventh, and says so there.
+#
+# Four gates fail as written. P4.0: eight workers do 4.56 times the runs of one, where the host
+# computes 4.89 times as much on eight threads as on one. P4.1: probes cost 26-33% wall time.
+# P4.2: every probe adds about 5 KB a block. P4.3: a worker's peak memory +12%, make gate +13%.
+[v0_4.gates]
+oracle_catches_its_defect = { revert_finality = "35 of 60", equivocate = "60 of 60", fork_on_partition = "40 of 60", stall_after_heal = "54 of 60" }   # G4.1, bound 30
+no_oracle_cries_wolf = "0 findings on seeds 1-200"                       # G4.2
+probed_chain_repeats = 1000                                              # G4.3, one digest
+reth_no_faults = "0 findings on seeds 1-30, restated from 100"           # G4.4
+reth_probe_answered = "14 of 55, from the 10.6th virtual second of 14"
+probe_events = "+7.7%"                                                   # G4.5, bound 10%
+make_pr = "green"                                                        # G4.6
+make_gate = "green, 13 of 13"
+mutation_injections_caught = "13 of 13"
+exit_from_another_thread_repeats = 100                                   # one digest; v0.3 diverges
+
+[v0_4.perf]
+per_call_us = { v0_3 = 8.8, v0_4 = 8.9 }                                 # P4.3, A/B on the VM
+startup_ms = { v0_3 = 2.59, v0_4 = 2.60 }
+redb_64_runs_ms = { j1 = { v0_3 = 5_678, v0_4 = 5_872 }, j4 = { v0_3 = 1_986, v0_4 = 1_798 } }
+peak_rss_mb = { v0_3 = 44.9, v0_4 = 50.1 }                               # P4.3: fails, +12%
+gate_s = { v0_3 = 105, v0_4 = 117 }                                      # P4.3: fails, +13%, one gate more
+pr_s = { v0_3 = 50, v0_4 = 49 }
+workers_scale = { ratio = 4.56, host_ceiling = 4.89 }                    # P4.0, bound 6: fails
+probe_wall = "1.26-1.33x"                                                # P4.1, bound 1.10: fails
+probe_memory_10657_blocks_mb = { run = 140, worker = 53 }                # P4.2, bound 16: fails
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

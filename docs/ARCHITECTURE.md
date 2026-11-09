@@ -731,6 +731,39 @@ bundles matter; a trait that touches only code can wait until a second implement
 | `Mutator` | byte operators are one implementation; a journal-aware structural mutator would be a second |
 | `FaultTargeting` | a function of the fault catalog, which §5.16 already makes pluggable |
 
+#### 5.17.2. Oracles that ask the guest's own API
+
+A third kind of verdict is about a program that neither asserts anything nor exits: a blockchain
+client that finalised a block and later reports another at the same height is wrong, alive, and
+answering. The crash oracle has nothing to read, an SDK is not something the client will adopt, and
+reading its memory or its disk would be a model of its internals per client. What every client does
+offer is its API, and the verdict is made from that (`API.md` §5.9).
+
+**The asking is done by a guest, not by the world.** The probe is a static binary the world starts
+as one more node; it calls the nodes' JSON-RPC over the virtual network and writes what came back as
+SDK records. Two alternatives were rejected. A probe outside the run would ask at host moments,
+so two runs of one seed would be asked different questions and nothing it saw would replay. A probe
+inside the world — the supervisor speaking HTTP over sockets it models — would be a TCP client in
+the sans-io core, a second implementation of the network's far end, and its timing would be the
+world's choice rather than the run's. As a guest it costs nothing new: its sockets are the modelled
+ones, its schedule is drawn from the tape, and its calls are on the timeline like any other node's.
+
+**The judging is done by the world, from records of the probe's node only**, and stated as a code
+an oracle reads — the division `watch.rs` keeps for liveness and durability. Any guest can write
+an event of that name; only the probe's are evidence, or a node under test would be grading its own
+answers. The probe's node is outside the fault model for the same reason an instrument is outside
+the experiment: a probe the run could kill or cut off would report its own outage as the cluster's.
+
+**Each chain oracle is a probe written out in advance.** `finality` is `never-reverts` on the
+finalised hash by height, `agreement` is `agrees` on the same answers, `liveness` is `advances` on
+the finalised height, and `double-sign` is `unique` on signed votes by signer and height. One
+judging path, so a property tested once is tested for every oracle that uses it.
+
+**What this leaves out.** A probe sees what it asked, when it asked: each node's finalised tip at
+drawn moments, so a revert undone between two askings is not seen. And a client that exposes no
+signed votes cannot be judged for double-signing — reading consensus messages off the wire is
+protocol parsing per client, and none is built in.
+
 ### 5.18. Handing a run to a debugger is inspection, not resumption
 
 `bohr replay --break-at` stops a reproduced run at a named event and releases the guests for an

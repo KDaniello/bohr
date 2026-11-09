@@ -97,7 +97,7 @@ fn target_for(
     program: Vec<String>,
     loaded: Option<&LoadedConfig>,
 ) -> Result<execute::Target, CliError> {
-    Ok(execute::Target::Program(crate::specs_for(program, loaded, None)))
+    Ok(execute::Target::Program(crate::specs_for(program, loaded, None)?))
 }
 
 /// Refuses on a host with no interceptor, for the same reason `bohr run` does.

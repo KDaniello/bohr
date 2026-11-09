@@ -549,6 +549,10 @@ pub struct DistributedWorld {
     durability: Option<Durability>,
     /// Readiness sets and event counters, which span a node's files and its sockets both.
     epolls: Epolls,
+    /// Judges what the probe reported, where the scenario has probes.
+    observer: Option<crate::probe::Observer>,
+    /// The node the probe runs on, which this world never faults and never counts as silent.
+    probe_node: Option<NodeId>,
 }
 
 /// A node's world as this cluster configures one.
@@ -641,6 +645,18 @@ impl Default for DistributedWorld {
 }
 
 impl DistributedWorld {
+    /// The same world, with a probe on node `node` asking what `probes` name.
+    ///
+    /// The probe's node is outside the fault model: never killed, never cut off, never counted as
+    /// silent, since an instrument the run could break would report its breakage as the cluster's.
+    #[must_use]
+    pub fn with_probes(mut self, probes: Vec<crate::ProbeSpec>, node: u32) -> Self {
+        self.observer = Some(crate::probe::Observer::new(probes));
+        self.probe_node = Some(NodeId(node));
+        self.sdk.probe_node = Some(NodeId(node));
+        self
+    }
+
     /// The same world, told which program each node runs.
     #[must_use]
     pub fn with_programs(mut self, programs: Vec<String>) -> Self {
@@ -671,6 +687,8 @@ impl DistributedWorld {
             liveness: None,
             durability: None,
             epolls: Epolls::default(),
+            observer: None,
+            probe_node: None,
             // Exactly what this model narrates, and nothing it merely intends to. A catalogue that
             // advertises a fault no scenario can ask for is worse than no catalogue: a reader
             // plans around it and a campaign reports having covered it. Held to the code by
@@ -806,8 +824,18 @@ impl DistributedWorld {
     /// stopped, so a state change it is not told about becomes a finding against the world's own
     /// doing — see [`watch::Liveness::node_became`].
     fn node_became(&mut self, node: NodeId, state: NodeState, now: Tick) {
+        // The probe is not a member of the cluster either watch is about.
+        if Some(node) == self.probe_node {
+            return;
+        }
         if let Some(watch) = self.liveness.as_mut() {
             watch.node_became(node, state, now);
+        }
+        if let Some(observer) = self.observer.as_mut() {
+            match state {
+                NodeState::Dead | NodeState::Frozen => observer.node_down(node.get()),
+                NodeState::Running | NodeState::Restarting => observer.node_up(node.get(), now),
+            }
         }
     }
 
@@ -971,8 +999,11 @@ impl DistributedWorld {
 
     fn node_world(&mut self, node: NodeId) -> &mut MinimalWorld {
         // A node that never completes a sync at all is the case the whole oracle is about, so the
-        // watcher has to know the node exists before it can notice it saying nothing.
-        if let Some(watch) = self.liveness.as_mut() {
+        // watcher has to know the node exists before it can notice it saying nothing. The probe
+        // syncs nothing by design and is not a member of the cluster it watches.
+        if let Some(watch) = self.liveness.as_mut()
+            && Some(node) != self.probe_node
+        {
             watch.knows(node);
         }
         self.node_parts(node).0
@@ -1231,7 +1262,7 @@ impl DistributedWorld {
         node: NodeId,
         ctx: &mut WorldCtx<'_, '_>,
     ) -> Result<Option<Effects>, KernelError> {
-        if !self.fault_policy.is_armed() {
+        if !self.fault_policy.is_armed() || Some(node) == self.probe_node {
             return Ok(None);
         }
         // The moment guided targeting aims at: something was written and not yet synced, so a
@@ -1412,6 +1443,24 @@ impl DistributedWorld {
         }
         if let Some(violation) = digested.violated {
             self.violated.get_or_insert(violation);
+        }
+        if let Some(observer) = self.observer.as_mut() {
+            let now = ctx.world_now();
+            let cut = !self.net.fully_healed();
+            for round in &digested.probe_rounds {
+                for (request, answer) in crate::probe::answers_in(round, observer.requests()) {
+                    for broken in observer.answer(now, cut, request, &answer) {
+                        ctx.emit_for(
+                            NodeId(broken.node),
+                            TaskId::ZERO,
+                            EventKind::Diagnostic {
+                                code: broken.code.to_owned(),
+                                message: broken.message,
+                            },
+                        )?;
+                    }
+                }
+            }
         }
 
         let ret = bytes.len() as i64;
@@ -2125,6 +2174,12 @@ impl WorldModel for DistributedWorld {
                     // cut lifting and not any cut lifting.
                     if !raise
                         && self.net.fully_healed()
+                        && let Some(observer) = self.observer.as_mut()
+                    {
+                        observer.healed(ctx.world_now());
+                    }
+                    if !raise
+                        && self.net.fully_healed()
                         && let Some(watch) = self.liveness.as_mut()
                     {
                         let due = watch.healed(ctx.world_now());
@@ -2303,7 +2358,13 @@ impl WorldModel for DistributedWorld {
                         // scenario rather than of a map's iteration.
                         NodeFaultKind::ChainReorg { back, nodes } => {
                             let targets: Vec<NodeId> = if nodes.is_empty() {
-                                let mut every: Vec<NodeId> = self.nodes.keys().copied().collect();
+                                // Every node of the cluster, and never the probe, which is not one.
+                                let mut every: Vec<NodeId> = self
+                                    .nodes
+                                    .keys()
+                                    .copied()
+                                    .filter(|n| Some(*n) != self.probe_node)
+                                    .collect();
                                 every.sort_unstable();
                                 every
                             } else {
@@ -2329,6 +2390,9 @@ impl WorldModel for DistributedWorld {
                             // the chain it was on is not the chain.
                             let mut applied = 0usize;
                             for node in &targets {
+                                if let Some(observer) = self.observer.as_mut() {
+                                    observer.rewound(node.get());
+                                }
                                 let (_, disk) = self.node_parts(*node);
                                 applied = applied.max(disk.rewind(back));
                                 let image = disk.durable_image();
@@ -2369,6 +2433,9 @@ impl WorldModel for DistributedWorld {
                         }
                         NodeFaultKind::RestartFromSnapshot { back } => {
                             self.note_what_came_back(fault.node, ctx)?;
+                            if let Some(observer) = self.observer.as_mut() {
+                                observer.rewound(fault.node.get());
+                            }
                             let (_, disk) = self.node_parts(fault.node);
                             disk.rewind(back);
                             let image = disk.durable_image();
@@ -2404,7 +2471,9 @@ impl DistributedWorld {
         self.node_of_task.insert(stop.task, node);
         // A node doing anything at all is a node that has not stopped. Recorded before the stop is
         // answered, because what is being told apart is a node that polls from one that does not.
-        if let Some(watch) = self.liveness.as_mut() {
+        if let Some(watch) = self.liveness.as_mut()
+            && Some(node) != self.probe_node
+        {
             watch.stirred(node, ctx.world_now());
         }
 

@@ -1,0 +1,34 @@
+# The chain with --fork-on-partition, judged by the agreement oracle alone.
+#
+# Identical to scenario.toml but for the flag and the oracle, so what this measures is whether the
+# oracle sees the defect, and not whether a scenario was tuned to show it.
+
+[cluster]
+nodes = 3
+argv = ["examples/chain-toy/build/chain-toy-node", "{node}", "--fork-on-partition"]
+
+[run]
+horizon_ticks = 4_000_000_000        # 4 s
+
+[network]
+topology = "full"
+latency_mean_ticks = 2_000_000       # 2 ms
+latency_jitter_ticks = 1_000_000
+drop_probability = "1/200"
+
+[disk]
+sync_semantics = "strict"
+
+[faults]
+kill_probability = "1/200"
+targeting = "uniform"
+draw = ["node_kill", "node_isolate"]
+# Long enough for the others to notice, short enough that the run sees the node come back.
+restart_after_ticks = 400_000_000    # 400 ms
+# After the chain has some height to lose.
+arm_after_ticks = 1_000_000_000      # 1 s
+budget_per_run = 3
+
+[chain]
+oracles = ["agreement"]
+every_ticks = 100_000_000            # 100 ms, about a block and a half

@@ -61,7 +61,7 @@ struct RawBench {
 
 /// The oracles a pack may name, each a section its scenario must carry or a judgement every run
 /// already makes.
-const ORACLES: [&str; 4] = ["crash", "durability", "liveness", "property"];
+const ORACLES: [&str; 5] = ["crash", "durability", "liveness", "property", "chain"];
 
 /// A pack, resolved against the repository it lives in.
 #[derive(Clone, Debug)]

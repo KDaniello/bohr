@@ -85,7 +85,7 @@ Bohr is an open implementation at the syscall level: no code changes, no rebuild
 
 ## Status
 
-**v0.3.0, one command — not published.** What it does and does not do is fixed in the
+**v0.4.0, blockchain oracles — not published.** What it does and does not do is fixed in the
 [changelog](./CHANGELOG.md). There is one public release, v1.0, and it ships after findings in real
 projects are confirmed by their maintainers. Until then the tape ABI, the bundle format and the
 command line all change.
@@ -99,6 +99,10 @@ Full matrix in [PLATFORMS.md](./docs/PLATFORMS.md).
 # Hunt a target from its pack: build or check the pinned binary, run its campaign, group findings.
 bohr hunt reth --time 1h -j 8 -o hunt-reth
 bohr findings hunt-reth/findings
+
+# A chain judged by its own JSON-RPC: finality, agreement, liveness, double-signing (API.md §5.9).
+make probe example-chain-toy
+bohr run --seed 1 --config examples/chain-toy/scenario-equivocate.toml -- examples/chain-toy/build/chain-toy-node
 
 # Or start from your own program: a first scenario from what a survey of it finds.
 bohr init --nodes 3 -- ./my-service

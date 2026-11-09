@@ -112,12 +112,13 @@ fn emit(build: impl FnOnce(Option<BohrMeta>) -> Record) {
         seq: channel.seq.fetch_add(1, Ordering::Relaxed),
         node: channel.node,
     };
-    let line = build(Some(meta)).to_line();
+    let mut line = build(Some(meta)).to_line();
+    line.push('\n');
     // A record that cannot be written is dropped rather than raised: the SDK is a bystander in
     // someone else's program, and taking it down over a full disk would be worse than the gap the
-    // supervisor will notice in the sequence numbers.
-    let _ = writeln!(file, "{line}");
-    let _ = file.flush();
+    // supervisor will notice in the sequence numbers. One write per record, terminator included,
+    // so a record costs the guest one call and arrives whole.
+    let _ = file.write_all(line.as_bytes());
 }
 
 /// Records an assertion. Called by the macros, which capture the call site.

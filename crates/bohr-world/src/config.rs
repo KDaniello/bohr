@@ -15,6 +15,7 @@ use crate::{
     DiskConfig, DurabilityConfig, FaultPolicy, GreyWindow, LivenessConfig, NetworkConfig,
     NodeFaultKind, ProjectionSpec, ScheduledNodeFault, ScheduledPartition, Source, StateImage,
     Targeting, Topology,
+    probe::{ProbeSpec, Property},
 };
 
 /// The largest file a prepared state may hold.
@@ -76,6 +77,10 @@ pub struct LoadedConfig {
     pub coverage_bytes: Option<usize>,
     /// The kernel the guest is shown, where the scenario names one other than the default.
     pub linux: LinuxConfig,
+    /// What the probe asks the nodes, and what their answers must keep.
+    ///
+    /// Empty where the scenario asks nothing, and then no probe node is started.
+    pub probes: Vec<ProbeSpec>,
 }
 
 /// The `[linux]` section: which kernel facilities the guest is told exist.
@@ -131,8 +136,19 @@ pub struct Implementation {
 impl LoadedConfig {
     /// What this scenario asks to be judged on.
     #[must_use]
-    pub const fn watching(&self) -> crate::Watching {
-        crate::Watching { liveness: self.liveness.is_some(), durability: self.durability.is_some() }
+    pub fn watching(&self) -> crate::Watching {
+        let has = |p: Property| self.probes.iter().any(|s| s.property == p);
+        crate::Watching {
+            liveness: self.liveness.is_some(),
+            durability: self.durability.is_some(),
+            probed: crate::Probed {
+                never_reverts: has(Property::NeverReverts),
+                monotonic: has(Property::Monotonic),
+                agrees: has(Property::Agrees),
+                advances: has(Property::Advances),
+                unique: has(Property::Unique),
+            },
+        }
     }
 
     /// Whether this scenario asks for anything to go wrong.
@@ -243,6 +259,9 @@ struct RawConfig {
     faults: Option<RawFaults>,
     coverage: Option<RawCoverage>,
     linux: Option<RawLinux>,
+    chain: Option<RawChain>,
+    #[serde(default)]
+    probe: Vec<RawProbe>,
     #[serde(default)]
     partition: Vec<RawPartition>,
     #[serde(default)]
@@ -366,6 +385,36 @@ struct RawNetwork {
 #[serde(deny_unknown_fields)]
 struct RawLinux {
     io_uring: Option<String>,
+}
+
+/// The `[chain]` section: the blockchain oracles, each a probe written out in advance.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChain {
+    oracles: Vec<String>,
+    nodes: Option<Vec<u32>>,
+    port: Option<u16>,
+    every_ticks: u64,
+    stall_ticks: Option<u64>,
+    votes_rpc: Option<String>,
+}
+
+/// One `[[probe]]`: a question asked of some nodes, and the property its answers keep.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProbe {
+    name: Option<String>,
+    node: Option<u32>,
+    nodes: Option<Vec<u32>>,
+    port: Option<u16>,
+    rpc: String,
+    #[serde(default)]
+    params: Vec<toml::Value>,
+    every_ticks: u64,
+    key: Option<toml::Value>,
+    value: String,
+    property: String,
+    within_ticks: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -736,6 +785,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         differential(raw.differential.as_ref(), raw.faults.as_ref(), cluster.as_ref())?;
     let liveness = liveness(raw.liveness.as_ref(), &raw.partition)?;
     let durability = durability(raw.durability.as_ref(), raw.faults.as_ref(), &raw.fault)?;
+    let probes = probes(raw.chain.as_ref(), &raw.probe, cluster.as_ref())?;
 
     // A policy armed after the run is over is a policy that never fires, and a configuration that
     // is read and does nothing is a configuration that lies. Both numbers are named, because the
@@ -765,6 +815,253 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         differential,
         coverage_bytes: coverage(raw.coverage.as_ref())?,
         linux: linux(raw.linux.as_ref(), &disk)?,
+        probes,
+    })
+}
+
+/// The port JSON-RPC is answered on where a probe names none: Ethereum's.
+const DEFAULT_RPC_PORT: u16 = 8545;
+
+/// Reads `[chain]` and every `[[probe]]` into the probes they amount to.
+///
+/// **Each oracle is a probe written out in advance**, so there is one judging path: `finality` is
+/// `never-reverts` on the finalised block's hash by its number, `agreement` is `agrees` on the
+/// same, `liveness` is `advances` on its number, and `double-sign` is `unique` on each signed vote
+/// by signer and height. A node the cluster does not have, a probe without a cluster, and a span
+/// on a property that has no use for one are refused where they are read.
+fn probes(
+    chain: Option<&RawChain>,
+    raw: &[RawProbe],
+    cluster: Option<&Cluster>,
+) -> Result<Vec<ProbeSpec>, ConfigError> {
+    if chain.is_none() && raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(cluster) = cluster else {
+        return Err(ConfigError::Refused(
+            "BOHR-1002: a probe asks the nodes of a [cluster], and this scenario has none"
+                .to_owned(),
+        ));
+    };
+    let all: Vec<u32> = (0..cluster.nodes).collect();
+    let known = |nodes: &[u32], what: &str| -> Result<(), ConfigError> {
+        match nodes.iter().find(|n| **n >= cluster.nodes) {
+            Some(missing) => Err(ConfigError::Refused(format!(
+                "BOHR-1002: {what} names node {missing}, and this cluster has {}",
+                cluster.nodes
+            ))),
+            None if nodes.is_empty() => {
+                Err(ConfigError::Refused(format!("BOHR-1002: {what} asks no node")))
+            }
+            None => Ok(()),
+        }
+    };
+    let mut out = Vec::new();
+
+    if let Some(chain) = chain {
+        let nodes = chain.nodes.clone().unwrap_or_else(|| all.clone());
+        known(&nodes, "[chain]")?;
+        if chain.every_ticks == 0 {
+            return Err(ConfigError::Refused(
+                "BOHR-1002: chain.every_ticks is zero, which asks without pause".to_owned(),
+            ));
+        }
+        if chain.oracles.is_empty() {
+            return Err(ConfigError::Refused(
+                "BOHR-1002: [chain] names no oracle; this build has finality, agreement, liveness \
+                 and double-sign"
+                    .to_owned(),
+            ));
+        }
+        let port = chain.port.unwrap_or(DEFAULT_RPC_PORT);
+        let finalized = |name: &str, key: &[&str], value: &str, property, within| ProbeSpec {
+            name: name.to_owned(),
+            nodes: nodes.clone(),
+            port,
+            rpc: "eth_getBlockByNumber".to_owned(),
+            params: "[\"finalized\",false]".to_owned(),
+            every: Tick(chain.every_ticks),
+            key: key.iter().map(|k| (*k).to_owned()).collect(),
+            value: value.to_owned(),
+            property,
+            within,
+        };
+        for oracle in &chain.oracles {
+            let spec = match oracle.as_str() {
+                "finality" => {
+                    finalized("finality", &["number"], "hash", Property::NeverReverts, None)
+                }
+                "agreement" => finalized("agreement", &["number"], "hash", Property::Agrees, None),
+                "liveness" => {
+                    let Some(stall) = chain.stall_ticks.filter(|s| *s > 0) else {
+                        return Err(ConfigError::Refused(
+                            "BOHR-1002: the liveness oracle needs chain.stall_ticks, how long a \
+                             finalised height may stay put once the cluster is whole"
+                                .to_owned(),
+                        ));
+                    };
+                    finalized("liveness", &[], "number", Property::Advances, Some(Tick(stall)))
+                }
+                "double-sign" => {
+                    let Some(rpc) = chain.votes_rpc.clone() else {
+                        return Err(ConfigError::Refused(
+                            "BOHR-1002: the double-sign oracle needs chain.votes_rpc, the method \
+                             that lists the votes a node signed or saw as signer, height and hash"
+                                .to_owned(),
+                        ));
+                    };
+                    ProbeSpec {
+                        name: "double-sign".to_owned(),
+                        nodes: nodes.clone(),
+                        port,
+                        rpc,
+                        params: "[]".to_owned(),
+                        every: Tick(chain.every_ticks),
+                        key: vec!["signer".to_owned(), "height".to_owned()],
+                        value: "hash".to_owned(),
+                        property: Property::Unique,
+                        within: None,
+                    }
+                }
+                other => {
+                    return Err(ConfigError::Refused(format!(
+                        "BOHR-1002: [chain] has no oracle named {other:?}; this build has \
+                         finality, agreement, liveness and double-sign"
+                    )));
+                }
+            };
+            if out.iter().any(|s: &ProbeSpec| s.name == spec.name) {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: [chain] names {oracle:?} twice"
+                )));
+            }
+            out.push(spec);
+        }
+        if chain.stall_ticks.is_some() && !chain.oracles.iter().any(|o| o == "liveness") {
+            return Err(ConfigError::Refused(
+                "BOHR-1002: chain.stall_ticks is read by the liveness oracle, and [chain] does not \
+                 name it"
+                    .to_owned(),
+            ));
+        }
+        if chain.votes_rpc.is_some() && !chain.oracles.iter().any(|o| o == "double-sign") {
+            return Err(ConfigError::Refused(
+                "BOHR-1002: chain.votes_rpc is read by the double-sign oracle, and [chain] does \
+                 not name it"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    for (i, probe) in raw.iter().enumerate() {
+        let what = format!("[[probe]] {}", i + 1);
+        let nodes = match (probe.node, &probe.nodes) {
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: {what} takes node or nodes, not both"
+                )));
+            }
+            (Some(node), None) => vec![node],
+            (None, Some(nodes)) => nodes.clone(),
+            (None, None) => all.clone(),
+        };
+        known(&nodes, &what)?;
+        let Some(property) = Property::parse(&probe.property) else {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: {what} has no property named {:?}; this build has never-reverts, \
+                 monotonic, agrees, advances and unique",
+                probe.property
+            )));
+        };
+        if probe.every_ticks == 0 {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: {what}: every_ticks is zero, which asks without pause"
+            )));
+        }
+        let within = match (property, probe.within_ticks) {
+            (Property::Advances, Some(w)) if w > 0 => Some(Tick(w)),
+            (Property::Advances, _) => {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: {what}: advances needs within_ticks above zero, the span a value \
+                     may stay the same"
+                )));
+            }
+            (_, Some(_)) => {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: {what}: within_ticks is read by advances only"
+                )));
+            }
+            (_, None) => None,
+        };
+        let key = match &probe.key {
+            None => Vec::new(),
+            Some(toml::Value::String(one)) => vec![one.clone()],
+            Some(toml::Value::Array(many)) => many
+                .iter()
+                .map(|k| k.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    ConfigError::Refused(format!("BOHR-1002: {what}: key names fields as strings"))
+                })?,
+            Some(_) => {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: {what}: key is a field name or a list of them"
+                )));
+            }
+        };
+        if property == Property::Advances && !key.is_empty() {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: {what}: advances watches one value and reads no key"
+            )));
+        }
+        if probe.value.is_empty() || key.iter().any(String::is_empty) || probe.rpc.is_empty() {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: {what}: rpc, value and every key field are named, never empty"
+            )));
+        }
+        let mut params = Vec::with_capacity(probe.params.len());
+        for value in &probe.params {
+            params.push(json_of(value).ok_or_else(|| {
+                ConfigError::Refused(format!(
+                    "BOHR-1002: {what}: params hold strings, integers, booleans, arrays and \
+                     tables; a float or a date has no single JSON spelling"
+                ))
+            })?);
+        }
+        let name = probe.name.clone().unwrap_or_else(|| format!("{}#{}", probe.rpc, i + 1));
+        if out.iter().any(|s: &ProbeSpec| s.name == name) {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: {what}: a probe is already named {name:?}"
+            )));
+        }
+        out.push(ProbeSpec {
+            name,
+            nodes,
+            port: probe.port.unwrap_or(DEFAULT_RPC_PORT),
+            rpc: probe.rpc.clone(),
+            params: bohr_sdk_proto::json::Json::Array(params).to_json(),
+            every: Tick(probe.every_ticks),
+            key,
+            value: probe.value.clone(),
+            property,
+            within,
+        });
+    }
+    Ok(out)
+}
+
+/// A TOML value as JSON, where it has exactly one JSON spelling.
+fn json_of(value: &toml::Value) -> Option<bohr_sdk_proto::json::Json> {
+    use bohr_sdk_proto::json::Json;
+    Some(match value {
+        toml::Value::String(s) => Json::Str(s.clone()),
+        toml::Value::Integer(i) => Json::Int(*i),
+        toml::Value::Boolean(b) => Json::Bool(*b),
+        toml::Value::Array(items) => Json::Array(items.iter().map(json_of).collect::<Option<_>>()?),
+        toml::Value::Table(table) => Json::Object(
+            table.iter().map(|(k, v)| Some((k.clone(), json_of(v)?))).collect::<Option<_>>()?,
+        ),
+        toml::Value::Float(_) | toml::Value::Datetime(_) => return None,
     })
 }
 
@@ -1352,5 +1649,105 @@ mode = \"shm\"
 
         let absent = read("file:2:/answer").expect_err("a node the cluster has not got");
         assert!(absent.to_string().contains("BOHR-1002"), "got: {absent}");
+    }
+
+    /// Each chain oracle is a probe written out in advance, and every node is asked unless the
+    /// section narrows it.
+    #[test]
+    fn the_chain_oracles_are_probes_of_every_node() {
+        let loaded = load(
+            r#"
+            [cluster]
+            nodes = 3
+            argv = ["./node"]
+
+            [chain]
+            oracles = ["finality", "agreement", "liveness", "double-sign"]
+            every_ticks = 100
+            stall_ticks = 1000
+            votes_rpc = "chain_votes"
+            "#,
+        )
+        .expect("loads");
+        let names: Vec<&str> = loaded.probes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["finality", "agreement", "liveness", "double-sign"]);
+        assert!(loaded.probes.iter().all(|p| p.nodes == [0, 1, 2] && p.port == 8545));
+        assert_eq!(loaded.probes[2].within, Some(Tick(1000)));
+        assert_eq!(loaded.probes[3].key, ["signer", "height"]);
+        let watching = loaded.watching();
+        assert!(watching.probed.never_reverts && watching.probed.agrees);
+        assert!(watching.probed.advances && watching.probed.unique && !watching.probed.monotonic);
+    }
+
+    /// A probe written by hand names its call, its value and its property, and only what it asks.
+    #[test]
+    fn a_probe_reads_its_params_as_json() {
+        let loaded = load(
+            r#"
+            [cluster]
+            nodes = 2
+            argv = ["./node"]
+
+            [[probe]]
+            node = 1
+            port = 9000
+            rpc = "eth_getBlockByNumber"
+            params = ["latest", false, { full = true }]
+            every_ticks = 50
+            key = "number"
+            value = "hash"
+            property = "never-reverts"
+            "#,
+        )
+        .expect("loads");
+        let probe = &loaded.probes[0];
+        assert_eq!(probe.nodes, [1]);
+        assert_eq!(probe.params, r#"["latest",false,{"full":true}]"#);
+        assert_eq!(probe.name, "eth_getBlockByNumber#1");
+    }
+
+    /// Every probe mistake is refused where it is read, by name.
+    #[test]
+    fn a_probe_that_could_not_mean_anything_is_refused() {
+        let refused = |text: &str, says: &str| {
+            let err = load(text).expect_err("refused");
+            assert!(err.to_string().contains(says), "{says:?} not in: {err}");
+        };
+        let cluster = "[cluster]\nnodes = 2\nargv = [\"./node\"]\n";
+        refused("[chain]\noracles = [\"finality\"]\nevery_ticks = 10\n", "has none");
+        refused(
+            &format!("{cluster}[chain]\noracles = [\"liveness\"]\nevery_ticks = 10\n"),
+            "stall_ticks",
+        );
+        refused(
+            &format!("{cluster}[chain]\noracles = [\"double-sign\"]\nevery_ticks = 10\n"),
+            "votes_rpc",
+        );
+        refused(
+            &format!(
+                "{cluster}[chain]\noracles = [\"finality\"]\nevery_ticks = 10\nstall_ticks = 5\n"
+            ),
+            "does not name it",
+        );
+        refused(
+            &format!("{cluster}[chain]\noracles = [\"safety\"]\nevery_ticks = 10\n"),
+            "no oracle named",
+        );
+        refused(
+            &format!("{cluster}[chain]\noracles = [\"finality\"]\nnodes = [2]\nevery_ticks = 10\n"),
+            "names node 2",
+        );
+        refused(
+            &format!("{cluster}[chain]\noracles = [\"finality\"]\nevery_ticks = 0\n"),
+            "without pause",
+        );
+        let probe = |extra: &str| {
+            format!("{cluster}[[probe]]\nrpc = \"m\"\nevery_ticks = 10\nvalue = \"v\"\n{extra}")
+        };
+        refused(&probe("property = \"sometimes\"\n"), "no property named");
+        refused(&probe("property = \"advances\"\n"), "within_ticks above zero");
+        refused(&probe("property = \"agrees\"\nwithin_ticks = 5\n"), "read by advances only");
+        refused(&probe("property = \"agrees\"\nparams = [1.5]\n"), "a float");
+        refused(&probe("property = \"agrees\"\nnode = 0\nnodes = [1]\n"), "not both");
     }
 }

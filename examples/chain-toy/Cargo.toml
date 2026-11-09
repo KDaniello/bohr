@@ -1,0 +1,19 @@
+# Deliberately outside the tool's workspace, as every example is: it is a guest, built static by
+# scripts/build-example.sh, and nothing in the tool depends on it.
+#
+# A seeded-defect program (docs/TESTING.md §8): correct without a flag, and each flag adds one
+# documented defect that one blockchain oracle exists to catch.
+[workspace]
+
+[package]
+name = "chain-toy"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "chain-toy-node"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

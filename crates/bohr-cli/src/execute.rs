@@ -287,7 +287,11 @@ fn run_against(exec: Execution<'_>, worlds: Worlds) -> Result<Completed, CliErro
     match exec.target {
         Target::Demo(name, program) => {
             let mut backend = NullBackend::new(program.clone());
-            let specs = [GuestSpec { argv: vec![format!("builtin:{name}")], env: Vec::new() }];
+            let specs = [GuestSpec {
+                argv: vec![format!("builtin:{name}")],
+                env: Vec::new(),
+                executable: None,
+            }];
             drive(&mut backend, "null", &specs, exec, worlds)
         }
 
@@ -349,6 +353,12 @@ fn drive(
             }
             if loaded.linux.io_uring == bohr_world::IoUring::Ring {
                 cluster = cluster.with_io_uring();
+            }
+            // The probe is the node after the last one the scenario numbers, as `specs_for`
+            // appends it.
+            if !loaded.probes.is_empty() {
+                let probe_node = loaded.cluster.as_ref().map_or(1, |c| c.nodes.max(1));
+                cluster = cluster.with_probes(loaded.probes.clone(), probe_node);
             }
             if let Some(state) = loaded.state.clone() {
                 cluster = cluster.from_state(state, loaded.cwd.clone());
@@ -498,14 +508,21 @@ fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
         }
         // A built-in guest is part of this binary: it has a name and no file, and its
         // fingerprint is the tool's own version, checked by the manifest rather than here.
+        // A program the tool supplies is read where it is executed from and named as the run knows
+        // it, so the record says which build of the probe a bundle was judged by.
+        let file = spec.executable.as_ref().unwrap_or(path);
         let blake3 = match path.strip_prefix("builtin:") {
             Some(_) => String::new(),
-            None => match std::fs::read(path) {
+            None => match std::fs::read(file) {
                 Ok(bytes) => bohr_types::Digest::of(&bytes).to_string(),
                 Err(_) => continue,
             },
         };
-        let role = if blake3.is_empty() { "builtin" } else { "executable" };
+        let role = match (blake3.is_empty(), spec.executable.is_some()) {
+            (true, _) => "builtin",
+            (false, true) => "probe",
+            (false, false) => "executable",
+        };
         out.push(BinaryRecord {
             path: path.clone(),
             blake3,
@@ -796,7 +813,7 @@ fn implementation_target(
     scenario: &LoadedConfig,
     implementation: &bohr_world::Implementation,
 ) -> Result<Target, CliError> {
-    Ok(Target::Program(crate::specs_for(argv, Some(scenario), Some(implementation))))
+    Ok(Target::Program(crate::specs_for(argv, Some(scenario), Some(implementation))?))
 }
 
 /// Refuses on a host with no interceptor, for the same reason `bohr run` does.

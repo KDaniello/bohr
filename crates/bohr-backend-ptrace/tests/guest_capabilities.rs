@@ -24,7 +24,11 @@ fn what_the_host_can_do_is_not_what_the_guest_was_given() {
         return;
     };
     let mut backend = PtraceBackend::new();
-    let spec = GuestSpec { argv: vec![program], env: vec![("HOME".to_owned(), "/".to_owned())] };
+    let spec = GuestSpec {
+        argv: vec![program],
+        env: vec![("HOME".to_owned(), "/".to_owned())],
+        executable: None,
+    };
     match backend.spawn(NodeId::ZERO, &spec) {
         Ok(_) => {}
         // No guest can be started here at all; the claim under test needs one.

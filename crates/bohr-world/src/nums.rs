@@ -162,6 +162,10 @@ pub(crate) mod sys {
     pub(crate) const GETPRIORITY: u32 = 140;
     /// `setpriority`, accepted and without effect: the tape is the scheduler.
     pub(crate) const SETPRIORITY: u32 = 141;
+    /// `sched_setparam`, answered as for a task under the ordinary policy.
+    pub(crate) const SCHED_SETPARAM: u32 = 142;
+    /// `sched_setscheduler`, the ordinary policies accepted and the real-time ones refused.
+    pub(crate) const SCHED_SETSCHEDULER: u32 = 144;
 
     /// `mmap`, which reaches here only where it named a file: the filter admits an anonymous
     /// mapping, which shapes the guest's own address space and nothing this model holds.
@@ -174,6 +178,8 @@ pub(crate) mod sys {
 
 /// Errors returned to the guest, spelled out so this crate needs no libc.
 pub(crate) mod errno {
+    /// Not permitted: the caller lacks the privilege the operation needs.
+    pub(crate) const EPERM: i64 = 1;
     /// No such file or directory.
     pub(crate) const ENOENT: i64 = 2;
     /// Bad file descriptor.

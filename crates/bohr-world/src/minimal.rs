@@ -3241,6 +3241,34 @@ impl MinimalWorld {
             // the first. A caller that reads its priority back gets the same answer as before,
             // because that is what this world's scheduling is.
             sys::SETPRIORITY => (0, Resume::Emulate { ret: 0 }, None),
+            // Scheduling policy, answered as an unprivileged process is: the ordinary, batch and
+            // idle policies are accepted and change nothing, for the reason niceness changes
+            // nothing; a real-time policy is refused with `EPERM`, which is what a task without the
+            // capability or a real-time limit gets, and every caller that asks for one has a path
+            // for that refusal because most machines give it.
+            sys::SCHED_SETSCHEDULER => {
+                /// `SCHED_RESET_ON_FORK`, a flag ORed into the policy.
+                const RESET_ON_FORK: u64 = 0x4000_0000;
+                let mut priority = [0u8; 4];
+                ctx.read_mem(GuestAddr(args[2]), &mut priority)?;
+                let ret = match args[1] & !RESET_ON_FORK {
+                    // SCHED_OTHER, SCHED_BATCH, SCHED_IDLE, whose one priority is zero.
+                    0 | 3 | 5 if i32::from_le_bytes(priority) == 0 => 0,
+                    0 | 3 | 5 => -errno::EINVAL,
+                    // SCHED_FIFO, SCHED_RR, SCHED_DEADLINE.
+                    1 | 2 | 6 => -errno::EPERM,
+                    _ => -errno::EINVAL,
+                };
+                (ret, Resume::Emulate { ret }, None)
+            }
+            // The ordinary policy has one priority, zero; asking for another is a mistake the
+            // kernel answers `EINVAL`.
+            sys::SCHED_SETPARAM => {
+                let mut priority = [0u8; 4];
+                ctx.read_mem(GuestAddr(args[1]), &mut priority)?;
+                let ret = if i32::from_le_bytes(priority) == 0 { 0 } else { -errno::EINVAL };
+                (ret, Resume::Emulate { ret }, None)
+            }
             // A hint about what will be wanted soon. Nothing here reads ahead, and a hint acted on
             // by nobody is answered exactly as a kernel that declined to act on it would.
             sys::READAHEAD => {
