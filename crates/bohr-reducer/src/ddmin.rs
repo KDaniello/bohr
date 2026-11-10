@@ -1,28 +1,22 @@
 //! Delta debugging over a list of elements, as something that yields one probe at a time.
 //!
-//! Zeller and Hildebrandt's ddmin, with one structural difference: the published algorithm is
-//! written as a loop that calls a test function, and this one cannot — running a candidate here
-//! means running a guest, which is the thing this crate is built not to do. So the loop is turned
-//! inside out into a state machine that answers "try this next" and is told what happened.
+//! Zeller and Hildebrandt's ddmin as a state machine: it proposes a subset and is told the result,
+//! since this crate never runs a guest.
 //!
-//! The algorithm itself is unchanged. At granularity `n` the elements are cut into `n` parts;
-//! every part is tried on its own, and if none of them still reproduces, every *complement* is
-//! tried. Whatever reproduces becomes the new set, at a granularity that keeps the parts the same
-//! size where it can. When `n` reaches the number of elements left and nothing worked, the set is
-//! one-minimal: no single element can be removed.
+//! At granularity `n` the set is cut into `n` parts. Each part is tried, then each complement. What
+//! reproduces becomes the new set. When `n` reaches the set size and nothing works, the set is
+//! one-minimal.
 
 /// A minimisation in progress over a list of positions.
 ///
-/// Positions rather than elements: what is being minimised may be entries in a document, draws on
-/// a tape or messages on a link, and the algorithm has no business knowing which.
+/// Positions, so the same code minimises entries, draws or messages.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DdMin {
     kept: Vec<usize>,
     granularity: usize,
     /// Subsets still to try at this granularity, each as the positions it *keeps*.
     queue: Vec<Vec<usize>>,
-    /// Whether the queue holds complements. Parts are tried first; complements only if no part on
-    /// its own reproduced.
+    /// Whether the queue holds complements, tried after no part reproduced.
     complements: bool,
     outstanding: Option<Vec<usize>>,
     done: bool,
@@ -38,10 +32,7 @@ impl DdMin {
             queue: Vec::new(),
             complements: false,
             outstanding: None,
-            // **One element still has a subset worth trying: the empty one.** Finishing at a count
-            // of one left a single entry in every reduced scenario whether or not the finding
-            // needed it, which is a set that is not one-minimal -- the property the module opens
-            // by promising. Nought elements is the only set with nothing left to ask about.
+            // A set of one still tries the empty set; only an empty set starts finished.
             done: count == 0,
         };
         ddmin.refill();
@@ -50,8 +41,7 @@ impl DdMin {
 
     /// The next subset to try, or nothing where the set is one-minimal.
     ///
-    /// A pure function of the state: asking twice without answering gives the same subset, which
-    /// is what a candidate whose run was lost is reissued from.
+    /// A pure function of the state, so a lost run can be reissued.
     #[must_use]
     pub fn next(&self) -> Option<&[usize]> {
         self.outstanding.as_deref()
@@ -61,14 +51,11 @@ impl DdMin {
     ///
     /// # Panics
     ///
-    /// Panics if nothing was proposed. An answer to a question nobody asked would minimise
-    /// towards a set that was never tried.
+    /// Panics if nothing was proposed.
     pub fn accept(&mut self, reproduced: bool) {
         let tried = self.outstanding.take().expect("an answer arrived for no proposal");
         if reproduced {
-            // The granularity drops back to two on a part and stays as fine as it can on a
-            // complement: removing one part leaves the rest cut the same way, and starting over
-            // coarsely would re-try what has already failed.
+            // A part resets granularity to two; a complement keeps it as fine as it can.
             self.granularity = if self.complements { (self.granularity - 1).max(2) } else { 2 };
             self.kept = tried;
             self.complements = false;
@@ -97,8 +84,7 @@ impl DdMin {
 
     /// Moves to complements, or to a finer granularity, or finishes.
     fn advance(&mut self) {
-        // A set of one has no finer granularity to reach, so its complement round is where the
-        // work ends rather than a step towards a wider one.
+        // A set of one ends after its complement round.
         if !self.complements && (self.granularity > 2 || self.kept.len() == 1) {
             self.complements = true;
         } else if self.granularity < self.kept.len() {
@@ -122,15 +108,11 @@ impl DdMin {
             parts
                 .iter()
                 .map(|part| self.kept.iter().copied().filter(|at| !part.contains(at)).collect())
-                // The empty complement is kept only where it is the one question left. For a
-                // larger set, removing everything at once is a subset successive halving reaches
-                // on its own; for a set of one, it is the only thing still worth asking, and
-                // dropping it left a single element in every result whether or not it was needed.
+                // The empty complement is kept only for a set of one; halving reaches it otherwise.
                 .filter(|complement: &Vec<usize>| !complement.is_empty() || self.kept.len() == 1)
                 .collect()
         } else {
-            // At granularity two a part and a complement are the same two subsets, so trying the
-            // parts alone is the whole of that round.
+            // At granularity two the parts are the complements.
             parts.into_iter().filter(|part| !part.is_empty()).collect()
         };
         self.queue.reverse();
@@ -141,8 +123,7 @@ impl DdMin {
     fn take_next(&mut self) {
         while self.outstanding.is_none() {
             if let Some(subset) = self.queue.pop() {
-                // A subset that changes nothing is not a question: it would spend a replay to be
-                // told what is already known.
+                // A subset equal to the current set is skipped.
                 if subset != self.kept {
                     self.outstanding = Some(subset);
                 }
@@ -192,7 +173,7 @@ mod tests {
         (ddmin.kept().to_vec(), probes)
     }
 
-    /// The case the algorithm exists for: one element is to blame and the rest are noise.
+    /// One element to blame among noise.
     #[test]
     fn one_guilty_element_is_found_among_many() {
         let (kept, probes) = minimise(64, |subset| subset.contains(&37));
@@ -200,8 +181,7 @@ mod tests {
         assert!(probes < 64, "{probes} probes for what a linear scan does in 64");
     }
 
-    /// Two elements that only reproduce together, which is what makes this delta debugging rather
-    /// than a scan: neither can be removed, and neither alone is the answer.
+    /// Two elements that reproduce only together are both kept.
     #[test]
     fn a_pair_that_only_fails_together_survives_together() {
         let (kept, _) = minimise(32, |subset| subset.contains(&5) && subset.contains(&29));
@@ -222,16 +202,14 @@ mod tests {
         assert_eq!(kept.len(), 8);
     }
 
-    /// Asking twice without answering asks the same thing, which is what a lost run is reissued
-    /// from.
+    /// Asking twice without answering proposes the same subset.
     #[test]
     fn proposing_twice_without_answering_proposes_the_same_subset() {
         let ddmin = DdMin::new(16);
         assert_eq!(ddmin.next(), ddmin.next());
     }
 
-    /// A minimisation never proposes the set it already holds: a probe that changes nothing spends
-    /// a replay to learn what is known.
+    /// A minimisation never proposes the set it already holds.
     #[test]
     fn nothing_proposed_is_the_set_already_held() {
         let mut ddmin = DdMin::new(9);
@@ -245,23 +223,20 @@ mod tests {
         }
     }
 
-    /// A set of one has exactly one question left: is the one needed at all?
-    ///
-    /// A scenario carrying a single entry keeps it only if the finding needs it; anything else is
-    /// not one-minimal, in the module's own words.
+    /// A set of one asks once whether its element is needed.
     #[test]
     fn a_set_of_one_is_asked_whether_it_is_needed() {
         let mut ddmin = DdMin::new(1);
         assert!(!ddmin.is_done(), "the one question was never asked");
         assert_eq!(ddmin.next(), Some(&[][..]), "the question is whether nothing reproduces");
 
-        // Answered no: the element is needed, and there is nothing further to ask.
+        // Answered no: the element is needed.
         ddmin.accept(false);
         assert!(ddmin.is_done());
         assert_eq!(ddmin.kept(), &[0]);
     }
 
-    /// And answered yes, the element goes and the set is empty.
+    /// Answered yes, the element goes.
     #[test]
     fn a_lone_element_that_is_not_needed_is_dropped() {
         let mut ddmin = DdMin::new(1);
@@ -271,7 +246,7 @@ mod tests {
         assert!(ddmin.kept().is_empty(), "the element nothing needed was kept");
     }
 
-    /// Nothing at all is nothing to ask about, which is the one set that starts finished.
+    /// An empty set starts finished.
     #[test]
     fn an_empty_set_has_nothing_to_minimise() {
         let ddmin = DdMin::new(0);

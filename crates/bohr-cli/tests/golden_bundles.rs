@@ -1,8 +1,7 @@
 //! Every bundle in `testdata/bundles/` must still replay.
 //!
-//! This is the promise that a finding stored today is still reproducible after the tool has moved
-//! on (`docs/TESTING.md` §7.2). Adding to the collection is mandatory whenever a determinism bug
-//! is fixed: the bundle that caught it becomes the test that it stays caught.
+//! A stored finding stays reproducible as the tool changes (`docs/TESTING.md` §7.2). Every
+//! determinism fix adds the bundle that caught it.
 
 use std::{path::PathBuf, process::Command};
 
@@ -25,9 +24,7 @@ fn every_golden_bundle_still_replays() {
         }
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
 
-        // A bundle produced under interception can only be replayed where a guest can be traced,
-        // and where its recorded binary is still on disk. Skipping is honest; pretending it
-        // passed is not, so the skip is printed.
+        // A traced bundle needs a tracing host and its recorded binary; a skip is printed.
         if name.starts_with("traced-") && !can_trace() {
             eprintln!("{name}: skipped, this host cannot trace a guest");
             continue;
@@ -53,8 +50,7 @@ const fn can_trace() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
-/// A bundle recorded under an older tape ABI is refused, with both versions named, and never
-/// replayed: a run derived from bytes interpreted another way is a different run.
+/// A bundle recorded under an older tape ABI is refused with both versions named.
 #[test]
 fn a_bundle_of_an_older_tape_abi_is_refused_by_name() {
     let dir = corpus().join("abi1");

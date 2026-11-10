@@ -1,12 +1,9 @@
 //! A reorg: every node rewound at one moment, and history let run again.
 //!
-//! The world has no notion of a block and this milestone forbids one, so what a reorg is here is
-//! protocol-free: a set of nodes goes back to a common older synced image at the same instant, what
-//! came after that point is discarded, and what the cluster does next is a different history rather
-//! than a replay of the same one.
+//! Protocol-free: the world has no notion of a block. A set of nodes returns to a common older
+//! synced image at one instant, and the cluster continues on a different history.
 //!
-//! The gate is the pair, as it is everywhere else here: the same scenario with the fault and
-//! without it, and the difference between them is what says the fault did something.
+//! Checked by comparing the scenario with and without the fault.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -20,7 +17,7 @@ use bohr_world::{NetworkConfig, NodeFaultKind, ScheduledNodeFault};
 const OPENAT: u32 = 257;
 /// `write`.
 const WRITE: u32 = 1;
-/// `fsync`: one completed sync is one entry in the history a reorg rewinds through.
+/// `fsync`; each completed sync is one step of rewindable history.
 const FSYNC: u32 = 74;
 /// `pread64`, which the node uses to read back what survived.
 const PREAD64: u32 = 17;
@@ -40,9 +37,7 @@ const REORG_AT: Tick = Tick(10 * Tick::MILLISECOND.get());
 
 /// A node that appends a record and makes it durable, over and over, reading back as it goes.
 ///
-/// The read-back is what makes a rewind visible from inside: after one, the node finds a shorter
-/// file than it wrote, which is exactly what a client sees when the chain it was on is not the
-/// chain any more.
+/// After a rewind the read-back finds a shorter file, as a client sees an abandoned chain.
 fn a_node() -> NullProgram {
     let mut ops =
         vec![GuestOp::Syscall { nr: OPENAT, args: [u64::MAX, PATH_AT, OPEN_FLAGS, 0o644, 0, 0] }];
@@ -90,8 +85,7 @@ fn a_reorg(back: usize, nodes: Vec<NodeId>) -> Vec<ScheduledNodeFault> {
     }]
 }
 
-/// The gate: a run with a reorg and one without differ, and the difference is measured rather than
-/// assumed.
+/// Runs with and without a reorg differ by a measured amount.
 #[test]
 fn a_run_with_a_reorg_and_one_without_are_different_runs() {
     let plain = judge(Vec::new());
@@ -104,8 +98,7 @@ fn a_run_with_a_reorg_and_one_without_are_different_runs() {
 
 /// Narrated once, at the world, and never as N node restarts.
 ///
-/// A reorg that looked like independent rewinds in the stream would be indistinguishable from N
-/// independent rewinds, and telling those apart is the whole of what this fault is for.
+/// One event, so it is distinguishable from independent rewinds.
 #[test]
 fn a_reorg_is_one_thing_that_happened_to_the_cluster() {
     let judged = judge(a_reorg(2, Vec::new()));
@@ -129,8 +122,7 @@ fn a_reorg_is_one_thing_that_happened_to_the_cluster() {
     assert_eq!(*fired[0], FaultKind::ChainReorg);
 }
 
-/// How deep it went is on the timeline, because it is not always how deep it was asked to go: a
-/// cluster has as many sync histories as it has nodes.
+/// The actual depth is on the timeline, since each node has its own sync history.
 #[test]
 fn how_far_history_went_back_is_recorded() {
     let judged = judge(a_reorg(2, Vec::new()));
@@ -153,8 +145,7 @@ fn how_far_history_went_back_is_recorded() {
     assert_eq!(nodes, 2, "both nodes went back");
 }
 
-/// A subset is rewound where the scenario names one, which is what a fork that only some of the
-/// cluster followed looks like.
+/// A named subset is rewound, like a fork only part of the cluster followed.
 #[test]
 fn a_reorg_may_rewind_some_of_the_cluster() {
     let judged = judge(a_reorg(2, vec![NodeId(0)]));
@@ -178,8 +169,7 @@ fn a_reorg_reproduces() {
     }
 }
 
-/// The measured difference, printed so the gate's number comes from a test rather than from
-/// somebody running the tool twice and writing down what they saw.
+/// Prints the measured difference for the gate.
 #[test]
 fn the_difference_a_reorg_makes_is_measured() {
     let plain = judge(Vec::new());
@@ -193,9 +183,7 @@ fn the_difference_a_reorg_makes_is_measured() {
         rewound.report.journal.len()
     );
 
-    // Recorded in `benches/baseline.toml` under `[m4_1.reorg]`. Asserted as a range rather than a
-    // number: what has to stay true is that the fault does something substantial, and pinning the
-    // exact count would make every change to the model a failing test with nothing wrong behind it.
+    // Recorded in `benches/baseline.toml` under `[m4_1.reorg]`; asserted as a range.
     let delta = plain.report.events.abs_diff(rewound.report.events);
     assert!(delta >= 10, "a reorg moved only {delta} events, which is not a rewind");
 }

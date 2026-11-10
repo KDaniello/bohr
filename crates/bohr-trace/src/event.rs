@@ -1,8 +1,7 @@
 //! Recorded facts, and the canonical projection they are digested through.
 //!
-//! The digest defines what "the same run" means, so its input is a hand-written byte encoding
-//! rather than the serialised form: a change of serialisation library or version must not be able
-//! to change what two runs compare as. Fields excluded from it are listed in `docs/API.md` §4.4.
+//! The digest uses a hand-written byte encoding, so serialisation libraries cannot change it.
+//! Excluded fields are listed in `docs/API.md` §4.4.
 
 use bohr_types::{EventId, Fd, NodeId, SyncWordId, TaskId, Tick, WorldModelId};
 use serde::{Deserialize, Serialize};
@@ -24,9 +23,7 @@ pub struct Event {
 
 /// A cluster that could talk to itself again went on committing nothing.
 ///
-/// Raised by a world model, read by anything that reads a timeline — which is why it is spelled
-/// here and not there: a reduction reconstructs what a run found from a stored log, and it depends
-/// on no world. Catalogued in `docs/API.md` §8.
+/// Defined here so readers of a stored log need no world model. Catalogued in `docs/API.md` §8.
 pub const LIVENESS_CODE: &str = "BOHR-2030";
 
 /// A node answered while what it had written was not durable, and came back without it.
@@ -62,9 +59,7 @@ pub enum EventKind {
         emulated: bool,
         /// Digest of bytes the world wrote into the guest, truncated to eight bytes.
         ///
-        /// Arguments carry addresses, not contents, so without this a syscall that delivered
-        /// different data would produce an identical event and two different runs would compare
-        /// as one.
+        /// Arguments carry addresses, so this tells apart calls that delivered different data.
         data_digest: Option<[u8; 8]>,
     },
     /// The scheduler moved execution between tasks.
@@ -134,7 +129,7 @@ pub enum EventKind {
         /// The word it waits on.
         on: SyncWordId,
     },
-    /// A waiting task was released, by the decision recorded here rather than by host ordering.
+    /// A waiting task was released, by the decision recorded here.
     Woke {
         /// The task that was released.
         task: TaskId,
@@ -164,9 +159,8 @@ pub enum EventKind {
     },
     /// Something the supervisor wants a reader to know. The message is excluded from the digest.
     ///
-    /// The codes a boundary oracle raises are named below rather than in the world model that
-    /// raises them: a reduction reads them back out of a stored timeline, and it cannot depend on
-    /// any world. See `docs/API.md` §8.
+    /// Boundary-oracle codes are defined in this crate so reductions need no world. See
+    /// `docs/API.md` §8.
     Diagnostic {
         /// Stable error or warning code.
         code: String,
@@ -215,7 +209,7 @@ pub enum ExitStatus {
 pub struct Endpoint {
     /// The node.
     pub node: NodeId,
-    /// The port, assigned by the world rather than by a host kernel.
+    /// The port, assigned by the world.
     pub port: u16,
 }
 
@@ -239,7 +233,7 @@ pub enum PacketFate {
 pub enum DiskOpKind {
     /// Read bytes.
     Read,
-    /// Write bytes, not necessarily durable.
+    /// Write bytes, durable only after a sync.
     Write,
     /// Make prior writes durable.
     Fsync,
@@ -284,9 +278,7 @@ pub enum FaultKind {
     ClockDrift,
     /// Rewind a set of nodes to a common older image and let history run again.
     ///
-    /// Appended rather than inserted, and that is load-bearing: this enum reaches the trace digest
-    /// as its declaration-order discriminant, so a variant added anywhere but the end renumbers
-    /// the ones after it and changes what every stored bundle hashes to.
+    /// Appended: the declaration-order discriminant reaches the digest.
     ChainReorg,
     /// Refuse an allocation: `mmap` and `mremap` answer `ENOMEM`, `brk` leaves the break where it
     /// was. Appended, for the reason above.
@@ -357,20 +349,11 @@ impl Event {
 
 /// Feeds a syscall's arguments into `hasher`, as the call itself reads them.
 ///
-/// **A syscall is entered with six registers whatever it takes**, and the ones it does not read
-/// hold whatever was there before. In a program the size of an execution client that is a pointer,
-/// so hashing all six makes the digest a function of the memory layout: measured, one client under
-/// two coverage map sizes produced the same 36 735 events, in the same order, with the same
-/// returns, and two different digests — every one of the 11 233 differing lines an argument
-/// register of a call that does not take one.
+/// Unread registers hold leftovers, often pointers, which would tie the digest to memory layout.
+/// One client under two map sizes gave 36 735 identical events and two digests.
 ///
-/// An address is hashed as whether it is null rather than as where it points. What it points *at*
-/// is behaviour and is already carried: bytes the world wrote into the guest by `data_digest`, and
-/// bytes the guest wrote out by whatever the world did with them. What it equals is a fact about
-/// this run's memory and about nothing else.
-///
-/// A number the table has never heard of is hashed by all six, which is stricter than necessary and
-/// never wrong — no scenario here can produce one, since an unmodelled call ends the run.
+/// An address is hashed as null or not; what it points at is carried by `data_digest`. An unknown
+/// number hashes all six registers.
 fn absorb_args(nr: u32, args: &[u64; 6], h: &mut blake3::Hasher) {
     let Some(shape) = crate::syscall_args(nr) else {
         for a in args {
@@ -386,8 +369,7 @@ fn absorb_args(nr: u32, args: &[u64; 6], h: &mut blake3::Hasher) {
     }
 }
 
-/// Discriminants are written explicitly rather than derived from declaration order, so that
-/// inserting a variant cannot renumber the ones after it and change stored digests.
+/// Outer discriminants are explicit, so inserting a variant changes no stored digest.
 impl EventKind {
     fn absorb(&self, h: &mut blake3::Hasher) {
         match self {
@@ -469,10 +451,7 @@ impl EventKind {
                 h.update(&[*kind as u8]);
                 h.update(&[u8::from(*hit), u8::from(*condition)]);
             }
-            // The word is absorbed as the ordinal it is, not as an address. Hashing where a
-            // lock happened to live made the digest a function of the memory layout, which is
-            // the same defect `absorb_args` was written to remove and which these two carried
-            // on past it.
+            // The word as an ordinal, as in `absorb_args`.
             Self::Waited { on } => {
                 h.update(&[15]);
                 h.update(&on.get().to_le_bytes());
@@ -486,8 +465,7 @@ impl EventKind {
                 h.update(&[12]);
                 h.update(&index.to_le_bytes());
             }
-            // The code identifies the condition; the wording is presentation and may be reworded
-            // without changing what the run did.
+            // The code only; the wording is presentation.
             Self::Diagnostic { code, message: _ } => {
                 h.update(&[13]);
                 absorb_str(h, code);
@@ -536,8 +514,7 @@ impl FaultTarget {
 
 /// Digest of `bytes`, truncated to what an event carries.
 ///
-/// Eight bytes is enough to make two different payloads differ in a trace while keeping the
-/// contents themselves out of it: a bundle records what happened, not what the guest was told.
+/// Eight bytes tell payloads apart while keeping contents out of the trace.
 #[must_use]
 pub fn short_digest(bytes: &[u8]) -> [u8; 8] {
     let full = blake3::hash(bytes);

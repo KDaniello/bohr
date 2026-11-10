@@ -418,6 +418,16 @@ probability, its candidate moments being a subset of uniform's and on that targe
 §5.4 withdraws the claim rather than softening it. The job stays, because the mechanism is sound and
 the heuristic choosing its moments is what needs the work — this is where that will show.
 
+**The bank.** Every finding in another project is kept in `findings/bank/`, private and never
+published: its bundles, the very binaries it was found on — a rebuilt binary is another program,
+and a finding banked by digest alone is one nobody can replay — and the command that found it.
+`make bank` replays each bundle to its digest and fails on one that no longer does, because a
+bundle that stops replaying means the tool changed what a stored run means.
+
+**Claims.** `make claims` prints each claim the tool makes with the figure that decides it, read
+from `benches/baseline.toml`: held, failed, or not measured where no figure was recorded. A claim
+is never reported as held for want of a measurement.
+
 **Reduction on a real client.** A fixture's ratio is not a reducer's ratio: `PingPong` shrinks from
 49,477 events to 18 because nothing in it costs events but the faults, and a real client spends
 thousands on starting. So the reducer is judged on findings the target packs produce, each reduced

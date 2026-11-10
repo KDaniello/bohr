@@ -1,21 +1,11 @@
 //! A node that stopped is not a node that is idle, and the difference is that one still polls.
 //!
-//! A guest with nothing to do does not fall silent: it asks the time, it waits on its poller, it
-//! asks again. An execution client with no work spends a million clock reads and half a million
-//! waits on saying so. A guest that has *stopped* — parked in a wait nothing will release — makes
-//! no call at all.
+//! An idle guest keeps reading the clock and polling; a stopped guest, parked in a wait nothing
+//! will release, makes no calls. The run loop sees both as blocked with a future timer. Against a
+//! real execution client, 12 of 20 runs left it unable to start and 8 of those were judged clean.
 //!
-//! From the run loop the two are identical: every task blocked, a timer somewhere in the future. So
-//! a horizon completes both, and a run that ended with a wedged guest is judged on the execution
-//! that happened rather than on the one that stopped. Measured against a real execution client:
-//! twelve runs of twenty left it unable to start, and the panel called eight of them clean.
-//!
-//! **This is the first verdict that needs no driver.** Every other way of noticing a dead guest
-//! here reads something the guest said about itself, or something a caller asked it — and a caller
-//! is written per target. A node that went quiet is a finding for anything.
-//!
-//! Stated as a pair, because a watcher that fired on the polling guest too would satisfy any claim
-//! made about it and mean nothing.
+//! This verdict needs no target-specific driver. It fires on the stopped guest and not on the
+//! idle one.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -43,7 +33,7 @@ const QUIET: Tick = Tick(20 * Tick::MILLISECOND.get());
 /// Far enough past the span that the check has fired well before the run ends.
 const HORIZON: Tick = Tick(200 * Tick::MILLISECOND.get());
 
-/// Asks the time for ever, which is what a server with nothing to do does.
+/// Asks the time for ever, like an idle server.
 fn polls_for_ever() -> NullProgram {
     NullProgram::single(
         (0..10_000)
@@ -54,8 +44,7 @@ fn polls_for_ever() -> NullProgram {
 
 /// Makes a few calls and then waits on a word nobody writes.
 ///
-/// The shape of a guest that has failed and is unwinding into a wait it will never leave — which is
-/// what an execution client does after it decides it cannot open its store.
+/// Like an execution client that cannot open its store.
 fn stops() -> NullProgram {
     let mut ops: Vec<GuestOp> = (0..3)
         .map(|_| GuestOp::Syscall { nr: SLEEP, args: [TIMESPEC_AT, 0, 0, 0, 0, 0] })
@@ -64,7 +53,7 @@ fn stops() -> NullProgram {
     NullProgram::single(ops)
 }
 
-/// Makes a few calls and leaves, which is what a caller with nothing left to ask does.
+/// Makes a few calls and exits, like a finished caller.
 fn finishes() -> NullProgram {
     let mut ops: Vec<GuestOp> = (0..3)
         .map(|_| GuestOp::Syscall { nr: SLEEP, args: [TIMESPEC_AT, 0, 0, 0, 0, 0] })
@@ -107,7 +96,7 @@ fn named(judged: &Judged) -> Vec<NodeId> {
         .collect()
 }
 
-/// The claim: a node that stopped is named, and the run says so.
+/// A stopped node is named.
 #[test]
 fn a_node_that_stopped_is_a_finding() {
     let judged = judge(stops());
@@ -119,7 +108,7 @@ fn a_node_that_stopped_is_a_finding() {
     );
 }
 
-/// And a cluster where both nodes are only idle is clean, so the pair means something.
+/// A cluster of idle nodes is clean.
 #[test]
 fn a_node_that_is_only_idle_is_not() {
     let judged = judge(polls_for_ever());
@@ -127,12 +116,7 @@ fn a_node_that_is_only_idle_is_not() {
     assert_eq!(judged.report.outcome, Outcome::Clean);
 }
 
-/// And a node this world killed is not accused of having stopped.
-///
-/// **The case that would have made the watch unusable in the campaigns it was built for.** A dead
-/// node makes no calls, which is what a stopped node looks like — so without this, arming the watch
-/// alongside a crash campaign reports a stopped node at every kill whose outage outlasts the span,
-/// and every run of a fault campaign carries a finding the world itself caused.
+/// A node the world killed is not reported as stopped, so the watch works in crash campaigns.
 #[test]
 fn a_node_this_world_killed_is_not_accused_of_stopping() {
     use bohr_world::{NodeFaultKind, ScheduledNodeFault};
@@ -161,9 +145,7 @@ fn a_node_this_world_killed_is_not_accused_of_stopping() {
 
 /// Nor is a node whose program finished.
 ///
-/// A caller that has asked everything it came to ask leaves, and is silent for whatever is left of
-/// the run. Every scenario driven by such a caller would otherwise carry a finding about it —
-/// including the one this watch was armed for, where the caller is the whole point.
+/// A finished caller is silent for the rest of the run and is not reported.
 #[test]
 fn a_node_whose_program_ended_is_not_accused_of_stopping() {
     let judged = judge(finishes());
@@ -173,14 +155,8 @@ fn a_node_whose_program_ended_is_not_accused_of_stopping() {
 
 /// A run says how much adversity actually landed on it.
 ///
-/// **A campaign that injected nothing looks exactly like one that injected plenty and was answered
-/// well.** Faults are drawn, so whether any fired is a fact about the run and not about the
-/// configuration that armed them: a scenario can arm a policy at a moment the run ends before, and
-/// reporting its clean runs without this would be reporting that a question was asked when it was
-/// not. Measured — twenty seeds against a real client armed a kill and fired none, and only this
-/// number said so.
-///
-/// The pair is a run with a fault written down and the same run without one.
+/// Faults are drawn and a run can end before they arm; twenty seeds against a real client fired
+/// none, and only this number showed it. Checked with and without a scheduled fault.
 #[test]
 fn a_run_says_how_much_adversity_landed() {
     use bohr_world::{NodeFaultKind, ScheduledNodeFault};

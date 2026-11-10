@@ -1,9 +1,7 @@
 //! The page, checked for the things a reader would never notice and an attacker would.
 //!
-//! Rendering is exempt from being written test-first — how a report looks is settled by showing it
-//! to somebody, not by asserting on it. What is not exempt is everything a test can decide: that a
-//! guest cannot write markup into it, that the elements close, that two renderings of one bundle
-//! are the same bytes, and that the file stays small enough to attach to an issue.
+//! Appearance is reviewed by eye. These check what a test can: no injected markup, closed elements,
+//! identical bytes for one bundle, and a size small enough to attach.
 
 use std::path::PathBuf;
 
@@ -20,8 +18,7 @@ fn page(name: &str) -> String {
     bohr_report::render(&bundle, Some("events.jsonl")).expect("a stored bundle renders").html
 }
 
-/// Every element that opens closes, in order. A page that does not is one a browser repairs by
-/// guessing, and two browsers guess differently.
+/// Every element that opens closes, in order.
 #[test]
 fn every_element_closes_in_the_order_it_opened() {
     const VOID: [&str; 6] = ["meta", "br", "hr", "img", "input", "link"];
@@ -31,9 +28,7 @@ fn every_element_closes_in_the_order_it_opened() {
     let mut rest = html.as_str();
     while let Some(at) = rest.find('<') {
         rest = &rest[at + 1..];
-        // A style or script element holds raw text, not markup: its body is full of angle
-        // brackets that are comparisons rather than tags, and a scanner that read them as tags
-        // would be checking a different document than a browser does.
+        // Style and script bodies are raw text, as a browser reads them.
         let raw_text = ["style>", "script>"].into_iter().find(|raw| rest.starts_with(raw));
         if let Some(raw) = raw_text {
             let closing = format!("</{raw}");
@@ -60,7 +55,7 @@ fn every_element_closes_in_the_order_it_opened() {
     assert!(open.is_empty(), "left open: {open:?}");
 }
 
-/// Anchors resolve. A "go to the violation" that goes nowhere is worse than not offering it.
+/// Every anchor resolves.
 #[test]
 fn every_identifier_is_unique() {
     let html = page("clock-and-random-seed0.bohr");
@@ -75,8 +70,7 @@ fn every_identifier_is_unique() {
     }
 }
 
-/// The one that matters. Everything a page shows came out of a guest, and a report is the file
-/// that circulates — so a run must not be able to make the page it is described by do anything.
+/// A guest cannot inject markup into its page.
 #[test]
 fn a_guest_cannot_write_markup_into_the_page() {
     let bytes = stored("two-tasks-seed0.bohr");
@@ -96,9 +90,7 @@ fn a_guest_cannot_write_markup_into_the_page() {
     }
 
     let html = bohr_report::render_model(&model, None);
-    // The sequence never survives intact, wherever it landed — as text, as an attribute value, or
-    // as data in the script block. Forbidding the characters instead would mean a page could never
-    // contain the word, which is not the property that matters.
+    // The sequence never survives intact, as text, attribute or script data.
     assert!(!html.contains(hostile), "a guest's own markup reached the page whole");
     assert!(!html.contains("<img src=x"), "a guest opened an element");
     assert_eq!(
@@ -109,15 +101,14 @@ fn a_guest_cannot_write_markup_into_the_page() {
     assert!(html.contains("&lt;/script&gt;") || html.contains("\\u003c"), "nothing was escaped");
 }
 
-/// Two renderings of one bundle are the same bytes. Anything else means something in the page is
-/// a fact about when it was made rather than about the run.
+/// Two renderings of one bundle are the same bytes.
 #[test]
 fn one_bundle_renders_the_same_twice() {
     assert_eq!(page("two-tasks-seed0.bohr"), page("two-tasks-seed0.bohr"));
     assert_eq!(page("large-random-seed0.bohr"), page("large-random-seed0.bohr"));
 }
 
-/// A page too large to attach to an issue has stopped being a report.
+/// A page stays small enough to attach to an issue.
 #[test]
 fn a_page_stays_small_enough_to_send() {
     for name in ["two-tasks-seed0.bohr", "clock-and-random-seed0.bohr", "large-random-seed0.bohr"] {
@@ -126,8 +117,7 @@ fn a_page_stays_small_enough_to_send() {
     }
 }
 
-/// A short run is drawn whole and needs nothing beside it; the sidecar exists for the runs that
-/// are not.
+/// A short run is drawn whole, with no sidecar.
 #[test]
 fn a_run_drawn_whole_needs_nothing_beside_it() {
     let bytes = stored("two-tasks-seed0.bohr");
@@ -136,7 +126,7 @@ fn a_run_drawn_whole_needs_nothing_beside_it() {
     assert!(rendered.sidecar.is_none(), "a whole run was given a sidecar it does not need");
 }
 
-/// What a reader is looking for is above what the tool is proud of.
+/// The verdict and command come before the machinery.
 #[test]
 fn the_verdict_comes_before_the_machinery() {
     let html = page("two-tasks-seed0.bohr");
@@ -149,14 +139,8 @@ fn the_verdict_comes_before_the_machinery() {
 
 /// A chip carries the slot it stands for, and the slot is not its position in the document.
 ///
-/// **Lanes are written one node at a time and the timeline runs across them**, so with a cluster
-/// the third chip in the document is not the third event of the run. With one node the two orders
-/// coincide, which is why only a cluster can tell a page selecting by slot from one selecting by
-/// document position -- and on a cluster the second opens somebody else's event.
-///
-/// Checked on the rendered page rather than through a browser: what the script reads is
-/// `data-index`, so what a test can decide is that the attribute says the slot and that the slots
-/// of one lane are not the positions of its chips.
+/// Lanes are written one node at a time, so in a cluster document order differs from run order.
+/// The script reads `data-index`, which this checks names the slot.
 #[test]
 fn a_chip_says_which_event_it_is_and_not_where_it_sits() {
     let bytes = stored("two-tasks-seed0.bohr");
@@ -185,7 +169,7 @@ fn a_chip_says_which_event_it_is_and_not_where_it_sits() {
         "the document order and the timeline order are the same, so this proves nothing"
     );
 
-    // And every slot the page names is one the script can look up in EVENTS.
+    // Every slot named is in EVENTS.
     let drawn = html.matches("\"id\":").count();
     for slot in &slots {
         assert!(*slot < drawn, "a chip names slot {slot} of {drawn} events");

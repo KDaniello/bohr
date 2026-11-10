@@ -22,8 +22,7 @@ fn stored(name: &str) -> String {
 const BUNDLES: [&str; 3] =
     ["clock-and-random-seed0.bohr", "large-random-seed0.bohr", "two-tasks-seed0.bohr"];
 
-/// A story is told from the bundle alone, so one bundle tells one story every time, and the JSON
-/// carries every field the text is written from.
+/// One bundle tells one story every time, and the JSON carries every field the text uses.
 #[test]
 fn a_stored_run_tells_the_same_story_every_time() {
     for name in BUNDLES {
@@ -82,8 +81,7 @@ fn a_kind_and_its_complement_are_the_whole_log() {
     }
 }
 
-/// A time is read exactly as written, and a kind nobody defined is refused rather than matching
-/// nothing.
+/// A time is read exactly as written, and an unknown kind is refused.
 #[test]
 fn a_selection_is_read_exactly_or_refused() {
     let path = stored("two-tasks-seed0.bohr");

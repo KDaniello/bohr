@@ -1,24 +1,15 @@
 //! The submission ring a guest hands work to, and the shape of everything in it.
 //!
-//! **A ring is not unobservable, only its poller is.** Work leaves the guest through shared memory
-//! and the supervisor sees none of it while a kernel thread drains the queue, and only then: a
-//! guest whose queue nobody drains must call `io_uring_enter`, and at that call every submission
-//! sits in memory this world can read. A polled queue is opened with its poller asleep
-//! ([`SETUP_SQPOLL`]), which turns it into the same case.
+//! Without a kernel poller the guest must call `io_uring_enter`, where every submission is in
+//! readable memory. A polled queue starts with its poller asleep ([`SETUP_SQPOLL`]).
 //!
-//! **Each submission is the plain call it stands for.** [`plain_call`] translates an entry into the
-//! syscall that does the same work, and the world carries it out by the route that call takes when
-//! the guest makes it directly — the same file table, the same disk marks, the same drawn faults.
-//! A write through a ring that skipped the disk model would survive every crash.
+//! [`plain_call`] translates each entry into the equivalent syscall, carried out by that call's
+//! route: same file table, disk marks and drawn faults.
 //!
-//! **The layout is ours.** A kernel tells the guest where each part of the queue sits, and every
-//! caller reads the offsets rather than assuming them; what matters is that what is reported is
-//! what is built.
+//! The layout is ours; callers read the reported offsets.
 //!
-//! What this does not do: registered buffers and files, buffer selection, timeouts, cancellation,
-//! any operation outside [`plain_call`], and anything asynchronous. Every submission is carried out
-//! where it is read and its completion posted before the call returns — a ring that is always empty
-//! by the time anyone looks, which is legal and the only one a replay can reconstruct.
+//! Not supported: registered buffers and files, buffer selection, timeouts, cancellation, other
+//! operations, and asynchrony. Every completion is posted before the call returns.
 
 /// Where the guest asks for each region, and what the kernel calls those numbers.
 pub(crate) mod offset {
@@ -36,21 +27,18 @@ pub(crate) const SQE_BYTES: u64 = 64;
 /// Bytes in one completion entry: what the submission carried, the result, and flags.
 pub(crate) const CQE_BYTES: u64 = 16;
 
-/// What this ring promises, and only what is true here: a bit advertised and not kept is worse
-/// than one withheld. `NODROP` (no entry is taken without a completion slot free), `SUBMIT_STABLE`
-/// (entries are read where they are carried out) and `SQPOLL_NONFIXED` (nothing can be registered).
-/// `SINGLE_MMAP` is withheld: the two queues are two regions.
+/// `NODROP` (no entry taken without a free completion slot), `SUBMIT_STABLE` (entries are read
+/// when carried out) and `SQPOLL_NONFIXED` (nothing registers). `SINGLE_MMAP` is withheld.
 const FEATURES: u32 = (1 << 1) | (1 << 2) | (1 << 7);
 
 /// `IORING_SETUP_SQPOLL`: the queue is drained by a thread of the kernel's own.
 ///
-/// The poller here is always asleep, so [`SQ_NEED_WAKEUP`] stays set and every caller wakes it
-/// through `io_uring_enter` — a state a real kernel produces constantly, and the one this answers.
+/// The poller is always asleep, so [`SQ_NEED_WAKEUP`] stays set and callers enter to wake it.
 pub(crate) const SETUP_SQPOLL: u32 = 1 << 1;
 
 /// Setup flags this ring honours: `SQPOLL`, `SQ_AFF`, `CQSIZE`, `CLAMP`, `ATTACH_WQ`, `SUBMIT_ALL`,
-/// `COOP_TASKRUN`, `TASKRUN_FLAG`, `SINGLE_ISSUER` and `DEFER_TASKRUN` — each either changes
-/// nothing a ring that completes everything at once does, or is carried out below.
+/// `COOP_TASKRUN`, `TASKRUN_FLAG`, `SINGLE_ISSUER` and `DEFER_TASKRUN`; each is a no-op here or
+/// handled below.
 const SETUP_HONOURED: u32 = (1 << 1)
     | (1 << 2)
     | SETUP_CQSIZE
@@ -61,7 +49,7 @@ const SETUP_HONOURED: u32 = (1 << 1)
     | (1 << 9)
     | (1 << 12)
     | (1 << 13);
-/// Setup flags a kernel knows and this ring does not carry, refused by name rather than answered.
+/// Setup flags a kernel knows and this ring does not carry, refused by name.
 const SETUP_REFUSED: [(u32, &str); 7] = [
     (1 << 0, "IORING_SETUP_IOPOLL"),
     (1 << 6, "IORING_SETUP_R_DISABLED"),
@@ -71,9 +59,9 @@ const SETUP_REFUSED: [(u32, &str); 7] = [
     (1 << 15, "IORING_SETUP_REGISTERED_FD_ONLY"),
     (1 << 16, "IORING_SETUP_NO_SQARRAY"),
 ];
-/// `IORING_SETUP_CQSIZE`: the completion queue's size is the caller's, not twice the submissions.
+/// `IORING_SETUP_CQSIZE`: the completion queue's size is the caller's.
 const SETUP_CQSIZE: u32 = 1 << 3;
-/// `IORING_SETUP_CLAMP`: sizes past the limit are clamped rather than refused.
+/// `IORING_SETUP_CLAMP`: sizes past the limit are clamped.
 const SETUP_CLAMP: u32 = 1 << 4;
 /// The most submission slots a kernel gives, and the most completion slots.
 const MAX_ENTRIES: u32 = 32_768;
@@ -90,8 +78,7 @@ pub(crate) enum Setup {
 
 /// `IORING_SQ_NEED_WAKEUP`, in the submission queue's own flag word.
 ///
-/// Kept set for the life of a polled ring. Clearing it would mean claiming a thread is draining the
-/// queue, and none is.
+/// Always set on a polled ring, since no thread drains it.
 const SQ_NEED_WAKEUP: u32 = 1 << 0;
 
 /// `IOSQE_FIXED_FILE`: the descriptor is an index into registered files, which this ring refuses.
@@ -154,8 +141,7 @@ pub(crate) struct Ring {
 impl Ring {
     /// A ring of `asked` slots, rounded up the way the interface says.
     ///
-    /// A power of two because the control block reports a mask rather than a count, and a caller
-    /// that took the mask at its word on a queue that was not one would read the wrong slot.
+    /// A power of two, since the control block reports a mask.
     pub(crate) fn new(asked: u32, polled: bool) -> Self {
         let entries = asked.clamp(1, MAX_ENTRIES).next_power_of_two();
         Self {
@@ -227,8 +213,7 @@ impl Ring {
 
     /// The `io_uring_params` block the guest is handed back, filled in.
     ///
-    /// A hundred and twenty bytes: what was asked for, what was given, what is promised, and where
-    /// every part of both queues will be found.
+    /// 120 bytes: sizes, flags, features and the queues' offsets.
     pub(crate) fn params(self) -> [u8; 120] {
         let mut out = [0u8; 120];
         let mut put = |at: usize, value: u32| {
@@ -261,9 +246,7 @@ impl Ring {
 
     /// The control block a freshly mapped submission queue starts with.
     ///
-    /// Written by this world rather than left as the zeroes an anonymous mapping arrives as: the
-    /// mask and the entry count are what the guest reads to know the shape of what it was given,
-    /// and a caller that read zero for both would put every submission in slot nought.
+    /// Written by the world, since the guest reads the mask and count from it.
     pub(crate) fn sq_control(self) -> [u8; sq::ARRAY as usize] {
         let mut out = [0u8; sq::ARRAY as usize];
         if self.polled {
@@ -310,8 +293,7 @@ impl Ring {
 
     /// Where one submission entry lives, or nothing for an index past the queue.
     ///
-    /// Not masked: a kernel drops an entry whose index names no slot and counts it, and a mask
-    /// would quietly carry out whatever another slot held.
+    /// Not masked: a bad index is dropped, as in a kernel.
     pub(crate) fn sqe_at(self, index: u32) -> Option<u64> {
         if index >= self.entries {
             return None;
@@ -428,9 +410,7 @@ pub(crate) enum Plain {
 
 /// The syscall a submission stands for, or why it stands for none this ring carries.
 ///
-/// **The translation is the whole model of an operation.** Carrying a write out by any route other
-/// than the one `pwrite64` takes would give the ring a file model of its own, and two file models
-/// disagree. A position of `-1` means the descriptor's own, as in the interface, and becomes the
+/// The translation is the whole model, so there is one file model. A position of `-1` becomes the
 /// non-positional call.
 pub(crate) fn plain_call(asked: &Submission) -> Result<Plain, String> {
     if asked.flags & SQE_FIXED_FILE != 0 {
@@ -442,8 +422,7 @@ pub(crate) fn plain_call(asked: &Submission) -> Result<Plain, String> {
     if asked.file_index != 0 && matches!(asked.opcode, op::OPENAT | op::CLOSE) {
         return Err("a registered slot".to_owned());
     }
-    // `RWF_DSYNC`, `RWF_APPEND` and the rest change where a write lands or when it is durable; a
-    // plain `pwrite64` would carry neither, so any of them is refused rather than dropped.
+    // `RWF_*` flags are refused, since `pwrite64` cannot carry them.
     if asked.op_flags != 0 && matches!(asked.opcode, op::READ | op::WRITE) {
         return Err(format!("read or write flags {:#x}", asked.op_flags));
     }
@@ -477,11 +456,9 @@ pub(crate) fn plain_call(asked: &Submission) -> Result<Plain, String> {
     Ok(Plain::Call(nr, args))
 }
 
-/// Whether an entry's descriptor is the thing it acts on, rather than a directory a path is under.
+/// Whether an entry's descriptor is the thing it acts on.
 ///
-/// Those are the entries that must name a file: a write to a socket wakes its peer and a write to
-/// a counter wakes a poller, and a submission carried out as a plain call has nowhere to put
-/// either.
+/// Such entries must name a file, since a plain call cannot wake a socket peer or a poller.
 pub(crate) const fn acts_on_descriptor(asked: &Submission) -> bool {
     matches!(asked.opcode, op::READ | op::WRITE | op::FSYNC | op::CLOSE)
 }
@@ -491,11 +468,8 @@ pub(crate) type Completed = (u64, i64);
 
 /// Carries out a batch in order, honouring links, and returns the completions to post.
 ///
-/// **In order is a legal schedule and the only reproducible one.** A kernel may run unlinked
-/// entries in any order, so no caller can depend on one, and running them as written satisfies
-/// `IOSQE_IO_DRAIN` without doing anything. An entry that fails cancels the rest of its soft chain
-/// with `ECANCELED`; a short read or write counts as failing there, because the next link would act
-/// on bytes that never arrived.
+/// In order, a legal schedule that also satisfies `IOSQE_IO_DRAIN`. A failure, including a short
+/// transfer, cancels the rest of its soft chain with `ECANCELED`.
 pub(crate) fn carry_all<E>(
     batch: &[Submission],
     mut carry: impl FnMut(&Submission) -> Result<i64, E>,
@@ -511,8 +485,7 @@ pub(crate) fn carry_all<E>(
         if failed || asked.flags & SQE_CQE_SKIP_SUCCESS == 0 {
             posted.push((asked.user_data, result));
         }
-        // The chain ends at the first entry that does not link onward; a hard link carries on past
-        // a failure, a soft one does not.
+        // A chain ends at the first unlinked entry; hard links survive failures.
         if asked.flags & (SQE_IO_LINK | SQE_IO_HARDLINK) == 0 {
             cancelling = false;
         } else if failed && asked.flags & SQE_IO_HARDLINK == 0 {
@@ -535,7 +508,7 @@ pub(crate) fn completion(user_data: u64, result: i64) -> [u8; CQE_BYTES as usize
 mod tests {
     use super::*;
 
-    /// A queue is a power of two whatever was asked for, because the guest is handed a mask.
+    /// A queue is always a power of two.
     #[test]
     fn a_queue_is_a_power_of_two() {
         assert_eq!(Ring::new(1, false).entries, 1);
@@ -547,8 +520,7 @@ mod tests {
 
     /// The mask the guest reads and the count it reads describe the same queue.
     ///
-    /// A caller puts a submission at `tail & mask` and believes there are `entries` of them; the
-    /// two disagreeing is how every submission lands in one slot.
+    /// The mask and count agree.
     #[test]
     fn the_mask_and_the_count_agree() {
         let ring = Ring::new(8, false);
@@ -566,8 +538,7 @@ mod tests {
         assert_eq!(mask + 1, count);
     }
 
-    /// **What is reported is what is built.** A caller reads the offsets rather than assuming them,
-    /// so the one thing that must hold is that the block describes the regions this hands out.
+    /// The reported offsets describe the built regions.
     #[test]
     fn the_reported_offsets_describe_the_regions_that_were_made() {
         let ring = Ring::new(4, false);
@@ -590,14 +561,13 @@ mod tests {
             entries + CQE_BYTES * u64::from(ring.completions())
                 <= ring.region_bytes(offset::CQ_RING).unwrap()
         );
-        // And every control field must sit inside the block, ahead of what follows it.
+        // Every control field sits inside the block.
         for field in [at(40), at(44), at(48), at(52), at(56), at(60)] {
             assert!(field + 4 <= array, "a control field overlaps the array");
         }
     }
 
-    /// A region nobody defined is not one, and saying so is what keeps a stray mapping from
-    /// silently becoming part of a ring.
+    /// An undefined region offset is refused.
     #[test]
     fn an_offset_that_names_no_region_is_refused() {
         let mut ring = Ring::new(4, false);
@@ -609,10 +579,7 @@ mod tests {
 
     /// Nothing is promised that this does not do.
     ///
-    /// The two bits here are the two that follow from carrying every submission out before the
-    /// call returns. Everything else -- one mapping for both queues, registered files, a stable
-    /// buffer index -- is a promise about machinery this does not have, and a caller reading one of
-    /// those takes a path that ends somewhere nobody wrote.
+    /// Only the features that follow from synchronous completion.
     #[test]
     fn only_what_is_true_is_promised() {
         const NODROP: u32 = 1 << 1;
@@ -632,10 +599,7 @@ mod tests {
 
     /// A polled queue is handed to the guest with its poller asleep, and an ordinary one is not.
     ///
-    /// The flag is the whole of how a polled ring is made watchable: a caller that finds it set
-    /// calls `io_uring_enter` before its work is looked at, which is the call this world answers.
-    /// Setting it on a queue nobody asked to have polled would be inventing a state that queue
-    /// never has.
+    /// The flag makes callers enter, which is where this world sees the work.
     #[test]
     fn a_polled_queue_says_its_poller_is_asleep() {
         let flags = |polled| {
@@ -685,7 +649,7 @@ mod tests {
         assert_eq!(Ring::from_setup(8, 1 << 30, 0), Err(Setup::Invalid), "a flag nobody defined");
     }
 
-    /// Read and write flags are refused, not dropped: each changes the write a plain call makes.
+    /// Read and write flags are refused: each changes the write a plain call makes.
     #[test]
     fn read_and_write_flags_are_refused() {
         let mut dsync = entry(op::WRITE, 0, 8);
@@ -693,7 +657,7 @@ mod tests {
         assert!(plain_call(&dsync).is_err());
     }
 
-    /// An index past the queue names no entry, rather than the slot a mask would wrap it onto.
+    /// An index past the queue names no entry.
     #[test]
     fn an_index_past_the_queue_names_nothing() {
         let mut ring = Ring::new(4, false);
@@ -738,7 +702,7 @@ mod tests {
         assert_eq!(plain_call(&entry(op::NOP, 0, 0)), Ok(Plain::Nothing));
     }
 
-    /// What this ring does not carry is named, never answered with a guess.
+    /// Unsupported operations are named.
     #[test]
     fn what_is_not_carried_is_named() {
         assert!(plain_call(&entry(13, 0, 0)).is_err(), "accept is not a file operation");

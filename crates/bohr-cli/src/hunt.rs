@@ -1,13 +1,11 @@
 //! `bohr hunt <pack>`: a campaign against a real client, from one command.
 //!
-//! Resolves the pack, takes its binary only if the digest matches (building it where it is
-//! missing), and runs the pack's scenario as a campaign: `bohr explore` by this very binary, so
-//! a hunt is the same search a person could have typed out, written to one directory. With
-//! `--seeds a..b` it runs those seeds once each instead, which is how a known defect is checked
-//! for on a range a person chose. Findings are grouped at the end.
+//! Resolves the pack, accepts its binary only if the digest matches (building it if missing), and
+//! runs the pack's scenario through `bohr explore`, writing everything to one directory. With
+//! `--seeds a..b` it runs those seeds once each instead. Findings are grouped at the end.
 //!
-//! What this does not do: choose what to search for. The pack's scenario and oracle decide that,
-//! and a hunt that finds nothing has measured that scenario and nothing else.
+//! The pack's scenario and oracle decide what is searched for; a clean hunt says nothing beyond
+//! that scenario.
 
 use std::{
     path::{Path, PathBuf},
@@ -52,11 +50,10 @@ pub(crate) fn parse_seeds(text: &str) -> Result<(u64, u64), String> {
     Ok((from, to))
 }
 
-/// The scenario with every drawn and scheduled fault taken out, for checking an oracle on runs
-/// nothing was done to: a pack whose oracle fires here is judging the client's normal behaviour.
+/// The scenario with every drawn and scheduled fault removed. An oracle that fires here is judging
+/// the client's normal behaviour.
 ///
-/// `[durability]` goes with the faults: it judges what a restarted node came back without, a run
-/// with no kill has nothing for it to judge, and a scenario arming it without one is refused.
+/// `[durability]` is removed too: it judges what a restarted node lost, which needs a kill.
 pub(crate) fn without_faults(text: &str) -> Result<String, CliError> {
     let mut value: toml::Table =
         toml::from_str(text).map_err(|e| refused(format!("the pack's scenario: {e}")))?;
@@ -88,8 +85,7 @@ pub(crate) fn without_faults(text: &str) -> Result<String, CliError> {
 
 /// The scenario with every program that is the pack's binary replaced by `binary`.
 ///
-/// Refused where the scenario names the pack's binary nowhere: a scenario whose argv runs another
-/// program would run that program whatever was checked.
+/// Refused where the scenario never names the pack's binary, since it would run something else.
 fn with_program(text: &str, pack: &targets::Pack, binary: &Path) -> Result<String, CliError> {
     let mut value: toml::Table =
         toml::from_str(text).map_err(|e| refused(format!("the pack's scenario: {e}")))?;
@@ -146,8 +142,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
         )));
     }
 
-    // **The oracle a pack names has to be armed by its scenario.** A durability or liveness pack
-    // whose scenario does not watch for it would report every run clean for want of looking.
+    // The scenario must arm the pack's oracle, or every run would be clean for lack of checking.
     let text = std::fs::read_to_string(&pack.scenario)
         .map_err(|e| refused(format!("cannot read {}: {e}", pack.scenario.display())))?;
     let loaded = bohr_world::config::load(&text)?;
@@ -169,9 +164,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
             }
         )));
     }
-    // **The binary checked is the binary run.** A scenario names its program in its own argv, and
-    // the argv is what a run starts; a binary given on the command line replaces the pack's there,
-    // or the digest checked would belong to one file and the run to another.
+    // The binary checked is the binary run: a `--binary` replaces the pack's in the scenario argv.
     let mut text = text;
     if request.binary.is_some() {
         text = with_program(&text, &pack, &binary)?;
@@ -236,8 +229,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
             args.extend(["--".into(), absolute(&binary)]);
             let mut campaign = Command::new(&me);
             campaign.args(&args).current_dir(&pack.root);
-            // Standard output belongs to the one object, so whatever the campaign prints goes
-            // where its progress goes.
+            // Standard output carries only the object, so the campaign's output goes to stderr.
             if crate::json::on() {
                 campaign.stdout(std::io::stderr());
             }
@@ -256,8 +248,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
         return Ok(code);
     }
 
-    // The campaign's own account, where it wrote one: a campaign that stopped before it wrote
-    // anything has a null here rather than an account of nothing.
+    // The campaign's account, or null if it stopped before writing one.
     let campaign = request.seeds.is_none().then(|| {
         std::fs::read_to_string(&summary)
             .ok()
@@ -281,7 +272,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
         "groups": [],
         "exit": code,
     });
-    // The groups `bohr findings` would print, inside this object rather than as a second one.
+    // The groups `bohr findings` would print, inside this object.
     if findings.is_dir()
         && let (serde_json::Value::Object(fields), serde_json::Value::Object(groups)) =
             (&mut body, crate::findings::groups_json(&findings.to_string_lossy())?)
@@ -359,8 +350,7 @@ fn sweep(
     let next = std::sync::atomic::AtomicUsize::new(0);
     let found: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     let other: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
-    // Why the first seed that did not complete did not, because a count alone sends a reader off
-    // to rerun a seed by hand to learn what one line would have said.
+    // Why the first incomplete seed stopped, so nobody has to rerun it to find out.
     let why: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     std::thread::scope(|scope| {
         for position in 0..jobs.max(1) {
@@ -426,7 +416,7 @@ fn sweep(
         incomplete: other.into_inner().unwrap_or_default(),
         why: why.into_inner().ok().flatten(),
     };
-    // Sorted, because the threads finish seeds in whatever order the host ran them.
+    // Sorted: threads finish seeds in any order.
     swept.found.sort_unstable();
     swept.incomplete.sort_unstable();
     if let Some(said) = &swept.why {

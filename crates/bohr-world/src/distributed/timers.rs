@@ -57,9 +57,7 @@ pub(crate) enum Due {
         node: NodeId,
         /// The task whose sync this timer belongs to.
         ///
-        /// Named, because a node can have several stalled at once: without it the first timer to
-        /// fire took whichever stall the disk happened to be holding, committed the wrong file
-        /// early and woke the wrong task.
+        /// Named, since a node can have several stalls at once.
         task: TaskId,
     },
     /// A scheduled node fault fires.
@@ -69,22 +67,18 @@ pub(crate) enum Due {
     },
     /// A liveness window opened by a heal is due an answer.
     ///
-    /// A timer because the finding is an absence, and nothing in a stream of events marks one:
-    /// this is what turns "nothing happened" into a moment somebody can be told about.
+    /// A timer, since the finding is an absence.
     LivenessWindow,
     /// Time to ask which nodes have stopped making calls.
     ///
-    /// Re-armed each time it fires, because the question is asked of the whole run rather than of
-    /// one moment in it, and a node can go quiet long after the last thing that would have armed a
-    /// timer for it.
+    /// Re-armed each time it fires.
     QuietCheck,
 }
 
 /// Timers ordered by `(tick, node, seq)` and never by insertion order.
 ///
-/// Two entries never compare equal: the sequence number is drawn from a per-run counter, so the
-/// firing order at one tick is a pure function of arming order, which itself is a pure function
-/// of the run. See `docs/ARCHITECTURE.md` §8.1.
+/// Entries never tie: the per-run sequence number orders timers at one tick. See
+/// `docs/ARCHITECTURE.md` §8.1.
 #[derive(Debug, Default)]
 pub(crate) struct TimerQueue {
     entries: BTreeMap<(Tick, NodeId, u64), Due>,

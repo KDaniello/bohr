@@ -1,14 +1,9 @@
 //! A node that answered before it synced, and came back without the data.
 //!
-//! This is the `fsyncgate` shape, and the version of it that matters here is the *quiet* one: the
-//! guest does not check itself, does not assert, does not exit. `testdata/bugs/kv_fsync` catches
-//! itself out and so is found by the crash oracle already; a real client does not, and what has to
-//! find it is the boundary.
+//! The quiet `fsyncgate` shape: the guest never checks itself, so only the boundary can find it.
 //!
-//! The pair is the claim. The defective node answers with writes behind it and loses them; the
-//! correct twin does the same work in the other order — sync, then answer — on the same scenario,
-//! the same seed and the same kill. An oracle that fired on both would satisfy "caught on a seeded
-//! defect" and mean nothing.
+//! The defective node answers before it syncs and loses the data; the correct twin syncs first, on
+//! the same scenario, seed and kill.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -24,7 +19,7 @@ const OPENAT: u32 = 257;
 const WRITE: u32 = 1;
 /// `fsync`.
 const FSYNC: u32 = 74;
-/// `sendto`: the node telling somebody something, which is what stands in for an answer.
+/// `sendto`, standing in for an answer.
 const SENDTO: u32 = 44;
 /// `nanosleep`.
 const SLEEP: u32 = 35;
@@ -53,10 +48,7 @@ fn prologue() -> Vec<GuestOp> {
 
 /// The defect: write, answer, and make it durable a moment later.
 ///
-/// The moment matters and is the whole shape of the bug. A node that answered and synced in the
-/// same breath loses nothing, because there is no window for a crash to land in; the defect is
-/// that the answer goes out and the sync happens *afterwards*, so the window is however long the
-/// node takes to get round to it.
+/// The gap between the answer and the later sync is the window a crash lands in.
 fn answers_before_syncing() -> NullProgram {
     let mut ops = prologue();
     for _ in 0..40 {
@@ -150,7 +142,7 @@ fn lost_on(judged: &Judged) -> Vec<NodeId> {
         .collect()
 }
 
-/// The claim, in the only form that is falsifiable.
+/// The defective twin is found and the correct twin is not.
 #[test]
 fn a_node_that_answered_before_syncing_is_caught_and_one_that_did_not_is_free() {
     let broken = judge(answers_before_syncing(), true);
@@ -170,7 +162,7 @@ fn a_node_that_answered_before_syncing_is_caught_and_one_that_did_not_is_free() 
     assert!(lost_on(&correct).is_empty());
 }
 
-/// A node that never told anybody anything cannot have broken a promise, however much it lost.
+/// A node that answered nobody broke no promise.
 #[test]
 fn a_node_that_answered_nobody_is_never_accused() {
     let judged = judge(never_answers(), true);
@@ -178,14 +170,10 @@ fn a_node_that_answered_nobody_is_never_accused() {
     assert!(lost_on(&judged).is_empty());
 }
 
-/// Where a node said yes is on the timeline, because a reader of a report has to be able to see it
-/// — and as a domain event rather than a diagnostic, because a diagnostic is what the oracle judges
-/// on and an answer by itself is not a finding.
+/// An answer is on the timeline as a domain event.
 #[test]
 fn an_answer_is_visible_on_the_timeline_without_being_a_finding() {
-    // The kinds inside the distributed model's namespace, as `docs/API.md` §5.6 records them. By
-    // number here rather than by name because this test reads the timeline the way any other
-    // reader would: from outside the crate that wrote it.
+    // Kinds by number, as `docs/API.md` §5.6 records them.
     const ANSWERED: u32 = 1;
 
     let answers = |judged: &Judged| {
@@ -210,9 +198,7 @@ fn an_answer_is_visible_on_the_timeline_without_being_a_finding() {
 
 /// What was at risk when a crash landed is on the timeline as a number, and it is not a verdict.
 ///
-/// The number is what tells a campaign whether its crashes asked anything. A thousand clean runs
-/// whose crashes all fell on a node with nothing outstanding are a thousand runs that asked
-/// nothing, and no other part of a run distinguishes them from a thousand that did.
+/// It shows whether a campaign's crashes ever had data at risk.
 #[test]
 fn what_a_crash_put_at_risk_is_recorded_whether_or_not_anything_was_lost() {
     const EXPOSED: u32 = 3;
@@ -240,14 +226,12 @@ fn what_a_crash_put_at_risk_is_recorded_whether_or_not_anything_was_lost() {
         "the node had answered for something it had not synced: {at_risk:?}"
     );
 
-    // The same crash on a node that synced first: recorded, and recorded as nothing at risk. The
-    // event has to be there either way, or a campaign could not tell a crash that asked nothing
-    // from a crash that never happened.
+    // A node that synced first records the crash with nothing at risk.
     let correct = judge(syncs_before_answering(), true);
     assert_eq!(exposure(&correct), vec![(0, 0)]);
 }
 
-/// Nothing is watched unless a scenario asks for it, which is what keeps stored bundles replaying.
+/// Nothing is watched unless the scenario asks, so stored bundles replay.
 #[test]
 fn a_scenario_that_does_not_watch_records_nothing() {
     let plain = judge(answers_before_syncing(), false);

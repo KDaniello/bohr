@@ -1,8 +1,6 @@
 //! A world model that answers clock, randomness and guest output for a single node.
 //!
-//! It replaces the things a guest most commonly reaches the outside world for. Anything else is
-//! refused by name rather than passed through or stubbed: a syscall this model does not understand
-//! is a hole in determinism, and a hole that reports itself is cheaper than one that does not. See
+//! Anything else is refused by name, never passed through or stubbed. See
 //! `docs/ARCHITECTURE.md` §5.7.
 
 #![forbid(unsafe_code)]

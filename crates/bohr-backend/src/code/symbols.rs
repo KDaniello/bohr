@@ -1,20 +1,13 @@
 //! Where the functions are, and which bytes inside one begin an instruction.
 //!
-//! A byte pair is not an instruction because it looks like one. `0F A2` is `cpuid` where an
-//! instruction begins and is two bytes of a displacement where it does not, and the two cases are
-//! told apart only by walking the code and measuring every step ([`crate::code::insn`]).
+//! `0F A2` is `cpuid` only where an instruction begins; elsewhere it may be part of a
+//! displacement. Walking the code and measuring each step ([`crate::code::insn`]) tells them apart.
 //!
-//! **The walk is anchored, not started from the section.** Text carries things that are not code:
-//! strings sitting beside hand-written assembly, alignment padding, jump tables. A sweep that runs
-//! from the first byte of `.text` eventually walks into one of them, comes out of it on the wrong
-//! boundary, and every measurement after that is wrong without saying so. Anchoring on a function
-//! symbol and stopping at its declared size bounds the damage to the one function: a wrong step
-//! inside it cannot escape into the next, and the regions between functions are never walked at
-//! all.
+//! The walk starts at a function symbol and stops at its declared size. `.text` also holds data,
+//! padding and jump tables; a sweep from the start of the section would walk into them and lose
+//! the boundaries. Per-function sweeps keep an error inside one function.
 //!
-//! What this does not do: find anything in a program that carries no symbols. A stripped object
-//! has no anchors, and the honest answer there is to say so rather than to sweep blindly — which
-//! is what a caller does with an empty result.
+//! An object without symbols yields no functions, and the caller handles the empty result.
 
 use super::insn;
 
@@ -31,17 +24,14 @@ pub struct Function {
 
 /// Every function an object names, in the order the symbol table lists them.
 ///
-/// Only those with a size and only those whose bytes are in the file: a symbol declaring a length
-/// that runs past the end describes an object this build cannot read, and guessing where it really
-/// ends would be inventing the anchor the whole approach rests on.
+/// Only functions with a size whose bytes lie inside the file.
 pub fn functions(bytes: &[u8]) -> Vec<Function> {
     let Some(sections) = Sections::of(bytes) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for table in [2u32, 11] {
-        // `SHT_SYMTAB` first, then `SHT_DYNSYM`: a stripped object keeps the second and loses the
-        // first, and an object that has both lists the same functions in each.
+        // `SHT_SYMTAB` first, then `SHT_DYNSYM`, which a stripped object still has.
         let Some((symbols, _)) = sections.by_kind(table) else {
             continue;
         };
@@ -71,9 +61,7 @@ pub fn functions(bytes: &[u8]) -> Vec<Function> {
 
 /// Every address inside `code` at which an instruction begins.
 ///
-/// Stops at the first byte pair no instruction may start with, because a sweep that guessed there
-/// would report boundaries that are not ones. What it has measured up to that point still holds:
-/// the guess would only have been about what comes after.
+/// Stops at the first invalid instruction; the boundaries before it stand.
 pub fn boundaries(code: &[u8], base: u64) -> Vec<u64> {
     let mut out = Vec::new();
     let mut at = 0;
@@ -131,9 +119,8 @@ impl<'a> Sections<'a> {
 
     /// Which byte of the file becomes this address once the object is mapped.
     ///
-    /// Read from the sections rather than from the program headers because a symbol names an
-    /// address inside one section, and a section carries both numbers. Sections that occupy no
-    /// space in the file are skipped: the zero-filled ones map to nothing to walk.
+    /// Read from the section headers, which carry both the address and the file offset.
+    /// Zero-filled sections are skipped.
     fn file_offset(&self, address: u64) -> Option<usize> {
         (0..self.count).find_map(|index| {
             let header = self.header(index);
@@ -163,7 +150,7 @@ mod tests {
         std::fs::read(path).ok()
     }
 
-    /// Boundaries are measured, not searched for.
+    /// Boundaries are measured from the symbol table.
     #[test]
     fn a_sweep_lands_on_every_instruction_and_no_other_byte() {
         // xor eax, eax; mov edi, 1; syscall; ret
@@ -171,11 +158,9 @@ mod tests {
         assert_eq!(boundaries(&code, 0x1000), vec![0x1000, 0x1002, 0x1007, 0x1009]);
     }
 
-    /// A byte pair inside a longer instruction is not a boundary, and this is the entire reason
-    /// the sweep exists.
+    /// A byte pair inside a longer instruction is not a boundary.
     ///
-    /// The displacement of an ordinary load spells `0F A2`. A search finds `cpuid` there; a sweep
-    /// finds one instruction seven bytes long and no boundary inside it.
+    /// The load's displacement contains `0F A2`; the sweep sees one seven-byte instruction.
     #[test]
     fn a_pair_inside_another_instruction_is_not_one() {
         // mov rax, [rip + 0x1100a20f] -- whose displacement carries the bytes of `cpuid`
@@ -185,20 +170,17 @@ mod tests {
         assert!(!found.contains(&3), "and nothing at the byte a search would have named");
     }
 
-    /// The sweep stops where the bytes stop being instructions rather than guessing onward.
+    /// The sweep stops at an invalid instruction.
     #[test]
     fn a_sweep_stops_rather_than_guesses() {
-        // ret, then an opcode no sixty-four bit program may contain
+        // ret, then an opcode invalid in 64-bit mode
         assert_eq!(boundaries(&[0xC3, 0x06, 0x06], 0), vec![0]);
     }
 
-    /// **Every function of a real object is walked end to end.**
+    /// A sweep of each function in a real guest ends exactly at its declared size.
     ///
-    /// The anchor and the measurement checking each other: a symbol says a function is `n` bytes
-    /// long, and a sweep of it must consume exactly `n` — landing short means an instruction was
-    /// measured too long, landing over means one was measured too short, and either way the walk
-    /// was not on boundaries. Run over every function a guest carries, which is thousands of them
-    /// including everything `libc` brought along.
+    /// Any other end means a wrong length somewhere. Covers thousands of functions, `libc`
+    /// included.
     #[test]
     fn every_function_measures_to_the_length_its_symbol_declares() {
         let Some(bytes) = guest("two_threads") else {
@@ -221,10 +203,8 @@ mod tests {
             walked += 1;
             exact += usize::from(at == code.len());
         }
-        // Measured at every one of them on the corpus this repository builds. The floor is lower
-        // than the measurement because not every symbol has to be code -- some name a table, and
-        // hand-written assembly puts constants inside a function's declared span -- and a
-        // different compiler is allowed to produce one of those without that being a defect here.
+        // Every function matches on this repository's corpus. The floor is 97% because some
+        // symbols name tables or hold constants inside assembly, which another compiler may emit.
         let ratio = exact * 100 / walked;
         assert!(ratio >= 97, "{exact} of {walked} functions swept exactly ({ratio}%)");
     }

@@ -1,8 +1,7 @@
 //! The framed event log.
 //!
-//! Each record is written as `u32 length | CBOR | u32 length`. The repeated trailing length lets a
-//! reader locate record boundaries from either end, so a log left behind by a supervisor that died
-//! mid-run is still readable — and the runs that kill the supervisor are the ones worth reading.
+//! Each record is `u32 length | CBOR | u32 length`, so boundaries are found from either end and a
+//! log from a supervisor that died mid-run is still readable.
 
 use std::io;
 
@@ -22,9 +21,9 @@ pub struct TraceWriter<W: io::Write> {
     inner: W,
     hasher: blake3::Hasher,
     count: u64,
-    /// Reused across records: an event is encoded once per record, and a run records millions.
+    /// Reused across records, since a run records millions.
     scratch: Vec<u8>,
-    /// Whether the log is kept, or only digested: a run nobody will read pays no encoding.
+    /// Whether the log is kept or only digested.
     keep: bool,
     stats: TraceStats,
 }
@@ -103,8 +102,7 @@ impl<W: io::Write> TraceWriter<W> {
                 }
             }
             crate::EventKind::Diagnostic { code, message } => {
-                // The last few distinct ones: a line repeated at the end would otherwise push out
-                // every different thing said before it.
+                // Distinct ones, so a repeated line does not push out the rest.
                 let said = (code.clone(), message.clone());
                 stats.diagnostics.retain(|kept| *kept != said);
                 if stats.diagnostics.len() == KEPT_DIAGNOSTICS {
@@ -169,8 +167,7 @@ pub fn read_events(bytes: &[u8]) -> Result<Vec<Event>, TraceError> {
 
 /// Reads as much of a log as is intact, reporting where it stopped.
 ///
-/// Separate from [`read_events`] because a truncated log is the normal artefact of a crash, and
-/// discarding the intact prefix would discard the evidence.
+/// A truncated log is the normal result of a crash, so the intact prefix is kept.
 #[must_use]
 pub fn read_events_lossy(bytes: &[u8]) -> (Vec<Event>, Option<TraceError>) {
     let mut events = Vec::new();
@@ -255,7 +252,7 @@ mod tests {
             }
             assert!(events.len() <= 16, "cut {cut} produced more events than were written");
 
-            // A cut landing exactly on a record boundary is a shorter log, not a damaged one.
+            // A cut landing exactly on a record boundary is a shorter, valid log.
             match err {
                 None => {
                     clean_cuts += 1;

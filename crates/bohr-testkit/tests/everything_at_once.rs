@@ -1,19 +1,9 @@
 //! Every adversity this world draws, turned on together, still makes one run.
 //!
-//! Each of them has a test of its own, and each of those turns on one thing. What none of them
-//! asks is whether they **compose**: a volume that reports itself full while a crash is restoring
-//! what a sync promised, a packet dropped to a node that is dead, a stall outliving the node that
-//! started it. Those are the states a campaign spends most of its time in and the ones no
-//! single-fault test visits.
+//! Single-fault tests miss combinations, such as a full volume during crash recovery or a packet
+//! to a dead node.
 //!
-//! Two claims, and the second is the one that matters:
-//!
-//! **They all reach the guest.** A scenario that armed six kinds and landed one would pass any
-//! check that only asked whether the run finished.
-//!
-//! **The run is still a function of its tape.** Determinism is the one promise this tool makes, and
-//! the place it is most likely to break is where several models act on one moment — so it is
-//! asserted here rather than assumed from the tests that arm one thing each.
+//! Every armed kind reaches the guest, and the run is still a function of its tape.
 
 use std::collections::BTreeSet;
 
@@ -58,9 +48,7 @@ const INBOX_AT: u64 = MEMORY_BASE + 0x1200;
 
 /// Writes, syncs and works the socket, over and over — enough for every model to act on.
 ///
-/// `listening` binds and reads, which is what makes a duplicate or a reordering visible at all:
-/// both are narrated at delivery, so a packet nobody is waiting for can only ever be recorded as
-/// dropped.
+/// `listening` binds and reads, since duplicates and reorders are narrated only at delivery.
 fn works_and_talks(listening: bool) -> NullProgram {
     let mut ops = vec![
         GuestOp::Syscall { nr: OPENAT, args: [u64::MAX, PATH_AT, OPEN_FLAGS, 0o644, 0, 0] },
@@ -148,9 +136,7 @@ fn run(seed: u64) -> Judged {
 
 /// Every kind of adversity the run narrated, in both vocabularies.
 ///
-/// The world says two different things and the guest cannot tell them apart: a **fault** is
-/// something the world was told to do to it, and a **packet fate** is the medium being the medium.
-/// A test that read only the first would call a lossy link a quiet one.
+/// Both faults and packet fates, which the guest cannot tell apart.
 fn kinds(judged: &Judged) -> BTreeSet<String> {
     judged
         .events
@@ -165,19 +151,14 @@ fn kinds(judged: &Judged) -> BTreeSet<String> {
         .collect()
 }
 
-/// They all reach the guest, rather than one of them crowding the others out.
+/// Every armed kind reaches the guest.
 #[test]
 fn every_drawn_adversity_lands_in_one_run() {
-    // Several seeds, because each kind is drawn and one seed is entitled to miss one of them.
-    // What is being shown is that arming them together lets each through, not that any single run
-    // must meet all six.
+    // Across seeds, since one seed may miss a kind.
     let seen: BTreeSet<String> = (1..=6).flat_map(|seed| kinds(&run(seed))).collect();
 
-    // Every kind a scenario can *draw*, which is a shorter list than the catalogue and that is the
-    // point of stating it here. `NetPartition`, `NodeFreeze`, `NodeThaw`, `NodeRestart` and
-    // `ChainReorg` are in the model's catalogue and cannot be drawn at all: they exist only where
-    // somebody wrote a tick down, so a campaign never searches them. This test is where that gap
-    // is recorded, and it is the list that will shrink when they become drawable.
+    // The drawable kinds. `NetPartition`, `NodeFreeze`, `NodeThaw`, `NodeRestart` and `ChainReorg`
+    // fire only when scheduled.
     let wanted = [
         format!("{:?}", FaultKind::DiskError),
         format!("{:?}", FaultKind::DiskFull),
@@ -193,8 +174,7 @@ fn every_drawn_adversity_lands_in_one_run() {
 
 /// And with all of them at once the run is still a function of its tape.
 ///
-/// The promise most likely to break where several models act on one moment, so it is asserted
-/// against the hardest scenario this suite has rather than against the easiest.
+/// Checked on the suite's hardest scenario.
 #[test]
 fn everything_at_once_still_repeats() {
     let once = run(3);

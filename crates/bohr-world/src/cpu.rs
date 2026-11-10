@@ -1,37 +1,24 @@
 //! The processor the guest is shown.
 //!
-//! One invented machine, identical on every host. A guest asks what it is running on and gets the
-//! same answer here and in a data centre, which is what lets a bundle produced on one machine
-//! replay on another — goal T4. The real processor is never consulted, so nothing in this table
-//! depends on the silicon under it.
+//! One invented machine, the same on every host, so bundles replay across machines (goal T4).
 //!
-//! **What is advertised, a guest may execute.** Promise `AVX-512` and a guest that takes that path
-//! dies on a host that has none, so the profile is a level and the level is a host requirement:
-//! `bohr doctor` refuses a machine that cannot do what this promises. The level is `x86-64-v3` —
-//! `AVX`, `AVX2`, `BMI`, `FMA` on top of `SSE4.2` — which is what a machine built since 2013
-//! carries and what the targets this exists for are compiled against. Under-promising was tried
-//! first and does not work: `solana_perf` refuses to start without `AVX` and says so.
+//! Advertised features may be executed, so the profile is `x86-64-v3` (`AVX`, `AVX2`, `BMI`, `FMA`
+//! over `SSE4.2`) and `bohr doctor` requires it of the host. `solana_perf` refuses to start
+//! without `AVX`.
 //!
-//! **`RDRAND` is absent from this table on purpose.** Clearing the bit sends most libraries down
-//! the path that asks the operating system for randomness instead, which this world answers from
-//! the tape. It does not stop a program that executes the instruction without asking first —
-//! that is `DETERMINISM.md` §2.2 and is closed elsewhere — but it is the cheap majority of the
-//! problem.
+//! `RDRAND` is clear, so most libraries ask the kernel for randomness, which the tape answers.
+//! Programs that execute it unasked are handled elsewhere (`DETERMINISM.md` §2.2).
 //!
-//! Every number here is part of what a run *is*: a guest branches on them. The golden test at the
-//! foot of this file is what makes changing one a decision rather than an accident.
+//! A golden test pins the whole table, since guests branch on it.
 
 /// What the guest reads from leaf zero, twelve bytes across `ebx`, `edx` and `ecx`.
 ///
-/// A real vendor rather than an invented one, because libraries branch on this string and the
-/// branches for the two real vendors are the ones that get tested. The choice is a one-way door:
-/// every bundle ever written records the machine its run was shown.
+/// A real vendor, since libraries test only the real vendors' branches. Fixed: bundles record it.
 const VENDOR: &[u8; 12] = b"GenuineIntel";
 
 /// What the guest reads from the extended leaves: forty-eight bytes, zero-padded.
 ///
-/// Named for what it is. A guest that prints its processor must not be able to claim it ran on
-/// hardware it did not, and a reader looking for a frequency finds one rather than falling over.
+/// Names the virtual processor, with a frequency for readers that parse one.
 const BRAND: &[u8; 48] =
     b"bohr virtual x86-64 CPU @ 1.00GHz\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
@@ -44,9 +31,7 @@ const MAX_EXTENDED: u32 = 0x8000_0008;
 /// Feature bits in `ecx` of leaf one.
 ///
 /// `SSE3`, `PCLMULQDQ`, `FMA`, `SSSE3`, `CMPXCHG16B`, `SSE4.1`, `SSE4.2`, `MOVBE`, `POPCNT`,
-/// `XSAVE`, `OSXSAVE`, `AVX` and `F16C`. Spelled bit by bit rather than copied from a real
-/// processor: bit thirty is `RDRAND`, and a copied word would carry it back one day with nobody
-/// noticing.
+/// `XSAVE`, `OSXSAVE`, `AVX` and `F16C`, spelled bit by bit so bit 30 (`RDRAND`) stays clear.
 const FEATURES_ECX: u32 = (1 << 0)
     | (1 << 1)
     | (1 << 12)
@@ -73,22 +58,17 @@ pub type Registers = [u32; 4];
 
 /// What the processor answers for one leaf and sub-leaf.
 ///
-/// A leaf this profile does not model reads as four zeros rather than as the highest leaf's
-/// answer. The difference is deliberate: zeros are read by every caller as "not present", where
-/// repeating another leaf's contents would answer one question with a fact about a different one.
+/// An unmodelled leaf reads as zeros, which callers read as "not present".
 #[must_use]
 pub fn identify(leaf: u32, subleaf: u32) -> Registers {
     match (leaf, subleaf) {
         (0x0000_0000, _) => [MAX_BASIC, word(VENDOR, 0), word(VENDOR, 8), word(VENDOR, 4)],
 
-        // Version, then what one core of it is. `ebx` carries the cache line in eight-byte units,
-        // one logical processor and identifier zero: this world runs a guest on one core and says
-        // so here as well as in `/proc/cpuinfo` and in `sysconf`. A thread pool sized from a
-        // disagreement between the three would be a pool this world cannot schedule.
+        // Version and one core: `ebx` has the cache line in 8-byte units, one logical processor,
+        // id 0, matching `/proc/cpuinfo` and `sysconf`.
         (0x0000_0001, _) => [0x0003_06C1, 0x0001_0800, FEATURES_ECX, FEATURES_EDX],
 
-        // Structured extended features. `RDSEED` is bit eighteen and stays clear for the same
-        // reason `RDRAND` does in the leaf above.
+        // Structured extended features; `RDSEED` (bit 18) stays clear.
         (0x0000_0007, 0) => [0, EXTENDED_EBX, 0, 0],
 
         // The saved state area, which a program reads before it may use the wide registers.
@@ -98,8 +78,7 @@ pub fn identify(leaf: u32, subleaf: u32) -> Registers {
 
         (0x8000_0000, _) => [MAX_EXTENDED, 0, 0, 0],
 
-        // Long mode, no-execute and `syscall`, without which a sixty-four bit program cannot run
-        // at all, plus `lahf` in `ecx`.
+        // Long mode, no-execute and `syscall`, plus `lahf` in `ecx`.
         (0x8000_0001, _) => [0, 0, 0x0000_0021, 0x2010_0800],
 
         (0x8000_0002, _) => brand(0),
@@ -131,8 +110,7 @@ const fn brand(at: usize) -> Registers {
 mod tests {
     use super::*;
 
-    /// The vendor reads back as itself, in the register order the instruction uses — which is not
-    /// alphabetical, and is the mistake this test exists to catch.
+    /// The vendor reads back in `ebx`, `edx`, `ecx` order.
     #[test]
     fn leaf_zero_spells_the_vendor() {
         let [max, ebx, ecx, edx] = identify(0, 0);
@@ -144,11 +122,7 @@ mod tests {
         assert_eq!(max, MAX_BASIC);
     }
 
-    /// The one bit this whole profile exists to clear.
-    ///
-    /// A guest told the instruction is there uses it, and what it returns is real entropy no seed
-    /// governs. Clearing the bit is the cheap majority of that problem, and a profile that set it
-    /// would undo the expensive half along with it.
+    /// `RDRAND` is clear.
     #[test]
     fn hardware_randomness_is_absent() {
         assert_eq!(identify(1, 0)[2] & (1 << 30), 0, "RDRAND in leaf 1 ecx");
@@ -165,9 +139,7 @@ mod tests {
 
     /// The level this profile presents, and nothing above it.
     ///
-    /// Advertising a feature is a promise that the guest may execute it, and it will do so on
-    /// whatever host it lands on. What is promised here is `x86-64-v3` and the host requirement
-    /// that goes with it; `AVX-512` is above that line and stays absent.
+    /// `x86-64-v3` and nothing above, so `AVX-512` is absent.
     #[test]
     fn nothing_above_the_presented_level() {
         let ecx = identify(1, 0)[2];
@@ -177,7 +149,7 @@ mod tests {
         assert_eq!(identify(7, 0)[1] & (1 << 16), 0, "AVX-512F, likewise");
     }
 
-    /// A leaf nobody modelled answers zeros rather than another leaf's contents.
+    /// An unmodelled leaf answers zeros.
     #[test]
     fn an_unmodelled_leaf_is_empty() {
         assert_eq!(identify(0x0000_0016, 0), [0, 0, 0, 0]);
@@ -198,11 +170,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&spelled).starts_with("bohr virtual"));
     }
 
-    /// **The whole table, as one number.**
-    ///
-    /// A guest branches on every value here, so a profile that moved would make a stored bundle
-    /// describe a machine that no longer exists and a replay diverge for a reason nobody would
-    /// think to look for. Changing this digest is a decision, and this is where it is taken.
+    /// The whole table as one digest; changing it changes every guest's view.
     #[test]
     fn the_profile_is_the_one_that_was_committed() {
         let leaves = [

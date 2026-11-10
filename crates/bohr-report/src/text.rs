@@ -8,9 +8,8 @@ use crate::describe;
 
 /// One event on one line: where it happened, then what it was, then what it says.
 ///
-/// A promise once it exists — somebody will grep it — so the shape is fixed: the envelope first in
-/// a width that keeps columns aligned for a whole run, then the kind, then whatever the kind
-/// carries. See `docs/API.md` §4.3.
+/// A fixed shape people grep: the aligned envelope, the kind, then its fields. See
+/// `docs/API.md` §4.3.
 #[must_use]
 pub fn event_line(event: &Event) -> String {
     let mut out = format!(
@@ -158,10 +157,8 @@ fn step_name(event: &Event) -> String {
 
 /// The log, one event per line, with a loop that repeats folded into two lines.
 ///
-/// **A fold is a view, not a deletion.** The two lines name the first and the last event of the
-/// stretch, how many times the steps repeated and over how much virtual time; `--json` and the
-/// bundle still hold every one of them. A stretch is folded from three repetitions of a pattern of
-/// up to four events on one task.
+/// The two lines name the first and last event, the repeat count and the virtual time spanned;
+/// `--json` keeps every event. Three repeats of up to four events on one task fold.
 #[must_use]
 pub fn write_squashed(events: &[Event], records: &[bohr_sdk_proto::Record]) -> String {
     let mut out = String::new();
@@ -222,8 +219,7 @@ const RECORD_SHOWN: usize = 240;
 
 /// The whole log, each record from a guest followed by what it said.
 ///
-/// What the record said, and not only that it was written, because a run judged by a probe is
-/// judged by those words, and a reader asking why has nowhere else to look.
+/// The record's words are shown, since a probe judges by them.
 #[must_use]
 pub fn write_log_with(events: &[Event], records: &[bohr_sdk_proto::Record]) -> String {
     let mut out = String::with_capacity(events.len() * 80);
@@ -248,8 +244,7 @@ pub fn write_log_with(events: &[Event], records: &[bohr_sdk_proto::Record]) -> S
 
 /// The summary a command prints when a bundle turned out to be what it said it was.
 ///
-/// Returned rather than printed: the same lines belong in a report's header, and a function that
-/// wrote to standard output could not be reused there without the report growing a terminal.
+/// Returned, so a report's header can reuse it.
 #[must_use]
 pub fn summary(manifest: &Manifest) -> String {
     let counters = &manifest.counters;

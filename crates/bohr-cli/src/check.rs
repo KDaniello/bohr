@@ -1,16 +1,13 @@
 //! `bohr check` and `bohr sweep`: one set of checks, held against any subject.
 //!
-//! **A check is not a test about one program, but a property of runs.** It takes a scenario and a
-//! program, starts `bohr run` on them as many times as it needs, and reads back what each run came
-//! to through `--facts`. So `repeats` is the same code for geth and for a forty-line C guest, and a
-//! gate is a line in a subject's file rather than a script beside it.
+//! A check is a property of runs. It starts `bohr run` on a scenario and program as often as it
+//! needs and reads each result through `--facts`. So `repeats` is the same code for geth and for
+//! a small C guest, and a gate is a line in the subject's file.
 //!
-//! Runs are separate processes, as a campaign's and a hunt's are: a run that wedges or dies takes
-//! its own process with it and leaves the count it belongs to intact.
+//! Each run is a separate process, so a run that hangs or dies does not take the count with it.
 //!
-//! What this does not do: say what a program means. Checks are about runs — that they repeat, stay
-//! clean without faults, find what was seeded — and what a run is judged by is still the scenario's
-//! oracle, the guest's SDK assertions and its probes.
+//! Checks cover runs: that they repeat, stay clean without faults, find what was seeded. Each run
+//! is still judged by the scenario's oracle, SDK assertions and probes.
 
 use std::{
     path::{Path, PathBuf},
@@ -136,16 +133,14 @@ impl Runner {
 
 /// The host clock, read around a run and never inside one.
 ///
-/// §5.5 bans the host clock because a run that read it would stop reproducing. This reading
-/// cannot reach a run: it times a whole `bohr run` process from outside, for `costs` to compare
-/// two scenarios by what a person waits for, and it is reported as a measurement of this host.
+/// §5.5 bans the host clock inside runs. This times a whole `bohr run` process from outside, for
+/// `costs`, and is reported as a measurement of this host.
 #[allow(clippy::disallowed_methods)]
 fn now() -> Instant {
     Instant::now()
 }
 
-/// When a result was written, in seconds since the epoch: a label on a file of measurements of
-/// this host, read by a person and never by a run.
+/// When a result was written, in seconds since the epoch. A label for people; no run reads it.
 #[allow(clippy::disallowed_methods)]
 fn written_at() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -334,8 +329,7 @@ fn works(
     min_virtual_s: Milli,
     probe_answers: Option<Milli>,
 ) -> Verdict {
-    // Without faults: whether the program runs at all is a property of the program, and a seed
-    // that kills it while it starts measures the fault. What faults reach is `adversity`'s.
+    // Without faults: this checks the program runs at all. `adversity` covers the faults.
     let calm = match runner.without_faults(scenario) {
         Ok(calm) => calm,
         Err(e) => return Verdict::new(name, false, e.to_string()),
@@ -373,9 +367,7 @@ fn works(
             ));
         }
     }
-    // A finding with nothing done to the program is a program that does not work, whatever it
-    // counted on the way: a node that fails on a full file at its tenth second has events and
-    // virtual time to spare.
+    // A finding without faults means the program does not work, however many events it reached.
     if facts.found() {
         holds = false;
         short_of.push(format!("ended {} with no fault: {}", facts.outcome, clip(&facts.detail)));
@@ -608,7 +600,7 @@ fn walls(
     seed: u64,
     allow: &[String],
 ) -> Verdict {
-    // Surveyed without faults: a node killed early is a survey of the first second of its life.
+    // Surveyed without faults, so an early kill does not cut the survey short.
     let calm = match runner.without_faults(scenario) {
         Ok(calm) => calm,
         Err(e) => return Verdict::new(name, false, e.to_string()),
@@ -663,7 +655,7 @@ fn costs(
     metric: Metric,
     max_ratio: Milli,
 ) -> Verdict {
-    // Alternately and best of three, so a host that slowed down for one run slows both sides.
+    // Alternating, best of three, so a host slowdown affects both sides.
     let mut best = [(u64::MAX, Duration::MAX); 2];
     for _ in 0..3 {
         for (side, file) in [scenario, against].iter().enumerate() {
@@ -683,8 +675,7 @@ fn costs(
         Metric::Events => (best[0].0, best[1].0, "events"),
         Metric::Wall => (ms(best[0].1), ms(best[1].1), "ms"),
     };
-    // A comparison that measured nothing compares nothing: a ratio against zero would hold every
-    // bound and say so.
+    // A zero baseline is refused: a ratio against zero would hold every bound.
     if theirs == 0 {
         return Verdict::new(
             name,
@@ -778,8 +769,7 @@ fn tenths(ratio: Milli) -> String {
 
 /// The fastest of `times` runs of a scenario, with what that run came to.
 ///
-/// A run that found anything is no measurement: a workload the supervisor answered wrongly would
-/// otherwise read as a fast one.
+/// A run that found anything is not a measurement; a wrongly answered workload could look fast.
 fn fastest(
     runner: &Runner,
     scenario: &Path,
@@ -827,9 +817,8 @@ fn fastest_native(argv: &[String], cwd: &Path, times: u64) -> Result<u64, String
 /// What one operation of a golden workload costs: time, the host's time for the same, the
 /// supervisor's stops, events and log, and the memory it held.
 ///
-/// **Per operation, with startup taken out.** The workload is run again with no operations, and
-/// natively both ways, so what remains is what the operations cost and not what starting a process
-/// does; a short workload's figure is otherwise mostly its start.
+/// Per operation, without startup: the workload also runs with zero operations, both under bohr and
+/// natively, and that is subtracted.
 fn performs(name: &str, runner: &Runner, scenario: &Path, spec: &Performs) -> Verdict {
     let program = match program_of(scenario) {
         Ok(program) => program,
@@ -1022,8 +1011,7 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
             println!();
             continue;
         }
-        // A pack whose binary is refused is reported and passed over, not the end of the command:
-        // the subjects after it are no less checkable for it.
+        // A pack whose binary is refused is reported and skipped; the other subjects still run.
         let program = match &subject.pack {
             Some(pack) => match crate::targets::binary_for(pack, None) {
                 Ok(binary) => absolute(&binary),
@@ -1060,8 +1048,7 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
                     }
                 }
             }
-            // A generated scenario is written beside the runs, so every check reads a file as it
-            // does for any other subject.
+            // A generated scenario is written to a file beside the runs, like any other.
             let materialised;
             let c: &Check = match &c.generated {
                 Some(text) => {
@@ -1130,8 +1117,8 @@ fn planned(subject: &Subject, checks: &[(&Option<String>, &Check)]) -> serde_jso
     serde_json::json!({ "subject": subject.name, "about": subject.about, "checks": checks })
 }
 
-/// The account a subject's file holds, with what the text shows and the file does not: the file's
-/// path, how many checks held of how many ran, and each result's detail and notes.
+/// A subject's account plus what only the text shows: the file path, held and run counts, and each
+/// result's detail and notes.
 fn with_what_was_printed(
     mut account: serde_json::Value,
     verdicts: &[Verdict],
@@ -1329,7 +1316,7 @@ fn swept(request: &Sweep, program: &str, ran: &[Ran]) -> serde_json::Value {
         .expect
         .as_ref()
         .map(|code| seeds_where(&|r| r.facts.as_ref().is_some_and(|f| f.names(code))));
-    // Counted, not subtracted: with `--expect Clean` a clean seed is also a hit.
+    // Counted: with `--expect Clean` a clean seed is also a hit.
     let other = request.expect.as_ref().map(|code| {
         seeds_where(&|r| r.facts.as_ref().is_some_and(|f| f.found() && !f.names(code))).len()
     });
@@ -1387,7 +1374,7 @@ fn print_sweep(request: &Sweep, ran: &[Ran]) {
                 .filter(|r| r.facts.as_ref().is_some_and(|f| f.names(code)))
                 .map(|r| r.seed)
                 .collect();
-            // Counted, not subtracted: with `--expect Clean` a clean seed is also a hit.
+            // Counted: with `--expect Clean` a clean seed is also a hit.
             let other = ran
                 .iter()
                 .filter(|r| r.facts.as_ref().is_some_and(|f| f.found() && !f.names(code)))
@@ -1478,8 +1465,7 @@ mod tests {
         assert_eq!(finds("finds", &swept, "GuestCrashed", 1).holds, Some(true));
     }
 
-    /// A seed that did not complete is not a clean seed: `never_finds` over a range where runs died
-    /// would otherwise hold on a program nobody ran.
+    /// `never_finds` fails when runs did not complete; an incomplete seed is not a clean one.
     #[test]
     fn never_finds_does_not_hold_over_runs_that_did_not_complete() {
         assert_eq!(
@@ -1494,8 +1480,7 @@ mod tests {
         assert_eq!(never_finds("n", &[ran(1, "Clean", None), lost]).holds, Some(false));
     }
 
-    /// A plan names each check with its label and scenario; a generated scenario is said to be
-    /// generated rather than given a path nobody can open.
+    /// A plan lists each check with its label and scenario; a generated scenario is marked so.
     #[test]
     fn a_plan_is_each_check_with_its_scenario() {
         let check = |name, generated: Option<&str>| Check {

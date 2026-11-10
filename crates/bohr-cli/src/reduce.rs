@@ -1,9 +1,7 @@
 //! `bohr reduce`: the smallest scenario that still goes wrong.
 //!
-//! The decisions are all in `bohr-reducer`, which cannot run anything. What is here is the other
-//! half: carry out what it asks for, tell it what happened, and write the answer as a bundle
-//! somebody can replay. The division is the same one the search makes, and for the same reason —
-//! every claim about what a reduction guarantees is decided in the crate with no processes in it.
+//! The decisions live in `bohr-reducer`, which runs nothing. This module runs what it proposes,
+//! reports the results back, and writes the answer as a replayable bundle.
 
 use bohr_reducer::{
     Baseline, CandidateOutcome, Keep, Limits, Reduction, Scenario, Size, Violation,
@@ -38,10 +36,10 @@ pub(crate) fn reduce(
     let bundle = Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
     let manifest = bundle.manifest().map_err(|e| CliError::Usage(e.to_string()))?;
     manifest.check_tape_abi(TAPE_ABI).map_err(|e| CliError::Usage(e.to_string()))?;
-    // A reduction replays the bundle hundreds of times and asks whether each one still reproduces
-    // the same violation, so it is judged by whatever this build wires — and a build wiring a
-    // different oracle would find the baseline itself clean and report that the bundle reproduces
-    // nothing. That message points a reader at the bundle; this one points at the mismatch.
+    // Every candidate runs the recorded programs, so a changed one is refused before the first.
+    replay::verify_binaries(&bundle, binaries)?;
+    // Candidates are judged by this build's oracle. A bundle recorded under another one is refused
+    // with that reason, instead of reporting that the baseline reproduces nothing.
     let stored_config = bundle
         .section(SectionId::Config)
         .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -54,13 +52,9 @@ pub(crate) fn reduce(
         .section(SectionId::Tape)
         .ok_or_else(|| CliError::Usage("BOHR-4002: bundle is missing required section 2".into()))?;
     let tape = Tape::from_container(tape_bytes).map_err(|e| CliError::Usage(e.to_string()))?;
-    // The prefix is written out to cover every byte the run read, once, before anything is
-    // proposed. The tape reads its keystream at an offset counted from the end of the prefix, so a
-    // prefix of a different length is a different tape — fixing it here is what makes every later
-    // edit an overwrite of one decision rather than a shift of all of them.
-    //
-    // How far the run read is read off its own journal rather than guessed at: a bound short of it
-    // does not leave the decisions past it alone, it moves every one of them.
+    // The prefix is written out once to cover every byte the run read, as its journal records.
+    // The keystream is counted from the end of the prefix, so a fixed prefix length makes each
+    // later edit change one decision instead of shifting all of them.
     let reach =
         bundle.section(SectionId::DrawJournal).map(reach_of).transpose()?.unwrap_or_default();
     let start = Scenario::new(tape.seed(), materialise(&tape, reach, path)?, stored_config);
@@ -73,13 +67,8 @@ pub(crate) fn reduce(
             } else {
                 match bohr_world::config::load(scenario.config()) {
                     Ok(loaded) => Some(loaded),
-                    // **A candidate the world refuses did not reproduce; it did not kill the
-                    // reduction.** Minimisation over the entries will propose a subset with no
-                    // `[[partition]]` left, and a scenario that watches for a heal refuses one --
-                    // so every liveness finding died part-way through its own reduction, with the
-                    // budget already spent and the *user's* file reported as a usage error.
-                    // The size is never read for a candidate that did not reproduce; nought
-                    // says a run never happened rather than that one happened and was empty.
+                    // A candidate the world refuses (for example a liveness scenario left without
+                    // its `[[partition]]`) counts as not reproduced. Its size is never read.
                     Err(_) => {
                         let nothing = Size { events: 0, draws: 0 };
                         return Ok((None, nothing, bohr_tape::Journal::new()));
@@ -129,8 +118,7 @@ pub(crate) fn reduce(
         let id = candidate.id;
         let (violation, size, journal) = carry_out(&candidate.scenario)?;
         reduction.accept(&CandidateOutcome { id, violation, size, journal });
-        // Carriage-returned so a long reduction is one line rather than a thousand. On the error
-        // stream, because everything the tool says about a run goes there.
+        // One redrawn line on stderr.
         eprint!(
             "\rreduce  {} · {} of {budget} replays · events {} · draws {}   ",
             pass_word(reduction.pass()),
@@ -144,8 +132,7 @@ pub(crate) fn reduce(
     let after = reduction.size();
     let best = reduction.best();
     let tape = Tape::with_prefix(best.seed(), best.prefix().to_vec());
-    // The reduced scenario's own bounds, not the original's: reduction may have removed the
-    // section that carried them, and the bundle written here has to replay to what this run does.
+    // The reduced scenario's bounds, which its bundle replays under.
     let reduced = optional_config(best.config())?;
     let completed = execute::once(execute::Execution {
         target: &replay::target_from(&bundle, &manifest, reduced.as_ref(), binaries)?,
@@ -185,8 +172,8 @@ pub(crate) fn reduce(
 /// A reduction as the body of a `bohr.reduce` object: the sizes before and after, the replays
 /// each pass spent, and the bundle written.
 ///
-/// `shrank` is false where neither events nor draws went down: the bundle written is then the
-/// finding as it was, re-recorded, and a reader acting on "reduced" should know it is not smaller.
+/// `shrank` is false when neither events nor draws went down; the bundle is then the original
+/// finding, re-recorded.
 fn account(
     from: &str,
     out: &str,
@@ -224,26 +211,17 @@ fn optional_config(text: &str) -> Result<Option<bohr_world::LoadedConfig>, CliEr
 
 /// Writes the tape's first bytes down so every decision the run made sits inside the prefix.
 ///
-/// Read from the tape rather than from the journal: the container carries only the prefix, and
-/// everything past it came from the keystream — which is where most of a long run's decisions are
-/// drawn from and none of them can be edited. Materialising is what brings them within reach.
+/// Decisions past the stored prefix come from the keystream and cannot be edited; writing them out
+/// makes them editable.
 fn materialise(tape: &Tape, reach: u64, path: &str) -> Result<Vec<u8>, CliError> {
     /// How far a reduction is prepared to write the keystream out.
     ///
-    /// A bound rather than a preference: the tape is infinite, and a run that read a gigabyte would
-    /// otherwise be given a gigabyte of prefix to carry through every candidate. Past it a
-    /// reduction is refused rather than attempted, for the reason below.
+    /// A run that read more is refused, since every candidate would carry that much prefix.
     const MOST: u64 = 64 * 1024 * 1024;
 
-    // **Short of what the run read is not a smaller prefix, it is a different tape.** The extension
-    // keystream is counted from the end of the prefix (`docs/API.md` §2.3), so the byte a run saw
-    // at offset X past a prefix of length P is the keystream's byte at X − P. Write out fewer bytes
-    // than the run read and every decision after them moves: what replays is a different run, and a
-    // reduction that started there would minimise something that never happened.
-    //
-    // This was a bound of 128 KiB and a claim that decisions past it were left alone. A run of an
-    // execution client reads several megabytes, so its bundle replayed clean and its finding could
-    // not be reduced at all.
+    // A shorter prefix is a different tape: the keystream is counted from the prefix's end
+    // (`docs/API.md` §2.3), so byte X past a prefix of length P is keystream byte X − P. Writing
+    // out less than the run read would shift every later decision.
     let wanted = (tape.prefix().len() as u64).max(reach);
     if wanted > MOST {
         return Err(CliError::Usage(format!(
@@ -258,16 +236,14 @@ fn materialise(tape: &Tape, reach: u64, path: &str) -> Result<Vec<u8>, CliError>
 
 /// How far into the tape a recorded run actually read, from its own journal.
 ///
-/// A trailing part-record is ignored rather than refused: what is wanted is a bound, and a journal
-/// that lost its last bytes still says how far the rest of the run reached.
+/// A truncated last record is ignored; the rest still gives the bound.
 fn reach_of(section: &[u8]) -> Result<u64, CliError> {
     Ok(section
         .as_chunks::<{ bohr_tape::DRAW_RECORD_BYTES }>()
         .0
         .iter()
         .filter_map(|bytes| {
-            // Damage is skipped rather than fatal, for the reason above: how far the readable part
-            // of a journal reached is still an answer.
+            // Damage is skipped; the readable part still gives the bound.
             let record = bohr_tape::DrawRecord::from_bytes(bytes).ok()?;
             Some(record.offset.saturating_add(u64::from(record.len)))
         })
@@ -292,12 +268,7 @@ mod tests {
 
     use super::*;
 
-    /// The property a reduction rests on: the tape it starts from serves the bytes the run saw.
-    ///
-    /// A prefix is not a window onto the same tape. The extension keystream is counted from the end
-    /// of the prefix, so a byte past a short prefix is a *different* byte — and a reduction that
-    /// began there would minimise a run that never happened. It did: the bound was 128 KiB, an
-    /// execution client reads several megabytes, and its findings replayed clean and were refused.
+    /// The materialised tape serves the same bytes the run saw, well past 128 KiB.
     #[test]
     fn the_prefix_serves_every_byte_the_run_read() {
         const READ: u64 = 300_000;
@@ -306,8 +277,7 @@ mod tests {
         let prefix = materialise(&original, READ, "test").expect("well inside the bound");
         let reduced = Tape::with_prefix(Seed(7), prefix);
 
-        // Sampled across the reach rather than compared whole, because what fails is an offset past
-        // the old bound and a sample that stopped short of one would pass either way.
+        // Sampled across the whole reach, including offsets past 128 KiB.
         for at in [0, 1_000, 131_071, 131_072, 200_000, READ - 8] {
             let (mut was, mut now) = ([0u8; 8], [0u8; 8]);
             original.read_at(at, &mut was);
@@ -316,8 +286,7 @@ mod tests {
         }
     }
 
-    /// The object says what went in and what came out, and whether it is any smaller: a reduction
-    /// that removed nothing still writes a bundle, and `shrank` is how a reader tells.
+    /// The object gives sizes before and after; `shrank` is false when nothing was removed.
     #[test]
     fn a_reduction_object_carries_both_sizes_and_the_replays() {
         let verdict = bohr_report::narrate::verdict(&bohr_trace::Outcome::GuestCrashed(
@@ -343,8 +312,7 @@ mod tests {
         assert_eq!(same["shrank"], false);
     }
 
-    /// And a run that read more than a reduction will write out is refused rather than reduced,
-    /// because reducing it would minimise a different run.
+    /// A run that read past the limit is refused.
     #[test]
     fn a_run_too_long_to_write_out_is_refused_and_says_why() {
         let tape = Tape::from_seed(Seed(7));

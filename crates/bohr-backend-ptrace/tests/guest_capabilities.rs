@@ -1,7 +1,7 @@
-//! What a guest actually gets, as opposed to what the host could have given it.
+//! What a real guest gets from the backend, and how it ends.
 //!
-//! These need a real guest, so they run only where one can be started. A host that cannot trap
-//! processor identification is not a reason to skip them: the point is that the backend says so.
+//! These need a real guest and skip where none can be started. They still run on a host that
+//! cannot trap processor identification; the backend must report it.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -15,9 +15,7 @@ fn tiny_guest() -> Option<String> {
     std::path::Path::new(path).exists().then(|| path.to_owned())
 }
 
-/// **A run may not claim a trap the guest was never given.** A probe in a throwaway child answers
-/// about the host, and `execve` clears the setting, so such a probe would report
-/// `determinism: full` for a guest that never had the trap.
+/// The capability reports the guest's trap; `execve` clears the setting.
 #[test]
 fn what_the_host_can_do_is_not_what_the_guest_was_given() {
     let Some(program) = tiny_guest() else {
@@ -31,7 +29,7 @@ fn what_the_host_can_do_is_not_what_the_guest_was_given() {
     };
     match backend.spawn(NodeId::ZERO, &spec) {
         Ok(_) => {}
-        // No guest can be started here at all; the claim under test needs one.
+        // No guest can be started on this host.
         Err(why) => {
             eprintln!("skipped: no guest could be started here: {why}");
             return;
@@ -67,32 +65,29 @@ fn running(program: &str) -> Vec<String> {
         .collect()
 }
 
-/// **A guest alive when its run ends ends with the run, not with the process that ran it.** A
-/// command of many runs in one process would otherwise keep every run's survivors.
+/// A guest still alive when the backend drops is killed and reaped.
 #[test]
 fn a_guest_still_alive_when_the_backend_goes_goes_with_it() {
     ends_with_its_backend("long_sleep", 1, false);
 }
 
-/// **A guest of several threads goes too, and the backend does not wait on it forever.** An
-/// isolated guest is the init of its pid namespace, and an exiting init waits for its traced
-/// threads to be reaped — by the backend that would be waiting for it.
+/// A multi-threaded guest is reaped without a deadlock: as a pid-namespace init it waits for its
+/// traced threads to be reaped first.
 #[test]
 fn a_guest_of_several_threads_goes_without_a_wait_on_itself() {
     ends_with_its_backend("threads_outlive_a_kill", 2, false);
 }
 
-/// **A node killed and not yet collected goes as well.** A kill forgets its tasks at once and
-/// leaves their deaths to the next wait, which a run that ends there never makes.
+/// A node killed just before the drop is reaped too, though no wait collected its death.
 #[test]
 fn a_node_killed_at_the_end_of_its_run_is_reaped_with_it() {
     ends_with_its_backend("threads_outlive_a_kill", 2, true);
 }
 
-/// Starts `guest`, runs it until it has `tasks` tasks, kills its node if `killed`, drops the
-/// backend, and requires that every process of it is reaped well inside the backend's deadline.
+/// Starts `guest`, runs it until it has `tasks` tasks, optionally kills it, drops the backend, and
+/// checks every process is reaped within 500 ms.
 ///
-/// The host clock is read, which nothing in the engine may do: the claim is about real time.
+/// Reads the host clock, which the engine never does: the check is about real time.
 #[allow(clippy::disallowed_methods)]
 fn ends_with_its_backend(guest: &str, tasks: usize, killed: bool) {
     let path = format!("{}/../../testdata/guests/build/{guest}", env!("CARGO_MANIFEST_DIR"));

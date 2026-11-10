@@ -1,8 +1,7 @@
-//! `bohr report --disclosure` and `bohr report --sarif`: a finding as somebody else receives it.
+//! `bohr report --disclosure` and `bohr report --sarif`: a finding in the form others receive it.
 //!
-//! The renderers are in `bohr-report` and open nothing. What is here is what they cannot do:
-//! read the bundles, find the target pack that built a program by its digest, and group a
-//! directory of findings the way `bohr findings` does.
+//! The renderers in `bohr-report` open no files. This module reads the bundles, finds the target
+//! pack that built a program by its digest, and groups a directory as `bohr findings` does.
 
 use std::path::{Path, PathBuf};
 
@@ -24,8 +23,7 @@ fn write(out: &str, text: &str) -> Result<(), CliError> {
 
 /// The pack under `targets/` whose build has one of these digests, where one does.
 ///
-/// Matched by digest and never by name: two packs can build programs of one name, and only the
-/// digest says which of them this run executed.
+/// Matched by digest, since two packs can build programs with the same name.
 fn source_of(model: &RunModel) -> Option<Source> {
     let digests: Vec<&str> = model.binaries.iter().map(|record| bare(&record.blake3)).collect();
     let mut names: Vec<String> = std::fs::read_dir("targets")
@@ -45,7 +43,7 @@ fn source_of(model: &RunModel) -> Option<Source> {
     })
 }
 
-/// A digest as a pack writes it: a bundle puts the algorithm in front, a pack writes the hex alone.
+/// A digest without its `blake3:` prefix, as a pack writes it.
 fn bare(digest: &str) -> &str {
     digest.strip_prefix("blake3:").unwrap_or(digest)
 }
@@ -76,8 +74,7 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
             .filter(|p| p.extension().is_some_and(|ext| ext == "bohr"))
             .collect()
     } else {
-        // One bundle named is one the caller expects read: a typo is an error, never an empty log
-        // that says there is nothing to fix.
+        // A single named bundle must read; a typo is an error.
         RunModel::of(&read(given)?).map_err(|e| CliError::Usage(e.to_string()))?;
         vec![given.to_owned()]
     };
@@ -86,7 +83,7 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
     let mut groups: std::collections::BTreeMap<String, Vec<(u64, PathBuf, RunModel)>> =
         std::collections::BTreeMap::new();
     for path in &paths {
-        // A bundle that does not read is named and left out, as `bohr findings` leaves it out.
+        // An unreadable bundle is named and skipped, as in `bohr findings`.
         let read = read(path).and_then(|bundle| {
             let model = RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
             Ok((bundle, model))

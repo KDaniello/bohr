@@ -1,12 +1,9 @@
 //! The record format an SDK writes and the supervisor reads.
 //!
-//! Shared by both halves so the contract cannot drift: the same types serialise a record in a
-//! customer's process and parse it in ours. The compatible subset is Antithesis's local-output
-//! format, and everything of ours lives under the `bohr` key — an external contract we do not own
-//! is extended by namespacing, never by reinterpreting (`docs/ARCHITECTURE.md` §5.14).
+//! Both halves use the same types. The compatible subset is Antithesis's local-output format; our
+//! fields live under the `bohr` key (`docs/ARCHITECTURE.md` §5.14).
 //!
-//! Nothing here depends on anything outside `std`. An SDK is linked into somebody else's build,
-//! and a dependency in that position is their problem to resolve. Normative: `docs/API.md` §6.3.
+//! Only `std`, since SDKs are linked into other people's builds. Normative: `docs/API.md` §6.3.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -17,8 +14,7 @@ use std::collections::BTreeMap;
 
 use json::Json;
 
-/// Version of the record schema. Additive: a reader ignores unknown fields inside `bohr`, and
-/// never inside `antithesis_*`, which is not ours to reinterpret.
+/// Version of the record schema. Additive: unknown fields inside `bohr` are ignored.
 pub const SDK_SCHEMA: u16 = 1;
 
 /// What an assertion claims.
@@ -34,8 +30,7 @@ pub enum AssertType {
     Reachable,
     /// Must never be reached.
     Unreachable,
-    /// A numeric guard from the Antithesis surface. Parsed and evaluated, never emitted by us,
-    /// so a record written by their SDK reads correctly here (`docs/API.md` §6.4).
+    /// A numeric guard from the Antithesis surface, read but never written (`docs/API.md` §6.4).
     NumericGuard(&'static str),
 }
 
@@ -92,8 +87,7 @@ pub struct Location {
     pub begin_column: u32,
     /// Everything else the writer put here, kept as it arrived.
     ///
-    /// Their location carries a `class` this build has no field for. See [`AssertRecord::rest`]
-    /// for why it is carried rather than dropped.
+    /// Such as their `class`; see [`AssertRecord::rest`].
     pub rest: BTreeMap<String, Json>,
 }
 
@@ -127,22 +121,15 @@ pub struct AssertRecord {
     pub location: Location,
     /// Every other key the writer put in the record, kept as it arrived.
     ///
-    /// **A record read and written back must come out as it went in.** Their format carries
-    /// `details`, `display_type` and the operands of a numeric guard, none of which this build has
-    /// a field for; a reader that modelled seven keys and emitted seven would quietly delete
-    /// whatever a guest deliberately attached, and redaction rewrites every record it keeps.
-    ///
-    /// Read but never interpreted: the compatible subset is an external contract this project does
-    /// not own (`docs/ARCHITECTURE.md` §5.14). A redaction that must remove a payload clears this
-    /// deliberately rather than relying on it being dropped.
+    /// Such as `details` and guard operands, so a record reads and writes back unchanged. Never
+    /// interpreted (`docs/ARCHITECTURE.md` §5.14); redaction clears it explicitly.
     pub rest: BTreeMap<String, Json>,
 }
 
 impl AssertRecord {
     /// Drops everything the guest attached, keeping what the record *is*.
     ///
-    /// For a redaction: the name, the type and the verdict identify the finding, while `details`
-    /// is whatever the guest chose to put beside it and belongs to whoever ran it.
+    /// For redaction: name, type and verdict identify the finding.
     #[must_use]
     pub fn without_attachments(mut self) -> Self {
         self.rest.clear();
@@ -162,10 +149,7 @@ pub struct FaultPointRecord {
 
 /// One line of the record stream.
 ///
-/// Every variant carries the run metadata as an [`Option`], because a record either came from one
-/// of our SDKs — which write the `bohr` key — or from theirs, which knows nothing about it. The
-/// absence is a fact about the writer and is recorded as one; inventing a sequence number for a
-/// foreign record would put it in a sequence it was never part of.
+/// Run metadata is an [`Option`]: Antithesis's SDKs write no `bohr` key, and none is invented.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Record {
     /// An assertion.
@@ -178,12 +162,8 @@ pub enum Record {
     Event(String, Json, Option<BohrMeta>),
     /// A record this build does not understand, kept verbatim.
     ///
-    /// Preserved rather than dropped, because a bundle carries records a newer SDK wrote and a
-    /// reader that discarded them would quietly lose what somebody deliberately recorded.
-    ///
-    /// The metadata is read even here. A record whose *body* is foreign may still carry our
-    /// namespace, and a reader that forgot its sequence number would leave a hole in the run of
-    /// numbers the supervisor checks — reporting records as lost because one of them was new.
+    /// Kept so newer SDKs' records survive. Its metadata is still read, so its sequence number
+    /// leaves no gap.
     Unknown(String, Option<BohrMeta>),
 }
 
@@ -216,9 +196,7 @@ impl Record {
                 assert.insert("condition".to_owned(), Json::Bool(a.condition));
                 assert.insert("id".to_owned(), Json::Str(a.id.clone()));
                 assert.insert("location".to_owned(), location_json(&a.location));
-                // Last, so a key the writer supplied wins over the one synthesised above: their
-                // `display_type` spells a numeric guard differently from ours, and what the record
-                // said is what the record says back.
+                // Last, so the writer's keys, such as their `display_type`, win.
                 assert.extend(a.rest.clone());
                 wrap("antithesis_assert", Json::Object(assert), *meta)
             }
@@ -244,12 +222,8 @@ impl Record {
 
     /// Reads one line.
     ///
-    /// **A line that parses but says something this build does not know is [`Record::Unknown`],
-    /// never an error: unknown is preserved, and only unreadable is refused.** A newer SDK will
-    /// name assertion types and carry keys this build has never heard of, and the supervisor drops
-    /// what it cannot read — so refusing the unfamiliar deletes the evidence somebody wrote on
-    /// purpose. Unreadable means the bytes are not a record: not JSON, or metadata that claims a
-    /// value its own field cannot hold.
+    /// A valid line this build does not understand becomes [`Record::Unknown`]. Only unreadable
+    /// lines are refused: not JSON, or `bohr` metadata out of range.
     ///
     /// # Errors
     ///
@@ -260,11 +234,8 @@ impl Record {
         let unknown = || Ok(Self::Unknown(line.to_owned(), meta));
 
         if let Some(a) = value.get("antithesis_assert") {
-            // A type outside the list, or the verdict itself missing, leaves the line whole and
-            // unread rather than half-read. Guessing the verdict is what turns a damaged record
-            // into a plausible pass — the one direction a default must never take. `hit` is not
-            // in that company: a record exists because the assertion was evaluated, and nothing
-            // reads it to decide whether a run failed.
+            // An unknown type or a missing verdict leaves the line unknown; a verdict is never
+            // guessed. A missing `hit` defaults, since nothing judges by it.
             let (Some(kind), Some(condition)) = (
                 a.get("assert_type").and_then(Json::as_str).and_then(AssertType::parse),
                 a.get("condition").and_then(Json::as_bool),
@@ -299,8 +270,7 @@ impl Record {
             ));
         }
         if let Some(Json::Object(body)) = value.get("antithesis_event") {
-            // One key is an event. Several is a shape this build has no reading of, and taking
-            // whichever sorted first would drop the rest without saying so.
+            // One key is an event; several are unknown.
             if let [(name, details)] = body.iter().collect::<Vec<_>>()[..] {
                 return Ok(Self::Event(name.clone(), details.clone(), meta));
             }
@@ -314,8 +284,7 @@ const ASSERT_FIELDS: &[&str] = &[
     "hit",
     "must_hit",
     "assert_type",
-    // Derived from `assert_type` on the way out, so carrying it as well would keep two answers
-    // to one question and let them disagree.
+    // Derived from `assert_type` when written.
     "display_type",
     "message",
     "condition",
@@ -339,12 +308,7 @@ fn rest_of(value: &Json, modelled: &[&str]) -> BTreeMap<String, Json> {
 
 /// Reads our own namespace, where the record carries it.
 ///
-/// Absent is not the same as zero. Their SDKs write no `bohr` key at all, and a record given a
-/// fabricated sequence number would be checked against a run of numbers it never belonged to.
-///
-/// A field present but outside what it can hold is unreadable rather than unknown: a `seq` of
-/// `-1` read as `u64` becomes a number near the top of the range, and the gap detector then
-/// reports every later record as lost.
+/// Absent stays absent. A field out of range, such as `seq: -1`, makes the line unreadable.
 fn parse_meta(value: &Json) -> Result<Option<BohrMeta>, String> {
     let Some(bohr) = value.get("bohr") else {
         return Ok(None);
@@ -360,8 +324,7 @@ fn parse_meta(value: &Json) -> Result<Option<BohrMeta>, String> {
         }
     };
     Ok(Some(BohrMeta {
-        // Missing means the writer stated no version, which is the version before the key
-        // existed. One answer for one absence, whichever way it is spelled.
+        // A missing version means the version before the key existed.
         schema: field("schema", u64::from(u16::MAX))? as u16,
         seq: field("seq", u64::MAX)?,
         node: field("node", u64::from(u32::MAX))? as u32,
@@ -370,11 +333,7 @@ fn parse_meta(value: &Json) -> Result<Option<BohrMeta>, String> {
 
 /// The name Antithesis displays a type under.
 ///
-/// Wholly derived from the type, which is why it is not carried in [`AssertRecord::rest`]: a field
-/// this build can compute is a field it must compute the same way they write it. The guards spell
-/// out their own display names rather than falling back to the wire name, because theirs is
-/// `AlwaysGreaterThan` where the wire says `always_greater_than`, and a record read and written
-/// back must keep that word.
+/// Derived from the type, matching Antithesis's spelling, such as `AlwaysGreaterThan`.
 const fn display_type(kind: AssertType) -> &'static str {
     match kind {
         AssertType::Always => "Always",
@@ -387,8 +346,7 @@ const fn display_type(kind: AssertType) -> &'static str {
             b"always_less_than" => "AlwaysLessThan",
             b"sometimes_greater_than" => "SometimesGreaterThan",
             b"sometimes_less_than" => "SometimesLessThan",
-            // Unreachable: `AssertType::parse` is the only source of a guard, and it names these
-            // four. Kept total rather than panicking, because a display name is presentation.
+            // Unreachable for parsed guards; total, since this is presentation.
             _ => name,
         },
     }
@@ -419,8 +377,7 @@ fn location_from(value: Option<&Json>) -> Location {
 
 /// A source position, clamped into the range a position can occupy.
 ///
-/// Clamped rather than truncated: `as u32` turns a line number past four billion into a small one,
-/// and a location that points at the wrong line is worse than one that admits the end of its range.
+/// Clamped, since `as u32` would wrap a huge line number to a wrong small one.
 fn line_number(value: Option<&Json>) -> u32 {
     value.and_then(Json::as_int).map_or(0, |held| u32::try_from(held).unwrap_or(u32::MAX))
 }
@@ -428,8 +385,7 @@ fn line_number(value: Option<&Json>) -> u32 {
 fn wrap(key: &str, body: Json, meta: Option<BohrMeta>) -> String {
     let mut top = BTreeMap::new();
     top.insert(key.to_owned(), body);
-    // Written only where the record carries it. A line that arrived without our namespace goes
-    // back out without one, because adding it would claim a sequence position nobody assigned.
+    // Written only where the record has it.
     if let Some(meta) = meta {
         let mut bohr = BTreeMap::new();
         bohr.insert("schema".to_owned(), Json::Int(i64::from(meta.schema)));
@@ -509,9 +465,7 @@ mod tests {
         assert_eq!(record.to_line(), line, "an unknown record is written back as it arrived");
     }
 
-    /// The whole point of keeping the metadata of a record we cannot read: the supervisor checks
-    /// that sequence numbers run without a gap, and a record it skipped would make the next one
-    /// look like proof that records escaped interception.
+    /// An unknown record keeps its sequence number, so the gap check holds.
     #[test]
     fn a_record_this_build_does_not_know_still_holds_its_place_in_the_sequence() {
         let line =
@@ -521,8 +475,7 @@ mod tests {
         assert_eq!(meta.node, 2);
     }
 
-    /// Their type list is theirs to extend. The day they add one, a build that refused the line
-    /// would drop an assertion somebody wrote on purpose.
+    /// An unknown assertion type is kept as unknown.
     #[test]
     fn an_assertion_type_this_build_never_heard_of_is_kept_rather_than_refused() {
         let line = "{\"antithesis_assert\":{\"assert_type\":\"always_within\",\"condition\":true}}";
@@ -531,8 +484,7 @@ mod tests {
         assert_eq!(record.to_line(), line, "and it is written back as it arrived");
     }
 
-    /// A record that lost its verdict must not be read as one that passed. Damage that reads as a
-    /// pass converts a finding into a clean run, which is the failure this whole crate guards.
+    /// A record without a verdict is never read as a pass.
     #[test]
     fn an_assertion_with_no_verdict_is_not_read_as_a_passing_one() {
         let line = "{\"antithesis_assert\":{\"assert_type\":\"always\",\"message\":\"m\"}}";
@@ -540,8 +492,7 @@ mod tests {
         assert!(matches!(record, Record::Unknown(..)), "{record:?}");
     }
 
-    /// One key is an event. Two is a shape with no reading, and taking whichever sorted first
-    /// dropped the other without a word.
+    /// An event record with two keys is unknown.
     #[test]
     fn an_event_carrying_several_names_is_kept_whole_rather_than_halved() {
         let one = "{\"antithesis_event\":{\"elected\":{\"term\":7}}}";
@@ -553,9 +504,7 @@ mod tests {
         assert_eq!(record.to_line(), two, "and both names survive");
     }
 
-    /// Metadata that claims a value its own field cannot hold is unreadable rather than unknown.
-    /// Read as `u64`, a negative sequence number lands near the top of the range and every later
-    /// record is reported as lost.
+    /// Out-of-range metadata makes the line unreadable.
     #[test]
     fn metadata_outside_what_it_can_hold_is_refused() {
         assert!(Record::parse_line("{\"bohr\":{\"seq\":-1}}").is_err());
@@ -564,7 +513,7 @@ mod tests {
         assert!(Record::parse_line("{\"bohr\":{\"seq\":\"5\"}}").is_err());
     }
 
-    /// Their records carry no namespace of ours, and one must not be invented for them.
+    /// Antithesis records get no `bohr` key.
     #[test]
     fn a_record_without_our_namespace_is_given_none() {
         let line = "{\"antithesis_assert\":{\"assert_type\":\"always\",\"condition\":true}}";

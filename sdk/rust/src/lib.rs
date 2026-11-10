@@ -14,13 +14,10 @@
 //! }
 //! ```
 //!
-//! **Nothing here has any logic of its own.** It checks whether a channel is open, serialises a
-//! record and writes a line. Everything that decides anything — whether an assertion is a finding,
-//! which fault points are armed, where randomness comes from — is the supervisor's, so the SDK
-//! stays something anyone could rewrite in an afternoon from `docs/API.md` §6.
+//! The SDK only checks for a channel, serialises a record and writes a line. Every decision is the
+//! supervisor's, so the SDK can be rewritten from `docs/API.md` §6.
 //!
-//! **Outside Bohr it costs one branch on a cached boolean.** A program built against this SDK and
-//! run normally does not open a file, does not format a string and does not allocate.
+//! Outside Bohr it costs one branch on a cached boolean: no file, no formatting, no allocation.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -40,14 +37,13 @@ pub use bohr_sdk_proto::{AssertType, Location, json::Json as Value};
 /// Where records are written when Bohr is running the program.
 const OUTPUT_VAR: &str = "BOHR_SDK_OUTPUT";
 
-/// The same, under the name Antithesis's own SDKs use. Honoured for compatibility (D14).
+/// The same, under Antithesis's name, for compatibility (D14).
 const ANTITHESIS_OUTPUT_VAR: &str = "ANTITHESIS_SDK_LOCAL_OUTPUT";
 
 /// Which node this process is, as the supervisor numbers them.
 const NODE_VAR: &str = "BOHR_SDK_NODE";
 
-/// Fault points this run armed, comma-separated. The decision is drawn from the tape before the
-/// guest starts, so the SDK only reports what it was told.
+/// Fault points this run armed, comma-separated, drawn before the guest starts.
 const ARMED_VAR: &str = "BOHR_ARMED_FAULT_POINTS";
 
 /// The open channel, resolved once.
@@ -66,17 +62,14 @@ fn channel() -> Option<&'static Channel> {
 
 /// Opens the channel the environment names, or none.
 ///
-/// Both variables set is not an error: ours wins, and the supervisor notices the ambiguity and
-/// records a diagnostic. An SDK that refused to run would break a program whose author did
-/// nothing wrong.
+/// If both variables are set, ours wins and the supervisor records a diagnostic.
 fn open_channel() -> Option<Channel> {
     let path = std::env::var(OUTPUT_VAR)
         .ok()
         .or_else(|| std::env::var(ANTITHESIS_OUTPUT_VAR).ok())
         .filter(|p| !p.is_empty())?;
 
-    // A bare number names an already-open descriptor. Opening it by its `/proc` path keeps this
-    // crate free of `unsafe`, and a guest under Bohr is on Linux by definition.
+    // A bare number is an open descriptor, opened via `/proc` to avoid `unsafe`.
     let target = match path.parse::<u32>() {
         Ok(fd) => format!("/proc/self/fd/{fd}"),
         Err(_) => path,
@@ -98,12 +91,7 @@ fn emit(build: impl FnOnce(Option<BohrMeta>) -> Record) {
     let Some(channel) = channel() else {
         return;
     };
-    // **The number and the line it goes on are taken together.** Numbered outside the lock, two
-    // threads could take five and six and then write six before five -- and the supervisor reads
-    // anything but the next number as records having escaped interception, so a multithreaded
-    // guest manufactured an alarm about its own evidence. The other three SDKs increment under the
-    // lock they write under; the Go one says in as many words that a counter incremented outside
-    // it would manufacture that alarm. This was the one that did not.
+    // Numbered and written under one lock, so sequence numbers arrive in order.
     let Ok(mut file) = channel.file.lock() else {
         return;
     };
@@ -114,10 +102,7 @@ fn emit(build: impl FnOnce(Option<BohrMeta>) -> Record) {
     };
     let mut line = build(Some(meta)).to_line();
     line.push('\n');
-    // A record that cannot be written is dropped rather than raised: the SDK is a bystander in
-    // someone else's program, and taking it down over a full disk would be worse than the gap the
-    // supervisor will notice in the sequence numbers. One write per record, terminator included,
-    // so a record costs the guest one call and arrives whole.
+    // A failed write is dropped; the supervisor sees the sequence gap. One write per record.
     let _ = file.write_all(line.as_bytes());
 }
 
@@ -137,7 +122,7 @@ pub fn assert_at(kind: AssertType, condition: bool, message: &str, id: &str, loc
                 condition,
                 id: id.to_owned(),
                 location,
-                // Nothing to carry: this SDK models every field it writes.
+                // This SDK writes no extra fields.
                 rest: std::collections::BTreeMap::new(),
             },
             meta,
@@ -147,8 +132,7 @@ pub fn assert_at(kind: AssertType, condition: bool, message: &str, id: &str, loc
 
 /// Whether this run armed the named fault point, and a record that it was reached.
 ///
-/// The answer is the supervisor's, drawn from the tape before the guest started; a program built
-/// without Bohr sees `false` and takes its ordinary path.
+/// Drawn by the supervisor before start; outside Bohr it is `false`.
 #[must_use]
 pub fn fault_point(name: &str) -> bool {
     let Some(channel) = channel() else {
@@ -161,8 +145,7 @@ pub fn fault_point(name: &str) -> bool {
 
 /// Announces that the program has finished setting itself up.
 ///
-/// A campaign uses this to tell "the system never started" from "the system started and then
-/// broke", which are different findings with different first questions.
+/// Lets a campaign tell "never started" from "started and broke".
 pub fn setup_complete(details: Json) {
     emit(move |meta| Record::SetupComplete(details, meta));
 }
@@ -172,11 +155,10 @@ pub fn send_event(name: &str, details: Json) {
     emit(move |meta| Record::Event(name.to_owned(), details, meta));
 }
 
-/// Random bytes that belong to the run rather than to the machine.
+/// Random bytes that belong to the run.
 ///
-/// Under Bohr these come from the entropy tape by way of the world model, so a seed reproduces
-/// them. Outside it they come from the platform, and the supervisor reports a run whose randomness
-/// escaped it (`BOHR-2020`) rather than pretending the run was reproducible.
+/// Under Bohr from the tape; otherwise from the platform, which the supervisor reports as
+/// `BOHR-2020`.
 pub fn random_bytes(out: &mut [u8]) {
     if channel().is_some() {
         let mut details = std::collections::BTreeMap::new();
@@ -191,9 +173,7 @@ pub fn random_choice<T>(choices: &[T]) -> Option<&T> {
     if choices.is_empty() {
         return None;
     }
-    // Eight bytes read as a `u64` and narrowed afterwards. Read straight into a `usize`, this did
-    // not compile for a 32-bit target at all -- and an SDK is linked into somebody else's build,
-    // which is compiled for more targets than a guest of this tool ever runs on.
+    // Read as `u64`, then narrowed, so 32-bit targets compile.
     let mut byte = [0u8; 8];
     random_bytes(&mut byte);
     let index = u64::from_le_bytes(byte) % choices.len() as u64;
@@ -208,8 +188,7 @@ fn fill_random(out: &mut [u8]) {
             return;
         }
     }
-    // Nothing to read from is not a reason to hand back a buffer the caller thinks is random;
-    // the hasher's own seed is at least not a constant.
+    // Without a platform source, the hasher's seed is used.
     use std::hash::{BuildHasher, Hasher};
     let mut state = std::collections::hash_map::RandomState::new().build_hasher();
     for (i, byte) in out.iter_mut().enumerate() {
@@ -220,10 +199,8 @@ fn fill_random(out: &mut [u8]) {
 
 /// The name of the function this is expanded in.
 ///
-/// Rust has no direct way to ask, so the idiom is to name an item inside the function and read
-/// the path back off it. The marker's own segment is trimmed, which leaves the enclosing function
-/// exactly. Defined before the macros that use it: within a crate, a `macro_rules!` is in scope
-/// only after its definition.
+/// Read from a marker item's type path, minus its own segment. Defined before the macros that use
+/// it.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! function_name {
@@ -319,11 +296,10 @@ pub fn here(file: &str, line: u32, column: u32, function: &str) -> Location {
 
 #[cfg(test)]
 mod tests {
-    /// Disabled is the state a customer's build is normally in, and it must reach nothing.
+    /// Disabled, the normal state, does nothing.
     #[test]
     fn everything_is_inert_without_a_channel() {
-        // No output variable is set in this process, so the channel resolves to none once and
-        // every call below is a branch on it.
+        // No output variable is set, so every call is one branch.
         crate::always!(1 + 1 == 2, "arithmetic still works");
         crate::sometimes!(false, "never true here");
         crate::reachable!("this line");

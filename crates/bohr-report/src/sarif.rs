@@ -1,16 +1,11 @@
 //! SARIF 2.1.0: findings as code scanning reads them.
 //!
-//! One result per finding group, never one per bundle. A campaign reaches one defect from many
-//! seeds, and a code-scanning view that listed each seed would bury the defect under its own
-//! repetitions — the same reason `bohr findings` groups. Each result is led by its group's
-//! smallest bundle, which is the one to replay.
+//! One result per finding group, as `bohr findings` groups, led by the group's smallest bundle.
 //!
-//! The rule is the violation's code. The location is the guest's own source line where its records
-//! name one; where they do not, the bundle itself, because a result with no location is one that
-//! code scanning refuses rather than shows.
+//! The rule is the violation's code. The location is the guest's source line where its records
+//! name one, else the bundle, since code scanning refuses results without a location.
 //!
-//! What this does not do: map a crash to a source line. A signal or an exit status carries no
-//! line, and symbolising the guest's stack is not something a stored run can do.
+//! A crash is never mapped to a source line; a stored run cannot symbolise the guest's stack.
 
 use serde_json::{Value, json};
 
@@ -94,8 +89,7 @@ pub fn sarif(version: &str, findings: &[Finding]) -> Value {
                     ),
                 },
                 "locations": [location],
-                // Stable across runs of one defect, so code scanning keeps one alert open rather
-                // than opening one per campaign.
+                // Stable per defect, so code scanning keeps one alert.
                 "partialFingerprints": { "bohrSignature/v1": fingerprint(&finding.signature) },
                 "properties": {
                     "bundle": finding.bundle,

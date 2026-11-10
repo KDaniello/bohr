@@ -1,9 +1,7 @@
 //! What a run recorded, in the words someone who has never used this tool would use.
 //!
-//! The vocabulary a trace is written in is precise and unhelpful: `AlwaysOrUnreachable`,
-//! `NetDeliver`, `PacketFate::Reordered`. Every one of those is the right name for the thing and
-//! the wrong name for a reader who arrived from a bug report. This module is the one place that
-//! translation happens, so a report and a text dump never explain the same event differently.
+//! Trace names such as `AlwaysOrUnreachable` or `PacketFate::Reordered` are translated here, in one
+//! place, so every output explains an event the same way.
 
 use bohr_trace::{
     AssertionKind, DiskOpKind, FaultKind, FaultTarget, NodeState, Outcome, PacketFate,
@@ -45,11 +43,10 @@ pub fn outcome_detail(outcome: &Outcome) -> Option<&str> {
     }
 }
 
-/// What an assertion promises, said rather than named.
+/// What an assertion promises, in words.
 ///
-/// A reader meeting `always_or_unreachable` for the first time has to be told that it is a promise
-/// about every time the line is reached and not about the line being reached at all — which is the
-/// distinction the name compresses and nobody unpacks correctly on first reading.
+/// For example, `always_or_unreachable` holds every time the line is reached, and also if it never
+/// is.
 #[must_use]
 pub const fn assertion_promise(kind: AssertionKind) -> &'static str {
     match kind {
@@ -63,7 +60,7 @@ pub const fn assertion_promise(kind: AssertionKind) -> &'static str {
     }
 }
 
-/// What a fault did, as a sentence rather than a variant.
+/// What a fault did, as a sentence.
 #[must_use]
 pub const fn fault_action(fault: FaultKind) -> &'static str {
     match fault {
@@ -138,7 +135,7 @@ pub const fn disk_op(op: DiskOpKind) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The point of the module: nothing it produces should read like the identifier it came from.
+    /// No description reads like the identifier it came from.
     #[test]
     fn nothing_reads_like_the_variant_it_came_from() {
         let said = [

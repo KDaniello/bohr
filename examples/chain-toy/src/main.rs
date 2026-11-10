@@ -1,23 +1,18 @@
 //! One node of a three-node chain that finalises a block on two votes of three.
 //!
-//! **The protocol, stated plainly, because a corpus program's correctness is documented rather
-//! than assumed.** Height `h` has one proposer, node `h % 3`. It builds one block on its finalised
-//! tip, and the block's hash is a function of the parent, the height and the proposer, so a
-//! proposer that crashes and comes back builds the same block. Every node votes at most once per
-//! height, for the proposer's block whose parent is its own tip, and records the vote durably
-//! before sending it. A block with two votes is final; a node appends it to its log, syncs, and
-//! only then reports it. Two blocks at one height cannot both gather two votes of three when nobody
-//! votes twice, so without a flag no two nodes ever finalise different blocks at one height.
+//! Height `h` has one proposer, node `h % 3`, which builds one block on its finalised tip. The hash
+//! depends on parent, height and proposer, so a restarted proposer builds the same block. Each node
+//! votes at most once per height, for the block on its own tip, and syncs the vote before sending.
+//! A block with two votes is final; a node appends it, syncs, then reports it. Without a flag no two
+//! nodes finalise different blocks at one height.
 //!
 //! Each flag adds one defect, and each needs the faults the scenario draws to show:
 //!
 //! - `--revert-finality`: the finalised log is written without a sync, and after a crash the node
 //!   rebuilds the heights it lost from blocks of its own instead of fetching them from its peers;
 //!   the hash it reports at a height it reported before changes.
-//! - `--equivocate`: a proposer that has not seen its block finalised by the time it resends builds
-//!   a new one and signs that too: two votes from one key at one height. Finality takes two turns
-//!   and a resend comes every three, so this shows on many heights without any fault at all; the
-//!   faults make it more frequent.
+//! - `--equivocate`: a proposer still waiting at its resend builds and signs a new block: two votes
+//!   from one key at one height. It shows on many heights even without faults.
 //! - `--fork-on-partition`: a node that hears no peer for a while finalises blocks of its own,
 //!   alone; after the cut, its blocks and the cluster's differ at the same heights.
 //! - `--stall-after-heal`: a node that was cut off stops proposing once it hears its peers again;
@@ -35,7 +30,7 @@ use std::{
     time::Duration,
 };
 
-/// Nodes in the cluster: the smallest number with a majority to disagree with.
+/// Nodes in the cluster, the smallest with a disagreeable majority.
 const NODES: u32 = 3;
 /// Votes that make a block final.
 const QUORUM: usize = 2;
@@ -55,7 +50,7 @@ const PATIENCE: u64 = 15;
 const VOTE_WINDOW: u64 = 8;
 /// Heights one catch-up message carries.
 const CATCH_UP: u64 = 8;
-/// Turns between two looks at the JSON-RPC callers, so a caller costs nothing on the turns between.
+/// Turns between two looks at the JSON-RPC callers.
 const RPC_TURNS: u64 = 4;
 
 const FINAL_LOG: &str = "final.log";
@@ -239,7 +234,7 @@ impl Node {
         turn.saturating_sub(self.heard_turn) >= PATIENCE
     }
 
-    /// Whether this node, restarted under `--revert-finality`, rebuilds rather than fetches.
+    /// Whether this node, restarted under `--revert-finality`, rebuilds its lost heights itself.
     fn rebuilds(&self) -> bool {
         self.flags.revert_finality && self.epoch > 1
     }
@@ -304,8 +299,8 @@ impl Node {
         Ok(())
     }
 
-    /// Notes that a peer was heard; under `--stall-after-heal`, a node hearing peers after a cut
-    /// stops proposing for good.
+    /// Notes that a peer was heard; under `--stall-after-heal`, hearing peers after a cut stops
+    /// proposing.
     fn heard(&mut self, turn: u64, from: u64) {
         if from as u32 == self.me {
             return;
@@ -501,7 +496,7 @@ fn accept(listener: &TcpListener, clients: &mut Vec<Client>) {
 impl Client {
     /// Answers every complete request that has arrived; false once the caller is gone.
     ///
-    /// One read per look: a request is small, and what does not fit waits for the next look.
+    /// One read per look; the rest waits.
     fn serve(&mut self, node: &Node) -> bool {
         let mut chunk = [0u8; 16 * 1024];
         match self.stream.read(&mut chunk) {
@@ -560,8 +555,7 @@ impl Client {
     }
 }
 
-/// The top-level objects of a JSON array, as text; strings are skipped so a brace inside one does
-/// not count.
+/// The top-level objects of a JSON array, as text, skipping braces inside strings.
 fn objects_in(text: &str) -> Vec<&str> {
     let (mut depth, mut start, mut in_string, mut escaped) = (0usize, 0usize, false, false);
     let mut out = Vec::new();

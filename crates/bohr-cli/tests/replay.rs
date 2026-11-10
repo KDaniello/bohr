@@ -1,8 +1,7 @@
 //! What `bohr replay` promises: a stored run comes back, or it says exactly where it did not.
 //!
-//! Every bundle here comes from a guest built into the binary, so these run on any operating
-//! system with no privileges — which is also what makes such a bundle portable enough to be worth
-//! carrying between machines.
+//! The bundles come from built-in guests, so these run on any operating system without
+//! privileges.
 
 use std::{path::PathBuf, process::Command};
 
@@ -44,8 +43,7 @@ fn a_saved_run_replays_to_the_digest_it_recorded() {
     }
 }
 
-/// Without `--verify-only` the replay says what the run was, not only that it matched: a bundle
-/// arrives without the terminal that produced it, and the manifest is what is left to read.
+/// Without `--verify-only` the replay also prints the manifest's counters and provenance.
 #[test]
 fn a_replay_reports_what_the_run_amounted_to() {
     let dir = bundles("report");
@@ -55,15 +53,14 @@ fn a_replay_reports_what_the_run_amounted_to() {
     assert!(out.contains("minimal"), "no provenance in: {out}");
 }
 
-/// A bundle whose recorded digest was edited must not replay to it — the check is the product.
+/// A bundle with an edited digest fails to replay and names the divergence.
 #[test]
 fn an_edited_digest_is_caught_and_the_divergence_is_named() {
     let dir = bundles("tamper");
     let path = bundle_path(&dir, "clock-and-random");
     let bytes = std::fs::read(&path).expect("read bundle");
 
-    // The manifest is JSON inside a packed section, so the digest cannot be edited in place.
-    // Rewriting the whole bundle is what a forger would have to do, and is what is done here.
+    // The manifest is packed, so the whole bundle is rewritten.
     let bundle = bohr_trace::Bundle::parse(&bytes).expect("parse");
     let mut manifest = bundle.manifest().expect("manifest");
     manifest.trace_digest = "blake3:".to_owned() + &"00".repeat(32);
@@ -157,11 +154,7 @@ fn a_batch_reports_every_bundle_and_the_worst_outcome() {
 
 /// A cluster run saved by `bohr run` replays to the digest it recorded.
 ///
-/// The regression this exists for was a two-variable difference in the environment: `bohr run`
-/// built its guest specifications one way and `bohr replay` another, so the guest's stack sat
-/// sixty-four bytes apart in the two invocations and any guest reading a stack address replayed to
-/// a different digest than it recorded. Nothing caught it, because the determinism gate compares
-/// runs against each other inside one invocation and never a run against its own replay.
+/// `run` and `replay` must build identical guest environments; any difference moves the stack.
 #[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn a_cluster_run_replays_to_what_it_recorded() {
@@ -202,15 +195,9 @@ fn a_cluster_run_replays_to_what_it_recorded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A run saved with arguments comes back with them.
+/// A run saved with arguments replays with them.
 ///
-/// **The bundle recorded the program and not what it was started with.** Arguments sit on the
-/// stack a guest is born with, so replaying without them moves everything above them — the run
-/// module records two environment variables shifting a stack by sixty-four bytes and breaking a
-/// digest, and missing arguments shift it the same way. A bundle that cannot replay reports
-/// BOHR-2011 against the tool that wrote it, which is a defect in this tool by its own taxonomy.
-///
-/// Needs a real program to pass arguments to, so it runs where one can be traced.
+/// Arguments sit on the initial stack, so replaying without them moves it and breaks the digest.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn a_run_saved_with_arguments_replays_with_them() {
@@ -225,17 +212,69 @@ fn a_run_saved_with_arguments_replays_with_them() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let bundle = dir.join("with-args.bohr");
 
-    // A name the modelled filesystem does not hold, so the guest fails to open it and says so --
-    // a run like any other and exactly as reproducible. What is under test is that the argument
-    // reaches the guest at all: without it the guest reads its standard input instead, takes a
-    // different path and records a different digest.
+    // The file is absent, so the guest fails to open it; without the argument it reads stdin.
     let saved = bundle.to_string_lossy().into_owned();
     let (code, _, said) = bohr(&["run", "--seed", "5", "--save", &saved, "--", guest, "/absent"]);
     assert!(code == 0 || code == 1, "the run did not complete: {code} {said}");
 
-    // The claim: the same bundle replays to the digest it recorded. Without the arguments the
-    // guest reads no file, the stack differs, and this is where it says so.
     let (code, out, said) = bohr(&["replay", &bundle.to_string_lossy()]);
     assert_eq!(code, 0, "the bundle did not replay: {out}{said}");
     assert!(!said.contains("BOHR-2011"), "the replay diverged from what was recorded: {said}");
+}
+
+/// A cluster run whose program moved replays from `--binaries`, running the file it checked.
+///
+/// The scenario names the program's path, and the recorded path no longer exists, so a replay that
+/// ran the configuration's path could not start. The new path is shorter, which moves the stack
+/// unless the replay keeps the recorded length.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_moved_program_replays_from_binaries() {
+    let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/guests/build/clock_and_random");
+    if !built.exists() {
+        eprintln!("skipped: the guests are not built");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join("bohr-replay-moved");
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["found", "b"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("a directory of this test's own");
+    }
+    let guest = dir.join("found/clock_and_random");
+    std::fs::copy(&built, &guest).expect("the guest is copied");
+    let config = dir.join("scenario.toml");
+    std::fs::write(
+        &config,
+        format!("[cluster]\nnodes = 2\nargv = [{:?}]\n", guest.to_string_lossy()),
+    )
+    .expect("the scenario is written");
+
+    let saved = dir.join("run.bohr");
+    let (code, out, report) = bohr(&[
+        "run",
+        "--seed",
+        "3",
+        "--config",
+        &config.to_string_lossy(),
+        "--save",
+        &saved.to_string_lossy(),
+        "--",
+        &guest.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "{out}{report}");
+
+    std::fs::rename(&guest, dir.join("b/clock_and_random")).expect("the guest is moved");
+    let (code, out, report) = bohr(&[
+        "replay",
+        "--verify-only",
+        "--binaries",
+        &dir.join("b").to_string_lossy(),
+        &saved.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "a moved program must replay from --binaries: {out}{report}");
+    assert!(format!("{out}{report}").contains("ok blake3:"), "{out}{report}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

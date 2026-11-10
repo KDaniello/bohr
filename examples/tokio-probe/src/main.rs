@@ -1,12 +1,8 @@
 //! The smallest program that starts a `tokio` reactor and asks it to do something.
 //!
-//! It exists to be surveyed rather than to be hunted: what a survey answers is which calls this
-//! build cannot model, and a runtime's reactor is where that list begins. Every real network client
-//! in Rust is built on this runtime, so the set it needs is the set that stands between the engine
-//! and every one of them.
+//! For surveys: Rust network clients are built on this runtime's reactor.
 //!
-//! A current-thread runtime deliberately: a multi-threaded one adds a work-stealing pool whose
-//! calls say more about the pool than about the reactor.
+//! A current-thread runtime, so the calls are the reactor's.
 
 use std::{net::SocketAddrV4, time::Duration};
 

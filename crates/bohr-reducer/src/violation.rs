@@ -1,17 +1,10 @@
 //! What made a run a finding, in a form two runs can be compared by.
 //!
-//! Reduction is a search for the smallest scenario that still goes wrong *in the same way*, so
-//! everything turns on what "the same way" means. The obvious answer — compare the outcome — does
-//! not work here, and the reasons are worth stating because they are not obvious either:
+//! A reduction keeps runs that go wrong the same way. Outcome messages cannot be compared: a hang's
+//! message names a tick no two candidates share.
 //!
-//! - a violated property carries the words the world model wrote, which name the promise and the
-//!   line it is written on, and that is exactly the right identity;
-//! - a hang carries the tick and the event count the run gave up at, which no two candidates reach,
-//!   so comparing the message would reject every reduction that worked;
-//! - a crash carries a signal or an exit status, which is stable and worth comparing.
-//!
-//! So the identity is the outcome's *shape* plus a signature drawn from what the run recorded,
-//! and each shape has its own notion of what recording it means.
+//! The identity is the outcome's class plus a signature from what the run recorded: the promise and
+//! its line for a property, the node and status for a crash, the reason for a hang.
 
 use std::collections::BTreeSet;
 
@@ -48,8 +41,7 @@ pub enum Class {
 
 /// One promise a guest made about itself and did not keep.
 ///
-/// Located as well as named, because two assertions can carry the same message and differ only in
-/// where they are written — and reducing one into the other is a false positive nobody can see.
+/// Named and located, since two assertions can share a message.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct FailedAssertion {
     /// What the guest called it.
@@ -65,39 +57,29 @@ enum Signature {
     Assertions(BTreeSet<FailedAssertion>),
     /// The nodes whose tasks ended badly, and how.
     ///
-    /// By node and status, never by task: a reduced run spawns fewer tasks and numbers them
-    /// differently, so a task identifier is a fact about the run rather than about the defect.
+    /// By node and status; task ids change between runs.
     Exits(BTreeSet<(NodeId, String)>),
     /// Why the loop gave up, and never the tick it gave up at.
     NoProgress(StopReason),
     /// The values the implementations did not agree on.
     ///
-    /// The labels and never the digests: two candidates reach different values by construction —
-    /// that is what makes them different runs — so a signature carrying what they came to would
-    /// reject every reduction that worked. What may not change is *which promise* was broken.
+    /// The labels, never the values, which differ between candidates.
     Disagreement(BTreeSet<String>),
     /// The nodes that lost an acknowledged write, and the file each lost it from.
     ///
-    /// The file by name and never how many bytes went missing: a smaller scenario loses a
-    /// different amount from the same file, and a signature carrying the count would match
-    /// nothing after the first move that worked.
+    /// By file name; the amount lost differs between candidates.
     Lost(BTreeSet<(NodeId, String)>),
     /// The nodes that committed nothing while the window was open.
     ///
-    /// Which nodes, never how long the window was or when it opened: a reduction brings moments
-    /// forward, so every candidate's window opens somewhere else, and a signature carrying the
-    /// tick would match nothing after the first successful move.
+    /// Which nodes; the window's timing moves as the reduction brings moments forward.
     Silent(BTreeSet<NodeId>),
     /// The properties a probe saw broken, by code, and the node each was seen on.
     ///
-    /// Never the key or the values: a smaller scenario finalises other blocks, so a signature
-    /// carrying a height or a hash would match nothing after the first move that worked.
+    /// Never heights or hashes, which differ between candidates.
     Probed(BTreeSet<(String, NodeId)>),
     /// The call this build does not model, by name.
     ///
-    /// Named rather than left as the class alone: two runs that stop at two different unmodelled
-    /// calls are two findings, and a reduction told they were one walked away from the call it
-    /// had been given towards whichever the smaller scenario happened to reach.
+    /// Named, since different unmodelled calls are different findings.
     Refused(String),
     /// A shape with nothing finer to say about itself.
     ClassAlone,
@@ -106,9 +88,8 @@ enum Signature {
 impl Signature {
     /// Whether this says nothing that would tell one finding from another of its class.
     ///
-    /// `ClassAlone` is not empty: it is a shape that has nothing finer to say, and every candidate
-    /// of that class genuinely is the same finding. An empty *set* is different -- it means the
-    /// run went wrong and left nothing behind that says how.
+    /// `ClassAlone` is a complete identity. An empty set means the run left nothing that says how
+    /// it went wrong.
     fn is_empty(&self) -> bool {
         match self {
             Self::Assertions(held) => held.is_empty(),
@@ -161,20 +142,13 @@ impl Violation {
             Class::LivenessViolated => Signature::Silent(silent_nodes(events)),
             Class::DurabilityViolated => Signature::Lost(lost_writes(events)),
             Class::ProbeViolated => Signature::Probed(probed_codes(events)),
-            // Read from the outcome's own words rather than from the timeline, because a
-            // disagreement is not something that happened at an event: it is what several event
-            // streams came to when they were compared, and no one of them carries it.
+            // Read from the outcome, since no single event stream records a disagreement.
             Class::ImplementationsDisagreed => Signature::Disagreement(disagreed_labels(outcome)),
-            // The call that could not be modelled, by name. `ClassAlone` made every unmodelled
-            // call the same finding, so a candidate that ran into a *different* one counted as
-            // having reproduced this one and the reduction walked away from what it was shrinking.
+            // The unmodelled call, by name.
             Class::UnsupportedSyscall => Signature::Refused(refused_call(outcome)),
             _ => Signature::ClassAlone,
         };
-        // **An empty signature tells nothing apart.** A crash whose events carried no bad exit --
-        // a truncated log -- would be one finding with every other crash whose log was cut short.
-        // Refused here, the way a clean baseline is refused one layer up: a finding this build
-        // cannot tell apart from its neighbours is not one it can shrink.
+        // An empty signature cannot tell findings apart, so it is refused like a clean baseline.
         if signature.is_empty() {
             return None;
         }
@@ -183,8 +157,7 @@ impl Violation {
 
     /// The violation as one line: its class and what tells it from others of its class.
     ///
-    /// Two findings with the same line are one defect as far as this build can tell, which is
-    /// what `bohr findings` groups by; the signature is already free of what a reduction moves.
+    /// `bohr findings` groups by this line.
     #[must_use]
     pub fn describe(&self) -> String {
         format!("{:?} {:?}", self.class, self.signature)
@@ -207,8 +180,8 @@ impl Violation {
 
     /// Whether `candidate` still reproduces this: the same class and the same signature.
     ///
-    /// Equality, not containment: a run that also trips a second assertion is another group's
-    /// finding in `bohr findings`, and a defect nobody asked about.
+    /// The signatures must be equal. A run that also trips a second assertion belongs to another
+    /// group in `bohr findings`.
     #[must_use]
     pub fn reproduced_by(&self, candidate: &Self) -> bool {
         self.class == candidate.class && self.signature == candidate.signature
@@ -217,9 +190,7 @@ impl Violation {
 
 /// Every promise the timeline says did not hold.
 ///
-/// Read from the events rather than from the stored records: the events are what a run always has,
-/// and the model already put the assertion's own words there. The location comes from the message
-/// the diagnostic carries, which is the only place a source line survives into the timeline.
+/// Read from the events, which every run has. The location comes from the diagnostic message.
 fn failed_assertions(events: &[Event]) -> BTreeSet<FailedAssertion> {
     let located = located_by_name(events);
     events
@@ -236,9 +207,7 @@ fn failed_assertions(events: &[Event]) -> BTreeSet<FailedAssertion> {
 
 /// Source locations, by the promise they belong to, read out of the diagnostics.
 ///
-/// The model writes `always("name") failed at file:line`, which is the only form the location
-/// reaches the timeline in. Parsed rather than re-derived because the alternative is reading the
-/// stored record section, and a reduction has to work on a bundle whose guest had no SDK at all.
+/// Parsed from `always("name") failed at file:line`, so bundles without an SDK record work.
 fn located_by_name(events: &[Event]) -> Vec<(String, String)> {
     events
         .iter()
@@ -255,9 +224,7 @@ fn located_by_name(events: &[Event]) -> Vec<(String, String)> {
 
 /// The nodes the world said committed nothing while a liveness window was open.
 ///
-/// Read from the timeline, like everything else here, and never from the stored records: a
-/// reduction has to work on a bundle whose guest had no SDK at all, which is the entire point of
-/// these oracles.
+/// Read from the timeline, so guests without the SDK work.
 fn silent_nodes(events: &[Event]) -> BTreeSet<NodeId> {
     events
         .iter()
@@ -293,9 +260,7 @@ fn disagreed_labels(outcome: &Outcome) -> BTreeSet<String> {
 
 /// The nodes that lost an acknowledged write, and the file each lost it from.
 ///
-/// The name is parsed out of the message, which is the only place it reaches the timeline — the
-/// same technique the assertion locations use, and for the same reason: a reduction works on a
-/// bundle whose guest had no SDK, so the stored record section is not available to it.
+/// The file name is parsed from the message, as assertion locations are.
 fn lost_writes(events: &[Event]) -> BTreeSet<(NodeId, String)> {
     events
         .iter()
@@ -391,8 +356,7 @@ mod tests {
         .expect("a finding")
     }
 
-    /// The identity is the promise and where it is written, never the outcome's message: that
-    /// message is one constant for every property in existence.
+    /// The identity is the promise and its location.
     #[test]
     fn the_same_promise_from_two_runs_is_one_violation() {
         let first = violated(&broke("log is monotonic", "src/log.rs:214"));
@@ -402,8 +366,7 @@ mod tests {
         assert_eq!(first.failed()[0].at.as_deref(), Some("src/log.rs:214"));
     }
 
-    /// Two assertions can share a message and differ only in the line. Reducing one into the other
-    /// is a false positive nobody can see by reading the result.
+    /// Two assertions with one message differ by line.
     #[test]
     fn one_promise_does_not_stand_in_for_another_written_elsewhere() {
         let here = violated(&broke("log is monotonic", "src/log.rs:214"));
@@ -411,8 +374,7 @@ mod tests {
         assert!(!here.reproduced_by(&there), "a promise from another file was accepted");
     }
 
-    /// A candidate that also trips something else is another group's finding, so it is not a
-    /// reproduction of this one, however small it is.
+    /// A candidate that also trips something else does not reproduce.
     #[test]
     fn a_candidate_that_breaks_more_is_a_different_finding() {
         let asked = violated(&broke("log is monotonic", "src/log.rs:214"));
@@ -431,12 +393,9 @@ mod tests {
         assert!(!both.reproduced_by(&one), "and silencing fewer is too");
     }
 
-    /// The reason this outcome exists rather than reusing `PropertyViolated`.
+    /// A liveness finding is not a property violation.
     ///
-    /// A guest with no SDK fails no assertions, so a liveness finding filed under that class would
-    /// carry the empty set — and the empty set is a subset of every other, so any property
-    /// violation whatsoever would count as reproducing it. A reduction would accept the first
-    /// candidate that broke anything at all and report it as the same bug.
+    /// Filed as one, it would carry the empty assertion set and any violation would reproduce it.
     #[test]
     fn a_silence_is_not_reproduced_by_something_else_going_wrong() {
         let silence = quiet(&[NodeId(1)]);
@@ -456,16 +415,13 @@ mod tests {
         assert!(!both.reproduced_by(&root), "and differing about less is too");
     }
 
-    /// Not by what they came to. Two candidates reach different values by construction — that is
-    /// what makes them different runs — so a signature carrying the values would reject every
-    /// reduction that worked.
+    /// Values differ between candidates and are ignored.
     #[test]
     fn a_disagreement_is_not_identified_by_what_they_came_to() {
         assert_eq!(disagreed("state-root"), disagreed("state-root"));
     }
 
-    /// A disagreement about something else is a different bug, and reduction must not accept one
-    /// for the other.
+    /// A disagreement about something else is a different bug.
     #[test]
     fn disagreeing_about_something_else_is_not_a_reproduction() {
         let root = disagreed("state-root");
@@ -484,7 +440,7 @@ mod tests {
         .expect("a finding")
     }
 
-    /// A run that goes wrong differently is not a reproduction, however small it is.
+    /// A run that goes wrong differently does not reproduce.
     #[test]
     fn a_different_kind_of_wrong_is_not_a_reproduction() {
         let promise = violated(&broke("log is monotonic", "src/log.rs:214"));
@@ -498,8 +454,7 @@ mod tests {
         assert!(!crashed.reproduced_by(&promise));
     }
 
-    /// A hang's own message names the tick it gave up at, which no two candidates reach. The
-    /// identity is why the loop stopped and nothing else.
+    /// A hang is identified by why the loop stopped, never by its tick.
     #[test]
     fn a_hang_is_compared_by_why_and_never_by_when() {
         let one = Violation::of(

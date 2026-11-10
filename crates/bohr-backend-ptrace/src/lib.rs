@@ -1,8 +1,8 @@
 //! Syscall-level interception on Linux x86-64.
 //!
-//! This is the one crate that talks to the host and the one crate permitted `unsafe`; every block
-//! carries the invariant its caller must hold. On any other target it compiles to nothing, so the
-//! layers above build and test unchanged wherever the toolchain runs.
+//! The only crate that talks to the host and the only one allowed `unsafe`; every unsafe block
+//! states its invariant. On other targets it compiles to nothing, so the layers above build and
+//! test anywhere.
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux;
@@ -14,7 +14,7 @@ pub use linux::{
 
 /// Whether this build contains a working interceptor.
 ///
-/// Callers use it to say so plainly rather than failing in a way that looks like a defect.
+/// Callers check it to report a missing interceptor clearly.
 #[must_use]
 pub const fn available() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))

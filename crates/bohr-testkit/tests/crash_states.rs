@@ -1,19 +1,11 @@
 //! Durability is a promise about one file, and a crash leaves a state the disk was never in.
 //!
-//! Two properties of the disk model, each stated as a pair. Neither can be shown by a single run:
-//! an oracle that fired on the correct twin as well as the defective one would satisfy any claim
-//! made about it and mean nothing.
+//! Two disk-model properties, each tested on a defective and a correct twin.
 //!
-//! **A sync promises nothing about a file it was not asked about.** A store that writes its data
-//! and syncs its log has made its log durable and nothing else — which is the whole reason a
-//! write-ahead log is worth having, and the whole reason a store that syncs the wrong descriptor
-//! loses data. A model that let one sync cover the disk would keep the data file's writes for
-//! free and would never reach the defect.
+//! A sync covers only its own file, so syncing the log leaves the data file at risk.
 //!
-//! **A crash decides each sector for itself.** Between a file's last sync and the power going, each
-//! sector it was written on either landed or did not. What comes back is therefore not a moment the
-//! disk ever passed through, and a model that restored some earlier moment would only ever produce
-//! states the store had already survived once.
+//! A crash decides each unsynced sector independently, so the result can be a state the disk never
+//! passed through.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -27,11 +19,11 @@ use bohr_world::{DurabilityConfig, NetworkConfig, NodeFaultKind, ScheduledNodeFa
 const OPENAT: u32 = 257;
 /// `write`.
 const WRITE: u32 = 1;
-/// `pwrite64`: a write at a named offset, which is how a store rewrites a page in place.
+/// `pwrite64`, for rewriting a page in place.
 const PWRITE64: u32 = 18;
 /// `fsync`.
 const FSYNC: u32 = 74;
-/// `sendto`: the node telling somebody something, which is what stands in for an answer.
+/// `sendto`, standing in for an answer.
 const SENDTO: u32 = 44;
 /// `nanosleep`.
 const SLEEP: u32 = 35;
@@ -71,9 +63,7 @@ fn prologue() -> Vec<GuestOp> {
 
 /// The defect: append to the data, sync the *log*, and answer as though the data were durable.
 ///
-/// Appending because what shows the loss is the durability watcher, and a mark is a file length: a
-/// store that only ever rewrote in place would lose data without its file ever going short, which
-/// is a limit of the watcher rather than of the disk (`docs/API.md` §5.6).
+/// Appends, since the durability watcher marks file lengths (`docs/API.md` §5.6).
 fn syncs_the_wrong_file() -> NullProgram {
     appending_twin(LOG_FD)
 }
@@ -101,11 +91,9 @@ fn appending_twin(synced: u64) -> NullProgram {
     NullProgram::single(ops)
 }
 
-/// Lay the file down and make it durable, so what follows rewrites rather than grows it.
+/// Lay the file down and make it durable, so what follows rewrites it in place.
 ///
-/// The shape a store actually has: a file whose length settles early and whose pages are then
-/// rewritten in place. Growing it instead would test the one axis a length does not have — a size
-/// survives whole, so an extending write is all or nothing and no sector of it ever decides alone.
+/// A real store's shape: the length settles early and pages are rewritten in place.
 fn established() -> Vec<GuestOp> {
     let mut ops = prologue();
     for _ in 0..PAGES {
@@ -199,8 +187,8 @@ fn lost(judged: &Judged) -> bool {
 
 /// The pair. Syncing the log does not make the data durable, and syncing the data does.
 ///
-/// Over a spread of seeds because the crash's landing is drawn: the defect has to be reachable, and
-/// the correct twin has to be safe on every one of them rather than on a lucky one.
+/// Over many seeds, since the crash is drawn: the defect is reached and the correct twin is safe on
+/// all of them.
 #[test]
 fn a_sync_promises_nothing_about_a_file_it_was_not_asked_about() {
     let wrong = (1..=20).filter(|seed| lost(&judge(syncs_the_wrong_file(), *seed))).count();
@@ -218,8 +206,7 @@ fn a_sync_promises_nothing_about_a_file_it_was_not_asked_about() {
 
 /// A crash leaves a state the disk was never in: some sectors of a write landed and others did not.
 ///
-/// The claim the whole model rests on. A crash that only ever restored an earlier moment would
-/// produce nothing a store had not already survived, and no seed would ever tear anything.
+/// Some seed tears a write.
 #[test]
 fn a_crash_can_leave_some_sectors_of_a_write_and_not_others() {
     let tore = |judged: &Judged| {
@@ -240,31 +227,24 @@ fn a_crash_can_leave_some_sectors_of_a_write_and_not_others() {
 
 /// A file cut down after a write, and then a crash.
 ///
-/// **A shape that can panic the supervisor.** A write marks its sectors as not yet durable, and a
-/// later `ftruncate` must take the marks above the new length with the bytes. Otherwise the crash
-/// image copies a sector out of a file shorter than the mark says -- an index past the end, in the
-/// sans-io core, from a guest doing nothing unusual and one drawn crash.
-///
-/// Over a spread of seeds because where a crash lands is drawn, and the sector that mattered has to
-/// be one the draw reaches.
+/// `ftruncate` drops the not-durable marks above the new length, so the crash image never reads
+/// past the file's end. Over many seeds, since the crash is drawn.
 #[test]
 fn a_file_cut_down_before_a_crash_does_not_take_the_supervisor_with_it() {
     /// `ftruncate`.
     const FTRUNCATE: u32 = 77;
 
-    // Eight pages written and promised, then the first page rewritten -- which marks sectors
-    // *below* what is durable -- and then the file cut down under those marks.
+    // Eight pages synced, the first rewritten, then the file truncated under those marks.
     let mut ops = established();
     ops.push(GuestOp::Syscall { nr: PWRITE64, args: [DATA_FD, PAYLOAD_AT, RECORD_BYTES, 0, 0, 0] });
     ops.push(GuestOp::Syscall { nr: FTRUNCATE, args: [DATA_FD, 100, 0, 0, 0, 0] });
-    // And then go on living, so the scheduled kill has a node to arrive at.
+    // Keep running so the scheduled kill has a target.
     for _ in 0..40 {
         ops.push(GuestOp::Syscall { nr: SLEEP, args: [TIMESPEC_AT, 0, 0, 0, 0, 0] });
     }
 
     for seed in 0..24 {
-        // The claim is that this returns at all: before, one of these seeds took the supervisor
-        // down inside the crash image rather than reporting anything about the guest.
+        // The run returns.
         let judged = judge(NullProgram::single(ops.clone()), seed);
         assert!(
             judged.report.ticks.get() > 0,

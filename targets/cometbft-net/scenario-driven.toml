@@ -1,0 +1,42 @@
+# Four CometBFT validators with the kvstore application, no faults: does the network form and agree.
+[run]
+horizon_ticks = 25_000_000_000
+ends_with_node = 4
+
+[state]
+dir = "targets/cometbft-net/state"
+cwd = "/"
+
+[cluster]
+nodes = 5
+programs = [
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node0", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node1", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node2", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node3", "--proxy_app", "kvstore"],
+  ["examples/comet-driver/build/comet-driver"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[[probe]]
+name = "agreement"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 1_000_000_000
+key = "block.header.height"
+value = "block_id.hash"
+property = "agrees"
+
+[[probe]]
+name = "liveness"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 1_000_000_000
+value = "block.header.height"
+property = "advances"
+within_ticks = 10_000_000_000

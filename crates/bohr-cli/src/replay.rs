@@ -1,10 +1,8 @@
 //! Running a stored bundle again and checking it produced what it says it did.
 //!
-//! There are not two engines: a replay is an ordinary run driven by the bundle's own tape, and
-//! success is the digest coming back the same. Everything a replay refuses — a foreign world
-//! model, another draw ABI, a binary that has changed underneath it — is refused rather than
-//! worked around, because a replay that quietly ran something else would be worse than none.
-//! See `docs/API.md` §7.3.
+//! A replay is an ordinary run driven by the bundle's tape; it succeeds when the digest matches.
+//! A foreign world model, another draw ABI or a changed binary is refused, so a replay never runs
+//! something else. See `docs/API.md` §7.3.
 
 use bohr_tape::{TAPE_ABI, Tape};
 use bohr_trace::{Bundle, Manifest, SectionId, read_events};
@@ -20,18 +18,14 @@ pub(crate) enum Verdict {
     Diverged(String),
     /// The run was stopped where it was asked to be and given to a debugger.
     ///
-    /// A hand-over verifies nothing: the run never reaches its end, so there is no digest to
-    /// compare and no journal to regenerate. Saying so is the point of the variant — a caller that
-    /// treated this as a match would report a bundle as verified by a run that stopped early.
+    /// Verifies nothing: the run stops early, so there is no digest to compare.
     HandedOver,
 }
 
-/// Replays one bundle.
+/// Replays one bundle, stopping at `break_at` and handing the world to a debugger if given.
 ///
-/// `binaries` is where to look for the recorded objects when their paths have moved; without it
-/// the recorded paths are used, and a missing or changed object is a refusal rather than a run
-/// against whatever is there now.
-/// Replays one bundle, stopping at an event where one was named and handing the world over there.
+/// `binaries` is where to look for recorded objects whose paths moved; a missing or changed object
+/// is refused.
 pub(crate) fn replay_to(
     bytes: &[u8],
     binaries: Option<&str>,
@@ -40,8 +34,7 @@ pub(crate) fn replay_to(
     let bundle = Bundle::parse(bytes).map_err(|e| CliError::Usage(e.to_string()))?;
     let manifest = bundle.manifest().map_err(|e| CliError::Usage(e.to_string()))?;
 
-    // Every refusal happens before anything runs: a check made afterwards has already spent the
-    // time it exists to save, and has a plausible wrong answer in hand to be tempted by.
+    // Every refusal happens before anything runs.
     manifest.check_tape_abi(TAPE_ABI).map_err(|e| CliError::Usage(e.to_string()))?;
     manifest.require_single_execution().map_err(|e| CliError::Usage(e.to_string()))?;
 
@@ -77,10 +70,7 @@ pub(crate) fn replay_to(
         crate::handover::refuse_if_a_debugger_cannot_attach()?;
     }
 
-    // The bundle's own configuration decides the bounds, exactly as it decides the world and the
-    // oracle: a run recorded to a horizon and replayed without one runs past where it ended and
-    // diverges, which would be reported as a defect in the tool rather than as the bound nobody
-    // carried over.
+    // The bundle's configuration sets the bounds, as it sets the world and the oracle.
     let mut run_config = crate::run_config_for(loaded.as_ref(), None);
     run_config.max_events = run_config.max_events.max(manifest.counters.events + 1);
     run_config.break_at = break_at.map(bohr_types::EventId);
@@ -103,9 +93,8 @@ pub(crate) fn replay_to(
         return Ok(Verdict::Diverged(diverged(&bundle, &completed.log, &manifest)));
     }
 
-    // Checked even where the digest matched, which is the whole point of storing it: the journal
-    // says where each decision came from, and a journal that no longer regenerates means the
-    // trace matched for a reason other than the one recorded.
+    // Checked even when the digest matched: a journal that no longer regenerates means the trace
+    // matched for another reason.
     if let Some(stored) = bundle.section(SectionId::DrawJournal) {
         let regenerated = completed.report.journal.to_bytes();
         if stored != regenerated.as_slice() {
@@ -122,11 +111,9 @@ pub(crate) fn replay_to(
 
 /// Names the first event where the replay and the bundle disagree.
 ///
-/// "Digests differ" leaves the reader with nowhere to go; the first differing event is the whole
-/// diagnosis, and a replay that could not decode the stored log says so rather than guessing.
+/// The first differing event is the diagnosis. An undecodable stored log is reported as such.
 fn diverged(bundle: &Bundle, log: &[u8], manifest: &Manifest) -> String {
-    // A divergence report is describing a run that already happened, so a bundle it cannot read as
-    // one execution leaves it with nothing to compare against rather than with a reason to fail.
+    // A bundle that is not one execution gives nothing to compare against.
     let recorded = bundle
         .single()
         .ok()
@@ -153,15 +140,7 @@ fn diverged(bundle: &Bundle, log: &[u8], manifest: &Manifest) -> String {
     )
 }
 
-/// Checks every recorded object still hashes to what the bundle says.
-///
-/// A binary that changed underneath a bundle is the most common way a replay silently becomes a
-/// different run, so this is a refusal (`BOHR-4004`) and never a warning. See `ARCHITECTURE.md`
-/// §5.9. Refuses a replay whose prepared state is not the one the run began from.
-///
-/// The same shape as the binary fingerprint check and for the same reason: a run that started from
-/// a different filesystem is a different run, and letting it proceed produces a divergence at the
-/// first read that gets reported as a defect in the tool.
+/// Refuses a replay whose prepared state differs from the one the run began from (`BOHR-4004`).
 fn verify_state(
     manifest: &bohr_trace::Manifest,
     loaded: Option<&bohr_world::LoadedConfig>,
@@ -185,7 +164,11 @@ fn verify_state(
     Ok(())
 }
 
-fn verify_binaries(bundle: &Bundle, dir: Option<&str>) -> Result<(), CliError> {
+/// Checks every recorded object still hashes to what the bundle says.
+///
+/// A changed binary is the most common way a replay turns into a different run, so it is refused
+/// (`BOHR-4004`). See `ARCHITECTURE.md` §5.9.
+pub(crate) fn verify_binaries(bundle: &Bundle, dir: Option<&str>) -> Result<(), CliError> {
     let Some(raw) = bundle.section(SectionId::Binaries) else {
         return Ok(());
     };
@@ -198,8 +181,7 @@ fn verify_binaries(bundle: &Bundle, dir: Option<&str>) -> Result<(), CliError> {
         if record.path.starts_with("builtin:") {
             continue;
         }
-        // The probe is found on this host the way a run finds it, and checked against the build
-        // the bundle was judged by.
+        // The probe is found as a run finds it and checked against the recorded build.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         let path = if record.role == "probe" {
             crate::probe::program()?
@@ -232,6 +214,27 @@ fn relocated(path: &str, dir: Option<&str>) -> String {
         }
         None => path.to_owned(),
     }
+}
+
+/// The moved file's path, padded with slashes to the recorded path's length.
+///
+/// The kernel copies the executed path onto the new stack (`AT_EXECFN`), so its length moves every
+/// address below it, and with them the digest. Repeated slashes name the same file; a longer path
+/// cannot be shortened and is refused before the run.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn executed_as(path: &str, dir: Option<&str>) -> Result<String, CliError> {
+    let moved = relocated(path, dir);
+    if moved.len() > path.len() {
+        return Err(CliError::Usage(format!(
+            "BOHR-4004: {moved} is longer than the recorded {path}, which would move the guest's \
+             stack; name the --binaries directory by a shorter path, such as a relative one"
+        )));
+    }
+    let Some((parent, name)) = moved.rsplit_once('/') else {
+        return Ok(moved);
+    };
+    let pad = path.len() - moved.len();
+    Ok(format!("{parent}/{}{name}", "/".repeat(pad)))
 }
 
 /// Reconstructs what to run from what the bundle recorded.
@@ -277,12 +280,20 @@ fn program_target(
         .first()
         .ok_or_else(|| CliError::Usage("BOHR-4002: bundle names no program to replay".into()))?;
 
-    // The program and what it was started with. Only the program was taken, so a run saved with
-    // arguments replayed without them -- a different stack, a different digest, and a bundle that
-    // reported BOHR-2011 against the tool that wrote it.
-    let mut argv = vec![relocated(&first.path, binaries)];
+    // The recorded argument list, unchanged even when the files moved: it shapes the stack and so
+    // the digest. A moved file is executed in place of `argv[0]`, the same file
+    // `verify_binaries` checked.
+    let mut argv = vec![first.path.clone()];
     argv.extend(first.args.iter().cloned());
-    Ok(execute::Target::Program(crate::specs_for(argv, loaded, None)?))
+    let mut specs = crate::specs_for(argv, loaded, None)?;
+    if binaries.is_some() {
+        for spec in specs.iter_mut().filter(|s| s.executable.is_none()) {
+            if let Some(program) = spec.argv.first() {
+                spec.executable = Some(executed_as(program, binaries)?);
+            }
+        }
+    }
+    Ok(execute::Target::Program(specs))
 }
 
 /// The same, where nothing can trace a program.

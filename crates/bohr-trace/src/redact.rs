@@ -1,20 +1,13 @@
 //! Removing from a bundle what a customer would not want published.
 //!
-//! A bundle is somebody's program under somebody's configuration, so it holds their data:
-//! environment, arguments, whatever a guest read or wrote. `docs/API.md` §4.6 says exactly what is
-//! removed, and this is where it happens.
+//! A bundle holds the customer's data: environment, arguments, records. `docs/API.md` §4.6 lists
+//! what is removed.
 //!
-//! **A bundle in and a bundle out, rather than a filter over a report.** The contract promises
-//! that a redacted bundle still replays, and a filter that only cleaned up a page could not keep
-//! that promise: there would be no redacted file to hand anybody. What circulates is the pair — a
-//! bundle somebody can run and a page they can read — and both have to be safe to attach.
+//! A bundle goes in and a bundle comes out, so the redacted bundle still replays.
 //!
-//! # What is not touched, and why that is not an oversight
+//! # The event log
 //!
-//! The event log is unchanged, because it never held the guest's data in the first place. What a
-//! syscall read or wrote is recorded as a length and an eight-byte digest, not as bytes, and an
-//! address is an address. That was decided when the event was designed, and the effect is that the
-//! timeline — the part a reduction and a report both work from — survives redaction intact.
+//! The event log is unchanged: it records lengths and eight-byte digests, never data.
 
 use crate::{Bundle, SectionId, TraceError};
 
@@ -52,7 +45,7 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
         writer.section(SectionId::Config, rewritten);
     }
 
-    // The bundle says so about itself, so nobody has to remember which copy is which.
+    // The bundle notes that it is redacted.
     let mut notes = bundle
         .section(SectionId::Notes)
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
@@ -67,27 +60,20 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
     ));
     writer.section(SectionId::Notes, notes.into_bytes());
 
-    // The same run identifier, because it is the same run. A redacted bundle that renamed itself
-    // could not be matched to the finding it came from.
+    // The same run identifier, so it matches its finding.
     Ok(writer.finish(bundle.run_id))
 }
 
 /// Replaces each recorded path with a digest of it, keeping the fingerprint that identifies the
 /// object itself.
 ///
-/// A path is a customer's directory layout and often their employer; the fingerprint is what
-/// proves two people are talking about the same binary, and is worth keeping.
+/// The fingerprint identifies the binary; the path reveals the customer's layout.
 ///
-/// A guest built into the tool is left alone. Its `builtin:` name is not a path, discloses nothing
-/// about anybody, and is how a replay knows to run a guest rather than look for a file — hashing
-/// it would produce a bundle that no longer replays, which is a worse outcome than the one
-/// redaction exists to prevent.
+/// A `builtin:` name is kept, since replay needs it and it reveals nothing.
 ///
 /// # Errors
 ///
-/// Refuses a section it cannot read or cannot write back. Passing the bytes through untouched and
-/// counting nought would note "0 binary paths hashed" over paths still there -- a redaction
-/// reporting success for work it had not done.
+/// Refuses a section it cannot read or write back.
 fn hash_paths(binaries: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
     let mut records: Vec<crate::BinaryRecord> =
         serde_json::from_slice(binaries).map_err(|e| TraceError::RedactionIncomplete {
@@ -95,9 +81,7 @@ fn hash_paths(binaries: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
         })?;
     let mut count = 0;
     for record in &mut records {
-        // **The arguments go with the path.** They are the other half of what a program was
-        // started with -- the half `drop_argv_and_env` takes out of the configuration -- and a
-        // token passed on a command line is a token whichever section of the bundle carries it.
+        // Arguments are removed too, as `drop_argv_and_env` does in the configuration.
         if !record.args.is_empty() {
             record.args.clear();
             count += 1;
@@ -116,14 +100,10 @@ fn hash_paths(binaries: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
 
 /// Removes the payloads a guest attached to its own records, keeping what each record is called.
 ///
-/// A line this build cannot parse is dropped rather than kept: it may carry a payload under a name
-/// nothing here knows, and a redaction that passed through what it did not understand would be
-/// redacting only what it happened to recognise.
+/// An unparsable line is dropped, since it may hide a payload.
 ///
-/// **Every dropped line leaves a marker behind.** Events on the timeline name a record by its
-/// position in this section (`EventKind::SdkRecord { index }`), so closing the gap would renumber
-/// every record after it and point each event at its neighbour — silently, in the one artefact
-/// whose job is to be believed.
+/// Each dropped line leaves a marker, so `EventKind::SdkRecord { index }` keeps pointing at the
+/// right record.
 fn strip_details(records: &[u8]) -> (Vec<u8>, usize) {
     let mut kept = String::new();
     let mut removed = 0;
@@ -132,26 +112,21 @@ fn strip_details(records: &[u8]) -> (Vec<u8>, usize) {
             continue;
         }
         let rewritten = match bohr_sdk_proto::Record::parse_line(line) {
-            // Cleared rather than left behind: the record model carries every field the writer
-            // supplied, `details` included, so what a guest attached to an assertion leaves only
-            // because this line says so.
+            // The record keeps every writer field, `details` included, so it is cleared here.
             Ok(bohr_sdk_proto::Record::Assert(assertion, meta)) => {
                 bohr_sdk_proto::Record::Assert(assertion.without_attachments(), meta).to_line()
             }
             Ok(bohr_sdk_proto::Record::FaultPoint(point, meta)) => {
                 bohr_sdk_proto::Record::FaultPoint(point, meta).to_line()
             }
-            // Setup and event records are a name and whatever the guest chose to attach. The name
-            // is what a report shows; the attachment is the customer's.
+            // Keep the name; drop the attachment.
             Ok(_) | Err(_) => {
                 removed += 1;
                 REMOVED_RECORD.to_owned()
             }
         };
         kept.push_str(&rewritten);
-        // The terminator the record format leaves to whoever writes the stream. Without it two
-        // kept records become one line that nothing can read back, and every reader here splits on
-        // lines — so a redacted finding would show no assertions at all.
+        // One record per line.
         kept.push('\n');
     }
     (kept.into_bytes(), removed)
@@ -159,23 +134,15 @@ fn strip_details(records: &[u8]) -> (Vec<u8>, usize) {
 
 /// What stands in for a record a redaction took out.
 ///
-/// A line rather than nothing, so the positions events refer to keep meaning what they meant. It
-/// parses as a record this build does not model, which is exactly what it is.
+/// A line, so record positions stay; it parses as an unknown record.
 const REMOVED_RECORD: &str = r#"{"bohr_redacted":{}}"#;
 
 /// Removes what a program was started with: its arguments, and its environment.
 ///
-/// Filtered rather than reparsed and re-emitted: the configuration a bundle carries is the text
-/// somebody wrote, and a replay reads exactly those bytes back. Removing lines can be read off a
-/// diff; re-serialising cannot, and would have to be trusted to have changed nothing else.
+/// Filtered as text, so the result reads as a diff of what the author wrote.
 ///
-/// **What it cannot prove it removed, it refuses.** Filtering by line alone would let a value
-/// spread over several lines lose only its first one -- `argv = [` keeps every argument under it --
-/// and would match nothing in an `[env]` table, which is not a key. So the scanner below
-/// understands a value's extent, and the result is then parsed and asked whether anything it was
-/// meant to remove survived.
-/// whether anything it was meant to remove survived. A redaction that cannot answer that question
-/// is not a redaction (`TraceError::RedactionIncomplete`).
+/// The scanner follows multi-line values and `[env]` tables. The result is then parsed, and any
+/// surviving forbidden key is `TraceError::RedactionIncomplete`.
 ///
 /// # Errors
 ///
@@ -183,8 +150,7 @@ const REMOVED_RECORD: &str = r#"{"bohr_redacted":{}}"#;
 /// the pass.
 fn drop_argv_and_env(config: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
     let text = String::from_utf8_lossy(config).into_owned();
-    // Read before it is edited, so a configuration nobody can parse is refused rather than
-    // filtered by guesswork and handed on.
+    // An unparsable configuration is refused.
     if toml::from_str::<toml::Value>(&text).is_err() {
         return Err(TraceError::RedactionIncomplete {
             reason: "the configuration is not readable as TOML".to_owned(),
@@ -193,8 +159,7 @@ fn drop_argv_and_env(config: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
 
     let mut kept = String::new();
     let mut removed = 0usize;
-    // Depth of the value being read, so the lines a multi-line array or inline table occupies go
-    // with the key that opened it.
+    // Depth, so a multi-line value goes with its key.
     let mut depth = 0usize;
     let mut dropping = false;
     let mut in_forbidden_table = false;
@@ -203,8 +168,8 @@ fn drop_argv_and_env(config: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
         if depth == 0 {
             let trimmed = line.trim_start();
             if let Some(name) = table_header(trimmed) {
-                // A table stands until the next header, so what to do with its lines is decided
-                // once, here. `[env]`, `[node.env]` and `[[env]]` all name the environment.
+                // A table runs to the next header. `[env]`, `[node.env]` and `[[env]]` are all the
+                // environment.
                 in_forbidden_table = name.rsplit('.').next().is_some_and(is_forbidden);
                 dropping = false;
                 if in_forbidden_table {
@@ -236,9 +201,7 @@ fn drop_argv_and_env(config: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
         kept.push('\n');
     }
 
-    // The proof. The scanner above understands the shapes it has been shown; this asks the parser
-    // whether anything it was meant to take is still there, so a shape nobody anticipated is a
-    // refusal rather than a leak.
+    // The parser confirms nothing forbidden survived.
     let parsed =
         toml::from_str::<toml::Value>(&kept).map_err(|e| TraceError::RedactionIncomplete {
             reason: format!("removing arguments and environment left unreadable TOML: {e}"),
@@ -275,16 +238,14 @@ fn key_of(trimmed: &str) -> Option<&str> {
 
 /// The nesting depth a line leaves behind it, given what it started at.
 ///
-/// Brackets and braces inside a string or a comment are text rather than structure, so the walk
-/// tracks both. Without it a path containing a bracket, or a comment mentioning one, would move
-/// the depth and take unrelated lines out with the value being removed.
+/// Brackets inside strings and comments are ignored.
 fn depth_after(line: &str, mut depth: usize) -> usize {
     let mut chars = line.chars();
     let mut quote: Option<char> = None;
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some('"'), '\\') => {
-                // An escape inside a basic string: whatever follows is text, quote included.
+                // An escape in a basic string.
                 let _ = chars.next();
             }
             (Some(open), c) if c == open => quote = None,
@@ -317,8 +278,7 @@ fn forbidden_key_in(value: &toml::Value) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A name that is not a path is not somebody directory layout, and it is what a replay
-    /// reconstructs the guest from.
+    /// A `builtin:` name is kept.
     #[test]
     fn a_guest_built_into_the_tool_keeps_its_name() {
         let binaries = serde_json::to_vec(&vec![crate::BinaryRecord {
@@ -353,9 +313,7 @@ mod tests {
         assert_eq!(back[0].blake3, "blake3:abc", "the fingerprint was taken too");
     }
 
-    /// A list of binaries this build cannot read is a list whose paths it cannot remove. Passing
-    /// the bytes through and reporting "0 binary paths hashed" is a redaction claiming to have
-    /// done work it did not do.
+    /// An unreadable binaries section is refused.
     #[test]
     fn binaries_that_cannot_be_read_are_refused_rather_than_passed_through() {
         let outcome = hash_paths(b"{not json at all");
@@ -376,9 +334,7 @@ mod tests {
         assert!(text.contains("nodes = 5"), "the shape of the cluster was taken too: {text}");
     }
 
-    /// The shapes the line filter missed. A value may occupy as many lines as it likes, and a
-    /// table is not a key at all, so the token stayed in the bundle while the note on it said the
-    /// arguments had been removed.
+    /// Multi-line values and tables are removed whole.
     #[test]
     fn a_value_spread_over_several_lines_goes_with_its_key() {
         let config = b"[cluster]\nnodes = 5\nargv = [\n  \"/opt/app\",\n  \"--token\",\n  \
@@ -396,7 +352,7 @@ mod tests {
         assert!(count >= 2, "removals were undercounted: {count}");
     }
 
-    /// A nested table names the environment as surely as a top-level one does.
+    /// A nested environment table is removed.
     #[test]
     fn an_environment_nested_under_a_table_goes_too() {
         let config = b"[node]\nname = \"a\"\n\n[node.env]\nTOKEN = \"secret\"\n";
@@ -405,8 +361,7 @@ mod tests {
         assert!(text.contains("name = \"a\""), "{text}");
     }
 
-    /// Brackets inside a string are text. Treating them as structure would take the lines after
-    /// them out of an unrelated part of somebody configuration.
+    /// Brackets inside a string do not change depth.
     #[test]
     fn a_bracket_inside_a_string_does_not_move_the_scanner() {
         let config = b"[cluster]\nargv = [\"a]b\", \"c[d\"]\nnodes = 5\n";
@@ -415,16 +370,14 @@ mod tests {
         assert!(text.contains("nodes = 5"), "the key after the array was taken too: {text}");
     }
 
-    /// The proof at the end of the pass: a configuration this build cannot read is one whose
-    /// secrets it cannot find, and it must say so rather than hand the file on.
+    /// An unreadable configuration is refused.
     #[test]
     fn a_configuration_that_cannot_be_read_is_refused() {
         let outcome = drop_argv_and_env(b"[cluster\nnodes = ");
         assert!(matches!(outcome, Err(TraceError::RedactionIncomplete { .. })), "{outcome:?}");
     }
 
-    /// A line this build cannot read might carry a payload under a name it does not know, so it
-    /// goes. Keeping it would mean redacting only what happened to be recognised.
+    /// An unreadable record line is dropped.
     #[test]
     fn a_record_this_build_cannot_read_is_dropped_rather_than_passed_through() {
         let records = b"{\"something_new\":{\"secret\":\"value\"}}\nnot json at all\n";
@@ -435,9 +388,7 @@ mod tests {
         assert_eq!(text.lines().count(), 2, "the positions of later records moved: {text}");
     }
 
-    /// Two records kept, two lines out. Written without a terminator they became one line that
-    /// nothing could read back, so a redacted finding showed no assertions at all -- and the only
-    /// test of this path asserted the output was empty, which it was.
+    /// Two kept records come out as two lines.
     #[test]
     fn records_that_survive_are_still_one_record_to_a_line() {
         let records = b"{\"antithesis_assert\":{\"assert_type\":\"always\",\"condition\":false,\
@@ -456,9 +407,7 @@ mod tests {
         assert!(text.contains("first") && text.contains("second"), "{text}");
     }
 
-    /// The record model carries every field its writer supplied, so an assertion arrives here with
-    /// the guest's attachment intact. What identifies the finding stays; what the guest hung on it
-    /// is the customer's and goes.
+    /// An assertion keeps its identity and loses its attachment.
     #[test]
     fn what_a_guest_attached_to_an_assertion_does_not_survive() {
         let records = b"{\"antithesis_assert\":{\"assert_type\":\"always\",\"condition\":false,\

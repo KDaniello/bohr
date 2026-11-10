@@ -1,8 +1,7 @@
 //! End-to-end runs through the whole stack above interception.
 //!
-//! Tape, clock, scheduler, world model, event log and digest, driven by a scripted guest. No
-//! syscalls, no privileges and no Linux are involved, which is what lets the claim these tests make
-//! be checked on any machine in milliseconds.
+//! Tape, clock, scheduler, world model, event log and digest with a scripted guest, on any machine
+//! in milliseconds.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
 use bohr_kernel::{Oracle, RunConfig, RunInputs, RunOutcome, Verdict, run};
@@ -34,7 +33,7 @@ const CLOCK_GETTIME: u32 = 228;
 const GETRANDOM: u32 = 318;
 const WRITE: u32 = 1;
 
-/// Reads the clock, asks for randomness and writes it out: the shape the founding claim is about.
+/// Reads the clock, asks for randomness and writes it out.
 fn clock_and_random() -> NullProgram {
     NullProgram::single(vec![
         GuestOp::Syscall { nr: CLOCK_GETTIME, args: [0, MEMORY_BASE, 0, 0, 0, 0] },
@@ -157,8 +156,7 @@ fn two_nodes_run_reproducibly_with_clocks_of_their_own() {
         assert_eq!(log, log_again, "the recorded log is not byte-identical");
     }
 
-    // Each node drew an offset and drift of its own before anything ran, so the first thing the
-    // two guests read must already disagree.
+    // Each node has its own skew, so the first readings differ.
     let events = read_events(&log).expect("read log");
     let mut first_read = std::collections::BTreeMap::new();
     for event in &events {
@@ -206,9 +204,7 @@ fn the_guest_receives_tape_bytes_rather_than_host_entropy() {
     let completed = execute(clock_and_random(), 7).expect("run");
     let tape = Tape::from_seed(Seed(7));
 
-    // The randomness is read from wherever the journal says it was drawn. A lone runnable task
-    // costs no entropy to schedule, but the node's clock is settled before anything runs, so the
-    // guest's bytes are not at the start of the tape.
+    // Read where the journal says, since the clock draws come first.
     let at = completed
         .random_draw_offset
         .expect("the run must have drawn the randomness it handed the guest");
@@ -238,7 +234,7 @@ fn virtual_time_advances_and_is_what_the_guest_is_told() {
 
 #[test]
 fn an_unsupported_syscall_is_refused_by_name() {
-    // 41 is `socket`; this model has no network and must say so rather than invent an answer.
+    // 41 is `socket`, which this model refuses.
     let program =
         NullProgram::single(vec![GuestOp::Syscall { nr: 41, args: [0; 6] }, GuestOp::Exit(0)]);
     let err = execute(program, 1).expect_err("an unmodelled syscall must not be answered");
@@ -277,7 +273,7 @@ fn interleaving_two_tasks_stays_reproducible() {
         assert_eq!(execute(program(), 11).expect("run").digest, first.digest);
     }
 
-    // With two runnable tasks the scheduler is actually choosing, so the seed must matter.
+    // With two runnable tasks the seed matters.
     let other = execute(program(), 12).expect("run");
     assert_ne!(other.digest, first.digest, "the schedule did not depend on the tape");
 
@@ -319,8 +315,7 @@ fn a_guest_that_never_ends_is_stopped_by_the_tick_budget() {
     assert!(report.ticks >= bohr_types::Tick::MILLISECOND);
 }
 
-/// A fresh descriptor is the lowest number not in use, as the kernel allocates them: programs
-/// redirect by number on that assumption.
+/// A fresh descriptor is the lowest free number, as the kernel allocates.
 #[test]
 fn descriptors_are_the_lowest_free_number() {
     const OPENAT: u32 = 257;

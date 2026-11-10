@@ -23,15 +23,13 @@ pub trait WorldModel {
 
     /// A task was created, and by which task.
     ///
-    /// Threads are created by a call the model has already seen, and this is what ties that call to
-    /// the task it produced: the identifier does not exist until the task does.
+    /// Ties the creating call, already seen, to the task it produced.
     fn task_created(&mut self, _task: TaskId, _parent: TaskId) {}
 
     /// A task ended, and what its ending releases.
     ///
-    /// A thread ending is a wake: whoever joined it was waiting on a word the kernel clears when
-    /// the thread goes. Nothing can be read from the task at this point — it is already gone — so
-    /// the model answers from what it recorded when the task was created.
+    /// A thread ending wakes its joiner, who waits on a word the kernel clears. The task is gone,
+    /// so the model answers from what it recorded at creation.
     fn task_exited(&mut self, _task: TaskId) -> Vec<Wake> {
         Vec::new()
     }
@@ -53,10 +51,9 @@ pub trait WorldModel {
 
     /// Fires everything armed at or before the world clock's current reading.
     ///
-    /// Called by the kernel at the top of every scheduling iteration while
-    /// [`Self::next_deadline`] reads due, and after advancing the clock to the next deadline when
-    /// nothing is schedulable. The context is detached — there is no current task — so events are
-    /// recorded through [`WorldCtx::emit_for`] and memory reached through the `_for` accessors.
+    /// Called while [`Self::next_deadline`] is due, and after the clock jumps to it. The context
+    /// is detached, so events go through [`WorldCtx::emit_for`] and memory through `_for`
+    /// accessors.
     fn on_deadline(&mut self, _ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
         Ok(DueEffects::default())
     }
@@ -71,14 +68,11 @@ pub struct Effects {
     pub advance: Tick,
     /// Tasks the world released, each with what its blocking call returns.
     ///
-    /// A wake is an effect of the stop rather than a stop of its own: the woken task is not
-    /// executing and has nothing to report until the scheduler picks it.
+    /// A wake is an effect of this stop; the woken task runs when the scheduler picks it.
     pub wake: Vec<Wake>,
     /// Whether the task asked to give up the processor.
     ///
-    /// A policy that runs one task in long stretches has to be told: a guest spinning on a flag
-    /// another task sets would otherwise spin until its budget ran out, having asked to be
-    /// interrupted every time round the loop.
+    /// A policy that runs long stretches switches here, so a spin on another task's flag ends.
     pub yielded: bool,
     /// Operations on whole nodes the world decided on, carried out by the kernel.
     pub node_ops: Vec<NodeOp>,
@@ -136,8 +130,8 @@ impl Effects {
 pub enum TaskState {
     /// Ready to run again whenever the scheduler picks it.
     Runnable(Resume),
-    /// Waiting on something only the world can release, and not a scheduling candidate until it
-    /// does. Every task blocked with nothing left to release it is a deadlock, which is a finding.
+    /// Waiting for the world to release it. All tasks blocked with nothing to release them is a
+    /// deadlock, which is a finding.
     Blocked,
 }
 
@@ -152,33 +146,27 @@ pub struct Wake {
 
 /// An operation on a whole node, decided by the world and carried out by the kernel.
 ///
-/// The split follows event authorship: the world has already arranged its own consequences —
-/// dropped what a crash loses, emitted the `FaultFired` and `NodeState` events — before returning
-/// one of these. The kernel's half is what only it can do: task bookkeeping and backend calls.
+/// The world has already applied its consequences and emitted its events; the kernel does the
+/// task bookkeeping and backend calls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeOp {
     /// End every task of the node, now.
     Kill(NodeId),
-    /// Keep the node's tasks out of scheduling until thawed. Wakes still land; frozen tasks
-    /// simply are not offered to the policy, which is what makes a freeze a pause and not a drop.
+    /// Keep the node's tasks out of scheduling until thawed. Wakes still land, so a freeze is a
+    /// pause.
     Freeze(NodeId),
     /// Let a frozen node run again.
     Thaw(NodeId),
     /// Re-spawn a dead node's initial task from the spec it was started with. The node keeps the
     /// clock it drew at spawn, so a restart cannot shift the tape position of later draws.
     Restart(NodeId),
-    /// The node's process has ended of its own accord, taking every one of its tasks with it.
+    /// The node's process called `exit_group`, ending every task.
     ///
-    /// Not a kill and never narrated as one: `exit_group` is what a program calls when it is done,
-    /// and every thread of the process goes with it whether or not it was in the middle of
-    /// something. Without this, a runtime that parks its workers on a futex and then exits -- the
-    /// Go runtime does -- leaves them parked for ever, and a run that finished is reported as one
-    /// where every task is waiting.
+    /// A normal exit. Workers parked on a futex, as in the Go runtime, end with it.
     Ended {
         /// The node whose process is ending.
         node: NodeId,
-        /// The task that called it, which is spared: it has still to execute the call and deliver
-        /// the status the whole process exits with.
+        /// The calling task, spared so it can deliver the process's exit status.
         by: TaskId,
     },
 }
@@ -222,8 +210,7 @@ pub trait Oracle {
 
     /// Judges a set of runs against each other.
     ///
-    /// Where independent implementations of one specification must agree, a disagreement is a bug
-    /// in one of them without anyone having to say which behaviour was correct.
+    /// Implementations of one specification must agree; a disagreement is a bug in one of them.
     fn judge_group(&mut self, _runs: &[RunOutcome]) -> Verdict {
         Verdict::Skipped
     }
@@ -231,9 +218,7 @@ pub trait Oracle {
 
 /// Something a world model noticed and wrote down, as an oracle reads it.
 ///
-/// The message travels with the code because an oracle that sees only the code cannot say *which*
-/// promise was broken — and "an assertion the guest makes about itself did not hold" is the same
-/// sentence for every assertion any guest will ever write.
+/// The message says which promise broke; the code alone names only the class.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Diagnostic {
     /// The code that names the class, stable forever (`docs/API.md` §8).
@@ -244,8 +229,7 @@ pub struct Diagnostic {
 
 /// What a run accumulated for whoever judges it.
 ///
-/// Gathered into one value because a context that carried a borrow per fact would grow an argument
-/// every time a run learned to notice something new.
+/// One value, so new facts do not add arguments.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Recorded {
     diagnostics: Vec<Diagnostic>,
@@ -266,20 +250,15 @@ impl Recorded {
 
     /// How much adversity actually landed on the guest.
     ///
-    /// **A campaign that injected nothing looks exactly like one that injected plenty and found
-    /// nothing, and only this tells them apart.** Faults are drawn, so whether any fired is a fact
-    /// about the run rather than about the configuration: a scenario can arm a policy that a run
-    /// ends before, and reporting the clean runs without this would be reporting that a question
-    /// was asked when it was not.
+    /// Faults are drawn, and a run can end before they arm, so only this shows whether any
+    /// landed.
     pub(crate) const fn adversity(&self) -> u32 {
         self.adversity
     }
 
     /// The event where a promise the guest made about itself first did not hold.
     ///
-    /// The *first*, and never the last event of the run: a violated assertion is followed by
-    /// whatever the guest did next, and pointing a reader at that instead is pointing them past
-    /// the answer.
+    /// The first violation, since what follows it is the guest's reaction.
     pub(crate) const fn violation_event(&self) -> Option<EventId> {
         self.violation_event
     }
@@ -298,16 +277,14 @@ pub struct RunOutcome {
     pub exit: Option<i32>,
     /// The signal that ended a task, where one did.
     ///
-    /// A task killed by a fault returns nothing at all, so an oracle reading only the exit status
-    /// would call a crashed guest clean.
+    /// A task killed by a fault has no exit status.
     pub killed_by: Option<u32>,
     /// What the run noticed and wrote down, in the order it did.
     pub diagnostics: Vec<Diagnostic>,
     /// What this run is compared by, where anything asked it to be.
     ///
-    /// Empty for an ordinary run, which is every run against one implementation. Filled by the
-    /// crate that carries runs out, because a projection is read off the world after the run ends
-    /// and the kernel is finished with the world by then.
+    /// Empty for a single implementation. Filled after the run by the crate that executes it,
+    /// since a projection is read from the finished world.
     pub projections: Vec<(String, Digest)>,
 }
 
@@ -326,8 +303,7 @@ pub enum Verdict {
 
 /// Watches a run as it goes, for whoever shows progress. Never part of what the run is.
 ///
-/// Called by the loop between stops with a copy of where the run stands; nothing it does is read
-/// back, so an observer cannot change a run.
+/// Called between stops with a copy of the run's position; nothing it does is read back.
 pub trait Observer {
     /// The run so far: every [`crate::PROGRESS_EVERY`] events, and once more when it ends.
     fn progress(&mut self, progress: &Progress);
@@ -368,13 +344,11 @@ impl<W: std::io::Write> EventSink for bohr_trace::TraceWriter<W> {
 
 /// What a world model is given while handling a stop or firing deadlines.
 ///
-/// Exposes the clock, the tape and guest memory through methods rather than fields, so that a model
-/// cannot take ownership of any of them or advance the cursor without the draw being journalled.
+/// Methods expose the clock, tape and memory, so every draw is journalled.
 ///
-/// While handling a stop the context carries the stopped task as its origin, and the short
-/// accessors ([`Self::task`], [`Self::now`], [`Self::emit`], the plain memory methods) speak about
-/// it. Inside [`WorldModel::on_deadline`] there is no current task: the context is detached, those
-/// accessors panic, and the model attributes everything explicitly through the `_for` methods.
+/// While handling a stop, the short accessors ([`Self::task`], [`Self::now`], [`Self::emit`], plain
+/// memory) refer to the stopped task. In [`WorldModel::on_deadline`] the context is detached: those
+/// panic, and the model uses the `_for` methods.
 pub struct WorldCtx<'a, 't> {
     clock: &'a mut Clock,
     cursor: &'a mut TapeCursor<'t>,
@@ -414,8 +388,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
 
     /// The stop's origin, which a detached context does not have.
     ///
-    /// Panicking rather than erroring is deliberate: a model asking "which task?" while firing
-    /// deadlines is a bug in the model, not a state a run can reach.
+    /// Panics, since asking while firing deadlines is a bug in the model.
     #[track_caller]
     fn origin(&self) -> (NodeId, TaskId) {
         self.origin.expect("no current task while firing deadlines; attribute explicitly")
@@ -423,8 +396,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
 
     /// What the node this stop happened on reads for the time.
     ///
-    /// Not the world clock: a node has its own offset and drift, and a guest that compares
-    /// timestamps with another node is meant to see them disagree.
+    /// Includes the node's own offset and drift.
     ///
     /// # Panics
     /// On a detached context; use [`Self::now_on`] there.
@@ -441,8 +413,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
 
     /// What the node this stop happened on reads for wall time (`CLOCK_REALTIME`).
     ///
-    /// [`Self::now`] on top of the wall epoch until the node's clock is stepped; after a step back
-    /// it can read earlier than before, as a wall clock can.
+    /// [`Self::now`] on the wall epoch plus any step; a step back makes it read earlier.
     ///
     /// # Panics
     /// On a detached context; use [`Self::wall_on`] there.
@@ -538,8 +509,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
         Ok(())
     }
 
-    /// Writes into the memory of a named task — a delivery lands in the receiver's buffer while
-    /// the receiver is not the task being handled.
+    /// Writes into a named task's memory, such as a receiver's buffer on delivery.
     pub fn write_mem_for(
         &mut self,
         task: TaskId,
@@ -563,8 +533,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
 
     /// Gives a node a clock of its own.
     ///
-    /// No world re-draws a clock during a run: clocks are skewed once, before the first task runs
-    /// (`docs/ARCHITECTURE.md` §4.5).
+    /// Clocks are skewed once, before the first task runs (`docs/ARCHITECTURE.md` §4.5).
     pub fn set_node_clock(&mut self, node: NodeId, clock: NodeClock) {
         self.clock.set_node_clock(node, clock);
     }
@@ -580,9 +549,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
 
     /// Replaces the stopped task's registers.
     ///
-    /// Needed where a trapped instruction is emulated rather than a syscall: the result has to be
-    /// placed in the registers the instruction would have written, and the instruction pointer
-    /// moved past it.
+    /// For emulating a trapped instruction: write its results and move past it.
     ///
     /// # Panics
     /// On a detached context.
@@ -601,8 +568,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
         self.emit_for(node, task, kind)
     }
 
-    /// Records an event attributed to a named node and task — cross-node facts such as a delivery
-    /// on the receiver, and everything emitted while firing deadlines.
+    /// Records an event for a named node and task, such as a delivery or a deadline's event.
     pub fn emit_for(
         &mut self,
         node: NodeId,
@@ -615,17 +581,12 @@ impl<'a, 't> WorldCtx<'a, 't> {
                     .diagnostics
                     .push(Diagnostic { code: code.clone(), message: message.clone() });
             }
-            // Read from the event rather than from the world's own bookkeeping, so a model that
-            // records a broken promise gets the point of violation for free and no model has to
-            // remember to report it twice.
+            // Taken from the event, so no model reports the violation point separately.
             EventKind::Assertion { condition: false, .. } => {
                 self.recorded.violation_event.get_or_insert(*self.next_event);
             }
-            // Both vocabularies, because the guest cannot tell them apart and this number is about
-            // the guest. A fault is something the world was told to do; a packet lost on a lossy
-            // link is the medium being the medium — and a campaign whose only adversity is a lossy
-            // link would otherwise report that it injected nothing. A packet doubled, overtaken or
-            // altered fires a fault of its own, and is counted there once.
+            // Faults and lossy-link drops both count, since the guest cannot tell them apart.
+            // Duplicated, reordered or altered packets fire their own fault and count there.
             EventKind::FaultFired { .. }
             | EventKind::PacketFate { fate: PacketFate::Dropped, .. } => {
                 self.recorded.adversity = self.recorded.adversity.saturating_add(1);
@@ -635,8 +596,7 @@ impl<'a, 't> WorldCtx<'a, 't> {
         let event = Event { id: *self.next_event, tick: self.clock.now(), node, task, kind };
         self.sink.emit(&event)?;
         *self.next_event = EventId(self.next_event.get() + 1);
-        // Draws made after this point belong to the next event, which is what lets the journal be
-        // read alongside the trace.
+        // Later draws belong to the next event, aligning the journal with the trace.
         self.cursor.set_event(*self.next_event);
         Ok(())
     }

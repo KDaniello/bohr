@@ -3,6 +3,7 @@
   "schema": "bohr.version/1",
   "schemas": {
     "check": "bohr.check/1",
+    "confirm": "bohr.confirm/1",
     "doctor": "bohr.doctor/1",
     "error": "bohr.error/1",
     "explain": "bohr.explain/1",

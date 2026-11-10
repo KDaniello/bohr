@@ -1,9 +1,8 @@
 //! Probes for what this host can and cannot do.
 //!
-//! Every probe that touches the machine lives here, behind the same boundary the backend does:
-//! `ptrace`, `seccomp` and `prctl` are vocabulary of one crate, and a diagnosis is the one thing
-//! that must name them out loud. What the answers mean, and what to do about them, belongs to
-//! whoever is asking — this module only measures. See `docs/PLATFORMS.md` §2.
+//! Every probe that touches the machine lives here, next to the backend that uses `ptrace`,
+//! `seccomp` and `prctl`. The module only measures; the caller decides what an answer means. See
+//! `docs/PLATFORMS.md` §2.
 
 use bohr_backend::code::entropy;
 
@@ -28,8 +27,7 @@ impl Probe {
 
 /// Whether this process may trace another.
 ///
-/// Probed by tracing a child rather than by reading a sysctl: a value that says tracing is
-/// permitted and a kernel that refuses it are different facts, and only the second one matters.
+/// Probed by tracing a child: a sysctl can permit tracing that the kernel still refuses.
 #[must_use]
 pub fn can_trace() -> Probe {
     // SAFETY: fork is async-signal-safe, and the child below reaches `_exit` on every path.
@@ -82,8 +80,7 @@ pub fn can_trap_rdtsc() -> Probe {
 
 /// Whether processor identification can be made to fault.
 ///
-/// A hardware capability before it is a kernel one: without `cpuid_fault` the processor cannot
-/// trap the instruction at all, which is why this is read from what the processor reports.
+/// Read from `/proc/cpuinfo`: without the `cpuid_fault` feature the processor cannot trap it.
 #[must_use]
 pub fn can_trap_cpuid() -> Probe {
     match std::fs::read_to_string("/proc/cpuinfo") {
@@ -112,14 +109,9 @@ pub fn can_disable_aslr() -> Probe {
 
 /// Whether the real processor carries every feature named in the two words handed in.
 ///
-/// The words are the ones a guest will be told it has, in the order the instruction returns them:
-/// `ecx` of leaf one and `ebx` of leaf seven. Asked of the silicon and not of anything modelling
-/// it, because the question is what will happen when the guest reaches such an instruction — and
-/// the model's answer is precisely what cannot settle that.
-///
-/// Advertising is a promise. A guest told of a feature executes it, on the real processor,
-/// whatever the world said; so a host that cannot keep the promise is a host where a guest dies on
-/// an instruction nothing in the run could have predicted.
+/// The words are what the guest will be told it has: `ecx` of leaf one and `ebx` of leaf seven.
+/// The real processor is asked, because a guest told of a feature executes it on real hardware.
+/// A host without the feature would kill the guest on that instruction.
 #[must_use]
 pub fn supports(leaf_one_ecx: u32, leaf_seven_ebx: u32) -> Probe {
     let (one, seven) = (std::arch::x86_64::__cpuid(1), std::arch::x86_64::__cpuid_count(7, 0));
@@ -130,10 +122,7 @@ pub fn supports(leaf_one_ecx: u32, leaf_seven_ebx: u32) -> Probe {
 
 /// Whether this user may create the namespaces a guest is isolated in.
 ///
-/// Performs what a launch performs, rather than a subset of it. Asking for two of the five
-/// namespaces and stopping at `unshare` let this report a capability the guest then failed to
-/// obtain, which is the one thing a diagnostic must never do: a report that is wrong in the
-/// permissive direction is worse than no report, because it is acted on.
+/// Performs the same steps a launch performs, so a pass here means the launch will succeed.
 #[must_use]
 pub fn can_use_namespaces() -> Probe {
     // SAFETY: a child of a fork, entering the guest's namespaces and reporting whether it may.
@@ -167,8 +156,7 @@ pub fn can_install_seccomp() -> Probe {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 libc::_exit(1);
             }
-            // Asking for a mode the kernel does not have fails differently from asking a kernel
-            // that has no seccomp at all; either way the answer is the same to us.
+            // Fails both on a kernel without seccomp and on one without this mode; both mean no.
             let supported = libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) >= 0;
             libc::_exit(i32::from(!supported));
         }
@@ -178,7 +166,7 @@ pub fn can_install_seccomp() -> Probe {
 
 /// Whether one process may read another's memory directly.
 ///
-/// Its absence is a slowdown rather than a failure: the fallback reads a word at a time.
+/// Without it reads are slower: the fallback reads a word at a time.
 #[must_use]
 pub fn can_read_memory_directly() -> Probe {
     let probe = 0x1234_5678u64;
@@ -196,7 +184,7 @@ pub fn can_read_memory_directly() -> Probe {
     Probe::from(read == std::mem::size_of::<u64>() as isize && out == probe)
 }
 
-/// Whether hardware branch counting is available, which is what fine progress measurement needs.
+/// Whether hardware branch counting is available, for fine progress measurement.
 #[must_use]
 pub fn can_count_branches() -> Probe {
     match std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") {
@@ -259,8 +247,8 @@ pub struct TargetReport {
     pub interpreter: Option<String>,
     /// Offsets of `RDRAND` or `RDSEED` in executable pages.
     ///
-    /// Each is a place where the guest could take a number from the processor that no supervisor
-    /// below a hypervisor can intercept — the one honest hole in the determinism map.
+    /// At each, the guest can take a number from the processor that only a hypervisor could
+    /// intercept.
     pub hardware_random: Vec<u64>,
     /// Whether the program references `io_uring`, which is not modelled.
     pub uses_io_uring: bool,
@@ -268,8 +256,7 @@ pub struct TargetReport {
 
 /// Reads what an ELF program will need.
 ///
-/// A minimal reader rather than a library: this is the only ELF this tool parses, and a
-/// dependency for it would be a dependency in every build.
+/// A minimal reader; this is the only ELF parsing the tool needs, so it takes no dependency.
 #[must_use]
 pub fn inspect_target(bytes: &[u8]) -> Option<TargetReport> {
     if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
@@ -292,8 +279,7 @@ pub fn inspect_target(bytes: &[u8]) -> Option<TargetReport> {
         let kind = bytes
             .get(at..at + 4)
             .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap_or_default()));
-        // PT_INTERP: the loader this program will ask the kernel for. The only header this reads
-        // now -- where the instructions are is a question for whoever knows what one looks like.
+        // PT_INTERP: the loader the program asks the kernel for.
         if kind == 3 {
             let offset = word(at + 0x08) as usize;
             let file_size = word(at + 0x20) as usize;
@@ -303,24 +289,15 @@ pub fn inspect_target(bytes: &[u8]) -> Option<TargetReport> {
             report.interpreter = std::str::from_utf8(text).ok().map(str::to_owned);
         }
     }
-    // Every place an instruction takes a number from the processor, including the ones nothing
-    // could establish: unjudged is not absent, and only the second may go unsaid.
+    // Every candidate site, including those the decoder could not settle.
     report.hardware_random = entropy::sites(bytes).into_iter().map(|site| site.at as u64).collect();
     report.uses_io_uring = references_io_uring(bytes);
     Some(report)
 }
 
-/// Keeps the candidates that sit where an instruction begins.
-///
-/// The scan below finds a byte pair, and a byte pair is `rdrand` only where an instruction starts:
-/// the same two bytes inside a displacement are part of a load. Which is which is settled by
-/// walking each function from its symbol and measuring every step, so the answer is a report about
-/// the program rather than about its byte histogram.
-///
-/// Whether a program references the asynchronous submission interface.
+/// Whether a program references `io_uring`.
 fn references_io_uring(bytes: &[u8]) -> bool {
-    // By name rather than by syscall number: the numbers are immediates that appear by chance in
-    // any large binary, and the symbol is what a program that really uses it carries.
+    // Matched by name: syscall numbers appear by chance as immediates in any large binary.
     let needle = b"io_uring";
     bytes.windows(needle.len()).any(|w| w == needle)
 }

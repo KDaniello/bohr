@@ -1,17 +1,13 @@
-//! `--json`: what a command came to, as one object on standard output.
+//! `--json`: a command's result as one object on standard output.
 //!
-//! Not the text with braces round it. The text is for a person and changes when its wording does;
-//! this is for a program — a pipeline, a CI step, an agent through `bohr mcp` — and changes only
-//! with its version. Every object names its schema, `"schema": "bohr.<command>/<n>"`, and the
-//! version moves whenever a field is removed, renamed or changes meaning. A field added is not
-//! a new version: a reader skips what it does not know.
+//! The object is for programs: pipelines, CI steps, agents through `bohr mcp`. It names its
+//! schema, `"schema": "bohr.<command>/<n>"`. The version changes when a field is removed, renamed
+//! or changes meaning; an added field keeps it.
 //!
-//! Under `--json` nothing else reaches standard output; progress and warnings stay on standard
-//! error, where they always were. A command that fails writes a `bohr.error` object and exits with
-//! the code it would have exited with anyway, so a reader learns why without parsing a sentence.
+//! Under `--json` standard output carries only the object. Progress and warnings stay on standard
+//! error. A failed command writes a `bohr.error` object and keeps its exit code.
 //!
-//! What this does not do: stream. A campaign's object arrives when the campaign ends; `bohr mcp`
-//! is where a long one is watched while it runs.
+//! The object arrives when the command ends. `bohr mcp` reports a long campaign while it runs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,10 +16,10 @@ use serde_json::{Map, Value};
 /// Whether this invocation asked for JSON. Set once, before any command runs.
 static ON: AtomicBool = AtomicBool::new(false);
 
-/// Every schema this build writes, with its version: the list `docs/API.md` §7.12 documents and
-/// the golden tests hold the output to.
+/// Every schema this build writes, with its version. `docs/API.md` §7.12 documents the list.
 pub(crate) const SCHEMAS: &[(&str, u32)] = &[
     ("check", 1),
+    ("confirm", 1),
     ("doctor", 1),
     ("error", 1),
     ("explain", 1),
@@ -47,7 +43,7 @@ pub(crate) fn set(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
-/// Whether output is JSON. A command that prints text checks this first and prints nothing.
+/// Whether output is JSON. A command checks this before it prints text.
 pub(crate) fn on() -> bool {
     ON.load(Ordering::Relaxed)
 }
@@ -55,8 +51,7 @@ pub(crate) fn on() -> bool {
 /// The schema name of `command` as this build writes it.
 ///
 /// # Panics
-/// Where `command` is not in [`SCHEMAS`]: an object with a schema nobody documented is a defect,
-/// caught by the first test that writes it.
+/// Where `command` is not in [`SCHEMAS`]. The first test that writes such an object fails.
 pub(crate) fn schema(command: &str) -> String {
     let version = SCHEMAS
         .iter()
@@ -85,7 +80,7 @@ pub(crate) fn emit(command: &str, body: Value) {
     println!("{}", object(command, body));
 }
 
-/// The object a failed command writes: the diagnostic code where the message opens with one.
+/// The object a failed command writes, with the `BOHR-` code its message opens with.
 pub(crate) fn error(message: &str, exit: u8) -> Value {
     let code = message
         .split(|c: char| c == ':' || c.is_whitespace())

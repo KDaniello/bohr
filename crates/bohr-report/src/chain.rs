@@ -1,17 +1,12 @@
 //! The chain's timeline: what each node answered the probe, over virtual time, beside its faults.
 //!
-//! **A picture of the evidence, not of the run.** One lane per node: virtual time across, the
-//! probed key up the lane, the value as a colour. A revert is a dot at a key the lane already
-//! showed in another colour; a fork is two lanes in two colours at one key; a stall is a lane that
-//! stops climbing. The stretches a node was dead are shaded on its lane, and the moment the
-//! violation was seen is a line across all of them.
+//! One lane per node: virtual time across, the probed key up, the value as a colour. A revert is a
+//! dot at a known key in a new colour; a fork is two colours at one key; a stall is a lane that
+//! stops climbing. Dead stretches are shaded, and a line marks the violation.
 //!
-//! Each answer is drawn once, the first time a node gives it: a node repeating its final height
-//! every round would otherwise draw thousands of dots that say one thing, and the page has a
-//! size bound. A changed answer is always a new dot.
+//! Each answer is drawn the first time a node gives it, which keeps the page within its size bound.
 //!
-//! What this does not do: draw a probe it has no lane for. Which node and which fields a request
-//! reads is the scenario's, and the caller derives it from there.
+//! Lanes come from the caller, who derives them from the scenario.
 
 use std::{collections::BTreeSet, fmt::Write as _};
 

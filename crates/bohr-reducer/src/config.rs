@@ -1,14 +1,10 @@
 //! The world configuration, as a document that can be made smaller.
 //!
-//! Edited as text rather than parsed and re-emitted. The configuration a bundle carries is the one
-//! somebody wrote, verbatim, and a replay reads exactly those bytes back — so a reduction that
-//! round-tripped it through a parser would hand the reader a file they did not write, with their
-//! comments gone and their sections reordered, and would have to be trusted to have changed
-//! nothing else. Removing lines can be read off a diff. Re-serialising cannot.
+//! Edited as text, so the reduced file keeps the author's comments and order and the change reads
+//! as a diff.
 //!
-//! What the document understands is therefore small on purpose: where each array-of-tables entry
-//! begins and ends, and which of its lines carry a tick. That is enough for both moves a reduction
-//! makes to the world — stop doing this at all, and start doing it sooner.
+//! It knows only where each array-of-tables entry begins and ends and which lines carry a tick:
+//! enough to remove an entry or bring it forward.
 
 /// A configuration document, kept as the lines it was written as.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -39,9 +35,7 @@ pub struct Moment {
 
 /// Keys that name a moment the world acts at.
 ///
-/// Named rather than guessed at by shape: `latency_mean_ticks` is also a number of ticks and
-/// bringing it forward means something entirely different — the network gets faster, which is not
-/// a smaller scenario but a different one.
+/// Listed by name: `latency_mean_ticks` is also ticks, but lowering it makes a different scenario.
 const MOMENT_KEYS: [&str; 4] = ["at_tick", "heal_at_tick", "until_tick", "restart_after_ticks"];
 
 impl ConfigDoc {
@@ -52,10 +46,8 @@ impl ConfigDoc {
         let mut entries = Vec::new();
         let mut open: Option<(String, usize)> = None;
 
-        // Depth of the value being read, so a line inside a multi-line array is text rather than
-        // structure. A continuation beginning with `[` -- an element of an array of arrays -- must
-        // not close the open entry: `[[0, 1], [2, 3]]` read that way registers an entry named
-        // `0, 1], [2, 3`, whose removal would cut arbitrary lines out of somebody else's file.
+        // Depth of the value being read, so lines inside a multi-line array, such as
+        // `[[0, 1], [2, 3]]`, are never read as headers.
         let mut depth = 0usize;
         for (at, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -106,9 +98,7 @@ impl ConfigDoc {
 
     /// The document with only the entries at these positions kept.
     ///
-    /// Everything that is not an entry — the `[network]` block, the disk, comments, blank lines —
-    /// is left exactly as it was. A reduction removes what the world was *told to do*, not the
-    /// world it was told to do it in.
+    /// Everything else, such as `[network]`, comments and blank lines, is left as it was.
     #[must_use]
     pub fn keeping(&self, keep: &[usize]) -> Self {
         let dropped: Vec<&Entry> = self
@@ -134,8 +124,7 @@ impl ConfigDoc {
         let mut lines = self.lines.clone();
         let line = &lines[moment.line];
         let indent = line.len() - line.trim_start().len();
-        // Whatever the writer put after the value stays: rewriting the whole line deleted their
-        // comment, and this module's first paragraph says a reader's file is not ours to tidy.
+        // Whatever follows the value, such as a comment, stays.
         let trailing =
             line.split_once('#').map(|(_, note)| format!("  #{note}")).unwrap_or_default();
         lines[moment.line] = format!("{}{} = {to}{trailing}", " ".repeat(indent), moment.key);
@@ -151,9 +140,7 @@ impl ConfigDoc {
 
 /// The nesting depth a line leaves behind it, given what it started at.
 ///
-/// Brackets inside a string or after a comment are text rather than structure, so both are
-/// tracked: without it a path containing a bracket would move the depth and take unrelated lines
-/// with it.
+/// Brackets inside strings and comments are ignored.
 fn depth_after(line: &str, mut depth: usize) -> usize {
     let mut chars = line.chars();
     let mut quote: Option<char> = None;
@@ -213,8 +200,7 @@ stall_probability = \"1/500\"
         assert_eq!(tables, vec!["partition", "fault"]);
     }
 
-    /// Removing an entry removes its lines and nothing else. What the reader wrote about the world
-    /// is not the reduction's to tidy.
+    /// Removing an entry removes its lines and nothing else.
     #[test]
     fn removing_an_entry_leaves_the_rest_of_the_file_alone() {
         let doc = ConfigDoc::parse(SCENARIO);
@@ -235,8 +221,7 @@ stall_probability = \"1/500\"
         assert!(text.contains("[network]"), "the network went with them: {text}");
     }
 
-    /// The moment a fault fires is what turns a long run into a short one, so it has to be found
-    /// and rewritten — including where it is written with the separators a person uses.
+    /// A fault's moment is found and rewritten, including with `_` separators.
     #[test]
     fn a_moment_is_found_and_brought_forward() {
         let doc = ConfigDoc::parse(SCENARIO);
@@ -250,8 +235,7 @@ stall_probability = \"1/500\"
         assert_eq!(sooner.moments()[0].ticks, 1);
     }
 
-    /// A key that happens to be a number of ticks but does not name a moment is left alone: making
-    /// the network faster is a different scenario rather than a smaller one.
+    /// A tick count that is not a moment is left alone.
     #[test]
     fn a_duration_is_not_a_moment() {
         let doc = ConfigDoc::parse("[network]\nlatency_mean_ticks = 500_000\n");

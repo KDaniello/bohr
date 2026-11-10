@@ -1,18 +1,10 @@
 //! This world refuses a run in which it has shown the guest something no machine could.
 //!
-//! **The most expensive thing about hunting a real target was not finding defects; it was telling
-//! whose they were.** Of four things that looked like an execution client's bugs on the first day
-//! against one, three were this tool's, and each was disproved only by reading the client's source
-//! — which does not scale, and is the opposite of what an external simulator is for.
+//! A guest told something untrue about its own state is not evidence, so the run stops under
+//! `BOHR-5005`.
 //!
-//! Two rules close two of those three classes, and they are stated as refusals rather than as
-//! findings: a guest that was told something untrue about its own state is not evidence about the
-//! guest, so the run stops under `BOHR-5005` instead of being reported.
-//!
-//! **A rule that cannot be seen failing is not a rule.** Each is tested against the defect it
-//! exists for, reintroduced by the injection that names it, exactly as `docs/TESTING.md` §7.4 has
-//! every other determinism claim tested. Without the injection this file compiles to nothing:
-//! there is no way to ask the question of a build that has the defect fixed.
+//! Each rule is tested against its defect, reintroduced by the injection of the same name
+//! (`docs/TESTING.md` §7.4). Without the injection this file compiles to nothing.
 
 #![cfg(any(feature = "chaos-unknown-descriptor", feature = "chaos-proc-on-the-disk"))]
 
@@ -85,11 +77,7 @@ mod descriptor {
         ]
     }
 
-    /// The claim: a socket answered as though this world had never issued it stops the run.
-    ///
-    /// The defect, verbatim: `writev` was left off the calls that follow a socket descriptor, so a
-    /// vectored answer was refused with `EBADF` for a socket the guest was holding. What the
-    /// client did afterwards read as a client defect for a day.
+    /// A socket answered as if never issued, here `writev` refused with `EBADF`, stops the run.
     #[test]
     fn a_descriptor_this_world_issued_is_never_answered_as_unknown() {
         let scenario = Scenario {
@@ -162,11 +150,7 @@ mod disk {
         ]
     }
 
-    /// The claim: a crash that would roll back what the kernel answers stops the run.
-    ///
-    /// The defect, verbatim: generated `/proc` files were on the modelled disk, so a crash took
-    /// away the process's own entry and an execution client panicked on `expect("own process")`
-    /// after coming back. It was one syscall away from being filed upstream.
+    /// A crash that would roll back a `/proc` file stops the run.
     #[test]
     fn a_disk_never_holds_what_the_kernel_answers_out_of_itself() {
         let scenario = Scenario {

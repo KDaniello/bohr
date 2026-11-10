@@ -35,13 +35,12 @@ pub const TAPE_FORMAT_VERSION: u16 = 1;
 
 /// Version of the draw ABI: the mapping from tape bytes to decisions.
 ///
-/// A bundle recording a different value is refused rather than replayed. A run derived from
-/// differently interpreted bytes is a different run. See `docs/API.md` §9.
+/// A bundle recording a different value is refused. See `docs/API.md` §9.
 pub const TAPE_ABI: u16 = 2;
 
 /// Largest denominator the boolean draw can express.
 ///
-/// A finer probability is rejected rather than rounded to never. See `docs/API.md` §5.2.
+/// A finer probability is rejected. See `docs/API.md` §5.2.
 pub const MAX_PROBABILITY_DENOMINATOR: u32 = 65_536;
 
 /// Failures that originate in the tape layer.
@@ -121,8 +120,7 @@ pub enum TapeError {
 
 /// Bytes consumed by a draw over `0..n`, as a function of `n` alone.
 ///
-/// Independence from the drawn value is what lets a mutated byte change one decision instead of
-/// shifting every decision after it. See `docs/API.md` §2.4.
+/// Independent of the drawn value, so a mutated byte shifts nothing. See `docs/API.md` §2.4.
 #[inline]
 #[must_use]
 pub const fn draw_width_bytes(n: u64) -> usize {

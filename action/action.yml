@@ -48,7 +48,7 @@ runs:
       env:
         BOHR_VERSION: ${{ inputs.version }}
         BOHRUP_SOURCE: ${{ inputs.source }}
-      # The installer published with the release, so its key is the release's key.
+      # Uses the installer published with the release; it carries the release key.
       run: |
         set -euo pipefail
         [ -n "$BOHR_VERSION" ] || unset BOHR_VERSION
@@ -60,7 +60,7 @@ runs:
           http://*|https://*)
             base=$BOHRUP_SOURCE ;;
           *)
-            # A directory is one release's files, and the installer is one of them.
+            # A directory holds one release's files, the installer included.
             [ -f "$BOHRUP_SOURCE/bohrup.sh" ] || { echo "::error::no bohrup.sh in $BOHRUP_SOURCE"; exit 1; }
             sh "$BOHRUP_SOURCE/bohrup.sh" < /dev/null
             exit 0 ;;
@@ -79,8 +79,7 @@ runs:
         SEEDS: ${{ inputs.seeds }}
         BINARY: ${{ inputs.binary }}
         OUT: ${{ inputs.out }}
-      # Exit 1 is a finding and is the job's answer, not a failure of this step: everything a
-      # reader needs is written first, and the job fails in the last step.
+      # Exit 1 means a finding. This step writes everything first; the last step fails the job.
       run: |
         set -uo pipefail
         budget=(--time "$TIME")
@@ -99,7 +98,7 @@ runs:
           if "$HOME/.bohr/bin/bohr" report "$OUT/findings" --sarif -o "$OUT/bohr.sarif" --json >/dev/null; then
             echo "sarif=$OUT/bohr.sarif" >> "$GITHUB_OUTPUT"
           fi
-          # The smallest bundle of the largest group; none where every bundle was unreadable.
+          # The smallest bundle of the largest group, or empty if no bundle was readable.
           smallest=$("$HOME/.bohr/bin/bohr" findings "$OUT/findings" --json | python3 -c \
             'import json,sys; g=json.load(sys.stdin).get("groups") or [{}]; print(g[0].get("smallest", ""))')
           if [ -n "$smallest" ]; then

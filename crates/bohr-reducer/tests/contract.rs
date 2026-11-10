@@ -1,12 +1,8 @@
-//! The reducer's entire contract, proven against a function rather than against a cluster.
+//! The reducer's entire contract, proven against a pure function.
 //!
-//! Two properties and nothing else: what comes out still reproduces what went in, and what comes
-//! out is never larger. A reducer that produced a smaller scenario which no longer reproduces is
-//! worse than no reducer, because it costs a maintainer an afternoon before they find out.
+//! Two properties: the output reproduces the input, and is never larger.
 //!
-//! The runner here is a pure function of a scenario. That is the whole point of the crate being
-//! sans-io: the properties are decided by the reduction and not by the guest, so they can be
-//! checked in milliseconds, on any machine, with no backend built.
+//! The runner is a pure function of the scenario, so these run in milliseconds anywhere.
 
 use bohr_kernel::StopReason;
 use bohr_reducer::{
@@ -76,9 +72,7 @@ fn promise_broken(name: &str) -> Violation {
 
 /// When the kill is scheduled, if it is scheduled at all.
 ///
-/// Read out of the text rather than through the document, because what the test needs is the
-/// moment belonging to *one* entry and the document deliberately does not model that — a reduction
-/// brings every moment forward independently and has no reason to know which belongs to which.
+/// Read from the text, since the document does not tie moments to entries.
 fn kill_at(config: &str) -> Option<u64> {
     let mut inside_fault = false;
     for line in config.lines() {
@@ -93,8 +87,8 @@ fn kill_at(config: &str) -> Option<u64> {
     None
 }
 
-/// A world where the guest waits until the responder is killed and then says its promise broke.
-/// The run is as long as that wait; everything else in the configuration is scenery.
+/// The guest waits for the responder's kill and then fails; the rest of the configuration is
+/// noise.
 fn answer(scenario: &Scenario) -> (Option<Violation>, Size) {
     let Some(fires_at) = kill_at(scenario.config()) else {
         return (None, Size { events: 4, draws: 2 });
@@ -147,8 +141,7 @@ fn a_reduction_is_monotonic() {
     assert!(reduction.size() <= before, "{:?} is not smaller than {before:?}", reduction.size());
 }
 
-/// And it has to actually work: a reduction that returned its input unchanged would satisfy both
-/// properties above and be worthless.
+/// The reduction removes the noise and moves the kill earlier.
 #[test]
 fn a_reduction_removes_what_does_not_matter_and_brings_forward_what_does() {
     let (reduction, probes) = reduce(Limits::default());
@@ -165,8 +158,7 @@ fn a_reduction_removes_what_does_not_matter_and_brings_forward_what_does() {
     assert!(size.events < 30, "{} events is not a reduction", size.events);
 }
 
-/// The budget is a hard stop, not a target: a reduction that overran would make "under two
-/// thousand replays" a description rather than a promise.
+/// The budget is never exceeded.
 #[test]
 fn the_budget_is_never_exceeded() {
     for replays in [4u32, 8, 25, 200] {
@@ -186,8 +178,7 @@ fn a_reduction_cut_short_still_answers_with_something_proven() {
     assert!(size <= Size { events: 4514, draws: 4514 });
 }
 
-/// Asking twice without answering asks the same thing, which is what a run that was lost is
-/// reissued from.
+/// Asking twice without answering proposes the same candidate.
 #[test]
 fn proposing_twice_without_accepting_proposes_the_same_candidate() {
     let input = Scenario::new(Seed(1), vec![0xAA; 64], SCENARIO.to_owned());
@@ -198,13 +189,9 @@ fn proposing_twice_without_accepting_proposes_the_same_candidate() {
     assert_eq!(reduction.next(), reduction.next());
 }
 
-/// A candidate the world would refuse is a candidate that did not reproduce, and nothing more.
+/// A candidate the world refuses to load counts as not reproducing.
 ///
-/// **This is the shape that killed every liveness reduction.** Minimisation over the entries will
-/// propose a subset with no `[[partition]]` left, and a scenario watching for a heal refuses one —
-/// so the load failed, the failure was raised out of the whole command, and a maintainer was told
-/// their own file was a usage error with the budget already spent. The reduction has to be able to
-/// hear "no" from a candidate that never ran, and go on.
+/// A liveness scenario refuses a subset with no `[[partition]]`, and the reduction carries on.
 #[test]
 fn a_candidate_the_world_would_refuse_does_not_end_the_reduction() {
     let input = Scenario::new(Seed(1), vec![0xAA; 64], SCENARIO.to_owned());
@@ -232,8 +219,7 @@ fn a_candidate_the_world_would_refuse_does_not_end_the_reduction() {
     }
 
     assert!(refused > 0, "no candidate dropped the partition, so nothing was under test");
-    // The reduction reached its own end rather than being carried out of, and what it produced
-    // still reproduces what went in.
+    // The reduction finished and its result reproduces.
     assert_eq!(reduction.pass(), bohr_reducer::Pass::Done);
     let (violation, _) = answer(reduction.best());
     assert!(
@@ -246,8 +232,8 @@ fn a_candidate_the_world_would_refuse_does_not_end_the_reduction() {
 /// A node that draws whether it dies at every call, and a defect reached only by a death after
 /// the tenth call: the run then lasts fifty calls more and breaks its promise.
 ///
-/// Read off the prefix the way the world reads it — two bytes of odds per call, and one byte of
-/// kind after a draw that fired — and journalled as the world journals it.
+/// Read as the world reads it, two odds bytes per call and a kind byte after a fired draw, and
+/// journalled the same way.
 fn drawn_kills(scenario: &Scenario) -> (Option<Violation>, Size, Journal, Vec<(u64, u8)>) {
     const CALLS: u64 = 1_000;
     const FIRES_BELOW: u64 = 33;
@@ -300,10 +286,8 @@ fn killing_at(calls: &[u64]) -> Vec<u8> {
     prefix
 }
 
-/// The fault pass on drawn kills: the kill the finding does not need goes, and the one it needs
-/// fires at an earlier chance — as the same kind, after the tenth call, and never before it.
-///
-/// Without the tape pass, which would make the kind plainer as well and hide whether it travelled.
+/// The fault pass removes the unneeded kill and fires the needed one earlier, as the same kind and
+/// after the tenth call. The tape pass is off, so the kind is unchanged.
 #[test]
 fn a_drawn_kill_is_fired_sooner_and_one_not_needed_is_removed() {
     let input = Scenario::new(Seed(1), killing_at(&[300, 700]), String::new());
@@ -329,8 +313,7 @@ fn a_drawn_kill_is_fired_sooner_and_one_not_needed_is_removed() {
     assert!(reduction.spent().total() <= 200);
 }
 
-/// A candidate already answered is never run twice: every scenario a reduction proposes is one
-/// it has not seen.
+/// A candidate already answered is never proposed again.
 #[test]
 fn no_scenario_is_proposed_twice() {
     let input = Scenario::new(Seed(1), killing_at(&[5, 300, 700]), SCENARIO.to_owned());

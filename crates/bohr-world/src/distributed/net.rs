@@ -1,15 +1,11 @@
 //! The virtual network: links, partitions, datagrams and byte streams.
 //!
-//! Semantics are normative in `docs/API.md` §5.3. The load-bearing rule: every packet makes the
-//! same four draws — drop, duplicate, reorder, delay — whatever the network's state, and only then
-//! is the partition matrix consulted, so a healed partition changes fates and never tape layout.
+//! Normative in `docs/API.md` §5.3. Every packet makes the same four draws (drop, duplicate,
+//! reorder, delay) before the partition matrix is consulted, so partitions change fates, never
+//! tape layout.
 //!
-//! The two kinds of socket are adverse in different ways, and deliberately so. A datagram is drawn
-//! upon four times and may be lost, doubled, overtaken or late, because that is what its transport
-//! promises and no more. A stream is drawn upon not at all, because its transport retransmits until
-//! all four are gone; the one adversity it cannot hide is that the far end is unreachable, and that
-//! is the one this model applies to it. A stream conversation therefore costs no entropy, so adding
-//! one to a scenario cannot shift a single draw anywhere else in it.
+//! A datagram may be lost, doubled, overtaken or late. A stream makes no draws, since its
+//! transport hides all four; only partitions affect it, so streams cost no tape.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -23,9 +19,7 @@ use crate::nums::errno;
 
 /// First descriptor handed out for a socket.
 ///
-/// Sockets are this model's own and files are the per-node world's, and the two allocators never
-/// learn about each other; disjoint ranges are what keeps a descriptor unambiguous. Guests treat
-/// descriptors as opaque, so the unrealistic values change nothing they can observe.
+/// Disjoint from file descriptors, so descriptors are unambiguous.
 pub(crate) const SOCKET_FD_BASE: i64 = 4096;
 
 /// Datagrams a receive queue holds; an arrival past this is dropped (API §5.3).
@@ -33,11 +27,8 @@ const RECV_QUEUE_LIMIT: usize = 64;
 
 /// Bytes a stream will hold on either side before a write stops being accepted.
 ///
-/// **The supervisor may not be what runs out of memory (§4.4), and these had no ceiling at all.**
-/// A guest writing into a stream nobody reads, or one a partition has cut, grew a queue inside the
-/// supervisor for as long as the run lasted -- while the datagram queue beside it has been bounded
-/// since it was written. A full stream answers the way a full socket buffer does, so a guest sees
-/// back-pressure rather than a supervisor that stops.
+/// Bounded so supervisor memory stays flat (§4.4); a full stream gives back-pressure like a full
+/// socket buffer.
 const STREAM_BUFFER_LIMIT: usize = 1 << 20;
 
 /// First ephemeral port, handed out upward in binding order.
@@ -106,8 +97,7 @@ impl Default for NetworkConfig {
     }
 }
 
-/// A scheduled window in which one directed link degrades without breaking (API §5.3): "not a
-/// break, just very slow" is its own bug class, and a partition test never reaches it.
+/// A scheduled window in which one directed link degrades without breaking (API §5.3).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct GreyWindow {
     /// The directed link that degrades.
@@ -122,7 +112,7 @@ pub struct GreyWindow {
     pub latency_factor: Option<u64>,
 }
 
-/// A scheduled, not drawn, partition (API §5.3): raised at one tick, healed at another.
+/// A scheduled partition (API §5.3): raised at one tick, healed at another.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ScheduledPartition {
     /// When the cut is raised.
@@ -204,29 +194,20 @@ enum Socket {
         port: Option<u16>,
         /// Where a send with no address of its own goes, once `connect` has named one.
         ///
-        /// A datagram socket addresses every send explicitly, so this is empty until the guest
-        /// says otherwise -- and connect-then-send is how a stub resolver talks, so forgetting it
-        /// sent the call looking for a stream and ended the run blaming a descriptor.
+        /// Empty until `connect`, as stub resolvers use.
         peer: Option<Endpoint>,
         queue: VecDeque<Arrived>,
         /// Tasks parked in `recvfrom`, oldest first.
         ///
-        /// A queue and not one slot: several threads reading one datagram socket is the ordinary
-        /// shape of a server, and a single slot would silently drop the first reader's wait and
-        /// leave it parked with nothing left to release it. The kernel wakes an unspecified one of
-        /// them; the longest-waiting is a legal choice and the only one a replay can reconstruct.
+        /// A queue, since servers read one socket from several threads. The longest waiter is
+        /// woken.
         waiting: VecDeque<PendingRecv>,
-        /// Set by `FIONBIO`: an empty queue answers `EAGAIN` instead of parking the task, which
-        /// is what an event loop asks for when it drains a socket between ticks.
+        /// Set by `FIONBIO`: an empty queue answers `EAGAIN` instead of parking.
         nonblocking: bool,
     },
     /// One end of a byte stream: a `socketpair`, or one side of a connection.
     ///
-    /// **A stream makes no draws.** The transport it stands for hides loss, duplication and
-    /// reordering from the program above it by retransmitting until they are gone, so a model that
-    /// injected any of the three would hand a guest a conversation the real thing cannot produce —
-    /// and every finding that came of it would be about this model. What the transport does not
-    /// hide is a partition, and that is the one thing here that acts on a stream.
+    /// A stream makes no draws; only partitions act on it.
     Stream {
         /// The port this end answers on; zero where it was never bound.
         local: u16,
@@ -239,8 +220,7 @@ enum Socket {
         inbox: VecDeque<u8>,
         /// Bytes written while the link was cut, waiting for it to come back.
         outbox: VecDeque<u8>,
-        /// The other end will send nothing further, so a read finds the end of the stream instead
-        /// of waiting for bytes that are not coming. This is how a guest learns its peer died.
+        /// The peer will send nothing more, so a read returns end-of-stream.
         finished: bool,
         waiting: VecDeque<PendingRecv>,
         nonblocking: bool,
@@ -272,24 +252,15 @@ pub(crate) struct Network {
     sockets: BTreeMap<(NodeId, i64), Socket>,
     /// Descriptors that are copies, each naming the socket it was copied from.
     ///
-    /// A runtime duplicates a socket so two parts of it hold handles of their own, and two
-    /// descriptors naming one socket is what a copy means. Kept as a name for the original rather
-    /// than a second socket: a copy with a queue of its own would be a different socket wearing
-    /// the same number, and a datagram delivered to one of them would be invisible to the
-    /// other.
+    /// Aliases, since a copy names the same socket and queue.
     aliases: BTreeMap<(NodeId, i64), i64>,
-    /// Which descriptor each bound port belongs to.
     /// Which descriptors hold each port, in the order they took it.
     ///
-    /// Several, because `SO_REUSEPORT` is how a server spreads one port across its threads and how
-    /// a validator opens its broadcast sockets. One descriptor per port refused the second bind
-    /// with `EADDRINUSE`, which no real machine would have reported to a program that asked for
-    /// sharing.
+    /// Several under `SO_REUSEPORT`.
     ports: BTreeMap<(NodeId, Transport, u16), Vec<i64>>,
     /// Descriptors whose owner asked that the port be shareable, before it was bound.
     ///
-    /// Kept beside the socket rather than inside it because the question is asked of a number and
-    /// not of a kind: both sorts of socket carry the option and both are asked the same thing.
+    /// Kept by descriptor, since both socket kinds carry the option.
     shareable: BTreeSet<(NodeId, i64)>,
     next_fd: BTreeMap<NodeId, i64>,
     next_ephemeral: BTreeMap<NodeId, u16>,
@@ -311,11 +282,7 @@ fn address_of(node: NodeId) -> u32 {
 
 /// The node behind a virtual address; loopback and the wildcard both mean "this node".
 ///
-/// A server binds the wildcard because it does not want to know which of its addresses callers
-/// will use. A node here has exactly one, so the question does not arise and the answer is the node
-/// itself — and refusing it instead, which is what an unrecognised address gets, turns "listen
-/// anywhere" into `EINVAL` and stops every server that did not name an address it could not have
-/// known.
+/// A node has one address, so the wildcard means the node itself.
 fn node_behind(address: u32, own: NodeId) -> Option<NodeId> {
     if address == 0x7F00_0001 || address == 0 {
         return Some(own);
@@ -334,9 +301,7 @@ impl Network {
 
     fn linked(&self, a: NodeId, b: NodeId) -> bool {
         let n = self.config.nodes.max(1);
-        // A node past the cluster's count is the probe, which is outside the layout as it is
-        // outside the fault model: it reaches every node, so what it reports is the node's state
-        // and not the topology's.
+        // The probe, past the cluster count, reaches every node.
         if a.get() >= n || b.get() >= n {
             return true;
         }
@@ -391,24 +356,20 @@ impl Network {
 
     /// Whether any directed link is still cut.
     ///
-    /// Asked after a heal, because one entry lifting is not the cluster healing: a scenario with
-    /// two overlapping partitions leaves the second in place, and a window opened there would be
-    /// measuring a silence the cluster has every reason to keep.
+    /// Asked after a heal, since overlapping partitions may remain.
     pub(crate) fn fully_healed(&self) -> bool {
         self.cuts.is_empty()
     }
 
-    /// Adds a partition the run drew rather than one a scenario wrote, and answers its index.
+    /// Adds a partition the run drew, and answers its index.
     ///
-    /// The same list the scheduled ones live in, so a drawn cut and a written one are raised,
-    /// healed and narrated by one piece of code.
+    /// The same list as scheduled ones, so both share code.
     pub(crate) fn add_partition(&mut self, partition: ScheduledPartition) -> usize {
         self.config.partitions.push(partition);
         self.config.partitions.len() - 1
     }
 
-    /// Adds a degradation the run drew, and answers its index. As [`Self::add_partition`], and for
-    /// the same reason.
+    /// Adds a degradation the run drew, and answers its index, like [`Self::add_partition`].
     pub(crate) fn add_grey(&mut self, window: GreyWindow) -> usize {
         self.config.grey.push(window);
         self.config.grey.len() - 1
@@ -416,9 +377,7 @@ impl Network {
 
     /// Every directed link between `node` and the rest of the cluster.
     ///
-    /// A whole node cut off rather than one link of a pair chosen by a draw: isolation is what a
-    /// campaign wants far more often, and it needs nothing drawn beyond the node the fault was
-    /// already aimed at — so arming it costs a fire and not a byte.
+    /// For isolating a whole node without further draws.
     pub(crate) fn links_isolating(&self, node: NodeId) -> Vec<(NodeId, NodeId)> {
         (0..self.config.nodes)
             .map(NodeId)
@@ -444,8 +403,7 @@ impl Network {
             } else {
                 self.cuts.remove(&(from, to));
             }
-            // The cut is a world-level fact with no task behind it; the `from` node carries the
-            // event so a per-node timeline shows its own connectivity changing.
+            // The `from` node carries the event.
             ctx.emit_for(
                 from,
                 TaskId::ZERO,
@@ -463,10 +421,8 @@ impl Network {
 
     /// Carries on every stream the partition had stopped.
     ///
-    /// Two things were held rather than lost: bytes written into a cut link, and a connection whose
-    /// handshake never arrived. Both are what the transport would have kept retrying, so both
-    /// happen now, in the order the sockets are held rather than the order they stalled — a stream
-    /// promises its own bytes stay in order, and says nothing about two of them against each other.
+    /// Held bytes and pending handshakes go now, in socket order; each stream keeps its own
+    /// order.
     fn resume_streams(
         &mut self,
         ctx: &mut WorldCtx<'_, '_>,
@@ -500,9 +456,7 @@ impl Network {
                     let port = self.local_port(stream.at.0, stream.at.1);
                     let from = Endpoint { node: stream.at.0, port };
                     if self.complete_connect(stream.at.0, stream.at.1, from, to, ctx, wakes)? != 0 {
-                        // Nobody was listening after all. The caller has already been told the
-                        // attempt was under way, so the refusal reaches it the only way a started
-                        // connection can end: as a stream with nothing left in it.
+                        // No listener: the started connection ends as an empty stream.
                         self.finish_peer(stream.at, wakes);
                     }
                 }
@@ -572,8 +526,7 @@ impl Network {
 
     /// The socket a descriptor really names, following a copy.
     ///
-    /// Applied at every call a guest makes, and never inside: once a call has resolved its own
-    /// descriptor, the numbers it works with afterwards are the model's own and already true.
+    /// Applied once per guest call.
     pub(crate) fn resolve(&self, node: NodeId, fd: i64) -> i64 {
         self.aliases.get(&(node, fd)).copied().unwrap_or(fd)
     }
@@ -601,11 +554,9 @@ impl Network {
         self.sockets.contains_key(&(node, fd))
     }
 
-    /// Binds a socket to a port, `0` meaning "hand me an ephemeral one".
     /// Whether this node holds any socket at all.
     ///
-    /// Asked by the call router: a call this world does not route to the network may still be
-    /// answered for a node that has none, and must not be for a node that has one.
+    /// Asked by the call router.
     pub(crate) fn node_has_sockets(&self, node: NodeId) -> bool {
         self.sockets.keys().any(|(held, _)| *held == node)
     }
@@ -632,18 +583,10 @@ impl Network {
         }
     }
 
-    /// Which of the two port spaces a socket lives in.
-    ///
-    /// Linux gives datagrams and streams a space each, so one number is two endpoints and a
-    /// service binding both is doing the ordinary thing. Keyed together, the second bind of the
-    /// pair was answered `EADDRINUSE` -- and a validator that binds its gossip port for both
-    /// stopped there, on a conflict no real machine would have reported.
     /// Gives up one descriptor's claim on a port, leaving whatever else holds it.
     ///
-    /// A claim is released only by the descriptor that made it. An accepted connection carries the
-    /// listening port so `getsockname` can answer and is not what that port is registered to, so
-    /// letting any holder clear the entry left a server bound to nothing the moment it finished
-    /// with its first caller.
+    /// Only by the claiming descriptor; an accepted connection carries the port but does not hold
+    /// it.
     fn release_port(&mut self, node: NodeId, transport: Transport, port: u16, fd: i64) {
         let key = (node, transport, port);
         if let Some(held) = self.ports.get_mut(&key) {
@@ -657,10 +600,7 @@ impl Network {
 
     /// Which descriptor of those holding a port receives what arrives for it.
     ///
-    /// **One holder is the ordinary case and costs no draw.** Where several share a port the
-    /// kernel picks between them by a rule of its own -- unspecified, and not the same twice -- so
-    /// the choice is made from the tape instead. A replay makes the same choice; a campaign that
-    /// wants the other one asks for another seed.
+    /// One holder costs no draw; among several the tape chooses.
     fn holder(
         &mut self,
         ctx: &mut WorldCtx<'_, '_>,
@@ -695,6 +635,7 @@ impl Network {
         }
     }
 
+    /// Binds a socket to a port, `0` meaning "hand me an ephemeral one".
     pub(crate) fn bind(&mut self, node: NodeId, fd: i64, port: u16) -> i64 {
         let fd = self.resolve(node, fd);
         let transport = match self.sockets.get(&(node, fd)) {
@@ -710,12 +651,8 @@ impl Network {
         } else {
             port
         };
-        // The port is taken, which Linux says with `EADDRINUSE`. `EINVAL` sent a server looking
-        // for a malformed request it had not made.
-        // A port already held is taken only where everybody involved asked for sharing: the
-        // descriptors holding it and the one asking. Linux wants the option on all of them, and a
-        // model that wanted it on none would let a program bind over a port it had no business
-        // taking -- a conflict it would then never find out about.
+        // A held port is shared only if every holder and the caller set `SO_REUSEPORT`, as on
+        // Linux; otherwise `EADDRINUSE`.
         if let Some(held) = self.ports.get(&(node, transport, requested)) {
             let shared = self.shareable.contains(&(node, fd))
                 && held.iter().all(|other| self.shareable.contains(&(node, *other)));
@@ -740,9 +677,7 @@ impl Network {
 
     /// Turns a bound stream socket into one that accepts connections.
     ///
-    /// The backlog is read and not kept. What a full backlog does is drop the handshake, leaving
-    /// the caller to retransmit until there is room; this model has no retransmission to stall, so
-    /// honouring the number would have to invent a refusal the real thing does not give.
+    /// The backlog is ignored, since there is no retransmission to stall.
     pub(crate) fn listen(&mut self, node: NodeId, fd: i64) -> i64 {
         let fd = self.resolve(node, fd);
         let Some(Socket::Stream { local, peer: None, nonblocking, .. }) =
@@ -751,11 +686,7 @@ impl Network {
             return -errno::EINVAL;
         };
         let port = *local;
-        // **Carried over, not started afresh.** Listening changes what a descriptor is for and
-        // nothing about how it behaves: a socket opened not to block does not begin blocking
-        // because it was told to listen. Losing the flag here parks an event loop in its own
-        // `accept` — for ever, because the loop that would have given it something to accept is
-        // the one now parked.
+        // The non-blocking flag carries over.
         let nonblocking = *nonblocking;
         if port == 0 {
             return -errno::EINVAL;
@@ -774,10 +705,7 @@ impl Network {
 
     /// Starts a connection, answering what `connect` returns.
     ///
-    /// A cut link swallows the handshake rather than refusing it: the caller is left connecting,
-    /// which is what a real one does until it gives up, and the attempt is finished if the link
-    /// comes back. Refusing outright would report in an instant a verdict the transport takes
-    /// minutes to reach, and would hide the very stall a partition exists to cause.
+    /// A cut link leaves the caller connecting until the heal, as a real transport would.
     pub(crate) fn connect(
         &mut self,
         node: NodeId,
@@ -819,8 +747,7 @@ impl Network {
         }
         let listener = listener.unwrap_or_default();
 
-        // The listening end is made now rather than at the accept, because a caller may write as
-        // soon as its own end is connected and those bytes have to land somewhere.
+        // Made now, since the caller may write before the accept.
         let accepted = self.allocate_fd(to.node);
         self.sockets.insert(
             (to.node, accepted),
@@ -994,19 +921,13 @@ impl Network {
             None => (self.config.drop_probability, self.config.latency_mean_ticks),
         };
 
-        // The four draws, always, in the documented order (API §5.3): state is consulted only
-        // after the tape has spoken, so state can never move the tape. Probabilities go through
-        // a fixed-width comparison rather than `draw_bool`, whose certainty shortcut would let a
-        // configured — or grey-overridden — zero change how many bytes a packet costs.
+        // The four draws, always, in order (API §5.3), at fixed width.
         let dropped = draw_odds(ctx, drop_probability, DrawSite::NetDeliver)?;
         let duplicated = draw_odds(ctx, self.config.duplicate_probability, DrawSite::NetDeliver)?;
         let reordered = draw_odds(ctx, self.config.reorder_probability, DrawSite::NetReorder)?;
         let jitter = ctx.draw_exponential(self.config.latency_jitter_ticks, DrawSite::NetDelay)?;
         let delay = mean.saturating_add(jitter);
-        // **Drawn only where the scenario asks for it, and then always at one width.** A run that
-        // arms no corruption keeps the tape every earlier run of it had; one that does draws the
-        // decision and every flip whether or not the datagram is altered, so where the tape stands
-        // never depends on what was drawn.
+        // Corruption draws only when armed, and then always at full width.
         let flips = if self.config.corrupt_probability.0 > 0 {
             let corrupted = draw_odds(ctx, self.config.corrupt_probability, DrawSite::NetCorrupt)?;
             let mut flips = Vec::with_capacity(self.config.corrupt_bytes as usize);
@@ -1029,8 +950,7 @@ impl Network {
 
         let now = ctx.world_now();
         let natural = Tick(now.get().saturating_add(delay).max(now.get() + 1));
-        // Reordering slots this packet just before the earliest one still flying on the same
-        // directed link; with an empty link the fate degrades to an ordinary delivery.
+        // Reordered before the earliest packet in flight on the link, if any.
         let earliest = reordered
             .then(|| {
                 self.on_link
@@ -1038,8 +958,7 @@ impl Network {
                     .and_then(|flights| flights.iter().map(|(_, at)| *at).min())
             })
             .flatten();
-        // Slotted just before the earliest packet still flying, where that is before this one's own
-        // moment and leaves it first; anything else delivers as it would have, and is no fault.
+        // Only when that moves it first; otherwise an ordinary delivery.
         let overtakes = earliest.map(|e| (e, Tick(e.get().saturating_sub(1).max(now.get() + 1))));
         let at = match overtakes {
             Some((e, slot)) if slot < e && slot < natural => slot,
@@ -1053,14 +972,11 @@ impl Network {
             ctx.emit(EventKind::FaultFired { fault: FaultKind::NetDuplicate, target: link })?;
         }
 
-        // Copied only where a duplicate was drawn. Every datagram would otherwise pay for the one
-        // in a thousand that is sent twice. The copy is the bytes as sent: what the wire alters it
-        // alters once, on the delivery it was drawn for.
+        // Copied only for a duplicate; corruption applies to one delivery.
         let copy = duplicated.then(|| payload.clone());
         let mut payload = payload;
         let corrupted = !flips.is_empty();
-        // Each flip on a byte no earlier flip took, so two cannot cancel: an offset into the
-        // datagram and a mask that changes at least one bit.
+        // Each flip takes a new byte and a non-zero mask, so flips never cancel.
         let mut taken = BTreeSet::new();
         for flip in flips {
             let at = (flip % payload.len() as u64) as usize;
@@ -1208,9 +1124,7 @@ impl Network {
                 });
                 Ok(None)
             }
-            // A stream end reads its own inbox, which is where its peer's writes land. An empty
-            // inbox on a finished stream is the end of it — nought, and never a wait, because
-            // nothing is coming and a task parked here would never be released.
+            // An empty inbox on a finished stream reads 0.
             Some(Socket::Stream { inbox, waiting, finished, nonblocking, .. }) => {
                 if inbox.is_empty() {
                     if *finished {
@@ -1239,9 +1153,7 @@ impl Network {
 
     /// Writes into a stream, waking a parked reader on the other end.
     ///
-    /// A cut link holds the bytes on this side instead of losing them: the transport this stands
-    /// for accepts a write into its own buffer and keeps trying, so the caller learns nothing from
-    /// the write itself. What it learns is that no answer comes back.
+    /// A cut link holds the bytes on this side.
     pub(crate) fn stream_write(
         &mut self,
         node: NodeId,
@@ -1262,9 +1174,7 @@ impl Network {
             if let Some(Socket::Stream { outbox, nonblocking, .. }) =
                 self.sockets.get_mut(&(node, fd))
             {
-                // What will not fit does not go. A blocking socket is told to try again rather
-                // than parked, because nothing here empties an outbox until the cut heals: the
-                // answer a real kernel gives a full buffer is the honest one either way.
+                // A full outbox answers `EAGAIN`, even when blocking.
                 let room = STREAM_BUFFER_LIMIT.saturating_sub(outbox.len());
                 if room == 0 {
                     let _ = nonblocking;
@@ -1291,9 +1201,7 @@ impl Network {
         let Some(Socket::Stream { inbox, waiting, .. }) = sockets.get_mut(&at) else {
             return Ok(());
         };
-        // Bounded for the same reason the outbox is: a peer that never reads is a peer whose bytes
-        // would otherwise accumulate in the supervisor. What does not fit is dropped, which is
-        // what a receive buffer at its limit does.
+        // Bounded like the outbox; overflow is dropped.
         let room = STREAM_BUFFER_LIMIT.saturating_sub(inbox.len());
         inbox.extend(payload[..room.min(payload.len())].iter().copied());
         while let Some(recv) = waiting.pop_front() {
@@ -1311,8 +1219,7 @@ impl Network {
 
     /// Tells a stream's peer that nothing further is coming, releasing any reader parked on it.
     ///
-    /// The one way a guest learns its counterpart is gone, and so the one way a client whose
-    /// server was killed mid-request finds out rather than waiting forever.
+    /// How a guest learns its peer is gone.
     fn finish_peer(&mut self, peer: (NodeId, i64), wakes: &mut Vec<Wake>) {
         let Some(Socket::Stream { finished, peer: theirs, waiting, .. }) =
             self.sockets.get_mut(&peer)
@@ -1321,8 +1228,7 @@ impl Network {
         };
         *finished = true;
         *theirs = None;
-        // Nought is the end of the stream, and it writes nothing into the reader's buffer, so a
-        // release here needs no memory of the task it releases.
+        // End-of-stream writes nothing to the reader's buffer.
         for recv in waiting.drain(..) {
             wakes.push(Wake { task: recv.task, ret: 0 });
         }
@@ -1331,9 +1237,7 @@ impl Network {
     /// Forgets everything a node's process held: its sockets and its ports. Packets already
     /// flying toward it will find nobody listening and evaporate, which is what UDP promises.
     ///
-    /// Every stream it was carrying ends, and the end is told to whoever was on the other side.
-    /// A node dies without closing anything, and a peer left waiting on a connection that no
-    /// longer has a process behind it would wait for the rest of the run.
+    /// Every stream it carried ends, and its peers are told.
     pub(crate) fn drop_node(&mut self, node: NodeId, wakes: &mut Vec<Wake>) {
         let bereaved: Vec<(NodeId, i64)> = self
             .sockets
@@ -1357,12 +1261,8 @@ impl Network {
 
     /// Whether a socket has something to give a reader, or nothing where it is not a socket.
     ///
-    /// The one question a readiness set asks of the network. Writability is not asked because this
-    /// model has no send buffer to fill: a datagram is drawn upon and either flies or does not, and
-    /// a stream takes whatever it is given, so a socket is always ready to be written to.
-    ///
-    /// The end of a stream counts as something to give. A poller told a finished stream is quiet
-    /// never wakes its reader, and the reader is exactly the one who needs to hear it.
+    /// Writability is not asked, since there are no send buffers. End-of-stream counts as
+    /// readable.
     pub(crate) fn readable(&self, node: NodeId, fd: i64) -> Option<bool> {
         let fd = self.resolve(node, fd);
         match self.sockets.get(&(node, fd))? {
@@ -1374,10 +1274,8 @@ impl Network {
 
     /// Forgets every receive a task was parked in, because the task has ended.
     ///
-    /// A delivery writes into the receiver's memory, so a parked task that ended and was left in a
-    /// queue is a write to a task the backend no longer has — `BOHR-3005`, raised at the delivery
-    /// and blamed on whatever happened to be running. The socket outlives the thread that was
-    /// reading it: several threads share one, and one of them ending closes nothing.
+    /// A delivery would otherwise write into a task the backend no longer has. The socket stays
+    /// open.
     pub(crate) fn forget_task(&mut self, task: TaskId) {
         for socket in self.sockets.values_mut() {
             match socket {
@@ -1407,9 +1305,7 @@ impl Network {
 
     /// Closes a socket, releasing its port and ending whatever stream it carried.
     pub(crate) fn close(&mut self, node: NodeId, fd: i64, wakes: &mut Vec<Wake>) -> i64 {
-        // A copy going away takes the copy and nothing else. The socket is still named by whoever
-        // it was copied from, and ending a conversation is not what a runtime does when it drops a
-        // spare handle on it.
+        // Closing an alias removes only the alias.
         if self.aliases.remove(&(node, fd)).is_some() {
             return 0;
         }
@@ -1429,11 +1325,7 @@ impl Network {
                 }
             }
             Socket::Stream { local, peer, .. } => {
-                // A port is given up by whoever holds it, and an accepted connection does not: it
-                // carries the listening port so `getsockname` can answer, and is not what that
-                // port is registered to. Letting it unregister left a server bound to nothing the
-                // moment it finished with its first caller — one request served and every one
-                // after it refused.
+                // Only the holder releases a port; an accepted connection is not one.
                 if local != 0 {
                     self.release_port(node, Transport::Stream, local, fd);
                 }
@@ -1455,8 +1347,7 @@ impl Network {
                 self.finish_peer(peer, wakes);
                 0
             }
-            // A datagram socket has no half to shut: the call is accepted and changes nothing,
-            // which is what it did before streams existed here.
+            // A datagram socket accepts `shutdown` and nothing changes.
             Some(_) => 0,
             None => -errno::EBADF,
         }

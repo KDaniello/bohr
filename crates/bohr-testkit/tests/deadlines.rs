@@ -181,8 +181,7 @@ fn a_killed_node_restarts_from_its_spec_and_runs_to_completion() {
 
     let report = execute(vec![killer, victim], 7);
     assert_eq!(report.outcome, bohr_trace::Outcome::Clean, "got {:?}", report.outcome);
-    // The victim's first incarnation dies mid-script and records no exit; the restarted one runs
-    // its whole script. Two clean exits therefore mean the restart really ran.
+    // The first incarnation dies with no exit, so two clean exits mean the restart ran.
     assert!(report.ticks.get() >= 1_000_000, "the restart happened after its delay");
 }
 

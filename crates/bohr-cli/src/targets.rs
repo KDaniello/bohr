@@ -1,13 +1,11 @@
 //! Target packs: what `bohr hunt <name>` builds, checks and runs.
 //!
-//! A pack is `targets/<name>/target.toml` in this repository: where the program comes from, how it
-//! is built, which binary that build must produce, and the scenario a campaign runs it in. The
-//! binary is pinned by its blake3 digest, the hash every artefact here is pinned by, so a pack
-//! names exactly one program and a binary that differs from it is refused before it runs.
+//! A pack is `targets/<name>/target.toml`: where the program comes from, how it is built, the
+//! blake3 digest the build must produce, and the scenario a campaign runs. A binary with another
+//! digest is refused before it runs.
 //!
-//! What a pack does not do: fetch anything itself beyond what its build command does, or accept a
-//! binary nobody can check. A build that does not reproduce the pinned digest on another machine
-//! is reported with both digests, not run.
+//! A pack fetches nothing beyond what its build command does. A build that does not reproduce the
+//! digest is reported with both digests and not run.
 
 use std::path::{Path, PathBuf};
 
@@ -95,9 +93,8 @@ fn refused(text: String) -> CliError {
 
 /// Where a pack named bare is read from: `targets/` here, or else the packs a release installed.
 ///
-/// Here first, so a checkout hunts its own packs as it edits them; then `$BOHR_HOME/packs`, or
-/// `~/.bohr/packs`, which is where `bohrup` puts the packs of the release it installed. A name in
-/// neither is reported where it was looked for first.
+/// `targets/` here first, then `$BOHR_HOME/packs` or `~/.bohr/packs`, where `bohrup` installs them.
+/// A name found in neither is reported at the first location.
 fn installed(name: &str) -> PathBuf {
     let here = Path::new("targets").join(name).join("target.toml");
     if here.is_file() {
@@ -113,10 +110,9 @@ fn installed(name: &str) -> PathBuf {
 
 /// Finds a pack by name under `targets/`, or by the path of its directory or its file.
 pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
-    // A bare name is a pack under `targets/`, even where a file of that name sits here: `reth` is
-    // the pack, and a `./reth` binary beside it is not a pack file.
+    // A bare name is a pack, even if a file of that name exists here.
     let given = Path::new(name);
-    // A path by its components rather than by a slash, which a Windows path does not contain.
+    // Checked by components, since a Windows path has no slash.
     let bare = given.components().count() == 1 && !name.ends_with(".toml");
     let file = if bare {
         installed(name)
@@ -130,8 +126,7 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
     })?;
     let raw: RawPack = toml::from_str(&text)
         .map_err(|e| refused(format!("{} does not parse: {e}", file.display())))?;
-    // `targets/<name>/target.toml`: the repository is two directories up from the file, counted on
-    // its absolute path so a pack given as `./target.toml` from its own directory resolves too.
+    // The repository is two directories above `target.toml`, on its absolute path.
     let file = std::path::absolute(&file).unwrap_or(file);
     let dir = file.parent().unwrap_or(Path::new("."));
     let root = dir.parent().and_then(Path::parent).unwrap_or(Path::new(".")).to_owned();
@@ -176,9 +171,7 @@ fn blake3_hex(bytes: &[u8]) -> String {
 
 /// The binary a campaign runs: the one given, or the pack's own, built where it is missing.
 ///
-/// **A binary that differs from the pack is refused, never rebuilt over.** Rebuilding would hide
-/// that the file someone handed in is not the program the pack names; refusing says so with both
-/// digests, which is what a person needs to decide which one is wrong.
+/// A binary that differs from the pack is refused with both digests, never rebuilt over.
 pub(crate) fn binary_for(pack: &Pack, given: Option<&Path>) -> Result<PathBuf, CliError> {
     let path = given.map_or_else(|| pack.binary.clone(), Path::to_owned);
     if !path.is_file() {
@@ -211,7 +204,7 @@ fn build(pack: &Pack) -> Result<(), CliError> {
     eprintln!("building {} from {} at {}", pack.name, pack.repository, pack.commit);
     let mut command = std::process::Command::new(&pack.build[0]);
     command.args(&pack.build[1..]).current_dir(&pack.root);
-    // A build talks on standard output, which under `--json` belongs to the one object.
+    // Under `--json`, the build's output goes to stderr.
     if crate::json::on() {
         command.stdout(std::io::stderr());
     }
@@ -248,7 +241,7 @@ scenario = "demo.toml"
 oracle = "crash"
 "#;
 
-    /// A pack's paths are its repository's, and an unknown key is refused rather than skipped.
+    /// A pack's paths are its repository's, and an unknown key is refused.
     #[test]
     fn a_pack_resolves_against_its_repository() {
         let dir = std::env::temp_dir().join(format!("bohr-pack-{}", std::process::id()));

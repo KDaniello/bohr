@@ -1,9 +1,7 @@
-//! What `bohr survey` reports, and what it must never be mistaken for.
+//! What `bohr survey` reports, and what it does not claim.
 //!
-//! A survey answers every call this build cannot model with `ENOSYS` and carries on, so the whole
-//! unsupported set is learned in one pass instead of one call per run. Everything it says rests on
-//! answers that were invented, so the properties worth testing are as much about what it refuses to
-//! claim as about what it finds.
+//! A survey answers each unmodelled call with `ENOSYS` and carries on, so the unsupported set comes
+//! back in one pass. Those answers are invented, so its caveats are tested as much as its list.
 
 use std::process::Command;
 
@@ -20,7 +18,7 @@ fn bohr(args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
-/// A guest built by `make guests`, or nothing where it has not been built.
+/// A guest built by `make guests`, if built.
 fn guest(name: &str) -> Option<String> {
     if !HAS_BACKEND {
         return None;
@@ -31,7 +29,7 @@ fn guest(name: &str) -> Option<String> {
     path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
-/// The whole point: a survey reports the call, where an ordinary run only refuses it.
+/// A survey reports the call that a run refuses.
 #[test]
 fn a_survey_names_what_the_run_would_only_refuse() {
     let Some(path) = guest("enters_io_uring") else {
@@ -47,9 +45,7 @@ fn a_survey_names_what_the_run_would_only_refuse() {
     assert!(out.contains("io_uring"), "and named, because a number is not a name:\n{out}");
 }
 
-/// What the report says about itself. A reader who takes the list for the program's whole surface
-/// will build against the wrong list, and the place to say so is beside the list rather than in a
-/// document nobody has open.
+/// The report states beside the list that it is a lower bound.
 #[test]
 fn a_survey_says_what_it_is_not_evidence_of() {
     let Some(path) = guest("enters_io_uring") else {
@@ -61,7 +57,7 @@ fn a_survey_says_what_it_is_not_evidence_of() {
     assert!(out.contains("fallback"), "and say why the guest's path changed:\n{out}");
 }
 
-/// A program this build models entirely has nothing to survey, and says so with a clean code.
+/// A fully modelled program surveys clean with exit 0.
 #[test]
 fn a_program_this_build_can_carry_surveys_clean() {
     let Some(path) = guest("startup") else {
@@ -73,7 +69,7 @@ fn a_program_this_build_can_carry_surveys_clean() {
     assert!(out.contains("every call it made was answered"), "{out}");
 }
 
-/// A survey with no program is a usage error, not an empty survey that passes.
+/// A survey with no program is a usage error.
 #[test]
 fn a_survey_of_nothing_is_refused() {
     let (code, out) = bohr(&["survey"]);
@@ -81,12 +77,10 @@ fn a_survey_of_nothing_is_refused() {
     assert!(out.contains("BOHR-1002"), "{out}");
 }
 
-/// A guest that never finished has no surface, and a survey that reported one would be handing
-/// back the wrong measurement under a clean code. The case that produced this was a dynamically
-/// linked program whose loader found none of its libraries: a dozen calls, every one of them
-/// answered, and exit 127 before the program's own first instruction — on which the survey said
-/// "every call it made was answered" and exited zero, which is what it says about a program that
-/// genuinely asks for nothing.
+/// A guest that never finished has no surface and the survey does not exit clean.
+///
+/// A dynamic program whose loader finds no libraries makes a dozen answered calls and exits 127
+/// before its first instruction.
 #[test]
 fn a_guest_that_never_finished_is_not_a_clean_surface() {
     let Some(path) = guest("segfault") else {

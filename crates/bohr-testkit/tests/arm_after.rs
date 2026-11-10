@@ -1,16 +1,9 @@
 //! Drawn faults can be held back until the guest is up.
 //!
-//! A kill is drawn at odds per eligible call, and a guest that is expensive to start spends most of
-//! its calls starting. At the finest odds this ABI expresses — one part in 65536 — an execution
-//! client is killed on average before it has finished coming up, so a campaign asks what a crash
-//! during startup does, run after run, and never what a crash to a working node does.
+//! A kill is drawn per eligible call, and an execution client makes most of its calls starting up,
+//! so even 1/65536 odds kill it before it is up. Held back, the same odds reach the working node.
 //!
-//! Held back, the same odds reach the working part instead. Stated as a pair, because a scenario
-//! that killed nothing either way would satisfy any claim made about it.
-//!
-//! **The draw still happens while the policy is held back.** It has to: byte consumption that
-//! depended on the clock would move every later decision the moment a run took a different amount
-//! of time to reach the same place, which is the property the whole draw ABI protects.
+//! The draw still happens while held back, so tape consumption never depends on time.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -39,7 +32,7 @@ const DATA_FD: u64 = 3;
 /// Where a run held back until would start offering kills.
 const ARM_AT: Tick = Tick(20 * Tick::MILLISECOND.get());
 
-/// Writes without syncing, for ever, so every moment is one a guided kill may fire at.
+/// Writes without syncing, for ever, so a kill can fire at any moment.
 fn writes_for_ever() -> NullProgram {
     let mut ops =
         vec![GuestOp::Syscall { nr: OPENAT, args: [u64::MAX, PATH_AT, OPEN_FLAGS, 0o644, 0, 0] }];
@@ -92,7 +85,7 @@ fn killed_at(judged: &Judged) -> Option<Tick> {
         .map(|e| e.tick)
 }
 
-/// The claim: held back, the kill lands after the moment it was held to.
+/// Held back, the kill lands after the moment it was held to.
 #[test]
 fn a_fault_held_back_fires_after_it_is_armed() {
     let at_once = killed_at(&run(Tick(0))).expect("an unheld policy kills early");

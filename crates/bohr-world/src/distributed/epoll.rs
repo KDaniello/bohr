@@ -1,14 +1,9 @@
 //! Readiness: which descriptors have something to offer, and who is waiting to hear it.
 //!
-//! Every asynchronous runtime in Linux is built on this call, and it is what stands between this
-//! engine and every network client written on one. What it needs from the world is not new
-//! behaviour but a new *question*: the model already knows whether a socket has a datagram waiting,
-//! and `epoll` is the way a guest asks about many descriptors at once instead of blocking on one.
+//! Asynchronous runtimes are built on `epoll`; it asks about many descriptors the model already
+//! tracks.
 //!
-//! **It lives in the cluster model rather than in a node's own world, because it is the only place
-//! that sees the whole descriptor space.** A node's files belong to its own world and its sockets
-//! belong to the network; a readiness set spans both, and a model that saw one half would answer
-//! confidently about the other.
+//! It lives in the cluster model, the only place that sees both files and sockets.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -16,9 +11,7 @@ use bohr_types::{GuestAddr, NodeId, TaskId};
 
 /// First descriptor handed out for an epoll instance.
 ///
-/// A range of its own, clear of files (which start at three) and sockets (at 4096): the three
-/// allocators never learn about each other, and disjoint ranges are what keeps a descriptor
-/// unambiguous. Guests treat descriptors as opaque, so the unrealistic values change nothing.
+/// A range clear of files (from 3) and sockets (from 4096), so descriptors are unambiguous.
 pub(crate) const EPOLL_FD_BASE: i64 = 8192;
 
 /// First descriptor handed out for an event counter.
@@ -35,7 +28,7 @@ pub(crate) const CTL_MOD: u64 = 3;
 pub(crate) const EPOLLIN: u32 = 0x001;
 /// The descriptor will accept a write.
 pub(crate) const EPOLLOUT: u32 = 0x004;
-/// Report a descriptor once, when it becomes ready, rather than for as long as it is.
+/// Report a descriptor once, when it becomes ready.
 pub(crate) const EPOLLET: u32 = 1 << 31;
 /// Report a descriptor once, and then not again until it is modified.
 pub(crate) const EPOLLONESHOT: u32 = 1 << 30;
@@ -48,9 +41,7 @@ pub(crate) const EVENT_BYTES: usize = 12;
 struct Watch {
     /// The events the guest wants to hear about.
     events: u32,
-    /// The guest's own token, handed back untouched. Never interpreted: it is a pointer or an
-    /// index in the guest's world, and a model that read it would be reading somebody else's
-    /// bookkeeping.
+    /// The guest's token, returned untouched.
     token: u64,
     /// The readiness epoch this descriptor was last reported in, for an edge-triggered watch.
     seen: Option<u64>,
@@ -66,7 +57,7 @@ struct Parked {
     out: GuestAddr,
     /// How many entries the buffer holds.
     max: usize,
-    /// Whether the answer is `pollfd` entries rather than `epoll_event`s.
+    /// Whether the answer is `pollfd` entries.
     poll: bool,
 }
 
@@ -79,8 +70,7 @@ struct Instance {
     watched: BTreeMap<i64, Watch>,
     /// Tasks waiting for something to become ready, oldest first.
     ///
-    /// A queue for the same reason a socket's is: several threads may wait on one instance, and a
-    /// single slot would drop the first one's wait without a word.
+    /// A queue, since several threads may wait on one instance.
     parked: VecDeque<Parked>,
 }
 
@@ -90,28 +80,22 @@ pub(crate) struct Epolls {
     instances: BTreeMap<(NodeId, i64), Instance>,
     /// Event counters, by the descriptor each was opened as.
     ///
-    /// Kept beside the epoll sets because they exist for the same reason: a runtime uses one to
-    /// wake its own poller, and a poller that could not be woken is a runtime that never returns.
+    /// Runtimes use them to wake their poller.
     counters: BTreeMap<(NodeId, i64), u64>,
     /// Duplicate descriptors, each naming the instance it was copied from.
     ///
-    /// A runtime duplicates its poller so that the thread which wakes it holds a handle of its
-    /// own, and two descriptors naming one instance is what `dup` means. Kept as an alias rather
-    /// than a second instance, because a copy that watched its own set would be a different poller
-    /// wearing the same number.
+    /// Aliases, since a `dup` names the same instance.
     aliases: BTreeMap<(NodeId, i64), i64>,
     next_epoll: BTreeMap<NodeId, i64>,
     next_counter: BTreeMap<NodeId, i64>,
     /// The next number for an instance a `poll` makes for itself.
     next_hidden: BTreeMap<NodeId, i64>,
-    /// Counts the moments something may have become ready: a delivery, a write to a counter, a
-    /// heal. An edge-triggered watch reports a descriptor once per epoch, which is what
-    /// "when it becomes ready" means to a model whose readiness only changes at those moments.
+    /// Counts moments readiness may change: deliveries, counter writes, heals. Edge-triggered
+    /// watches report once per epoch.
     epoch: u64,
 }
 
-/// Where the instances a `poll` makes for itself are numbered from: past every number a guest can
-/// hold, so closing one never reaches a descriptor of the guest's, however many polls a run makes.
+/// Past every guest descriptor, so closing a `poll`'s instance never closes a guest's.
 pub(crate) const HIDDEN_BASE: i64 = 1 << 40;
 
 /// One descriptor that became ready, as `epoll_wait` reports it.
@@ -143,10 +127,7 @@ impl Epolls {
 
     /// Copies a descriptor, answering with the new one, or nothing where it is not ours.
     ///
-    /// Both kinds are copied and both for the same reason. A runtime duplicates its poller so the
-    /// thread that wakes it holds a handle of its own, and it duplicates the counter it wakes it
-    /// *with* for exactly the same reason — a copy that named a counter of its own would be a
-    /// second bell, and ringing it would wake nobody.
+    /// Pollers and counters are both aliased.
     pub(crate) fn dup(&mut self, node: NodeId, fd: i64) -> Option<i64> {
         let original = self.resolve(node, fd);
         let next = if self.instances.contains_key(&(node, original)) {
@@ -235,9 +216,7 @@ impl Epolls {
 
     /// Everything an instance may report now, as `(descriptor, wanted events, token)`.
     ///
-    /// An edge-triggered watch already reported in this epoch is left out, and so is a one-shot
-    /// watch that has fired: reporting either again is a level a guest that asked for an edge
-    /// spins on.
+    /// Leaves out edge-triggered watches already reported this epoch and fired one-shot watches.
     pub(crate) fn watched(&self, node: NodeId, epfd: i64) -> Vec<(i64, u32, u64)> {
         self.instances.get(&(node, self.resolve(node, epfd))).map_or_else(Vec::new, |instance| {
             instance
@@ -296,11 +275,7 @@ impl Epolls {
 
     /// Takes one named task off an instance, where it is still waiting there.
     ///
-    /// **A timeout belongs to one waiter, and taking the front one was not it.** With two tasks on
-    /// one instance -- the ordinary shape of a threaded runtime -- the timer took whoever had
-    /// waited longest, found it was somebody else, and put that task back with no output buffer
-    /// and no count: a later wake then reported nothing ready to a wait that had asked for as much
-    /// as would fit. Meanwhile the task whose timer it was stayed parked with its timer spent.
+    /// For a timeout, which belongs to one named waiter.
     pub(crate) fn take_parked_task(
         &mut self,
         node: NodeId,
@@ -348,9 +323,7 @@ impl Epolls {
 
     /// Forgets a descriptor: an instance, a counter, or a watch on any instance of the node.
     pub(crate) fn close(&mut self, node: NodeId, fd: i64) -> bool {
-        // A copy going away takes the copy and nothing else: the thing it named is still named by
-        // whoever it was copied from, and closing the last handle onto a poller is not what a
-        // runtime does when it drops a spare one.
+        // Closing an alias removes only the alias.
         if self.aliases.remove(&(node, fd)).is_some() {
             return true;
         }
@@ -359,9 +332,7 @@ impl Epolls {
         }
         let was_ours = self.instances.remove(&(node, fd)).is_some()
             || self.counters.remove(&(node, fd)).is_some();
-        // A closed descriptor stops being watched, whether or not it was ours: the guest may close
-        // a socket an instance was told about, and reporting readiness on it afterwards would name
-        // a descriptor that no longer exists.
+        // A closed descriptor is no longer watched, ours or not.
         for ((owner, _), instance) in &mut self.instances {
             if *owner == node {
                 instance.watched.remove(&fd);
@@ -384,7 +355,7 @@ impl Epolls {
         for instance in self.instances.values_mut() {
             instance.parked.retain(|p| p.task != task);
         }
-        // A `poll`'s own instance exists for the task waiting on it, and goes with it.
+        // A `poll`'s instance goes with its task.
         self.instances.retain(|(_, id), instance| *id < HIDDEN_BASE || !instance.parked.is_empty());
     }
 }

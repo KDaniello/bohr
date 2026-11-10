@@ -1,12 +1,9 @@
 //! Arbitrary syscalls, with arbitrary arguments, driven into the world.
 //!
-//! A hostile guest chooses its own registers: addresses that do not map, lengths that do not fit,
-//! flags nobody defined, an unsupported number every third call. The world must answer or refuse
-//! each one — the supervisor is the single thing in the system that cannot be allowed to fall
-//! over, because a supervisor that crashes takes the run's evidence with it.
+//! Unmapped addresses, oversized lengths, undefined flags, unsupported numbers: the world answers
+//! or refuses each, since a supervisor crash loses the run's evidence.
 //!
-//! The scripted backend is what makes this a fuzz target rather than an experiment: the guest is
-//! a list of operations, so a mutated input is a different program with no process behind it.
+//! The scripted backend makes each input a program with no process behind it.
 #![no_main]
 
 use bohr_backend::GuestSpec;
@@ -37,9 +34,7 @@ const OP_BYTES: usize = 4 + 6 * 8;
 const MAX_OPS: usize = 64;
 
 fuzz_target!(|data: &[u8]| {
-    // The first eight bytes choose the tape; the rest are the program. A seed drawn from the
-    // input matters because the answers a guest gets are drawn, so the same call can take
-    // different paths through the world on different tapes.
+    // The first eight bytes choose the tape; the rest are the program.
     if data.len() < 8 + OP_BYTES {
         return;
     }
@@ -69,8 +64,7 @@ fuzz_target!(|data: &[u8]| {
     let mut sink = TraceWriter::new(Vec::new());
     let specs = [GuestSpec::default()];
 
-    // A run that ends in an error is a valid outcome — a refusal is the world working. What is
-    // being fuzzed is that it ends: no panic, no unbounded allocation, no loop without a budget.
+    // An error is a valid end; the run must simply end.
     let _ = run(RunInputs {
         arming: bohr_kernel::Arming::NONE,
         tape: &tape,

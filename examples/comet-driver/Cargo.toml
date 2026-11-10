@@ -1,0 +1,15 @@
+# Outside the tool's workspace, like every guest (docs/ARCHITECTURE.md §5.11).
+[workspace]
+
+[package]
+name = "comet-driver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "comet-driver"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1

@@ -1,8 +1,7 @@
 //! Digest goldens for `minimal/1` runs.
 //!
-//! A refactor of the world or the kernel that is meant to be pure code motion must not move a
-//! single digest; these vectors are what proves it. A deliberate behaviour change re-blesses them
-//! in the same commit, and the commit message says why.
+//! A pure refactor moves no digest. A deliberate behaviour change re-blesses these in the same
+//! commit and says why.
 
 use bohr_testkit::{Fixture, run_once};
 use bohr_types::Seed;

@@ -1,22 +1,16 @@
 //! What the guest promised, counted across a whole campaign.
 //!
-//! `always` is answered by one run: it either held or it did not. `sometimes` and `reachable` are
-//! questions about a campaign — "did this *ever* happen" — and one run cannot answer them. They do
-//! not find crashes. They produce the map of what was never tested, which is the half of the SDK
-//! teams underestimate: "across ten million runs we never once reached a leader change with a full
-//! disk" is a sentence no crash report contains.
+//! One run answers `always`. `sometimes` and `reachable` ask whether something ever happened, so
+//! they are answered by the campaign and map what was never tested.
 //!
-//! # Why the counter adds
+//! # Merging
 //!
-//! Campaigns are resumed, merged, and run on several workers at once, so the counter has to be a
-//! thing that can be combined in any order and give one answer. Addition is: per property, the
-//! evaluations and the true ones are summed, and the run that first satisfied it is whichever came
-//! earlier. Nothing here depends on the order the results were handed over, which is what lets
-//! `-j 1` and `-j 8` produce the same map.
+//! Tallies add: evaluations and satisfactions are summed, and the first satisfying run is the
+//! smallest digest. The result is independent of order, so resumed, merged and parallel campaigns
+//! agree.
 //!
-//! Recomputing this from the findings was never available, and it is worth saying why: a satisfied
-//! `sometimes` produces no finding, and an unsatisfied one produces nothing at all. There would be
-//! nothing to recompute from. See `docs/ARCHITECTURE.md` §14, question 5.
+//! Neither outcome of a `sometimes` produces a finding, so the tally cannot be rebuilt from
+//! findings. See `docs/ARCHITECTURE.md` §14, question 5.
 
 use bohr_types::Digest;
 
@@ -27,18 +21,14 @@ pub struct Tally {
     pub evaluations: u64,
     /// Times it was true.
     pub satisfied: u64,
-    /// The first run that satisfied it, by digest — the tape to look at when asking how.
-    ///
-    /// The *first* by digest order rather than by time, because time is not a thing two workers
-    /// agree on and a digest is.
+    /// The satisfying run with the smallest digest, which workers agree on.
     pub first_satisfied: Option<Digest>,
 }
 
 impl Tally {
     /// Folds another account of the same property in.
     ///
-    /// Commutative and associative, which is the whole requirement: two campaigns merged in either
-    /// order, or one campaign's workers finishing in any order, give one answer.
+    /// Commutative and associative, so merge order never matters.
     pub fn merge(&mut self, other: &Self) {
         self.evaluations += other.evaluations;
         self.satisfied += other.satisfied;
@@ -57,24 +47,19 @@ impl Tally {
 
 /// Names a campaign will hold before it stops taking new ones.
 ///
-/// **A bound, because the names are the guest's to choose.** A property named after something that
-/// changes — a tick, a term, an index — is an ordinary mistake in using the SDK, and it produces
-/// one name per evaluation: an overnight campaign of a million runs then holds a million tallies
-/// in supervisor memory, which §4.4 says is the one thing that may not be what runs out first.
-/// Generous enough that no deliberate set of properties comes near it.
+/// The guest chooses names, and one named after a tick makes a name per evaluation. The bound
+/// keeps supervisor memory flat (§4.4) and is far above any deliberate set.
 pub const MOST_PROPERTIES: usize = 4096;
 
 /// Every property a campaign has seen, by the name the guest gave it.
 ///
-/// A map ordered by name, so a report reads the same twice and two campaigns can be compared line
-/// by line.
+/// Ordered by name, so reports compare line by line.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Properties {
     pub(crate) by_name: std::collections::BTreeMap<String, Tally>,
     /// Evaluations of names that arrived after the bound was reached.
     ///
-    /// Counted and reported rather than dropped in silence: a map of the untested that had quietly
-    /// stopped growing would read as a guest with few promises.
+    /// Counted and reported, so a full map is visible.
     pub(crate) refused: u64,
 }
 
@@ -118,7 +103,7 @@ impl Properties {
 
     /// Evaluations of names this campaign had no room for.
     ///
-    /// Nought for every campaign whose guest names its promises rather than numbering them.
+    /// Zero unless the guest generates names.
     #[must_use]
     pub const fn refused(&self) -> u64 {
         self.refused
@@ -132,9 +117,7 @@ impl Properties {
 
     /// The properties the guest stated and the campaign never satisfied.
     ///
-    /// The map of the untested. Every name here is a thing somebody thought was worth claiming and
-    /// the search never managed to bring about — which is a gap in the testing, not in the guest,
-    /// and is the more useful of the two to be told about.
+    /// The map of the untested: claims the search never brought about.
     #[must_use]
     pub fn unsatisfied(&self) -> Vec<&str> {
         self.by_name
@@ -171,7 +154,7 @@ mod tests {
         assert!(properties.tallies()["an entry committed"].is_satisfied());
     }
 
-    /// The requirement the whole design turns on: workers finish in whatever order they like.
+    /// The order results arrive in does not matter.
     #[test]
     fn merging_gives_one_answer_whatever_order_it_happens_in() {
         let build = |names: &[(&str, bool, u8)]| {
@@ -195,8 +178,7 @@ mod tests {
         assert_eq!(forwards.unsatisfied(), vec!["y"]);
     }
 
-    /// Which run first satisfied a property must be a fact about the runs, not about the clock:
-    /// two workers do not agree on time, and both agree on a digest.
+    /// The first satisfying run is chosen by digest.
     #[test]
     fn the_first_satisfying_run_is_chosen_by_digest_not_by_arrival() {
         let mut early = Properties::new();
@@ -210,8 +192,7 @@ mod tests {
         assert_eq!(early.tallies()["p"].first_satisfied, late.tallies()["p"].first_satisfied);
     }
 
-    /// The names are the guest's, so their number is too. A property named after a tick produces
-    /// one name per evaluation, and an overnight campaign would hold a million tallies.
+    /// New names past the bound are counted and refused.
     #[test]
     fn a_guest_that_numbers_its_promises_cannot_grow_the_map_without_end() {
         let mut properties = Properties::new();
@@ -221,7 +202,7 @@ mod tests {
         assert_eq!(properties.tallies().len(), MOST_PROPERTIES, "the bound was not held");
         assert_eq!(properties.refused(), 100, "what was refused was not counted");
 
-        // And a name already held is still counted, however full the map is.
+        // A name already held is still counted.
         let held = properties.tallies().keys().next().expect("a name").clone();
         properties.observe(&held, true, run(2));
         assert_eq!(properties.tallies()[&held].evaluations, 2);

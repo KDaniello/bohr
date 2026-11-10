@@ -1,14 +1,12 @@
-//! The suite the whole product rests on: the same seed produces the same run.
+//! The same seed produces the same run.
 //!
-//! Every assertion here is also a negative test of the mutation harness, which enables one
-//! deliberate defect at a time and requires this file to fail. A test that passes under an
-//! injection has a hole in it, and the hole is closed by strengthening the test.
+//! The mutation harness enables one deliberate defect at a time and requires this file to fail; a
+//! test that passes under an injection is strengthened.
 
 use bohr_testkit::{Fixture, digests, run_once};
 use bohr_types::Seed;
 
-/// Repetitions per fixture. Enough that an ordering that only sometimes differs is caught, and
-/// cheap enough to run on every commit.
+/// Repetitions per fixture: enough to catch an intermittent difference, cheap enough per commit.
 const REPEATS: usize = 200;
 
 #[test]
@@ -43,8 +41,7 @@ fn the_whole_run_repeats_not_only_its_digest() {
     }
 }
 
-/// A run driven by a longer tape must read the same bytes at the same offsets as a shorter one,
-/// because consumption is a function of the request alone.
+/// A longer tape reads the same bytes at the same offsets as a shorter one.
 #[test]
 fn draws_land_at_the_same_offsets() {
     for fixture in Fixture::all() {
@@ -56,8 +53,7 @@ fn draws_land_at_the_same_offsets() {
     }
 }
 
-/// Every draw carries the event it was made for, which is what lets the journal be read against the
-/// trace. A journal whose entries all name event zero says nothing about when a decision was taken.
+/// Every draw carries its event, so the journal aligns with the trace.
 #[test]
 fn draws_name_the_event_they_belong_to() {
     let report = run_once(Fixture::ClockAndRandom, Seed(3));
@@ -74,11 +70,10 @@ fn draws_name_the_event_they_belong_to() {
     );
 }
 
-/// Which waiter a wake releases comes from the tape, not from the order they arrived in.
+/// Which waiter a wake releases comes from the tape.
 ///
-/// This is the promise `docs/DETERMINISM.md` makes about `futex`: the kernel may wake waiters in
-/// any order, so the model keeps its own queue and draws the choice. A run that took the first
-/// waiter would still reproduce — and would explore one ordering forever.
+/// As `docs/DETERMINISM.md` promises for `futex`: the model keeps its own queue and draws the
+/// choice.
 #[test]
 fn futex_wake_order_comes_from_the_tape() {
     let orders: Vec<Vec<u64>> = (0..32u64)
@@ -120,9 +115,8 @@ mod cluster {
         ])
     }
 
-    /// The presented time carries each node's own offset, which is millions of ticks; a cluster
-    /// answered from the world clock alone would read small multiples of the syscall cost. This
-    /// is the test the shared-clock injection must fail.
+    /// Presented time carries each node's offset of millions of ticks. The shared-clock injection
+    /// fails this.
     #[test]
     fn node_clocks_are_their_own_not_the_worlds() {
         let (_, events) = run_cluster(vec![read_clock(), read_clock()], &[], Seed(5));
@@ -133,8 +127,7 @@ mod cluster {
             }
         }
         assert_eq!(first_read.len(), 2, "both nodes read the clock");
-        // The wall clock starts at the epoch on every node; what a node's own offset adds is above
-        // it, so the epoch is taken off before asking whether any offset shows.
+        // Subtract the wall epoch before looking for offsets.
         let loudest = first_read
             .values()
             .map(|at| at.saturating_sub(bohr_kernel::WALL_EPOCH.get()))
@@ -146,8 +139,8 @@ mod cluster {
         );
     }
 
-    /// The same numeric address on two nodes is two different words. A wake crossing node
-    /// boundaries would release the waiter and let this run finish; the honest outcome is a hang.
+    /// One address on two nodes is two words, so the cross-node wake does nothing and the run
+    /// hangs.
     #[test]
     fn futex_spaces_do_not_cross_nodes() {
         let word = MEMORY_BASE + 512;
@@ -168,8 +161,8 @@ mod cluster {
         );
     }
 
-    /// `poll` alone: what a file is ready for is reported, an empty wait spends its timeout, and a
-    /// wait with no timeout on nothing is a deadlock rather than a refusal.
+    /// `poll` reports readiness, an empty wait spends its timeout, and an untimed wait on nothing
+    /// deadlocks.
     #[test]
     fn poll_alone_answers_what_linux_answers() {
         const POLL: u32 = 7;
@@ -303,7 +296,7 @@ mod network {
     const SENDTO: u32 = 44;
     const RECVFROM: u32 = 45;
     const BIND: u32 = 49;
-    /// The first socket a node opens; deterministic, which is what lets a script name it.
+    /// The first socket a node opens, deterministic.
     const FD: u64 = 4096;
 
     const ADDR_SELF: u64 = MEMORY_BASE;
@@ -582,13 +575,8 @@ mod network {
         ])
     }
 
-    /// Several sockets may hold one port where all of them asked for it, and none may otherwise.
-    ///
-    /// This is how a server spreads one port across its threads, and it is how a validator opens
-    /// the four sockets it broadcasts from. Refusing the second bind sent a program that had every
-    /// right to make it into a panic, on a conflict no real machine would have reported.
-    ///
-    /// Both halves, because either alone is a rule that never says no or never says yes.
+    /// Several sockets share a port only when all set `SO_REUSEPORT`, as servers and validators
+    /// do.
     #[test]
     fn a_port_is_shared_only_where_everyone_asked_for_it() {
         /// `setsockopt`, `SOL_SOCKET`, `SO_REUSEPORT`.
@@ -634,12 +622,8 @@ mod network {
         assert_eq!(binds(false), vec![0, -98], "neither asked, so the second is refused");
     }
 
-    /// One port number is two endpoints, because Linux gives datagrams and streams a space each.
-    ///
-    /// A service that binds both for one number is doing the ordinary thing -- gossip on a
-    /// validator does exactly that. Keyed together, the second bind of the pair was answered
-    /// `EADDRINUSE`, a conflict no real machine would have reported, and the program stopped on
-    /// it.
+    /// Datagram and stream sockets have separate port spaces, as on Linux; a validator's gossip
+    /// binds both.
     #[test]
     fn a_datagram_and_a_stream_may_hold_one_port() {
         /// `SOCK_STREAM` and `SOCK_DGRAM`, in the order the call takes them.
@@ -685,7 +669,7 @@ mod disk {
     const FUTEX: u32 = 202;
     const SCHED_YIELD: u32 = 24;
     const O_CREAT: u64 = 0o100;
-    /// The first descriptor `openat` hands out; deterministic, so a script can name it.
+    /// The first `openat` descriptor, deterministic.
     const FD: u64 = 3;
 
     const PATH: u64 = MEMORY_BASE + 900;
@@ -831,8 +815,7 @@ mod disk {
         let preloads = [path_preload(0), (0, DATA, vec![0xAB; 600]), (0, DATA2, vec![0xCD; 1536])];
         let scenario = || Scenario {
             disk: DiskConfig {
-                // The second fsync must stall past the kill: certain stall, an effectively
-                // endless mean.
+                // The second fsync stalls past the kill.
                 stall_probability: (1, 1),
                 stall_mean_ticks: 1_000_000_000_000,
                 ..DiskConfig::default()
@@ -1091,7 +1074,7 @@ mod cluster_scenarios {
     }
 
     /// A frozen node misses nothing: the delivery lands while it is frozen and is read after the
-    /// thaw — the pause is a pause, not a drop.
+    /// thaw — a freeze loses nothing.
     #[test]
     fn a_frozen_node_reads_what_arrived_while_it_slept() {
         let sender = NullProgram::single(vec![
@@ -1120,8 +1103,7 @@ mod cluster_scenarios {
             },
             node_faults: vec![
                 ScheduledNodeFault {
-                    // Past both nodes' startup syscalls, so the receiver is already bound and
-                    // parked in its receive when the freeze lands.
+                    // After startup, so the receiver is parked when the freeze lands.
                     at_tick: Tick(50_000),
                     node: NodeId(1),
                     kind: NodeFaultKind::Freeze,
@@ -1151,8 +1133,7 @@ mod cluster_scenarios {
         );
     }
 
-    /// The threaded fixture holds under the cluster world: per-node futex spaces do not disturb
-    /// interleaving within one node.
+    /// The threaded fixture holds under the cluster world.
     #[test]
     fn threads_race_deterministically_under_the_cluster_world() {
         use bohr_testkit::{Fixture, run_cluster};
@@ -1175,7 +1156,7 @@ mod sdk {
     const OPENAT: u32 = 257;
     const WRITE: u32 = 1;
     const O_CREAT: u64 = 0o100;
-    /// The first descriptor `openat` hands out, which is deterministic and so can be scripted.
+    /// The first `openat` descriptor, deterministic.
     const FD: u64 = 3;
 
     const PATH: u64 = MEMORY_BASE;
@@ -1199,11 +1180,7 @@ mod sdk {
         Scenario { sdk_output: Some("/bohr/records.jsonl".to_owned()), ..Scenario::default() }
     }
 
-    /// The run names where the promise broke, and it is not where the run stopped.
-    ///
-    /// A guest carries on after an assertion fails — the write that reported it returns, and the
-    /// guest exits on its own terms — so the last event is wherever it happened to finish. A
-    /// report that pointed a reader there would point them past the answer.
+    /// The run names where the promise broke, which is before where it stopped.
     #[test]
     fn the_run_names_the_event_the_promise_broke_at() {
         let preloads = [(0u32, PATH, CHANNEL.to_vec()), (0, RECORD, LINE.as_bytes().to_vec())];
@@ -1251,9 +1228,7 @@ mod sdk {
         assert_eq!(assertion.1, AssertionKind::Always);
         assert!(!assertion.2, "the condition was recorded as holding when it did not");
 
-        // Recording the violation is the world's half; the verdict is the oracle's, and this
-        // harness runs one with no opinion so a determinism test measures reproduction rather
-        // than judgement. What must be here is the diagnostic an oracle judges on.
+        // This harness's oracle judges nothing; the diagnostic must still be recorded.
         let violation = events
             .iter()
             .any(|e| matches!(&e.kind, EventKind::Diagnostic { code, .. } if code == "BOHR-2012"));
@@ -1261,7 +1236,7 @@ mod sdk {
         let _ = &report;
     }
 
-    /// A line that arrives in pieces is one record, not two malformed ones.
+    /// A line that arrives in pieces is one record.
     #[test]
     fn a_record_split_across_writes_is_still_one_record() {
         let half = LINE.len() as u64 / 2;
@@ -1282,7 +1257,7 @@ mod sdk {
         assert_eq!(records, 1, "a split line was read as {records} records");
     }
 
-    /// Records are the same whatever else the run does, so a run carrying them still repeats.
+    /// A run with records still repeats.
     #[test]
     fn a_run_with_records_repeats_exactly() {
         let preloads = [(0u32, PATH, CHANNEL.to_vec()), (0, RECORD, LINE.as_bytes().to_vec())];

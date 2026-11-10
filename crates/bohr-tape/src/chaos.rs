@@ -1,7 +1,6 @@
 //! A deliberate defect: bytes that do not come from the tape.
 //!
-//! Present so the tests that are supposed to catch ambient randomness can be shown to catch it.
-//! Reachable only through the feature that names it, which no ordinary build enables.
+//! It shows the tests catch ambient randomness. Only the feature of the same name enables it.
 
 use std::hash::{BuildHasher, Hasher};
 

@@ -1,9 +1,8 @@
 //! Records a guest writes about itself, on their way into the trace.
 //!
-//! An SDK writes lines to a descriptor, and a write is a syscall the world already answers — so
-//! there is no channel here beyond the one every guest has. What this module does is recognise
-//! the descriptor, split what arrives into lines, and turn each into an event and a stored record.
-//! See `docs/ARCHITECTURE.md` §7.4.
+//! An SDK writes lines to a descriptor through ordinary writes. This module recognises the
+//! descriptor, splits lines, and turns each into an event and a stored record. See
+//! `docs/ARCHITECTURE.md` §7.4.
 
 use bohr_sdk_proto::Record;
 use bohr_trace::{AssertionKind, EventKind};
@@ -11,27 +10,23 @@ use bohr_types::NodeId;
 
 /// The diagnostic a failed per-run assertion raises.
 ///
-/// A run is judged from what it recorded, so the violation travels as an event like everything
-/// else rather than as a second channel into the oracle.
+/// The violation is an event, since the oracle judges what the run recorded.
 pub(crate) const VIOLATION_CODE: &str = "BOHR-2012";
 
 /// Everything the guests have said about themselves.
 #[derive(Debug, Default)]
 pub(crate) struct SdkRecords {
-    /// Lines as they arrived, in order. Stored verbatim: a record written by a newer SDK carries
-    /// fields this build does not model, and rewriting it would lose exactly those.
+    /// Lines as they arrived, verbatim, so fields from newer SDKs survive.
     lines: Vec<String>,
     /// What each node's descriptor has received but not yet terminated with a newline.
     partial: std::collections::BTreeMap<(NodeId, i64), String>,
     /// The last sequence number seen from each node, for noticing a gap.
     last_seq: std::collections::BTreeMap<NodeId, u64>,
-    /// Lines that did not parse. Counted rather than kept: a malformed line is a defect in
-    /// whatever wrote it, and a run that filled its bundle with them would bury the rest.
+    /// Lines that did not parse, counted but not kept.
     malformed: u64,
     /// The node the probe runs on, the one node whose probe rounds are read as answers.
     ///
-    /// Any guest can write an event of that name; only the probe's are evidence. A node under test
-    /// that wrote rounds of its own would otherwise be grading its own answers.
+    /// Only the probe's rounds count, so a node cannot grade itself.
     pub(crate) probe_node: Option<NodeId>,
 }
 
@@ -61,13 +56,11 @@ impl SdkRecords {
 
     /// Takes what a guest wrote to its record descriptor.
     ///
-    /// Partial lines are held: a write is not a record, and an SDK that flushed mid-line would
-    /// otherwise have half its record read as malformed and the other half as a new one.
+    /// Partial lines are held until their newline.
     pub(crate) fn accept(&mut self, node: NodeId, fd: i64, bytes: &[u8]) -> Digested {
         let mut digested = Digested::default();
 
-        // Complete lines come out of the buffer first and are digested after: digesting touches
-        // the whole record store, and holding the buffer across it would borrow twice.
+        // Lines are taken out first, then digested, to avoid a double borrow.
         let mut complete = Vec::new();
         {
             let buffered = self.partial.entry((node, fd)).or_default();
@@ -90,8 +83,7 @@ impl SdkRecords {
         let record = match Record::parse_line(&line) {
             Ok(record) => record,
             Err(reason) => {
-                // Dropped, counted, and reported once so a run that produces a stream of them
-                // still says what happened without the log becoming the stream.
+                // Dropped, counted, and reported once.
                 self.malformed += 1;
                 if self.malformed == 1 {
                     digested.diagnostics.push((
@@ -105,9 +97,8 @@ impl SdkRecords {
 
         if let Some(meta) = record.meta() {
             let last = self.last_seq.entry(node).or_insert(0);
-            // Sequence numbers are per node and start at one; anything but the next one means
-            // records escaped interception, which makes the record stream incomplete rather than
-            // wrong. The run continues, degraded and saying so.
+            // Per-node sequence numbers start at one; a gap means records escaped, and the run
+            // continues degraded.
             if meta.seq != *last + 1 {
                 digested.diagnostics.push((
                     "BOHR-2021".to_owned(),
@@ -137,8 +128,7 @@ impl SdkRecords {
                 bohr_sdk_proto::AssertType::Sometimes => AssertionKind::Sometimes,
                 bohr_sdk_proto::AssertType::Reachable => AssertionKind::Reachable,
                 bohr_sdk_proto::AssertType::Unreachable => AssertionKind::Unreachable,
-                // A numeric guard is evaluated over a campaign; on the timeline it is what it
-                // most nearly is, and its own record carries the rest.
+                // A numeric guard maps to its nearest kind; the record has the rest.
                 bohr_sdk_proto::AssertType::NumericGuard(_) => AssertionKind::Sometimes,
             };
             digested.events.push(EventKind::Assertion {
@@ -148,8 +138,7 @@ impl SdkRecords {
                 condition: assertion.condition,
             });
 
-            // Only the per-run kinds can fail here. Whether something never happens is a question
-            // about a campaign, and one run cannot answer it.
+            // Only per-run kinds fail here.
             if assertion.assert_type.is_per_run() && !assertion.condition {
                 let detail = format!(
                     "{}(\"{}\") failed at {}:{}",
@@ -158,8 +147,7 @@ impl SdkRecords {
                     assertion.location.file,
                     assertion.location.begin_line
                 );
-                // Raised as a diagnostic as well, because that is what the oracle reads: a run is
-                // judged from what it recorded, never from a side channel into the world.
+                // Also a diagnostic, which the oracle reads.
                 digested.diagnostics.push((VIOLATION_CODE.to_owned(), detail.clone()));
                 digested.violated.get_or_insert(detail);
             }

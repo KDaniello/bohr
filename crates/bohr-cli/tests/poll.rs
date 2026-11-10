@@ -1,6 +1,6 @@
 //! `poll` over a socket in a cluster, against a real program.
 //!
-//! Linux only, and skipped where the guest has not been built, like the other tests of real guests.
+//! Linux only; skips when the guest is not built.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 

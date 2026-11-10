@@ -1,20 +1,14 @@
 //! The smallest program that keeps something in a memory-mapped store and reads it back.
 //!
-//! It exists to be surveyed rather than to be hunted. An execution client keeps its chain in a
-//! store of this kind, and a store of this kind is reached through a mapping rather than through
-//! reads — so the set of calls it needs is the set that stands between this engine and every such
-//! client, whatever else that client does.
+//! For surveys. Execution clients keep their chain in such a store, reached through mappings.
 //!
-//! One table, a handful of keys, one commit and one read back. Small on purpose: what a survey
-//! answers is which calls a build cannot model, and a larger program would only ask for the same
-//! ones more times.
+//! One table, a few keys, one commit, one read back.
 
 use std::{error::Error, path::Path, process::ExitCode};
 
 use libmdbx::{DatabaseFlags, Environment, EnvironmentFlags, WriteFlags};
 
-/// Where the store is kept. A directory, because that is what this store expects: a data file and
-/// a lock file beside it.
+/// The store's directory, holding its data and lock files.
 const STORE: &str = "/store";
 
 /// How many keys are written and read back.
@@ -38,9 +32,7 @@ fn main() -> ExitCode {
 }
 
 fn exercise() -> Result<u64, Box<dyn Error>> {
-    // Exclusive, which is what one process per node actually is. It is not a way around anything:
-    // a store told it is the only one holding its files stops keeping a lock file for the readers
-    // that do not exist, and that is the truth of a run here rather than a convenience.
+    // Exclusive, as one process per node is.
     let environment = Environment::builder()
         .set_max_dbs(2)
         .set_flags(EnvironmentFlags { exclusive: true, ..EnvironmentFlags::default() })
@@ -53,8 +45,7 @@ fn exercise() -> Result<u64, Box<dyn Error>> {
     }
     writing.commit()?;
 
-    // A fresh transaction, so what is read comes off the store rather than out of the one that
-    // wrote it: a write not yet visible to a new reader is exactly the defect this shape looks for.
+    // A fresh transaction reads from the store.
     let reading = environment.begin_ro_sync()?;
     let table = reading.open_db(Some("chain"))?;
     let mut found = 0;

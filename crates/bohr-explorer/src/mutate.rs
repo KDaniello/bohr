@@ -1,19 +1,13 @@
 //! Turning one tape into another.
 //!
-//! A corpus entry is a tape prefix: the bytes a run reads before the keystream takes over. So
-//! mutating an input means mutating those bytes, and every operator here is a rule about how.
+//! A mutation rewrites a tape prefix.
 //!
-//! **The rule they all obey: an operator overwrites or appends, never inserts or removes.** The
-//! draw ABI's founding property is that a draw's byte consumption depends on the request and never
-//! on the value, which is what makes one flipped byte change exactly one decision. Inserting a
-//! byte would break that from the other side — every later draw would read from a shifted offset,
-//! and a single mutation would perturb the whole run. Appending is safe for the same reason:
-//! bytes past the old end were coming from the keystream anyway, so writing them explicitly moves
-//! nothing.
+//! Operators overwrite or append, never insert or remove. A draw consumes a fixed number of bytes,
+//! so one changed byte changes one decision; an insertion would shift every later draw. Appended
+//! bytes replace keystream bytes and move nothing.
 //!
-//! The operators are AFL's, with one addition nothing else can offer: the draw journal says which
-//! byte ranges a run's *network* decisions consumed, or its *disk* ones, so a mutation can aim at
-//! them. Every other fuzzer needs a grammar to do that; here it falls out of recording the draws.
+//! The operators are AFL's, plus one that uses the draw journal to rewrite every byte one kind of
+//! decision consumed, such as the network's or the disk's.
 
 use bohr_tape::Journal;
 
@@ -21,12 +15,10 @@ use crate::choices::Choices;
 
 /// Values that sit on the edge of something: a boundary, a sign change, a maximum.
 ///
-/// Bugs cluster at them, which is the whole reason a mutator carries a table of constants rather
-/// than trusting a uniform byte to land on 255 by chance.
+/// Bugs cluster at them.
 const INTERESTING: [u8; 8] = [0x00, 0x01, 0x02, 0x0F, 0x10, 0x7F, 0x80, 0xFF];
 
-/// Deltas an arithmetic mutation applies. Small, because a bug at a boundary is usually one step
-/// away from it rather than a hundred.
+/// Deltas an arithmetic mutation applies; small, since boundary bugs sit one step away.
 const DELTAS: [i16; 8] = [-16, -8, -4, -1, 1, 4, 8, 16];
 
 /// Bytes an [`Operator::Extend`] adds at a time.
@@ -34,14 +26,12 @@ const EXTEND_BY: usize = 32;
 
 /// The largest prefix a corpus entry may grow to.
 ///
-/// A bound rather than a policy: without it, a campaign that keeps extending its best entry turns
-/// a corpus of tapes into a corpus of one enormous tape, and every run pays to read it.
+/// Without it, repeated extension grows one enormous tape.
 pub const MAX_PREFIX_BYTES: usize = 64 * 1024;
 
 /// What was done to a prefix.
 ///
-/// Reported so a campaign can say which kinds of mutation are finding anything. An operator that
-/// never contributes an entry is one to reconsider, and that is only visible if it is named.
+/// Reported, so a campaign shows which operators contribute entries.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Operator {
     /// One bit inverted.
@@ -58,8 +48,7 @@ pub enum Operator {
     Extend,
     /// Every byte one draw site consumed, replaced at once.
     ///
-    /// The journal-guided one: "change what the network did and leave the schedule alone" is a
-    /// sentence no byte-blind mutator can say.
+    /// Journal-guided: it can change what the network did and leave the schedule alone.
     SiteBurst,
     /// Several of the above, one after another.
     Havoc,
@@ -81,7 +70,7 @@ impl Operator {
         }
     }
 
-    /// Every operator, for a report that must name the ones that found nothing as well.
+    /// Every operator, so a report also names those that found nothing.
     #[must_use]
     pub const fn all() -> [Self; 8] {
         [
@@ -108,8 +97,7 @@ pub struct Context<'a> {
 
 /// Applies one mutation, chosen from the stream, and says which it was.
 ///
-/// An empty prefix is extended rather than mutated: there is nothing to flip, and a search that
-/// answered "nothing to do" would stall on its first generation.
+/// An empty prefix is extended, since there is nothing to flip.
 pub fn mutate(prefix: &mut Vec<u8>, context: Context<'_>, choices: &mut Choices) -> Operator {
     if prefix.is_empty() {
         extend(prefix, choices);
@@ -124,8 +112,7 @@ pub fn mutate(prefix: &mut Vec<u8>, context: Context<'_>, choices: &mut Choices)
 
 /// The operators that can do something here.
 ///
-/// An operator with nothing to work on — a splice with no donor, a site burst with no journal —
-/// is left out rather than chosen and skipped: a mutation that changes nothing wastes a whole run.
+/// A splice without a donor or a site burst without a journal is left out.
 fn available_operators(prefix: &[u8], context: Context<'_>) -> Vec<Operator> {
     let mut available =
         vec![Operator::BitFlip, Operator::ByteFlip, Operator::Arithmetic, Operator::Interesting];
@@ -179,8 +166,7 @@ fn apply(op: Operator, prefix: &mut Vec<u8>, context: Context<'_>, choices: &mut
             }
         }
         Operator::Havoc => {
-            // Between two and five in a row. One mutation reaches a neighbour; a handful reaches
-            // somewhere a chain of single steps would take a whole campaign to walk to.
+            // Two to five in a row, to reach further than one step.
             let rounds = 2 + choices.below(4);
             for _ in 0..rounds {
                 let available = available_operators(prefix, context)
@@ -204,12 +190,9 @@ fn extend(prefix: &mut Vec<u8>, choices: &mut Choices) {
 
 /// Replaces every byte one draw site consumed.
 ///
-/// The site is chosen among those the parent run actually used, so the mutation lands on decisions
-/// that happened rather than on decisions that might have.
+/// The site is chosen among those the parent run used.
 fn burst(prefix: &mut [u8], journal: &Journal, choices: &mut Choices) {
-    // Grouped by the code the journal stored rather than by a decoded name: a record written by a
-    // newer build can name a site this one has no case for, and a mutation aimed at every draw
-    // that shares a code is right whether or not this build knows what to call it.
+    // Grouped by stored code, so sites unknown to this build still work.
     let mut sites: Vec<u16> = journal.records().iter().map(|r| r.site).collect();
     sites.sort_unstable();
     sites.dedup();
@@ -239,9 +222,7 @@ mod tests {
         Choices::new(Seed(n))
     }
 
-    /// The property the whole crate rests on: a mutation may overwrite and may append, and may
-    /// never move a byte that was already there. If it could, one mutation would shift every later
-    /// draw and the search would be perturbing runs wholesale instead of one decision at a time.
+    /// A mutation overwrites or appends and never moves an existing byte.
     #[test]
     fn no_operator_moves_a_byte_that_was_already_there() {
         for seed in 0..200u64 {
@@ -268,8 +249,7 @@ mod tests {
         }
     }
 
-    /// A mutation has to change something. One that returns the input unchanged costs a whole run
-    /// to learn nothing.
+    /// A mutation almost always changes the prefix.
     #[test]
     fn a_mutation_changes_the_input() {
         let mut unchanged = 0;
@@ -282,13 +262,11 @@ mod tests {
                 unchanged += 1;
             }
         }
-        // Not zero: a splice can copy bytes that were already equal, and an arithmetic step can
-        // land back where it started. Rare is the requirement; never is not achievable without
-        // making the operators dishonest about what they do.
+        // Not zero: a splice can copy equal bytes, and a step can land where it started.
         assert!(unchanged < 20, "{unchanged} of 200 mutations changed nothing");
     }
 
-    /// Same entry, same seed, same mutation — or a campaign cannot be repeated.
+    /// One entry and one seed give one mutation.
     #[test]
     fn one_seed_is_one_mutation() {
         let original: Vec<u8> = (0..96).map(|i| (i * 3 % 249) as u8).collect();

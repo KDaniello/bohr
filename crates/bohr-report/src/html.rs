@@ -1,13 +1,10 @@
 //! The page, written top to bottom in the order somebody reads it.
 //!
-//! The audience decides every choice here: a maintainer who has never used this tool, who was sent
-//! a file, and who wants to know what went wrong and what to do next. So the verdict is first, the
-//! command that reproduces it is second, and the machinery that produced both is further down than
-//! its authors would like.
+//! Written for a maintainer new to the tool: the verdict first, the reproduction command second,
+//! the machinery below.
 //!
-//! One file, no framework, no build step, nothing fetched. What that costs is written out in
-//! `docs/ARCHITECTURE.md` §5.13; what it buys is a report that opens from a bug tracker in ten
-//! years' time.
+//! One file, no framework, no build step, nothing fetched, so it opens from a bug tracker years
+//! later. See `docs/ARCHITECTURE.md` §5.13.
 
 use std::fmt::Write as _;
 
@@ -15,14 +12,13 @@ use bohr_trace::{Event, EventKind};
 
 use crate::{describe, escape, model::RunModel, window::Window};
 
-/// The stylesheet and the behaviour, included as written rather than generated.
+/// The stylesheet and the behaviour, included as written.
 const STYLE: &str = include_str!("../assets/report.css");
 const BEHAVIOUR: &str = include_str!("../assets/report.js");
 
 /// Events shown before the point of violation in the card that explains it.
 ///
-/// Enough to be the story and few enough to be read: what a reader wants is the handful of steps
-/// that led somewhere, not the run again in miniature.
+/// A handful of steps, enough to tell the story.
 const LEADING_UP: usize = 10;
 
 /// Renders the whole page.
@@ -86,8 +82,7 @@ pub(crate) fn render_with(
 
 /// Above everything, and impossible to skip.
 ///
-/// A run whose determinism was not guaranteed makes every number below it worth less than it
-/// looks, so it is said before any of them rather than in a table halfway down.
+/// Degraded determinism weakens every number below, so it is stated first.
 fn degraded_strip(model: &RunModel, page: &mut String) {
     let mut reasons: Vec<String> = model.manifest.determinism.reasons.clone();
     if model.host.as_ref().is_some_and(|host| !host.traps_rdrand) {
@@ -111,8 +106,7 @@ fn degraded_strip(model: &RunModel, page: &mut String) {
 
 /// One sentence, in the words somebody who has never used this tool would use.
 fn verdict(model: &RunModel, page: &mut String) {
-    // The heading carries the verdict, so it is opened and closed by the arm that knows it: a
-    // heading closed before anything was said leaves the page untitled.
+    // Each arm writes the whole heading, since it carries the verdict.
     match (&model.manifest.outcome, &model.violation) {
         (bohr_trace::Outcome::Clean, _) => {
             let _ = writeln!(
@@ -137,8 +131,7 @@ fn verdict(model: &RunModel, page: &mut String) {
             );
         }
         (outcome, None) => {
-            // The verdict every other view prints, so a page and a terminal never word one finding
-            // two ways.
+            // The same verdict every other view prints.
             let verdict = crate::narrate::verdict(outcome);
             let _ = writeln!(
                 page,
@@ -169,12 +162,8 @@ fn chain_timeline(model: &RunModel, lanes: &[crate::chain::Lane], page: &mut Str
 
 /// The line a maintainer runs, above the fold and copyable.
 fn reproduction(model: &RunModel, bundle_name: Option<&str>, page: &mut String) {
-    // The bundle this page was made from, where the caller knows what it is called. Built out of
-    // the run identifier instead, the command named a file nothing writes: findings are saved as
-    // `finding-…` and a saved run takes whatever name its caller chose, so the one line the page
-    // exists to be copied answered "cannot read". Without a name, it asks for the bundle.
-    // Escaped either way: the placeholder is angle-bracketed, which a browser reads as a tag if
-    // it is written straight into the document.
+    // The bundle's real name where the caller knows it, else a placeholder. Escaped either way,
+    // since the placeholder has angle brackets.
     let bundle = escape::text(bundle_name.unwrap_or("<bundle>"));
     let _ = write!(
         page,
@@ -353,9 +342,7 @@ fn timeline(
                 title = escape::attr(said_about(event).trim())
             );
         }
-        // The gap after the last shown event. `gaps()` returns one entry more than there are
-        // slots precisely so the end of the run is counted, and the loop above reads one fewer
-        // -- so a window centred on an early failure read as a run that stopped at the last chip.
+        // The gap after the last shown event: `gaps()` has one more entry than there are slots.
         if let Some(missing) = gaps.last().copied().filter(|missing| *missing > 0) {
             let _ = write!(page, "<span class=\"gap\">{missing} more</span>");
         }
@@ -558,8 +545,7 @@ fn notes(model: &RunModel, page: &mut String) {
     page.push_str("</div>\n");
 }
 
-/// No timestamp, deliberately: the same bundle rendered twice is the same bytes, which is what
-/// lets two reports be compared and what keeps a stored example from changing under its test.
+/// No timestamp, so one bundle always renders to the same bytes.
 fn footer(model: &RunModel, sidecar: Option<&str>, window: &Window, page: &mut String) {
     let _ = write!(
         page,
@@ -582,7 +568,7 @@ fn footer(model: &RunModel, sidecar: Option<&str>, window: &Window, page: &mut S
     page.push_str("</footer>\n");
 }
 
-/// The events the page can show details for, as data rather than as markup.
+/// The events the page can show details for, as data.
 fn events_data(model: &RunModel, window: &Window, page: &mut String) {
     let by_event = model.draws_by_event();
     let mut json = String::from("[");

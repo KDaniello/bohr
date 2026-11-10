@@ -1,14 +1,13 @@
-//! A deliberate defect: coverage that does not come from the guest alone.
+//! A deliberate defect: coverage mixed with state from outside the guest.
 //!
-//! Present so the test that is supposed to catch it can be shown to catch it. Reachable only
-//! through the feature that names it, which no ordinary build enables. See `docs/TESTING.md` §7.4.
+//! It exists to show that the test meant to catch it does. Only the feature of the same name
+//! enables it. See `docs/TESTING.md` §7.4.
 
-/// Mixes a count of how often this process has recorded an edge into the edge itself.
+/// Mixes a per-process counter into each recorded edge.
 ///
-/// The shape of the mistake it stands for: coverage gathered from anything but the guest's own
-/// execution — a timestamp, a counter, an address the loader chose. The map then differs between
-/// two runs of one seed, which makes every corpus decision built on it unrepeatable, and a search
-/// whose corpus is unrepeatable produces findings nobody else can reach.
+/// Stands for coverage taken from anything but the guest's execution: a timestamp, a counter, a
+/// loader address. The map then differs between two runs of one seed, and the campaign stops
+/// being repeatable.
 #[cfg(feature = "chaos-coverage-ambient")]
 pub(crate) fn drift() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};

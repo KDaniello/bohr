@@ -1,9 +1,8 @@
 //! The event log, the trace digest and the `.bohr` scenario bundle.
 //!
-//! The digest is the operational definition of "the same run": a byte-identical projection of the
-//! event stream, with host-derived values excluded so that one seed produces one digest on any
-//! machine. The bundle is what that run is stored and exchanged as — self-contained, and refusing
-//! to be replayed under components that did not produce it.
+//! The digest defines "the same run": a projection of the event stream without host-derived values,
+//! so one seed gives one digest on any machine. The bundle stores a run and refuses replay under
+//! other components.
 //!
 //! Formats are normative in `docs/API.md` §4 and frozen by [`BUNDLE_FORMAT`].
 //!
@@ -95,8 +94,7 @@ pub enum TraceError {
 
     /// `BOHR-4002` — a section is present but cannot be read back.
     ///
-    /// Damage to a packed payload stops it decoding before its hash can be checked, so the
-    /// promise that a damaged bundle names its bad part is kept here rather than there.
+    /// A damaged packed payload fails to decode before its hash is checked.
     #[error("BOHR-4002: section {id} cannot be read: {reason}")]
     SectionUnreadable {
         /// Which section.
@@ -116,8 +114,7 @@ pub enum TraceError {
 
     /// `BOHR-4005` — the tape ABI is not the one this build interprets.
     ///
-    /// Refused rather than replayed: a run derived from differently interpreted bytes is a
-    /// different run, and one that would look self-consistent.
+    /// Differently interpreted bytes are a different run.
     #[error("BOHR-4005: bundle tape ABI {found} is not this build's ({supported})")]
     TapeAbiMismatch {
         /// ABI recorded in the manifest.
@@ -168,8 +165,7 @@ pub enum TraceError {
 
     /// `BOHR-4002` — the stream table disagrees with the manifest about how many runs are here.
     ///
-    /// Distinct from [`Self::MultipleExecutions`], which is a bundle that genuinely holds several
-    /// and a reader that handles one. This is damage: the two halves of one file do not agree.
+    /// Damage, unlike [`Self::MultipleExecutions`].
     #[error("BOHR-4002: bundle declares {declared} executions and carries {found} streams")]
     FrameCountMismatch {
         /// How many the manifest says there are.
@@ -180,9 +176,7 @@ pub enum TraceError {
 
     /// `BOHR-4008` — a redaction could not prove it removed what it was asked to.
     ///
-    /// Refused rather than written. A redacted bundle is handed to somebody outside the room, and
-    /// one that passed through what it did not understand would be redacting whatever it happened
-    /// to recognise — which is the same as not redacting, except that it says otherwise.
+    /// Nothing is written, since a redacted bundle leaves the room.
     #[error("BOHR-4008: redaction cannot be proven complete: {reason}")]
     RedactionIncomplete {
         /// What could not be removed, or could not be understood well enough to remove.

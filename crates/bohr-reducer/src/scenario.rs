@@ -4,11 +4,8 @@ use bohr_types::Seed;
 
 /// Everything a run of this scenario needs that a reduction is allowed to change.
 ///
-/// The seed is not one of them, and neither is the prefix's length. The tape reads its extension
-/// keystream at an offset counted from the end of the prefix, so a prefix of a different length is
-/// a different tape rather than an edited one — every byte past the old end would change at once,
-/// and a reduction that did that would be comparing two unrelated runs. So the prefix is fixed at
-/// the start and only ever overwritten in place.
+/// The seed and the prefix length are fixed: the keystream is read at an offset past the prefix,
+/// so another length is another tape. The prefix is only overwritten in place.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Scenario {
     seed: Seed,
@@ -51,9 +48,7 @@ impl Scenario {
     ///
     /// # Panics
     ///
-    /// Panics if an edit falls outside the prefix. Every edit is resolved from a journal the run
-    /// itself produced against the prefix that produced it, so one that does not fit is a defect
-    /// in the resolution rather than a scenario to try.
+    /// Panics if an edit falls outside the prefix, which is a defect in edit resolution.
     #[must_use]
     pub fn with_bytes(&self, edits: &[Edit]) -> Self {
         let mut prefix = self.prefix.clone();
@@ -69,10 +64,7 @@ impl Scenario {
 
 /// Bytes to write over one decision.
 ///
-/// Never an insertion and never a removal: the draw ABI promises that what a draw consumes is a
-/// function of the request and not of the value, so overwriting one draw's bytes changes exactly
-/// that decision and leaves every later one reading from the same offset. Moving a byte would
-/// break the property from the other side.
+/// Always an overwrite, so later draws keep their offsets.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Edit {
     /// Offset into the prefix.
@@ -83,9 +75,7 @@ pub struct Edit {
 
 /// How large a run is, in the two units a reduction reports.
 ///
-/// Ordered by events first because that is the number a scenario is judged small by, and by draws
-/// second because two runs of one length are not equally simple — the one that made fewer
-/// decisions is the one with less left to explain.
+/// Ordered by events, then by draws: of two equal-length runs, fewer decisions is simpler.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Size {
     /// Events recorded.
@@ -116,8 +106,7 @@ mod tests {
         let _ = scenario().with_bytes(&[Edit { at: 7, bytes: vec![0, 0] }]);
     }
 
-    /// Events decide, and draws break the tie. A scenario that records as much but decides less is
-    /// the better one to hand somebody.
+    /// Events decide, and draws break the tie.
     #[test]
     fn fewer_events_wins_and_fewer_draws_breaks_the_tie() {
         let small = Size { events: 18, draws: 400 };

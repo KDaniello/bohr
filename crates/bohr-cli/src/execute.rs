@@ -18,8 +18,7 @@ use crate::CliError;
 pub(crate) enum Target {
     /// A guest built into the binary, executed in process, and the name it answers to.
     ///
-    /// Named as well as carried, because a bundle has to say which guest to replay: a program on
-    /// disk is identified by its path, and a built-in one has none.
+    /// The name identifies the guest in a bundle, since a built-in guest has no path.
     Demo(String, NullProgram),
     /// Programs on disk — one per node — executed under interception.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -28,10 +27,8 @@ pub(crate) enum Target {
 
 /// Which worlds a run is carried out against.
 ///
-/// Not a flag on any command a person types: the two answer different questions and one of them
-/// invents answers. What keeps them apart for a user is that `bohr survey` is its own subcommand,
-/// and what keeps them apart afterwards is that a surveying world has an identity of its own, so
-/// a bundle claiming one is refused before it replays.
+/// Chosen by subcommand, since the surveying world invents answers. Its world has its own
+/// identity, so a bundle that claims one is refused before replay.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Worlds {
     /// A call nothing models ends the run by name, which is §5.7.
@@ -103,28 +100,25 @@ pub(crate) struct Completed {
     pub(crate) state_manifest: Option<String>,
     /// What the guest executed, where the backend could observe it.
     ///
-    /// Empty for a guest built without the coverage runtime, which is a run searched without
-    /// coverage rather than a run that covered nothing — the two are opposite facts and the
-    /// section is absent for the first so that nobody has to tell them apart by reading zeroes.
+    /// Empty for a guest built without the coverage runtime; its bundle then has no coverage
+    /// section, so it is never confused with a run that covered nothing.
     pub(crate) coverage: Option<CoverageMap>,
     /// How many edges the guest was instrumented with, as the guest itself said.
     ///
-    /// Beside the map rather than inside it, because it is a fact about the program and the map is
-    /// a fact about one run of it. What it is for is the comparison: a guest with more edges than
-    /// the map has counters is a guest whose paths the search cannot fully tell apart.
+    /// Kept beside the map: it describes the program, the map one run. A guest with more edges
+    /// than counters has paths the search cannot fully tell apart.
     pub(crate) coverage_edges: u64,
 }
 
 /// Where a guest is told to write its records.
 ///
-/// A path inside the guest's own virtual filesystem: nothing reaches the host, and the world
-/// recognises a descriptor opened on it as the record channel rather than as a file.
+/// A path in the guest's virtual filesystem; the world treats a descriptor opened on it as the
+/// record channel.
 pub(crate) const SDK_RECORD_PATH: &str = "/bohr/records.jsonl";
 
 /// Counts a run leaves, as the trace writer counted them while it recorded each event.
 ///
-/// Counted by the writer rather than read back from the log: the writer sees exactly the events
-/// the log holds, and reading the log again cost more than the run's own bookkeeping.
+/// Counted by the writer, which sees exactly the logged events, so the log is never read back.
 fn count_from_stats(stats: &bohr_trace::TraceStats, report: &RunReport) -> (Counters, Option<u64>) {
     let counters = Counters {
         events: report.events,
@@ -134,9 +128,7 @@ fn count_from_stats(stats: &bohr_trace::TraceStats, report: &RunReport) -> (Coun
         tasks: stats.tasks.len() as u64,
         nodes: stats.nodes.len() as u64,
     };
-    // A broken promise names its own event; anything else points at the last thing the run
-    // recorded, which for a crash or a hang is where the outcome was reached. The two are
-    // different questions and the run answers the first one itself.
+    // A broken promise names its own event; any other outcome points at the last recorded event.
     let event = match (&report.outcome, report.violation_event) {
         (bohr_trace::Outcome::Clean, _) => None,
         (_, Some(at)) => Some(at.get()),
@@ -147,8 +139,7 @@ fn count_from_stats(stats: &bohr_trace::TraceStats, report: &RunReport) -> (Coun
 
 /// Whether the guest's own output is delivered to this process's standard output.
 ///
-/// A repetition beyond the first is a check, not an execution the user asked to see, so only one
-/// run of a seed ever prints. What the guest wrote is compared through the trace, not the terminal.
+/// Only the first run of a seed prints; repetitions compare the guest's output through the trace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Output {
     /// Deliver the guest's bytes.
@@ -159,9 +150,8 @@ pub(crate) enum Output {
 
 /// Whether the event log is kept or only digested.
 ///
-/// A repetition that agrees with the first is never read, and a thousand of them is a gigabyte
-/// written and thrown away. The digest is maintained either way, so a run that disagrees is still
-/// noticed — and then repeated with the log, which is the only time it is needed.
+/// A repetition that agrees is never read, so it keeps only the digest. A repetition that disagrees
+/// is run again with the log.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Record {
     /// Keep every event.
@@ -172,8 +162,7 @@ pub(crate) enum Record {
 
 /// How execution is interleaved, by the name the command line accepts.
 ///
-/// A policy that does not exist is refused before a run starts rather than substituted, so a report
-/// never names a policy that did not run.
+/// An unknown policy is refused before the run, so a report never names a policy that did not run.
 pub(crate) fn policy_named(name: &str) -> Option<Box<dyn SchedulePolicy>> {
     match name {
         "pct" => Some(Box::new(PctPolicy::default())),
@@ -183,13 +172,11 @@ pub(crate) fn policy_named(name: &str) -> Option<Box<dyn SchedulePolicy>> {
     }
 }
 
-/// Everything one execution is given, named rather than positional.
+/// Everything one execution is given, as named fields.
 ///
-/// One value because the same eight things travel together through every entry point — an ordinary
-/// run, a survey, a hand-over, one implementation of a comparison — and each of those would
-/// otherwise repeat the whole list. Named because a signature of eight positional parameters, four
-/// of which are small enumerations, is a signature two arguments can be swapped in without the
-/// compiler having anything to say about it (`docs/ARCHITECTURE.md` §8, rule 5).
+/// The same eight values go to every entry point: a run, a survey, a hand-over, one
+/// implementation of a comparison. Named fields stop two of them being swapped unnoticed
+/// (`docs/ARCHITECTURE.md` §8, rule 5).
 #[derive(Clone, Copy)]
 pub(crate) struct Execution<'a> {
     /// What is run, and therefore how it is caught.
@@ -217,9 +204,7 @@ pub(crate) fn once(exec: Execution<'_>) -> Result<Completed, CliError> {
 
 /// Runs `target` up to the break its configuration names, then gives the guests to a debugger.
 ///
-/// Separate from the ordinary run because what happens at the end is the opposite of it: nothing
-/// is digested, nothing is compared and nothing is written. The run is a way of getting the world
-/// into a particular state, and the state is the deliverable.
+/// Nothing is digested, compared or written: the run only brings the world to the break state.
 ///
 /// # Errors
 ///
@@ -230,8 +215,7 @@ pub(crate) fn once(exec: Execution<'_>) -> Result<Completed, CliError> {
 )]
 pub(crate) fn hand_over_at(exec: Execution<'_>) -> Result<(), CliError> {
     match exec.target {
-        // Refused earlier, where it can be said before a replay is paid for; kept because the
-        // arm has to exist and an unreachable one that lies is worse than one that repeats.
+        // Already refused earlier, before the replay; the arm repeats the refusal.
         Target::Demo(..) => Err(CliError::Internal(crate::handover::NO_PROCESS.to_owned())),
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -251,8 +235,7 @@ pub(crate) fn hand_over_at(exec: Execution<'_>) -> Result<(), CliError> {
             )?;
             let asked_for = exec.config.break_at.map(bohr_types::EventId::get).unwrap_or_default();
             let targets = backend.hand_over().map_err(|e| CliError::Internal(e.to_string()))?;
-            // While the backend is still alive: dropping it is what ends the guests, and it is
-            // the only thing that knows they exist once they have been released.
+            // While the backend lives: dropping it ends the released guests.
             crate::handover::conduct(&targets, completed.report.events, asked_for);
             Ok(())
         }
@@ -266,10 +249,8 @@ pub(crate) fn run_with(exec: Execution<'_>) -> Result<Completed, CliError> {
 
 /// Runs `target` once against worlds that answer what they cannot model instead of refusing it.
 ///
-/// Everything a survey learns it learns from answers that were invented, so what this produces is
-/// a report and never a verdict. The worlds say so themselves: their identity differs, and a
-/// bundle claiming one is refused before it replays. The log is kept only where the caller asks,
-/// as `bohr init` does to learn which calls a program makes; no survey writes a bundle.
+/// A survey runs on invented answers, so it yields a report, never a verdict, and never a bundle.
+/// The log is kept only on request, as `bohr init` asks to learn which calls a program makes.
 pub(crate) fn survey_with(exec: Execution<'_>) -> Result<Completed, CliError> {
     run_against(exec, Worlds::Surveying)
 }
@@ -313,8 +294,7 @@ fn drive(
     let Execution {
         tape, config, output, policy: policy_name, record, scenario, config_toml, ..
     } = exec;
-    // Two slots, one world: the scenario decides which model runs, and the borrow lives in
-    // whichever slot was filled.
+    // Two slots for one world; the scenario decides which model fills its slot.
     let mut minimal = bohr_world::MinimalWorld::new();
     let mut cluster = bohr_world::DistributedWorld::new();
     let world: &mut dyn bohr_kernel::WorldModel = match scenario {
@@ -325,8 +305,7 @@ fn drive(
             if worlds == Worlds::Surveying {
                 minimal = minimal.surveying();
             }
-            // What the guest answers when it asks where it is. Taken from the specs rather than
-            // from the host: a replay is handed the same argument list, so the answer repeats.
+            // The guest's own path, from the specs, so a replay repeats it.
             if let Some(program) = specs.first().and_then(|spec| spec.argv.first()) {
                 minimal = minimal.with_program(program.clone());
             }
@@ -378,8 +357,7 @@ fn drive(
         .ok_or_else(|| CliError::Internal(format!("no scheduler named {policy_name}")))?;
     let mut oracle =
         bohr_world::panel(scenario.map(bohr_world::LoadedConfig::watching).unwrap_or_default());
-    // A run nobody will read is digested and not encoded: the digest is taken from the events'
-    // fields, so it is the same either way.
+    // An unread run is only digested; the digest comes from the event fields either way.
     let mut sink = match record {
         Record::Log => TraceWriter::new(LogSink::new(record)),
         Record::DigestOnly => TraceWriter::digest_only(LogSink::new(record)),
@@ -425,8 +403,7 @@ fn drive(
                 .filter_map(|spec| {
                     let value = match scenario {
                         Some(_) => cluster.project(spec),
-                        // No scenario is one node, and a source naming another was refused at
-                        // load, so there is nothing here to resolve.
+                        // No scenario means one node; other node names were refused at load.
                         None => minimal.project(&spec.source),
                     }?;
                     Some((spec.label.clone(), value))
@@ -445,8 +422,7 @@ fn drive(
     let log = sink.into_bytes();
     let (counters, outcome_event) = count_from_stats(&stats, &report);
     let capabilities = backend.capabilities();
-    // Read now that the run is over, which is the only moment it may be read: sampling while the
-    // guest was running would make what a search does next depend on when it looked.
+    // Read after the run, so the search never depends on when it sampled.
     let coverage = backend.coverage().filter(|map| !map.is_empty()).cloned();
     let coverage_edges = backend.coverage_edges();
 
@@ -492,8 +468,7 @@ fn drive(
 /// What every guest is shown, whatever the host runs.
 const PRESENTED_PAGE_SIZE: u32 = 4096;
 
-/// The kernel release the world model presents. Recorded here as well because a bundle is read
-/// without the world that wrote it.
+/// The kernel release the world model presents, recorded in bundles read without that world.
 const PRESENTED_KERNEL_RELEASE: &str = "5.15.0-bohr";
 
 /// Depth the default `pct` policy is built with.
@@ -504,15 +479,12 @@ const SWITCH_POINTS: &str = "syscall+futex";
 
 /// Fingerprints of the programs a run was started with.
 ///
-/// Only what the supervisor was asked to run: the objects a guest maps afterwards are known to
-/// the backend, not here, and recording a path without a hash would be worse than recording
-/// nothing at all.
+/// Only what the supervisor was asked to run; objects mapped later are known only to the backend.
 fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    // Kept for the life of the process: a campaign worker saves bundle after bundle of one guest,
-    // and reading and hashing the whole binary is a large share of a short run. Keyed by path,
-    // length and modification time, so a binary rebuilt in place is hashed again.
+    // Cached for the process: a worker saves many bundles of one guest, and hashing the binary is
+    // a large share of a short run. Keyed by path, length and mtime, so a rebuild is rehashed.
     type Known = std::collections::BTreeMap<(String, u64, Option<std::time::SystemTime>), String>;
     static KNOWN: std::sync::Mutex<Known> =
         std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -523,10 +495,9 @@ fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        // A built-in guest is part of this binary: it has a name and no file, and its
-        // fingerprint is the tool's own version, checked by the manifest rather than here.
-        // A program the tool supplies is read where it is executed from and named as the run knows
-        // it, so the record says which build of the probe a bundle was judged by.
+        // A built-in guest has a name and no file; the manifest's tool version covers it.
+        // A program is hashed where it runs from, so the record names the bytes that ran: the
+        // probe build that judged the bundle, or a file moved with `--binaries`.
         let file = spec.executable.as_ref().unwrap_or(path);
         let blake3 = match path.strip_prefix("builtin:") {
             Some(_) => String::new(),
@@ -549,7 +520,9 @@ fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
                 }
             }
         };
-        let role = match (blake3.is_empty(), spec.executable.is_some()) {
+        // The probe is known by its name inside the run: a replay with `--binaries` also runs
+        // the scenario's programs from a file other than `argv[0]`.
+        let role = match (blake3.is_empty(), path == crate::PROBE_ARGV0) {
             (true, _) => "builtin",
             (false, true) => "probe",
             (false, false) => "executable",
@@ -627,8 +600,7 @@ impl std::fmt::Display for Divergence {
 /// Runs `target` `times` times under one seed and checks every run agrees; the first run's output
 /// goes where `exec` says, every repetition's nowhere.
 ///
-/// Reports the first event where a run differs rather than that the digests differ: the difference
-/// is the whole diagnosis, and "digests differ" leaves the reader with nowhere to go.
+/// Reports the first differing event, which is more useful than "digests differ".
 pub(crate) fn repeat(
     exec: Execution<'_>,
     times: usize,
@@ -637,21 +609,19 @@ pub(crate) fn repeat(
     if times <= 1 {
         return Ok(Ok(first));
     }
-    // Decoded only where a repetition can disagree with it: one run has nothing to compare, and
-    // reading its whole log back costs a long run as much as recording it did.
+    // Decoded only when there are repetitions to compare; decoding a long log is expensive.
     let reference: Vec<Event> =
         read_events(&first.log).map_err(|e| CliError::Internal(e.to_string()))?;
 
-    // Every repetition beyond the first is a check rather than an execution anybody asked to see.
+    // Repetitions are checks; their output is discarded.
     let quiet = Execution { output: Output::Discard, ..exec };
     for attempt in 2..=times {
         let again = run_with(Execution { record: Record::DigestOnly, ..quiet })?;
         if again.report.digest == first.report.digest {
             continue;
         }
-        // The run that disagreed was not recorded, so it is repeated for its log. A repetition of a
-        // repetition that then agrees would mean the divergence is not in the tape at all, and the
-        // comparison below reports that as an empty difference rather than inventing one.
+        // The disagreeing run had no log, so it runs again with one. If that run agrees, the
+        // divergence is not in the tape, and the comparison reports an empty difference.
         let again = once(quiet)?;
         let actual = read_events(&again.log).map_err(|e| CliError::Internal(e.to_string()))?;
         let index = (0..reference.len().max(actual.len()))
@@ -670,11 +640,8 @@ pub(crate) fn repeat(
 
 /// How many syscalls a run intercepted, and which numbers dominated.
 ///
-/// Interception is what a run pays for, so this is the first thing to look at when one is slower
-/// than it was: a jump here is a syscall that moved from admitted to traced, which is a change in
-/// the table rather than in the machine.
-///
-/// Taken from what the trace writer counted, so the log is not read back to answer it.
+/// The first place to look when a run gets slower: a jump usually means a syscall moved from
+/// admitted to traced. Taken from the trace writer's counts.
 pub(crate) fn syscall_profile(
     stats: &bohr_trace::TraceStats,
     take: usize,
@@ -694,8 +661,7 @@ pub(crate) fn syscall_profile(
 
 /// The last diagnostics a run recorded, most recent last.
 ///
-/// A run that ended badly says what went wrong in its outcome; these say what the supervisor
-/// noticed on the way there, which is usually where the answer is.
+/// What the supervisor noticed on the way to the outcome, which usually explains it.
 pub(crate) fn last_diagnostics(stats: &bohr_trace::TraceStats, take: usize) -> Vec<String> {
     let mut seen: Vec<String> =
         stats.diagnostics.iter().map(|(code, message)| format!("{code}: {message}")).collect();
@@ -708,9 +674,8 @@ pub(crate) fn last_diagnostics(stats: &bohr_trace::TraceStats, take: usize) -> V
 
 /// Serialises a completed run as a scenario bundle.
 ///
-/// Every section a replay needs is written, including the ones that only ever say "nothing here":
-/// an absent `Binaries` and an empty one mean different things, and a replay that guessed which it
-/// was looking at would skip a fingerprint check without saying so.
+/// Every section a replay needs is written, empty ones included: an absent `Binaries` section and
+/// an empty one mean different things to a replay.
 pub(crate) fn to_bundle(
     completed: &Completed,
     tape: &Tape,
@@ -754,13 +719,11 @@ pub(crate) fn to_bundle(
     if !completed.sdk_records.is_empty() {
         writer.section(SectionId::SdkRecords, completed.sdk_records.clone());
     }
-    // The list and never the content: what a bundle owes a reader is which state it needs, and a
-    // real one is measured in gigabytes.
+    // The file list only; real state runs to gigabytes.
     if let Some(manifest) = &completed.state_manifest {
         writer.section(SectionId::StateManifest, manifest.clone().into_bytes());
     }
-    // Present only where there was something to record. A section of sixty-four kilobytes of
-    // zeroes in every bundle from an uninstrumented guest would cost more than it says.
+    // Only when something was recorded; an uninstrumented guest would add 64 KB of zeroes.
     if let Some(map) = &completed.coverage {
         writer.section(SectionId::Coverage, map.as_bytes().to_vec());
     }
@@ -769,10 +732,8 @@ pub(crate) fn to_bundle(
 
 /// One tape, several implementations, and what a group oracle made of them.
 ///
-/// Sequential rather than interleaved, and that is the whole shape of the feature: the kernel does
-/// not change at all. Each implementation is run on its own against the same bytes, and what is
-/// compared afterwards is what each produced — never their event streams, which cannot match and
-/// were never meant to.
+/// The implementations run one after another on the same tape; the kernel is unchanged. What each
+/// produced is compared, never their event streams, which differ by nature.
 #[cfg_attr(
     not(all(target_os = "linux", target_arch = "x86_64")),
     allow(dead_code) // only a build with an interceptor has implementations to compare
@@ -809,9 +770,8 @@ pub(crate) fn compare(
     let mut names = Vec::new();
     for implementation in &differential.implementations {
         let target = implementation_target(program.clone(), scenario, implementation)?;
-        // The same tape, from offset zero, for each. What that shares is one source of adversity
-        // and not one schedule: two implementations make different calls in a different order, so
-        // every draw whose position depends on the guest lands somewhere else for each of them.
+        // The same tape from offset zero for each. Implementations make different calls, so their
+        // draws land differently.
         executions.push(run_with(Execution {
             target: &target,
             tape,

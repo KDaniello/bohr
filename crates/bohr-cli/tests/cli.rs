@@ -1,7 +1,6 @@
 //! The command line as a contract: what it prints, what it writes and what it returns.
 //!
-//! Exit codes are checked by running the binary rather than the library, because a pipeline
-//! branches on the process result and nothing else.
+//! Exit codes are checked on the binary, since a pipeline branches on the process result.
 
 use std::process::Command;
 
@@ -12,7 +11,7 @@ fn bohr() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bohr"))
 }
 
-/// Standard output exactly as it was written, since what a guest prints is not text.
+/// Standard output as raw bytes.
 fn guest_output(args: &[&str]) -> Vec<u8> {
     bohr().args(args).output().expect("the binary must be runnable").stdout
 }
@@ -54,16 +53,14 @@ fn the_same_seed_reports_the_same_digest_across_invocations() {
     assert_ne!(a, c, "a different seed must reach a different digest");
 }
 
-/// What a guest writes and what the tool says about the run travel on different streams, so a
-/// pipeline receives the guest's bytes and nothing else.
+/// The guest writes to stdout and the report goes to stderr.
 #[test]
 fn the_report_stays_clear_of_the_guests_own_output() {
     let args = ["selftest", "--repeat", "2", "--seed", "3", "--guest", "clock-and-random"];
     let (code, _, stderr) = run(&args);
     assert_eq!(code, 0, "{stderr}");
 
-    // The guest writes thirty-two bytes and nothing else; the report carries its name and never
-    // reaches the stream those bytes travel on.
+    // The guest writes exactly 32 bytes.
     let bytes = guest_output(&args);
     assert_eq!(bytes.len(), 32, "standard output belongs to the guest");
     assert!(stderr.contains("clock-and-random"), "the report must reach standard error");
@@ -73,8 +70,7 @@ fn the_report_stays_clear_of_the_guests_own_output() {
 
 #[test]
 fn a_bad_invocation_is_a_usage_error_not_a_finding() {
-    // Exit 2 rather than 1: a pipeline must be able to tell "the tool found a bug" from
-    // "the tool was called wrongly".
+    // Exit 2 for a usage error; 1 means a finding.
     let (code, _, stderr) = run(&["selftest", "--repeat", "0"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("BOHR-1002"), "the error must carry its code: {stderr}");
@@ -132,8 +128,7 @@ fn a_saved_bundle_is_self_describing_and_refuses_foreign_components() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An option the build cannot honour is refused by name. Accepting it and running something else
-/// would report a run under a policy that never executed.
+/// An option this build cannot honour is refused by name, with the alternatives.
 #[test]
 fn an_option_this_build_cannot_honour_is_refused() {
     let (code, _, stderr) = run(&["run", "--scheduler", "adversarial", "--", "./whatever"]);
@@ -142,8 +137,7 @@ fn an_option_this_build_cannot_honour_is_refused() {
     assert!(stderr.contains("pct"), "and what is available instead: {stderr}");
 }
 
-/// A stored tape and a seed are two answers to the same question, so naming both is refused rather
-/// than resolved by precedence.
+/// A seed and a tape together are refused.
 #[test]
 fn a_seed_and_a_tape_together_are_refused() {
     let (code, _, stderr) = run(&["run", "--seed", "1", "--tape", "t.tape", "--", "./whatever"]);
@@ -151,11 +145,9 @@ fn a_seed_and_a_tape_together_are_refused() {
     assert!(stderr.contains("BOHR-1004"), "the refusal must carry its code: {stderr}");
 }
 
-/// A null path argument is answered, not treated as memory the supervisor failed to read.
+/// A null path argument gets Linux's `errno`, which `glibc` branches its startup on.
 ///
-/// The guest asserts the answer itself, so a wrong `errno` is exit 2 rather than a passing run:
-/// what matters is that the number reaching the guest is the one Linux gives, since `glibc` reads
-/// it as a statement about the kernel and branches its whole startup on it.
+/// The guest checks the answer itself and exits 2 on a wrong one.
 #[test]
 fn a_null_path_is_answered_rather_than_ending_the_run() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -170,10 +162,8 @@ fn a_null_path_is_answered_rather_than_ending_the_run() {
 /// Symbolic links, duplicated descriptors, the oldest spelling of the clock, and taking a
 /// directory away.
 ///
-/// The guest judges every answer itself and returns a different number for each promise, so a
-/// model that invented one of them is a named failure rather than a run that passed. Measured
-/// against a real target: none of these were modelled, and `solana-test-validator` met them in
-/// this order before it reached its own storage.
+/// The guest checks each answer and exits with a distinct status per check. `solana-test-validator`
+/// uses all of these before it reaches its storage.
 #[test]
 fn names_and_descriptors_answer_the_way_the_kernel_does() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -185,12 +175,10 @@ fn names_and_descriptors_answer_the_way_the_kernel_does() {
     assert_eq!(code, 0, "the guest judged its own answers and said: {stderr}");
 }
 
-/// A process that ends while its other threads are alive is an ordinary run, not a broken tool.
+/// A process that exits with threads still running ends the run cleanly.
 ///
-/// The world declares the node gone on the call that ended it and takes the rest of its tasks off
-/// the books there; the backend then reports each thread's own exit. Reading those as exits for
-/// tasks nobody created ended the run with an internal error — on the shape every threaded
-/// program stops in.
+/// The world removes the node's tasks on the exiting call; the per-thread exits the backend
+/// reports afterwards are ignored.
 #[test]
 fn a_process_that_ends_with_threads_running_is_not_an_internal_error() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -203,13 +191,9 @@ fn a_process_that_ends_with_threads_running_is_not_an_internal_error() {
     assert!(!stderr.contains("BOHR-5001"), "no invariant may fail on this shape: {stderr}");
 }
 
-/// A name is taken from the directory the call named, not from wherever the program stands.
+/// An `*at` call resolves a relative name against its directory descriptor.
 ///
-/// The guest judges every answer and returns a different number for each, and one of its checks is
-/// that the file is *not* in the working directory. An `*at` call whose directory descriptor
-/// nothing read would put every relative name there and report success -- worse than a refusal,
-/// because what the guest believed it had written and what the world held would part with nothing
-/// reporting anything wrong.
+/// The guest checks each answer, including that the file is absent from the working directory.
 #[test]
 fn a_relative_name_is_taken_from_the_directory_that_was_named() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -221,14 +205,11 @@ fn a_relative_name_is_taken_from_the_directory_that_was_named() {
     assert_eq!(code, 0, "the guest judged its own answers and said: {stderr}");
 }
 
-/// The processor question is answered from this world's own profile, on a host that cannot trap it.
+/// `cpuid` is answered from the world's profile on a host that cannot trap it.
 ///
-/// The instruction is rewritten in a copy of the program, and the fault it raises is recognised by
-/// the byte at the fault address rather than by a table of offsets — which is what lets it work on
-/// the program itself, mapped by the kernel where nothing on this side knows where it landed.
-///
-/// The run must also stop calling itself degraded for a facility it no longer needs: a run whose
-/// guest asks and is answered is determined, whatever the host could not have done.
+/// The instruction is rewritten in a copy of the program, and the fault is recognised by the byte
+/// at the fault address, so it works wherever the kernel maps the binary. Such a run is not
+/// degraded.
 #[test]
 fn a_processor_question_is_answered_where_the_host_cannot_trap_it() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -1,8 +1,6 @@
 //! Reduction against a real run: forty thousand events, and what is left of them.
 //!
-//! Process-free and on any machine — the guests are scripted and the backend executes them in
-//! memory — so the number this produces is a fact about the reduction rather than about the host
-//! it was measured on.
+//! Scripted and in memory, so the result measures only the reduction.
 
 use bohr_kernel::RunConfig;
 use bohr_reducer::{
@@ -18,15 +16,13 @@ const ROUNDS: usize = 4600;
 
 /// Late enough that almost every round is answered, so what makes the run long is the waiting.
 ///
-/// The heal is written as a tick the run will never reach rather than as the largest one there is:
-/// a configuration file is TOML, whose integers stop at what fits in sixty-three bits.
+/// The heal tick is unreachable but fits TOML's 63-bit integers.
 const CUT_AT: u64 = 9_000_000_000;
 const KILL_AT: u64 = 9_100_000_000;
 
 /// The scenario as the configuration text a bundle would carry.
 ///
-/// Written here rather than derived from the fixture because reduction works on the file: what it
-/// removes is an entry somebody wrote, and the result has to be a file that same person could read.
+/// Written as text, since reduction edits the file.
 fn config_text() -> String {
     format!(
         "[cluster]\n\
@@ -84,9 +80,7 @@ fn carry_out(scenario: &Scenario) -> (Option<Violation>, Size, bohr_tape::Journa
 
 /// The scenario a reduction starts from: long, and going wrong for a reason that is in the file.
 fn baseline() -> (Scenario, Baseline, Judged) {
-    // Long enough to cover every draw the run makes, so a rewritten decision is one a mutation can
-    // reach. The explorer's bound on a corpus entry does not apply here and must not be borrowed:
-    // a run of this length draws well past it.
+    // Covers every draw the run makes; the explorer's prefix bound does not apply.
     let scenario = Scenario::new(Seed(1), vec![0u8; 128 * 1024], config_text());
     let (violation, size, journal, judged) = carry_out(&scenario);
     let baseline = Baseline {
@@ -97,7 +91,7 @@ fn baseline() -> (Scenario, Baseline, Judged) {
     (scenario, baseline, judged)
 }
 
-/// The measurement: how far a reduction gets, and what it spends getting there.
+/// How far a reduction gets and what it spends.
 #[test]
 fn a_forty_thousand_event_scenario_reduces_to_a_readable_one() {
     let (scenario, before, judged) = baseline();
@@ -138,8 +132,7 @@ fn a_forty_thousand_event_scenario_reduces_to_a_readable_one() {
     );
 }
 
-/// The other half of the contract, and the one a maintainer's afternoon depends on: the result
-/// still goes wrong the same way, every time it is run.
+/// The result goes wrong the same way every time.
 #[test]
 fn the_reduced_scenario_still_reproduces_what_it_started_from() {
     let (scenario, before, _) = baseline();
@@ -160,8 +153,7 @@ fn the_reduced_scenario_still_reproduces_what_it_started_from() {
     }
 }
 
-/// What the reduction actually removed, which is what a reader of the result sees. A scenario that
-/// still listed everything it started with would be smaller only in a number.
+/// The reduced file lists fewer entries.
 #[test]
 fn the_result_names_only_what_mattered() {
     let (scenario, before, _) = baseline();
@@ -175,9 +167,7 @@ fn the_result_names_only_what_mattered() {
     let kept: Vec<&str> = doc.entries().iter().map(|entry| entry.table.as_str()).collect();
     eprintln!("kept: {kept:?} · moments: {:?}", doc.moments());
     assert!(kept.len() <= 2, "the result still lists {kept:?}");
-    // Only the moments something happens at. A heal is written at a tick the run never reaches,
-    // and bringing that forward would undo the partition rather than shrink the scenario — so a
-    // reduction leaving it alone is a reduction doing the right thing.
+    // The unreachable heal stays; moving it forward would undo the partition.
     let fires_at: Vec<u64> = doc
         .moments()
         .iter()

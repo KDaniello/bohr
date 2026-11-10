@@ -133,8 +133,7 @@ impl DeterminismBackend for Scripted {
         Ok(Vec::new())
     }
 
-    /// Ends a task and reports nothing about it afterwards, as both real backends do: the task is
-    /// already forgotten and there is nobody left to tell.
+    /// Ends a task and reports nothing afterwards, as both real backends do.
     fn kill(&mut self, task: TaskId) -> Result<(), BackendError> {
         self.queues.remove(&task);
         if self.running == Some(task) {
@@ -283,8 +282,7 @@ fn run_scripts(scripts: Vec<Vec<Step>>, child: Vec<Step>, config: RunConfig) -> 
     Ran { result, backend, progress: watching.reports }
 }
 
-/// A node that is still running when another node acts on it, whatever order the schedule draws:
-/// one call and an exit can be over before the other node's first call.
+/// A node still running when another acts on it, in any schedule order.
 fn long_lived() -> Vec<Step> {
     let mut steps = vec![Step::Call(call::PLAIN); 20];
     steps.push(Step::Exit(0));
@@ -425,9 +423,8 @@ fn a_restarted_node_runs_its_program_again() {
     assert_eq!(ran.backend.spawns[&NodeId(1)], 2, "spawned once and again");
 }
 
-/// A killed task leaves the node's books at once: no backend reports its exit, so a record kept for
-/// that exit would count against the node for ever, and a restarted node that exited cleanly could
-/// never be restarted again.
+/// A killed task leaves the node's books at once, since no backend reports its exit, so a
+/// restarted node can be restarted again.
 #[test]
 fn a_restarted_node_that_exits_can_be_restarted_again() {
     let ran = run_scripts(

@@ -1,14 +1,13 @@
-//! The claim the whole product rests on, checked against real programs under real interception.
+//! Determinism, checked against real programs under real interception.
 //!
-//! These need a guest built from `testdata/guests` and a host that can trace it, so they are Linux
-//! only and skip themselves where the guest has not been built. Everything they assert is also
-//! asserted against scripted guests in `bohr-testkit`, which runs anywhere.
+//! Linux only; each test skips itself when its guest from `testdata/guests` is not built. The same
+//! claims are checked against scripted guests in `bohr-testkit`, which runs anywhere.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::{path::PathBuf, process::Command};
 
-/// Repetitions behind goal T1. One process, one seed, and every run required to agree.
+/// Repetitions behind goal T1: one process, one seed, every run agreeing.
 const REPEATS: &str = "1000";
 
 fn guest(name: &str) -> Option<String> {
@@ -39,13 +38,8 @@ fn repeat_1000() {
 
 /// A guest that replaces itself is intercepted as fully afterwards as before.
 ///
-/// The kernel builds a fresh auxiliary vector at every `execve`, so everything done to the first
-/// one at spawn is undone: the vDSO returns and `AT_RANDOM` is filled anew. That leaked twice over
-/// — the second program read the host's own clock, and its stack moved between runs, which is a
-/// divergence in the one thing this tool guarantees.
-///
-/// It survived every milestone because nothing ever ran a guest that execs. The gate compares runs
-/// of one program, and the program that shows this is two.
+/// Every `execve` gets a fresh auxiliary vector, with the vDSO back and a new `AT_RANDOM`; both are
+/// suppressed again, or the second program reads the host clock and its stack moves.
 #[test]
 fn a_guest_that_replaces_itself_still_repeats() {
     let (Some(launcher), Some(target)) = (guest("becomes_another"), guest("clock_and_random"))
@@ -57,8 +51,7 @@ fn a_guest_that_replaces_itself_still_repeats() {
     assert_eq!(code, 0, "{report}");
     assert!(!report.contains("DIVERGED"), "{report}");
 
-    // The clock the second program read, which is the world's and starts at nothing. A run that
-    // reached the host's would print a date instead, and would still repeat within one invocation.
+    // The world's clock starts at zero; the host's would print a date.
     let line = String::from_utf8_lossy(&printed);
     assert!(
         line.starts_with("0000000000000000."),
@@ -86,8 +79,7 @@ fn urandom_stable() {
     assert_ne!(bytes, different, "a different seed must reach different bytes");
 }
 
-/// A guest reading the processor's counter directly is answered from logical time like any other
-/// clock, so reaching past the kernel gains it nothing.
+/// `rdtsc` is answered from logical time like any other clock.
 #[test]
 fn timestamp_counter_reproduces() {
     let Some(path) = guest("rdtsc_and_clock") else {
@@ -100,8 +92,7 @@ fn timestamp_counter_reproduces() {
     assert_eq!(bytes, again, "the counter must read the same on every run");
 }
 
-/// A syscall the world does not model stops the run by name rather than reaching the host, which is
-/// the difference between a tool that is wrong and a tool that says so.
+/// An unmodelled syscall stops the run by name and never reaches the host.
 #[test]
 fn an_unmodelled_syscall_stops_the_run() {
     let Some(path) = guest("unmodelled_syscall") else {
@@ -112,29 +103,23 @@ fn an_unmodelled_syscall_stops_the_run() {
     assert!(report.contains("BOHR-2001"), "the refusal must carry its code: {report}");
 }
 
-/// A ring is refused under its own code, not as one more number the table has no row for.
+/// io_uring has its own code, `BOHR-2004`.
 ///
-/// The distinction is the whole point of having a second code: `BOHR-2001` sends a reader looking
-/// for a missing table entry, and there is no entry to add — an asynchronous ring submits work
-/// without a syscall per operation, so a guest holding one is unobserved rather than partly
-/// modelled.
+/// A ring submits work without a syscall per operation, so there is no table row to add, which is
+/// what `BOHR-2001` would suggest.
 #[test]
 fn io_uring_is_declined_at_the_door_and_refused_past_it() {
     let Some(path) = guest("uses_io_uring") else {
         return;
     };
-    // Opening a ring is answered `ENOSYS`, which the guest checks for itself: a kernel built
-    // without the option says exactly that, and the fallback every such program keeps is a path
-    // this model does answer. No ring means nothing submits work past the interception.
+    // Setup is answered `ENOSYS`, as on a kernel without io_uring, and the guest falls back.
     let (code, _, report) = bohr(&["run", "--seed", "1", "--", &path]);
     assert_eq!(code, 0, "opening a ring must not end the run: {report}");
 
     let Some(path) = guest("enters_io_uring") else {
         return;
     };
-    // Entering one still ends the run, under the code that means "io_uring" rather than the one
-    // that means "some number nobody has got to yet": the two send a reader looking in different
-    // places.
+    // Entering a ring ends the run under `BOHR-2004`.
     let (code, _, report) = bohr(&["run", "--seed", "1", "--", &path]);
     assert_eq!(code, 3, "{report}");
     assert!(report.contains("BOHR-2004"), "the refusal must carry its own code: {report}");
@@ -165,8 +150,7 @@ fn threads_reproduce_and_follow_the_seed() {
 
 /// Goal C2: a guest that waits a day finishes in the time its own code takes.
 ///
-/// The host clock is read here, which nothing in the engine may do. This is the one thing it is
-/// legitimate for: the claim under test is about real time, and no logical clock can measure it.
+/// The claim is about real time, so this test reads the host clock.
 #[allow(clippy::disallowed_methods)]
 #[test]
 fn a_day_of_sleep_costs_no_real_time() {
@@ -177,8 +161,7 @@ fn a_day_of_sleep_costs_no_real_time() {
     let (code, elapsed, report) = bohr(&["run", "--seed", "1", "--", &path]);
     assert_eq!(code, 0, "{report}");
 
-    // A day, as this node's clock counts it. The clock runs at its own rate, so a day of world time
-    // is a day give or take the drift it accumulated: at 200 parts per million that is 17 seconds.
+    // A day give or take the node's drift: 17 seconds at 200 ppm.
     let seen: i64 = String::from_utf8_lossy(&elapsed).trim().parse().expect("a count of seconds");
     let day = 24 * 60 * 60;
     assert!(
@@ -194,8 +177,7 @@ fn a_day_of_sleep_costs_no_real_time() {
 
 /// Goal C3: a known race is found by searching seeds, well inside the budget.
 ///
-/// The tool is told nothing about the defect: the guest checks itself and exits non-zero, and a
-/// non-zero exit is what the oracle turns into a finding.
+/// The tool knows nothing of the defect; the guest exits non-zero and that is the finding.
 #[test]
 fn a_known_race_is_found_by_searching_seeds() {
     let Some(path) = guest("race_counter") else {
@@ -210,9 +192,7 @@ fn a_known_race_is_found_by_searching_seeds() {
 
 /// A process that fails from a thread other than its first is a finding, on every run alike.
 ///
-/// Every thread of the group reports its own end, in an order the host decides; a run that ended
-/// on the first report to arrive lost the failing status on some runs and kept it on others. A
-/// hundred repetitions is where that showed as two digests.
+/// Each thread reports its own end in host order; the run waits for the group's status.
 #[test]
 fn a_failure_from_another_thread_is_found_on_every_run() {
     let Some(path) = guest("exits_from_a_thread") else {
@@ -246,8 +226,8 @@ horizon_ticks = 20_000_000_000
     assert_eq!(code, 0, "{report}");
 }
 
-/// A fault point is armed by the run's own draw: always at certain odds, never where none is
-/// listed, and at even odds on some seeds and not others — the same on every repeat of one seed.
+/// A fault point is armed by the run's draw: always at 1/1, never when unlisted, on some seeds at
+/// 1/2, and the same on every repeat of one seed.
 #[test]
 fn a_fault_point_is_armed_by_the_run_and_repeats() {
     let Some(path) = guest("reads_its_armed_fault_points") else {
@@ -290,8 +270,7 @@ argv = [\"{path}\"]
     assert!(code == 0 || code == 1, "{report}");
 }
 
-/// A file survives being unlinked while it is open, which is how a temporary file works and what a
-/// database relies on.
+/// A file survives being unlinked while open, as temporary files and databases expect.
 #[test]
 fn files_round_trip_and_reproduce() {
     let Some(path) = guest("file_roundtrip") else {
@@ -303,10 +282,8 @@ fn files_round_trip_and_reproduce() {
 
 /// A file reached through a mapping agrees with the same file reached through its descriptor.
 ///
-/// The store an execution client keeps its chain in is read this way and not by reading, so a
-/// mapping showing bytes the file does not hold is a guest judged on something the world never
-/// handed it. The guest checks both directions and reports which one failed; a non-zero exit here
-/// is a numbered claim rather than a mystery.
+/// Execution clients read their chain store through mappings. The guest checks both directions
+/// and its exit status names the one that failed.
 #[test]
 fn a_mapped_file_and_its_descriptor_agree() {
     let Some(path) = guest("maps_a_file") else {
@@ -318,10 +295,8 @@ fn a_mapped_file_and_its_descriptor_agree() {
 
 /// A thread that gives up its turn gets another one, whatever the policy does with it in between.
 ///
-/// The shape a runtime has while it is starting: a worker with nothing to do yet says so, and the
-/// thread setting it up carries on. A scheduler that took the first at its word and never came back
-/// would leave the second waiting for something only the first can do, and nothing above would say
-/// why. The guest exits non-zero if the yielding thread never ran again.
+/// A starting runtime looks like this: an idle worker yields while another thread sets up. The
+/// guest exits non-zero if the yielding thread never runs again.
 #[test]
 fn a_thread_that_yields_is_scheduled_again() {
     let Some(path) = guest("one_yields_one_spins") else {
@@ -335,9 +310,7 @@ fn a_thread_that_yields_is_scheduled_again() {
 
 /// A guest that faults ends, and ending that way is a finding.
 ///
-/// Both halves matter. A supervisor that swallows the fault leaves the guest to re-run the same
-/// instruction forever, and one that reports the crash as a clean exit hides the very thing the
-/// tool exists to find. The host clock is read to tell those two apart, which is what it is for.
+/// A swallowed fault re-runs the instruction forever, so the host clock bounds the test.
 #[allow(clippy::disallowed_methods)]
 #[test]
 fn a_guest_that_faults_is_reported_as_one() {
@@ -365,12 +338,10 @@ fn write_scenario(name: &str, body: &str) -> String {
 
 /// The per-commit guest set from `docs/TESTING.md` §7.1, each under real interception.
 ///
-/// One test rather than five, because what is asserted is identical and a failure names the guest
-/// it failed on: five copies of one assertion drift apart the first time one of them is edited.
+/// One test with one assertion; a failure names its guest.
 #[test]
 fn the_per_commit_guests_reproduce() {
-    // `socketpair_pingpong` needs sockets, which only the cluster world answers, so it runs
-    // under a configuration. The rest need nothing the single-node world lacks.
+    // `socketpair_pingpong` needs sockets, which only the cluster world has.
     let scenario = write_scenario(
         "per-commit.toml",
         "[cluster]
@@ -392,8 +363,7 @@ argv = []
         assert!(!report.contains("DIVERGED"), "{name}: {report}");
         assert!(!out.is_empty(), "{name} printed nothing, so nothing was compared");
 
-        // A second invocation is a second process: the guest's own bytes must match too, not only
-        // the digest the first process computed for itself.
+        // A second process must print the same bytes.
         let mut once = args.clone();
         once.drain(3..5);
         let (_, again, _) = bohr(&once);
@@ -450,9 +420,8 @@ fn a_multi_node_cluster_of_real_programs_reproduces() {
     assert!(!report.contains("DIVERGED"), "{report}");
 }
 
-/// The three waits a model once refused on purpose, each answered now and each repeating: a signal
-/// sent to another thread runs that thread's handler, a timed wait on a machine of its own times
-/// out, and a poll with no timeout on a ready descriptor returns.
+/// Three waits run and repeat: a signal to another thread runs its handler, a timed wait times out,
+/// and an untimed poll on a ready descriptor returns.
 #[test]
 fn what_was_refused_on_purpose_now_runs_and_repeats() {
     for (name, says) in [

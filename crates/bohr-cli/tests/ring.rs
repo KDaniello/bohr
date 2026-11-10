@@ -1,6 +1,6 @@
 //! A file moved through an `io_uring` ring, against a real program.
 //!
-//! Linux only, and skipped where the guest has not been built, like the other tests of real guests.
+//! Linux only; skips when the guest is not built.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -65,9 +65,10 @@ fn a_ring_repeats() {
     assert!(!report.contains("DIVERGED"), "{report}");
 }
 
-/// **A sync through the ring is the disk model's sync.** With every sync drawn to fail, the write
-/// lands whole and the linked sync completes `EIO`: exit 19 is that step and no other, and a ring
-/// that carried its sync past the disk model would have reported success.
+/// A sync through the ring goes through the disk model.
+///
+/// With every sync drawn to fail, the write lands and the linked sync completes `EIO`; exit 19 is
+/// that step.
 #[test]
 fn a_sync_through_the_ring_meets_the_disk_model() {
     if !built() {

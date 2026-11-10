@@ -1,13 +1,11 @@
-# bohr in a container: the static release binary and its target packs on a small Debian.
+# bohr in a container: the static release binary and its target packs on Debian slim.
 #
-# Built from a release's own files, never from source, so the image runs exactly the binary the
-# release signed: put `bohr`, `bohr-packs-<version>.tar.gz` and `scripts/docker-help.txt` beside
-# this file, then
+# Built from a release's files, so the image runs the binary the release signed. Put `bohr`,
+# `bohr-packs-<version>.tar.gz` and `scripts/docker-help.txt` beside this file, then
 #
 #   docker build --build-arg VERSION=v1.0.0 -t ghcr.io/kdaniello/bohr:v1.0.0 .
 #
-# A base with a shell and a C library rather than none: the programs bohr runs are the user's,
-# and most of them are linked against glibc and started by a dynamic loader.
+# The base has glibc and a dynamic loader, which most programs bohr runs need.
 FROM debian:12.8-slim
 
 ARG VERSION
@@ -27,6 +25,5 @@ RUN mkdir -p /root/.bohr/packs \
 COPY docker-help.txt /usr/share/doc/bohr/docker.txt
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/bohr"]
-# Run with no arguments, the image checks what its container lets it do and says which flag is
-# missing: ptrace, the namespaces a guest is isolated in, and the seccomp profile that hides both.
+# With no arguments the image runs `bohr doctor`, which names any missing container flag.
 CMD ["doctor"]

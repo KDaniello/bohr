@@ -16,8 +16,7 @@ use crate::{
 /// What a reduction may spend, and what it is allowed to make smaller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
-    /// Verification replays. The reproducible budget: two reductions given the same number do the
-    /// same work, whatever the machine.
+    /// Verification replays; one number does the same work on any machine.
     pub replays: u32,
     /// Which passes run.
     pub keep: Keep,
@@ -31,8 +30,7 @@ impl Default for Limits {
 
 /// What `--keep` selects.
 ///
-/// It names what is *minimised*, never what is touched: not delivering a message is a tape edit in
-/// this design, so `Events` writes tape bytes too.
+/// It names what is minimised; `Events` also writes tape bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Keep {
     /// What the world did.
@@ -45,14 +43,13 @@ pub enum Keep {
 
 /// Which pass is running.
 ///
-/// In the order that removes most per replay. The configuration goes first because it is read
-/// before the tape: an entry removed shifts every draw after it, so faults moved before that would
-/// be moved again by it.
+/// Passes run in this order, which removes most per replay. The configuration goes first because
+/// it is read before the tape, and removing an entry shifts every draw after it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pass {
     /// Removing what the world was told to do, and bringing forward what is left.
     Config,
-    /// Removing the faults the run drew and that fired, and firing the node faults left sooner.
+    /// Removing the faults that fired, then firing the remaining node faults sooner.
     Faults,
     /// Not delivering what the world chose to deliver.
     Events,
@@ -111,8 +108,7 @@ pub struct Candidate {
 
 /// What carrying one out amounted to.
 ///
-/// Four facts decide a reduction, and taking the whole run report would tie it to the shape of the
-/// kernel's output — the same division the search makes, for the same reason.
+/// A subset of the run report, so the reducer does not depend on the kernel's output shape.
 #[derive(Clone, Debug)]
 pub struct CandidateOutcome {
     /// The candidate this answers.
@@ -127,27 +123,22 @@ pub struct CandidateOutcome {
 
 /// Replays a reduction sets aside before it proposes anything.
 ///
-/// One to establish what is being reduced, one to confirm the result. Never spent on a probe: a
-/// reduction that had used its whole budget guessing would have nothing left to prove its answer.
+/// One to establish the baseline and one to confirm the result; never spent on probes.
 const RESERVED: u32 = 2;
 
 /// How the remaining budget is divided.
 ///
-/// The fault pass goes first and gets a fifth: a run against a real client carries a handful of
-/// fired faults, and one kill fired at an earlier chance removes more of the run than anything
-/// else can. The configuration pass is cheap per candidate and enormous per success, and there
-/// are few entries to try, so it needs little. The event pass is where a cluster's collapse
-/// happens. The tape pass is the long tail: it improves the number and rarely changes the answer,
-/// so it runs last on what is left.
+/// The fault pass gets a fifth. A run against a real client fires only a handful of faults, and
+/// one kill fired earlier removes more of the run than any other edit. The configuration pass
+/// has few entries to try, so it needs little. The event pass gets the most, since most of a
+/// cluster's reduction happens there. The tape pass rarely changes the answer and gets the rest.
 const SHARE_FAULTS: u32 = 20;
 const SHARE_CONFIG: u32 = 15;
 const SHARE_EVENTS: u32 = 40;
 
 /// A reduction in progress.
 ///
-/// Adaptive where a campaign is generational: the next probe is a function of the last answer, so
-/// there is nothing to plan a batch of. What survives from the campaign's shape is the division
-/// that matters — this type decides and never executes, so every claim it makes is provable
+/// Each probe depends on the last answer. This type decides and never executes, so it is tested
 /// without a process.
 #[derive(Clone, Debug)]
 pub struct Reduction {
@@ -165,10 +156,9 @@ pub struct Reduction {
     faults: FaultState,
     /// Scenarios already answered, by fingerprint, so none is replayed twice.
     ///
-    /// A minimisation that restarts after a success re-proposes subsets it has already been
-    /// refused, and two passes can arrive at one scenario. Each of those is a replay that would
-    /// learn an answer this reduction holds; on a client whose replay takes a minute, that is the
-    /// budget. A collision costs a candidate that is never tried, never a wrong answer.
+    /// Minimisation re-proposes refused subsets after a success, and two passes can reach the same
+    /// scenario. On a client whose replay takes a minute, those repeats would spend the budget. A
+    /// hash collision skips a candidate; it never gives a wrong answer.
     answered: BTreeSet<u64>,
 }
 
@@ -177,10 +167,9 @@ pub struct Reduction {
 struct FaultState {
     /// Whether removing faults has converged and moving them has begun.
     removed: bool,
-    /// Which fired node fault is being moved, counted from the first; moved from the last back.
+    /// Which fired node fault is being moved, counted from the first. Faults move last to first.
     nth: Option<usize>,
-    /// Chances still to try for it, as positions among its earlier chances, soonest last.
-    /// Nothing until its ladder is built.
+    /// Positions among its earlier chances still to try, soonest last. `None` until built.
     ladder: Option<Vec<usize>>,
     /// Positions this fault has already been refused at.
     refused: Vec<usize>,
@@ -195,7 +184,7 @@ enum Move {
     Sooner { at: usize, to: u64 },
     /// Leave these decisions alone and make the rest go the dull way.
     KeepDecisions,
-    /// Fire the node fault being moved at this position among its earlier chances, at this offset.
+    /// Fire the node fault being moved at this earlier chance, which sits at this offset.
     FaultSooner { to: usize, at: u64 },
 }
 
@@ -209,9 +198,7 @@ struct PassState {
     ladder: Vec<u64>,
     /// Ticks this moment has already been refused at.
     ///
-    /// A success rebuilds the ladder from the new tick, and every ladder ends at one -- so a
-    /// moment that had already failed at tick one was offered it again after each success, and a
-    /// replay went on learning an answer the reduction already had.
+    /// A success rebuilds the ladder; refused ticks are skipped on the new one.
     refused: Vec<u64>,
     /// Minimisation over the decisions the pass on the tape is working through.
     decisions: Option<DdMin>,
@@ -222,9 +209,7 @@ impl Reduction {
     ///
     /// # Errors
     ///
-    /// Refuses a budget that cannot cover the replays a reduction spends before proposing
-    /// anything, because the alternative is a reduction that stops before it starts and reports
-    /// its input as its answer.
+    /// Refuses a budget smaller than the reserved replays.
     pub fn new(input: Scenario, baseline: Baseline, limits: Limits) -> Result<Self, ReducerError> {
         if limits.replays < RESERVED + 1 {
             return Err(ReducerError::BudgetTooSmall {
@@ -263,8 +248,7 @@ impl Reduction {
     /// The next scenario to carry out, or nothing where the budget is spent or every pass has
     /// converged.
     ///
-    /// A pure function of the state: asking twice without accepting anything proposes the same
-    /// candidate, which is what a run that was lost is reissued from.
+    /// A pure function of the state, so a lost run can be reissued.
     #[must_use]
     pub fn next(&self) -> Option<&Candidate> {
         self.outstanding.as_ref().map(|(candidate, _)| candidate)
@@ -298,8 +282,7 @@ impl Reduction {
     ///
     /// # Panics
     ///
-    /// Panics if the outcome answers a candidate that was not proposed. A reduction that accepted
-    /// an answer to a question it did not ask would keep a scenario nobody verified.
+    /// Panics if the outcome answers a candidate that was not proposed.
     pub fn accept(&mut self, outcome: &CandidateOutcome) {
         let (candidate, applied) =
             self.outstanding.take().expect("an outcome arrived for no candidate");
@@ -313,8 +296,7 @@ impl Reduction {
             Pass::Done => {}
         }
 
-        // Reproduced *and* no larger. A candidate that still goes wrong but records more is not a
-        // reduction, and keeping it would make the reported numbers wander upward.
+        // Accepted only if it reproduces and is no larger.
         let kept =
             outcome.violation.as_ref().is_some_and(|found| self.baseline.reproduced_by(found))
                 && outcome.size <= self.best_size;
@@ -332,10 +314,7 @@ impl Reduction {
     fn fold_move(&mut self, applied: &Move, kept: bool) {
         match applied {
             Move::KeepEntries(_) => {
-                // A removal renumbers what is left, so the positions this minimisation is holding
-                // stop meaning what they meant and it starts again over the smaller document.
-                // That re-tries some subsets; addressing entries that no longer exist would
-                // remove the wrong ones, which is not a trade.
+                // A removal renumbers entries, so minimisation restarts on the smaller document.
                 if kept {
                     self.config.entries = None;
                 } else if let Some(ddmin) = self.config.entries.as_mut() {
@@ -346,18 +325,14 @@ impl Reduction {
                 if let Some(ddmin) = self.config.decisions.as_mut() {
                     ddmin.accept(kept);
                 }
-                // A success changed what the run does next, so every offset after it belongs to
-                // something else and the working set has to be read from the new journal.
+                // Offsets shifted, so the working set is re-read from the new journal.
                 if kept {
                     self.config.decisions = None;
                 }
             }
             Move::FaultSooner { to, at } => {
-                // Nothing before the chance it now fires at changed, so the chances before it are
-                // the same chances, and what it was refused at among them is still an answer. A
-                // candidate kept without a fault at that chance -- zero odds there, or the bytes
-                // after it moved something else -- is smaller, and is not a move: its rung is
-                // spent as a refusal.
+                // Earlier refusals still hold. A kept candidate that did not fire the fault at the
+                // new chance counts that rung as refused.
                 if kept && fired_at(&self.journal, *at) {
                     let refused = self.faults.refused.clone();
                     let mut ladder = rungs_below(*to);
@@ -371,10 +346,7 @@ impl Reduction {
             }
             Move::Sooner { .. } => {
                 if kept {
-                    // A moment that moved is a moment worth trying to move further, so the ladder
-                    // keeps descending from where it succeeded -- minus the rungs it has already
-                    // been refused at, which are answers this reduction has and would pay for
-                    // again.
+                    // The ladder descends from the success, skipping refused rungs.
                     self.config.ladder = ladder_for(self.current_moment_ticks());
                     let refused = self.config.refused.clone();
                     self.config.ladder.retain(|rung| !refused.contains(rung));
@@ -383,8 +355,7 @@ impl Reduction {
                 }
                 if self.config.ladder.is_empty() {
                     self.config.moment += 1;
-                    // A different moment has its own history; what this one was refused at says
-                    // nothing about the next.
+                    // A new moment starts with no refusals.
                     self.config.refused.clear();
                     self.config.ladder = ladder_for(self.current_moment_ticks());
                 }
@@ -429,7 +400,7 @@ impl Reduction {
                 self.enter_next_pass();
                 continue;
             };
-            // An answer already held is folded in as the refusal it was, without a replay.
+            // A scenario already answered counts as a refusal and is not replayed.
             if self.answered.contains(&fingerprint(&candidate.scenario)) {
                 self.fold_move(&applied, false);
                 continue;
@@ -454,8 +425,7 @@ impl Reduction {
             (Pass::Events, _) => Pass::Tape,
             _ => Pass::Done,
         };
-        // Each pass reads its own working set out of the journal of whatever is best by the time
-        // it starts, so nothing is carried across from the pass before it.
+        // Each pass reads its working set from the current best journal.
         self.config.decisions = None;
     }
 
@@ -463,12 +433,8 @@ impl Reduction {
     fn propose_config(&mut self) -> Option<(Candidate, Move)> {
         let doc = ConfigDoc::parse(self.best.config());
 
-        // Entries first. Removing one takes everything it caused with it, which is worth more per
-        // replay than any amount of moving what stays.
-        // **One entry is one entry to try removing.** Minimisation started only at two, and
-        // `DdMin::new(1)` is finished before it begins, so a scenario carrying a single `[[fault]]`
-        // that the finding does not need kept it for ever -- a result that is not one-minimal,
-        // against the promise the ddmin module opens with. One replay buys the answer.
+        // Entries first, since a removal takes its consequences with it. A single entry is tried
+        // too.
         if self.config.entries.is_none() && !doc.entries().is_empty() {
             self.config.entries = Some(DdMin::new(doc.entries().len()));
         }
@@ -480,8 +446,7 @@ impl Reduction {
             return Some((self.candidate(scenario), Move::KeepEntries(keep)));
         }
 
-        // Then the moments. A scenario whose decisive fault fires at the first tick is the same
-        // scenario reached in a fraction of the events.
+        // Then moments, brought forward to shorten the run.
         loop {
             let moments = doc.moments();
             let moment = moments.get(self.config.moment)?;
@@ -509,9 +474,7 @@ impl Reduction {
             self.config.decisions = None;
         }
 
-        // From the last fault back. Moving the last one leaves nothing after it to land on bytes
-        // that now mean something else; moving an earlier one does, and the signature check
-        // refuses the candidates that broke.
+        // Faults move last to first, so a move never disturbs a later fault's bytes.
         loop {
             let nth = match self.faults.nth {
                 Some(nth) => nth,
@@ -548,9 +511,7 @@ impl Reduction {
 
     /// The next candidate for a pass that rewrites decisions on the tape.
     ///
-    /// The working set is read from the journal of the run that is currently best, so a success
-    /// starts the pass again over what the smaller run actually decided rather than over what its
-    /// predecessor did.
+    /// The working set comes from the current best run's journal, re-read after each success.
     fn propose_bytes(&mut self, target: Target) -> Option<(Candidate, Move)> {
         let reachable: Vec<_> = decisions(&self.journal, self.best.prefix().len(), target)
             .into_iter()
@@ -587,8 +548,7 @@ impl Reduction {
 
 /// Positions to try among `count` earlier chances, soonest last.
 ///
-/// The same geometric ladder a moment descends, for the same reason: what matters is whether the
-/// fault can fire near the start, and four probes answer that.
+/// A geometric ladder; four probes show whether the fault can fire near the start.
 fn rungs_below(count: usize) -> Vec<usize> {
     let mut rungs: Vec<usize> =
         [count / 2, count / 4, count / 8, 0].into_iter().filter(|rung| *rung < count).collect();
@@ -608,10 +568,8 @@ fn fingerprint(scenario: &Scenario) -> u64 {
 
 /// The ticks to try for a moment, soonest last.
 ///
-/// A geometric ladder rather than a search: what matters is whether the decisive moment can happen
-/// at the start of the run instead of near its end, and four probes answer that. Bisecting to the
-/// exact earliest tick would spend dozens of replays to make a number in a configuration file
-/// prettier.
+/// A geometric ladder: four probes show whether the moment can move to the start. Bisecting to
+/// the exact tick would cost dozens of replays.
 fn ladder_for(ticks: u64) -> Vec<u64> {
     if ticks < 2 {
         return Vec::new();

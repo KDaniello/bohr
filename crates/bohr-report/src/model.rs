@@ -1,13 +1,10 @@
 //! A stored bundle, digested once into the shape every renderer asks it for.
 //!
-//! Each output — text, JSON Lines, a page — needs the same joins performed: the failed assertion
-//! tied to the record that says where it is written, the draws tied to the events they belong to,
-//! the events grouped by the node that recorded them. Doing them per renderer is how two outputs
-//! of one bundle end up disagreeing, so they happen here, once, and every renderer reads the
-//! result.
+//! The joins every output needs (assertion to source record, draw to event, event to node) are done
+//! once here, so outputs agree.
 //!
-//! Absence is not an error. A bundle from a guest with no SDK has no records; one from a run with
-//! no coverage runtime has no map. A model that refused those would refuse most real bundles.
+//! Missing sections are normal: a guest without the SDK has no records, and one without coverage
+//! has no map.
 
 use std::collections::BTreeMap;
 
@@ -31,8 +28,7 @@ pub struct RunModel {
     pub journal: Journal,
     /// What the guests wrote about themselves, parsed.
     ///
-    /// A line this build has no case for survives as [`Record::Unknown`] rather than being
-    /// dropped: a bundle written by a newer tool is still worth reading.
+    /// Unknown lines survive as [`Record::Unknown`], so newer bundles still read.
     pub records: Vec<Record>,
     /// What the guest was shown of the machine, where the bundle carries it.
     pub host: Option<HostProfile>,
@@ -46,9 +42,7 @@ pub struct RunModel {
     pub violation: Option<Violation>,
     /// How far the log could be read before it stopped making sense, where it did.
     ///
-    /// A truncated log is worth showing up to the truncation — a supervisor killed mid-write still
-    /// recorded everything before it — and worth saying so about, because a reader who is not told
-    /// will read the last event as the end of the run.
+    /// A truncated log is shown up to the truncation, and the report says so.
     pub truncated: Option<String>,
 }
 
@@ -63,8 +57,7 @@ pub struct Violation {
     pub name: String,
     /// What kind of promise it was.
     pub kind: bohr_trace::AssertionKind,
-    /// Where it is written, from the record the guest wrote. Absent where the bundle carries no
-    /// records, which is every bundle from a guest built without the SDK.
+    /// Where it is written, from the guest's record; absent without the SDK.
     pub location: Option<Location>,
 }
 
@@ -84,12 +77,10 @@ impl RunModel {
     ///
     /// # Errors
     ///
-    /// Returns an error only where the bundle lacks something no reader can do without: the
-    /// manifest, or an event log that is not a log at all.
+    /// Only when the manifest or the event log is unreadable.
     pub fn of(bundle: &bohr_trace::Bundle) -> Result<Self, ReportError> {
         let manifest = bundle.manifest().map_err(ReportError::Unreadable)?;
-        // Asked for rather than assumed: a report of one execution built from a bundle holding
-        // several would describe a run nobody made, and would look exactly like a report.
+        // A report describes one execution; a bundle of several is refused.
         let single = bundle.single().map_err(ReportError::Unreadable)?;
 
         let (events, damage) = match single.events() {
@@ -140,8 +131,7 @@ impl RunModel {
 
     /// The draws each event made, by event.
     ///
-    /// The join the draw journal exists for: a record carries the event current when it was drawn,
-    /// so "what decided this" is a lookup rather than a guess about ordering.
+    /// Each record carries its event, so this is a lookup.
     #[must_use]
     pub fn draws_by_event(&self) -> BTreeMap<EventId, Vec<&DrawRecord>> {
         let mut by_event: BTreeMap<EventId, Vec<&DrawRecord>> = BTreeMap::new();
@@ -166,15 +156,12 @@ impl RunModel {
 
 /// Reads a draw journal section back, ignoring a trailing partial record.
 ///
-/// The section is a flat array of fixed-width records, so a short tail is damage rather than a
-/// shorter journal — and a report that refused to open a damaged bundle would refuse exactly the
-/// bundles somebody most wants to look at.
+/// Fixed-width records, so a short tail is damage; a damaged bundle still opens.
 fn read_journal(bytes: &[u8]) -> Journal {
     let (whole, _short_tail) = bytes.as_chunks::<DRAW_RECORD_BYTES>();
     let records = whole
         .iter()
-        // A record with rubbish in its reserved field is damage of the same kind as a short tail,
-        // and it is skipped for the same reason: the page still shows the run.
+        // A record with a bad reserved field is skipped as damage.
         .filter_map(|fixed| DrawRecord::from_bytes(fixed).ok())
         .collect();
     Journal::from_records(records)
@@ -191,9 +178,7 @@ fn read_records(bytes: &[u8]) -> Vec<Record> {
 
 /// Ties the first failed assertion on the timeline to the record that says where it is written.
 ///
-/// Matched by name rather than by position: the record section holds every record the run wrote,
-/// including from guests that never failed anything, and a positional match would attach the wrong
-/// source location to the right assertion — which is worse than attaching none.
+/// Matched by name, since the record section holds every guest's records.
 fn find_violation(events: &[Event], records: &[Record]) -> Option<Violation> {
     let (event, name, kind) = events.iter().find_map(|e| match &e.kind {
         EventKind::Assertion { name, kind, condition: false, .. } => Some((e, name, *kind)),

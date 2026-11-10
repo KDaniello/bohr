@@ -1,18 +1,11 @@
 //! The filesystem a node starts from.
 //!
-//! Until now every run began with an empty disk, which is right for a program under test and
-//! impossible for a real client: a node that syncs for days cannot sync again for each of a
-//! thousand runs. A prepared state makes "the run begins here" a first-class input.
+//! A real client cannot sync for days before every run, so a run can start from a prepared state.
 //!
-//! **A directory on the host, named in the configuration and identified by digest — never bundle
-//! content.** A gigabyte inside a `.bohr` file that maintainers are meant to attach to an issue is
-//! not a format, it is a mistake. What the bundle records is *which* state a run began from, so a
-//! replay against a different one is refused rather than quietly producing a different run.
+//! The state is a host directory named in the configuration and pinned by digest. The bundle
+//! records which state, never its content, and a replay against another is refused.
 //!
-//! What is reachable is bounded by the world rather than by this module, and the bound is worth
-//! knowing before anybody plans around it: every file is held in supervisor memory, and a node's
-//! disk is cloned whole into a snapshot ring at each `fsync`. A state of any real size is measured
-//! against that, not against disk.
+//! Every file is held in supervisor memory, which bounds the state's size.
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -20,8 +13,7 @@ use bohr_types::Digest;
 
 /// Why a prepared state was refused.
 ///
-/// One variant, like the configuration's: every refusal is the same kind of thing — something in
-/// the directory this world cannot present to a guest — and the message names the path.
+/// One variant; the message names the path.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     /// Named in the message, always with the path that caused it.
@@ -34,8 +26,7 @@ pub enum StateError {
 pub struct StateImage {
     /// Contents by the path a guest opens them at, in sorted order.
     ///
-    /// Sorted because inode numbers are handed out in the order files are added, and a guest that
-    /// branched on one would branch differently for a directory walked in another order.
+    /// Sorted, since inode numbers follow insertion order.
     files: BTreeMap<String, Vec<u8>>,
     /// What this image is, independently of the machine it was built on.
     digest: Digest,
@@ -44,7 +35,7 @@ pub struct StateImage {
 impl StateImage {
     /// Reads a directory as the filesystem a node will start from.
     ///
-    /// Every refusal names the path, because the reader is about to go and look at it.
+    /// Every refusal names the path.
     ///
     /// # Errors
     ///
@@ -59,19 +50,11 @@ impl StateImage {
 
     /// The same image with the instructions that take a number from the processor replaced.
     ///
-    /// **On a copy, and only ever on a copy.** What is read here is what a guest will be given;
-    /// the file on the host is not touched, which is the rule for every rewrite this tool does
-    /// (`ARCHITECTURE.md` §5.8).
+    /// On a copy; host files are never touched (`ARCHITECTURE.md` §5.8). The digest changes with
+    /// the contents.
     ///
-    /// The digest moves with the contents, and that is the point: a run started from a rewritten
-    /// image is a different run from one started from the original, and a bundle that recorded the
-    /// original digest would replay against files the guest never saw.
-    ///
-    /// What this does not do: touch the program itself. A guest is started by the interceptor from
-    /// wherever it lives, not from this image, so a program carrying one of these instructions in
-    /// its own text is reported and not rewritten. The libraries it loads are here, and for the
-    /// targets this was built for that is where the instructions are: `libstdc++` carries five, in
-    /// the path `std::random_device` takes, and a program that reaches one of them stops repeating.
+    /// The program itself is not in the image and is only reported. Its libraries are, such as
+    /// `libstdc++` with five sites on the `std::random_device` path.
     #[must_use]
     pub fn without_hardware_randomness(self) -> (Self, Vec<(String, usize)>) {
         let mut files = BTreeMap::new();
@@ -93,14 +76,8 @@ impl StateImage {
 
     /// The same image with the instruction that asks the processor what it is made to fault.
     ///
-    /// On a copy, like every rewrite here. The digest moves with the contents, because a run
-    /// started from a rewritten image is a different run and a bundle recording the original digest
-    /// would replay against files the guest never saw.
-    ///
-    /// What this does not do: touch the program. It is started by the interceptor and mapped by the
-    /// kernel, so it is not in this image -- the caller rewrites a copy of it separately, and the
-    /// stand-in is recognised at the fault by its own byte rather than by an offset either of them
-    /// would have to translate.
+    /// On a copy; the digest changes with the contents. The program is rewritten separately by the
+    /// caller, and the fault is recognised by its byte.
     #[must_use]
     pub fn with_processor_questions_trapped(self) -> (Self, Vec<(String, usize)>) {
         let mut files = BTreeMap::new();
@@ -122,9 +99,7 @@ impl StateImage {
 
     /// What this image is: `blake3` over `(path, length, content digest)` in sorted order.
     ///
-    /// Content and names only. Host inode numbers, modification times and permissions are all
-    /// things the world does not model, so a digest that included them would differ between two
-    /// machines holding the same state — which is the opposite of what it is for.
+    /// Content and names only, so two machines holding the same state agree.
     #[must_use]
     pub const fn digest(&self) -> Digest {
         self.digest
@@ -141,8 +116,7 @@ impl StateImage {
         (self.files.len(), self.files.values().map(|c| c.len() as u64).sum())
     }
 
-    /// The per-file list a bundle records, as JSON, so a bundle says what it needs without
-    /// carrying it.
+    /// The per-file list a bundle records, as JSON.
     #[must_use]
     pub fn manifest(&self) -> String {
         let mut out = String::from("[");
@@ -173,8 +147,7 @@ fn walk(
         StateError::Refused(format!("BOHR-1002: cannot read {}: {e}", at.display()))
     })?;
 
-    // Collected and sorted rather than taken in the order the host hands them out: a directory's
-    // reading order is a fact about the filesystem, and a run must not depend on one.
+    // Sorted, since host directory order varies.
     let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
 
@@ -187,8 +160,7 @@ fn walk(
             walk(root, &path, into, largest_file)?;
             continue;
         }
-        // A symlink in an image would be a lie: this world's `readlinkat` always answers ENOENT,
-        // so whatever the guest did with the link would not be what the host would have done.
+        // Symlinks are refused.
         if meta.is_symlink() {
             return Err(StateError::Refused(format!(
                 "BOHR-1002: {} is a symbolic link, which this world does not present",
@@ -229,8 +201,7 @@ fn guest_path(root: &Path, path: &Path) -> Result<String, StateError> {
     let text = relative.to_str().ok_or_else(|| {
         StateError::Refused(format!("BOHR-1002: {} is not a UTF-8 path", relative.display()))
     })?;
-    // Always absolute and always forward-slashed, because that is what a guest asks for and what
-    // this world matches on — and because a state built on Windows must present the same names.
+    // Absolute with forward slashes, on every host.
     Ok(format!("/{}", text.replace('\\', "/")))
 }
 
@@ -277,8 +248,7 @@ mod tests {
         assert_eq!(image.size(), (2, 13));
     }
 
-    /// The digest is what a bundle records, so it has to be a fact about the content and not about
-    /// the machine that read it.
+    /// The digest depends only on content.
     #[test]
     fn the_same_content_has_the_same_digest_wherever_it_was_read() {
         let here = scratch("digest-a");

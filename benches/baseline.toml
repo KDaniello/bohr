@@ -1454,6 +1454,35 @@ redb_64_runs_ms = { j1 = { v0_7 = 3_043, v0_8 = 3_102 }, j4 = { v0_7 = 1_027, v0
 peak_rss_mb = { v0_7 = 14.0, v0_8 = 14.4 }
 pr_s = 77
 
+# The campaigns of v0.9, master seed 0, on a 4 GB VM with 2 cores. A campaign counts runs and
+# landed faults; it does not count runs the model refused, so no target has `refused`. What the
+# campaigns found is private until the maintainers have it, in findings/baseline.toml.
+[v0_9.hunts]
+tree = "cd602fd"
+geth = { minutes = 60, runs = 3_072, adversity = 8_857 }
+cometbft = { minutes = 60, runs = 3_232, adversity = 9_554 }
+redb = { minutes = 30, runs = 98_784, adversity = 1_267_551 }
+reth = { minutes = 30, runs = 24_640, adversity = 99_413 }
+not_run = ["op-reth", "lighthouse", "solana"]
+
+# Findings confirmed by their maintainers count toward claim 4.
+[v0_9.findings]
+confirmed = 0
+projects = 0
+
+[v0_9.gates]
+G9_1 = "not measured: no 60-seed refusal sweep was run"
+G9_4 = "0 disclosed, 0 confirmed by a maintainer"
+G9_11 = "5 of 5 banked bundles replay to their digest, 3 entries"
+G9_12 = "not measured: the two v0.1 bundles carry no binaries to stage"
+G9_13 = "no submission made"
+
+[v0_9.perf]                                                                          # P9.1, P9.2
+rss_mb_geth = { minutes_1_5 = 102, minutes_26_30 = 126, minutes_56_60 = 114 }        # P9.1 FAILED, +23%
+rss_mb_cometbft = { minutes_1_5 = 415, minutes_26_30 = 461, minutes_56_60 = 634 }    # P9.1 FAILED, +11%
+rss_sampling = "the sum over every bohr process once a minute; three adjacent geth samples read 81, 155 and 109 MB"
+runs_per_minute_geth = { minutes_8_12 = 48.0, minutes_26_30 = 55.8 }                 # P9.2 holds; minutes 1-5 not sampled
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

@@ -1,20 +1,9 @@
 //! Naming a syscall, and knowing what it is called with, on any host.
 //!
-//! The crate that owns these names is built for one operating system and one architecture, and it
-//! sits below a boundary this crate is above — so it cannot be asked. On every other host it is not
-//! even compiled, and a run's syscalls print as bare numbers. A trace and the report made from it
-//! are precisely the artefacts that travel, written on the machine that found the bug and read on
-//! the maintainer's, so neither can be the thing that loses the names.
+//! The backend's table compiles only on Linux x86-64, so traces read elsewhere need this copy.
+//! `scripts/lint-rules.sh` checks it against the original.
 //!
-//! The copy that follows from that is kept honest mechanically rather than by attention:
-//! `scripts/lint-rules.sh` compares the numbers and names against the table they were copied from
-//! and fails on any disagreement. It is a data file because a hundred number-name-shape triples are
-//! data, and because reformatting would otherwise rewrite the whole table every time one row
-//! changed.
-//!
-//! **The shape is here rather than in the report because the digest needs it.** What a call does
-//! not read holds whatever the register held before, and hashing that makes two runs of one program
-//! under two memory layouts compare unequal — see [`crate::EventKind::absorb`].
+//! The argument shape is here because the digest uses it; see [`crate::EventKind::absorb`].
 
 use std::sync::OnceLock;
 
@@ -32,8 +21,7 @@ pub enum Arg {
 
 /// The name of a syscall, where this build has an opinion about it.
 ///
-/// A number with no name is not an error: a scripted guest may issue anything, and a bundle from a
-/// newer build may name a call this one has never heard of. The caller shows the number.
+/// `None` for unknown numbers, which the caller prints as is.
 #[must_use]
 pub fn syscall_name(nr: u32) -> Option<&'static str> {
     entry(nr).map(|(_, name, _)| *name)
@@ -41,9 +29,7 @@ pub fn syscall_name(nr: u32) -> Option<&'static str> {
 
 /// The arguments a call reads, in ABI order, or nothing where this build has never heard of it.
 ///
-/// Nothing means "assume all six", which is stricter than necessary and never wrong: a number this
-/// table does not carry is one no scenario here can produce, so the fallback exists for bundles
-/// from other builds rather than for runs from this one.
+/// `None` means all six, for bundles from other builds.
 #[must_use]
 pub fn syscall_args(nr: u32) -> Option<&'static [Arg]> {
     entry(nr).map(|(_, _, args)| args.as_slice())
@@ -107,7 +93,7 @@ mod tests {
         assert_eq!(syscall_name(60), Some("exit"));
     }
 
-    /// A number nothing claims is answered with nothing, rather than with a neighbour's name.
+    /// An unknown number gets no name.
     #[test]
     fn an_unknown_number_is_not_guessed_at() {
         assert_eq!(syscall_name(u32::MAX), None);
@@ -115,7 +101,7 @@ mod tests {
         assert_eq!(syscall_name(6), None, "a gap in the table is a gap, not the call below it");
     }
 
-    /// The lookup is a binary search, so the order it searches has to be the order it holds.
+    /// The table is sorted.
     #[test]
     fn the_table_is_sorted_and_holds_each_number_once() {
         let table = parsed();
@@ -124,9 +110,7 @@ mod tests {
         }
     }
 
-    /// The column the digest reads. Spot-checked against the prototypes rather than exhaustively,
-    /// with the three shapes that matter: a call that reads nothing, one that reads a buffer, and
-    /// one whose only argument is an address.
+    /// Spot-checks: no arguments, a buffer, an address only.
     #[test]
     fn a_call_says_which_of_its_registers_it_reads() {
         assert_eq!(syscall_args(24), Some([].as_slice()), "sched_yield takes none of six");
@@ -139,8 +123,7 @@ mod tests {
         assert_eq!(syscall_args(12), Some([Arg::Address].as_slice()), "brk");
     }
 
-    /// Every row carries a shape, because a row that lost its third column would silently fall back
-    /// to all six registers and reintroduce exactly what the column exists to remove.
+    /// Every row has a shape.
     #[test]
     fn every_row_names_the_arguments_its_call_reads() {
         let rows = TABLE.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).count();

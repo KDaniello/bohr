@@ -1,14 +1,10 @@
 //! A file's bytes, shared block by block with every disk image taken of them.
 //!
-//! **A write copies the blocks it touches, not the file.** A disk image is taken at every `fsync`
-//! and shares the file with the live world, so the first write after a sync copies what it lands
-//! in. Held as one buffer, that is the whole file, and a store that syncs each transaction would
-//! copy its whole database each time; held as blocks, each behind its own counted pointer, it is
-//! one block.
+//! A write copies only the blocks it touches. Every `fsync` takes an image that shares blocks with
+//! the live file, so a store syncing each transaction copies one block.
 //!
-//! Every block but the last holds exactly [`BLOCK`] bytes and the last holds the rest, so a file of
-//! ten bytes costs ten bytes and not a block. A file grown with zeros shares one block of zeros
-//! until it is written, so a store that reserves its file with `ftruncate` costs nothing for it.
+//! Every block but the last holds [`BLOCK`] bytes. A file grown with zeros shares one zero block
+//! until written, so reserving space with `ftruncate` is free.
 
 use std::sync::{Arc, LazyLock};
 
@@ -18,8 +14,7 @@ static ZEROS: LazyLock<Arc<Vec<u8>>> = LazyLock::new(|| Arc::new(vec![0; BLOCK])
 /// The span a collected mapping is compared and written in: the page the guest dirties.
 const PAGE: usize = 4096;
 
-/// Bytes a block holds: large enough that a big file is few pointers, small enough that a write
-/// copies little.
+/// Bytes per block: few pointers for a big file, little copying per write.
 pub(crate) const BLOCK: usize = 64 * 1024;
 
 /// A file's content.
@@ -50,7 +45,7 @@ impl FileBytes {
         self.blocks.get(at / BLOCK).and_then(|block| block.get(at % BLOCK)).copied()
     }
 
-    /// Whether two contents are the same blocks, which a sync that changed nothing leaves them.
+    /// Whether two contents share the same blocks, as after a sync that changed nothing.
     pub(crate) fn same(&self, other: &Self) -> bool {
         self.len == other.len
             && self.blocks.len() == other.blocks.len()
@@ -111,8 +106,7 @@ impl FileBytes {
 
     /// Writes `bytes` at `at`, page by page, where they differ from what is held.
     ///
-    /// For a mapping carried back into its file: the guest changed a few pages of it, and writing
-    /// the whole window copied every block a disk image still shared, at every sync.
+    /// For writing a mapping back, so unchanged pages stay shared with disk images.
     pub(crate) fn write_changed(&mut self, at: usize, bytes: &[u8]) {
         let mut done = 0;
         while done < bytes.len() {
@@ -171,8 +165,7 @@ impl FileBytes {
 mod tests {
     use super::*;
 
-    /// The property the type exists for: a write to content shared with an image copies the
-    /// blocks it touches and leaves the image's other blocks shared.
+    /// A write copies only the blocks it touches; the rest stay shared.
     #[test]
     fn a_write_copies_only_the_blocks_it_touches() {
         let image = FileBytes::from_vec(vec![7; BLOCK * 4]);

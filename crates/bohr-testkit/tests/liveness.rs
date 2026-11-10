@@ -1,13 +1,10 @@
 //! A cluster that healed and went on committing nothing.
 //!
-//! The pair is the point. An oracle that fires on the defective cluster proves nothing on its own —
-//! one that fired on every run would satisfy that too. What makes the claim falsifiable is the same
-//! scenario, the same seeds, and a correct twin it must stay silent about.
+//! The oracle fires on the defective cluster and stays silent on its correct twin, with the same
+//! scenario and seeds.
 //!
-//! Scripted against the null backend, so this runs on any machine in milliseconds and says only
-//! what the oracle does. Whether a *search* can reach such a defect is a different claim, measured
-//! against the seeded corpus on Linux, and conflating the two is how a gate comes to mean less than
-//! it reads.
+//! Scripted against the null backend, so it tests the oracle only. Whether a search reaches such a
+//! defect is measured on the seeded corpus on Linux.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -21,7 +18,7 @@ use bohr_world::{LivenessConfig, NetworkConfig, ScheduledPartition};
 const OPENAT: u32 = 257;
 /// `write`.
 const WRITE: u32 = 1;
-/// `fsync`: the one call that makes something durable, and the only thing counted as progress.
+/// `fsync`, the only call counted as progress.
 const FSYNC: u32 = 74;
 /// `nanosleep`.
 const SLEEP: u32 = 35;
@@ -67,8 +64,7 @@ fn healthy() -> NullProgram {
 
 /// A node that commits for a while and then stops, holding a view of the cluster it never revises.
 ///
-/// The shape of the defect this oracle exists for: nothing crashes, nothing asserts, nothing exits.
-/// The node is alive and answering, and the cluster is not committing anything.
+/// Nothing crashes, asserts or exits; the node is alive and the cluster commits nothing.
 fn goes_quiet() -> NullProgram {
     let mut ops = prologue();
     for _ in 0..6 {
@@ -136,8 +132,7 @@ fn silent_nodes(judged: &Judged) -> Vec<NodeId> {
         .collect()
 }
 
-/// The claim, in the only form that is falsifiable: the defective cluster is caught, and the
-/// correct one — same scenario, same seed, same window — is not.
+/// The defective cluster is caught and the correct one is not.
 #[test]
 fn a_cluster_that_goes_quiet_is_caught_and_a_healthy_one_is_not() {
     let quiet = judge(vec![goes_quiet(), goes_quiet()], true);
@@ -157,16 +152,14 @@ fn a_cluster_that_goes_quiet_is_caught_and_a_healthy_one_is_not() {
     assert!(silent_nodes(&healthy).is_empty());
 }
 
-/// One node going quiet while the other commits is that node's finding, not the cluster's silence.
-/// The identity is which nodes, so a reduction can tell one from the other.
+/// One quiet node is identified by node, so a reduction can tell it from the cluster's silence.
 #[test]
 fn a_silence_names_the_node_that_was_silent() {
     let judged = judge(vec![goes_quiet(), healthy()], true);
     assert_eq!(silent_nodes(&judged), vec![NodeId(0)]);
 }
 
-/// Nothing is watched unless a scenario asks for it, and that is what keeps every stored bundle
-/// replaying: a diagnostic's code enters the trace digest.
+/// Nothing is watched unless asked, since diagnostics enter the digest.
 #[test]
 fn a_scenario_that_does_not_watch_records_nothing_and_runs_identically() {
     let watched = judge(vec![goes_quiet(), goes_quiet()], true);
@@ -191,16 +184,9 @@ fn a_watched_run_reproduces() {
     }
 }
 
-/// The test that proves the design decision rather than asserting it.
+/// The watcher counts a sync when the disk image freezes; a stalled `DiskOp` is emitted earlier.
 ///
-/// A stalled `fsync` emits its `DiskOp` at the *start* of the stall and nothing at all when it
-/// completes, so an oracle that read the timeline would count an interrupted sync as durability —
-/// and would therefore see progress in a cluster whose syncs all stalled and never landed. This
-/// watcher is fed at the moment the disk image actually freezes, so it does not.
-///
-/// With every sync stalling, a node that keeps syncing still commits, just later. The claim is
-/// that the watcher tracks the real thing: the healthy twin is still not a finding, and the quiet
-/// one still is.
+/// With every sync stalling, the healthy twin is still clean and the quiet one is still caught.
 #[test]
 fn a_stalled_sync_is_measured_where_it_lands_and_not_where_it_starts() {
     let stalling = bohr_world::DiskConfig {

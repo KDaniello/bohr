@@ -1,12 +1,9 @@
 //! A campaign written down between generations, so it can be resumed as the same campaign.
 //!
-//! **Not a snapshot of tapes but of the whole search.** A corpus directory keeps tapes and has to
-//! re-run them to learn what they covered, which is a different campaign from the one that stopped:
-//! visit counts, evictions, credit and findings are gone. This keeps all of it, and a campaign
-//! resumed from it plans the same next generation an uninterrupted one would.
+//! The state holds the whole search: corpus, coverage, visit counts, credit and findings. A resumed
+//! campaign plans the same next generation an uninterrupted one would.
 //!
-//! The format is versioned, and a build reads only its own version: a state of another is refused
-//! with both numbers, never misread as a smaller campaign.
+//! A build reads only its own format version and refuses others with both numbers.
 
 use bohr_backend::CoverageMap;
 use bohr_tape::{DRAW_RECORD_BYTES, DrawRecord, Journal};

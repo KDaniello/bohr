@@ -1,12 +1,9 @@
 //! `--json` held to golden files: a schema's output changes only together with its version.
 //!
-//! Each case runs the binary in a directory of its own, holding copies of the stored bundles, so
-//! every path in the output is relative and the same on every host. A difference under the same
-//! schema name is a change nobody versioned and fails; a difference under a new name is a version
-//! bumped, and fails until the golden file is written again with `BOHR_BLESS=1`.
+//! Each case runs in its own directory of bundle copies, so paths are relative and host-neutral.
+//! Any difference fails; after a version bump, `BOHR_BLESS=1` rewrites the golden file.
 //!
-//! What this does not cover: commands that need a backend. Their objects are built from the same
-//! code on every host and are checked by the tests that run them on Linux.
+//! Commands that need a backend are checked by the Linux tests that run them.
 
 use std::{
     path::{Path, PathBuf},
@@ -40,7 +37,7 @@ impl Drop for Here {
     }
 }
 
-/// The one object `args` writes, with the exit code; standard output must hold nothing else.
+/// The one object `args` writes, with the exit code; stdout holds nothing else.
 fn object(case: &str, args: &[&str]) -> (Value, i32) {
     let here = Here::new(case);
     let out = Command::new(env!("CARGO_BIN_EXE_bohr"))
@@ -56,8 +53,7 @@ fn object(case: &str, args: &[&str]) -> (Value, i32) {
     (value, out.status.code().unwrap_or(-1))
 }
 
-/// What differs from build to build or host to host without being part of the shape: the
-/// version, and the separator a path is written with.
+/// Normalises the version and the path separator, which vary by build and host.
 fn steady(mut value: Value) -> Value {
     fn separators(value: &mut Value) {
         match value {
