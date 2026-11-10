@@ -78,18 +78,26 @@ pub struct Entry {
 /// A traced cluster makes hundreds of thousands of draws; the earliest ones matter most.
 const REMEMBERED_DRAWS: usize = 256;
 
+/// The part of a run's journal the corpus can use: the first draws inside the prefix that
+/// consumed bytes, at most `REMEMBERED_DRAWS`.
+///
+/// A worker sends only this, so a campaign never holds a whole journal: a cluster's run draws
+/// millions of times, and a generation of whole journals held a campaign past 3 GB.
+#[must_use]
+pub fn corpus_draws(journal: &Journal, prefix_len: usize) -> Journal {
+    let draws: Vec<_> = journal
+        .records()
+        .iter()
+        .filter(|r| r.len > 0 && r.offset < prefix_len as u64)
+        .take(REMEMBERED_DRAWS)
+        .copied()
+        .collect();
+    Journal::from_records(draws)
+}
+
 impl Entry {
     /// The entry an offer becomes, once the corpus has decided to keep it.
     fn from(offer: Offer<'_>, id: EntryId) -> Self {
-        // Only draws inside the prefix that consumed bytes.
-        let draws: Vec<_> = offer
-            .draws
-            .records()
-            .iter()
-            .filter(|r| r.len > 0 && r.offset < offer.prefix.len() as u64)
-            .take(REMEMBERED_DRAWS)
-            .copied()
-            .collect();
         Self {
             id,
             seed: offer.seed,
@@ -97,7 +105,7 @@ impl Entry {
             origin: offer.origin,
             visits: 0,
             edges: offer.coverage.edges(),
-            draws: Journal::from_records(draws),
+            draws: corpus_draws(offer.draws, offer.prefix.len()),
         }
     }
 

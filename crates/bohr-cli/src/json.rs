@@ -18,6 +18,7 @@ static ON: AtomicBool = AtomicBool::new(false);
 
 /// Every schema this build writes, with its version. `docs/API.md` §7.12 documents the list.
 pub(crate) const SCHEMAS: &[(&str, u32)] = &[
+    ("ablate", 1),
     ("check", 1),
     ("confirm", 1),
     ("doctor", 1),

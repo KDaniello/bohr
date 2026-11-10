@@ -38,6 +38,8 @@ pub struct RunModel {
     pub config: String,
     /// Whatever anybody wrote on the bundle afterwards.
     pub notes: Vec<String>,
+    /// The end of what each incarnation of each node printed, where the bundle kept it.
+    pub output: Vec<bohr_trace::OutputTail>,
     /// Where a promise broke, and which promise.
     pub violation: Option<Violation>,
     /// How far the log could be read before it stopped making sense, where it did.
@@ -104,6 +106,11 @@ impl RunModel {
             .section(SectionId::Notes)
             .map(|b| String::from_utf8_lossy(b).lines().map(str::to_owned).collect())
             .unwrap_or_default();
+        // An unreadable section is read as none: the text is for a reader, the run is elsewhere.
+        let output = bundle
+            .section(SectionId::GuestOutput)
+            .and_then(|b| serde_json::from_slice(b).ok())
+            .unwrap_or_default();
 
         let violation = find_violation(&events, &records);
         Ok(Self {
@@ -115,6 +122,7 @@ impl RunModel {
             binaries,
             config,
             notes,
+            output,
             violation,
             truncated: damage.map(|e| e.to_string()),
         })

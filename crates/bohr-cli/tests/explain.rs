@@ -94,3 +94,36 @@ fn a_selection_is_read_exactly_or_refused() {
     assert_eq!(code, 0);
     assert!(out.lines().count() < bohr(&["trace", &path]).1.lines().count());
 }
+
+/// A run keeps what its guest printed, and `explain` reads where it fell from it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_saved_run_says_where_its_guest_fell() {
+    let guest = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/guests/build/fails_loudly");
+    if !std::path::Path::new(guest).exists() {
+        eprintln!("skipped: the guests are not built");
+        return;
+    }
+    let dir = std::env::temp_dir().join("bohr-explain-fell");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory of this test's own");
+    let saved = dir.join("fell.bohr").to_string_lossy().into_owned();
+
+    let (code, out, err) = bohr(&["run", "--seed", "1", "--save", &saved, "--", guest]);
+    assert_eq!(code, 1, "the guest exits 1, which is a finding: {out}{err}");
+
+    let (code, story, err) = bohr(&["explain", &saved]);
+    assert_eq!(code, 0, "{err}");
+    assert!(story.contains("Where it fell"), "{story}");
+    assert!(
+        story.contains("ERROR: failed to open the store at height 41: entry point missing"),
+        "{story}"
+    );
+
+    let (_, json, _) = bohr(&["explain", &saved, "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&json).expect("one JSON object");
+    assert_eq!(value["where"]["kind"], "fatal line", "{json}");
+    assert_eq!(value["where"]["node"], 0, "{json}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

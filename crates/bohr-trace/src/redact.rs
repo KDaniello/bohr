@@ -17,6 +17,7 @@ struct Removed {
     paths: usize,
     records: usize,
     config_lines: usize,
+    output: bool,
 }
 
 /// Rewrites a bundle without what §4.6 says must not travel.
@@ -44,6 +45,11 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
         removed.config_lines = count;
         writer.section(SectionId::Config, rewritten);
     }
+    // What the guest printed is its data; the events keep the length and digest of every write.
+    if bundle.section(SectionId::GuestOutput).is_some() {
+        writer.remove(SectionId::GuestOutput);
+        removed.output = true;
+    }
 
     // The bundle notes that it is redacted.
     let mut notes = bundle
@@ -55,8 +61,11 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
     }
     notes.push_str(&format!(
         "redacted: {} binary paths hashed, {} record payloads removed, {} configuration lines \
-         removed\n",
-        removed.paths, removed.records, removed.config_lines
+         removed{}\n",
+        removed.paths,
+        removed.records,
+        removed.config_lines,
+        if removed.output { ", guest output removed" } else { "" }
     ));
     writer.section(SectionId::Notes, notes.into_bytes());
 
@@ -421,5 +430,19 @@ mod tests {
         assert!(!text.contains("raft::log"), "their location field survived: {text}");
         assert!(text.contains("log is monotonic"), "what names the finding was taken: {text}");
         assert!(text.contains("\"condition\":false"), "the verdict was taken: {text}");
+    }
+
+    #[test]
+    fn what_the_guest_printed_is_removed_and_said_so() {
+        let mut writer = crate::BundleWriter::new();
+        writer
+            .section(SectionId::Manifest, b"{}".to_vec())
+            .section(SectionId::GuestOutput, b"[{\"text\":\"API_KEY=secret\"}]".to_vec());
+        let bundle = Bundle::parse(&writer.finish([7; 16])).expect("a bundle");
+
+        let redacted = Bundle::parse(&redact(&bundle).expect("redactable")).expect("a bundle");
+        assert!(redacted.section(SectionId::GuestOutput).is_none(), "the output travelled");
+        let notes = String::from_utf8_lossy(redacted.section(SectionId::Notes).expect("notes"));
+        assert!(notes.contains("guest output removed"), "{notes}");
     }
 }

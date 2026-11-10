@@ -5,7 +5,8 @@
 # entry.toml, bin/ holding the exact binaries it was found on under the names the bundles record,
 # and the prepared state the run began from, under the path its configuration names. A rebuilt
 # binary or state is a different run, so the bank keeps the originals and replays each bundle from
-# its own directory.
+# its own directory. The probe of a scenario with probes is one of them: it ships with bohr and every
+# release rebuilds it, so the bank keeps the one the finding ran with, as bin/bohr-probe-<digest>.
 #
 # A bundle that stops replaying means the tool changed what a stored run means.
 set -u
@@ -31,7 +32,10 @@ for entry in "$bank"/*/; do
       echo "MISSING $bundle"
       continue
     fi
-    if out=$(cd "$entry" && "$BOHR" replay --verify-only --binaries bin "$name" 2>&1); then
+    probe=$(find "$entry/bin" -maxdepth 1 -name 'bohr-probe-*' 2>/dev/null | head -1)
+    [ -z "$probe" ] || probe=$(realpath "$probe")
+    if out=$(cd "$entry" && ${probe:+env BOHR_PROBE="$probe"} \
+      "$BOHR" replay --verify-only --binaries bin "$name" 2>&1); then
       echo "ok      $bundle"
     else
       failed=$((failed + 1))

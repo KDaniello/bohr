@@ -1,10 +1,9 @@
 <div align="center">
 
-# bohr
-
-**Deterministic simulation testing for unmodified Linux programs.**
-
-One seed defines one execution: the same bytes, the same schedule, the same faults, on every machine.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+  <img alt="bohr — deterministic simulation testing for unmodified Linux programs" src="docs/assets/banner-light.svg" width="100%">
+</picture>
 
 [![CI](https://github.com/KDaniello/bohr/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/test.yml)
 [![Determinism](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml)
@@ -19,9 +18,12 @@ One seed defines one execution: the same bytes, the same schedule, the same faul
 [Evidence](./docs/EVIDENCE.md) ·
 [Changelog](./CHANGELOG.md)
 
-</div>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/divider-dark.svg">
+  <img alt="" src="docs/assets/divider-light.svg" width="100%">
+</picture>
 
----
+</div>
 
 ## Overview
 
@@ -49,9 +51,9 @@ stages on a real host without bohr.
   per height.
 - **Target packs.** `bohr hunt <pack>` builds or checks the pinned binary of a target, runs its
   campaign and groups its findings.
-- **Findings that explain themselves.** `bohr explain` gives the verdict with its code and the
-  faults, restarts and failed tasks before it. `bohr findings` groups bundles by cause, each group
-  led by its smallest bundle.
+- **Findings that explain themselves.** `bohr explain` gives the verdict, where the program fell
+  (a Go or Rust panic frame with its module version, or the last fatal log line), and the faults
+  before it. `bohr findings` groups bundles by cause and by place.
 - **Reduction.** `bohr reduce` shrinks the tape and the faults of a finding while it keeps its
   signature.
 - **Confirmation on a real host.** `bohr confirm` writes a script that stages the recorded faults
@@ -120,7 +122,7 @@ Hunt a target from its pack, then read what it found:
 ```bash
 bohr hunt redb --runs 2000 -j 2 -o hunt-redb
 bohr findings hunt-redb/findings              # groups, each led by its smallest bundle
-bohr explain  hunt-redb/findings/<bundle>     # the verdict and the faults before it
+bohr explain  hunt-redb/findings/<bundle>     # the verdict, where it fell, the faults before it
 ```
 
 Work with one finding:
@@ -140,6 +142,19 @@ bohr run --seed 42 -- ./my-service            # one deterministic run
 bohr run --seed 42 --repeat 1000 -- ./my-service
 bohr init --nodes 3 -- ./my-service           # a first scenario.toml from a survey of the program
 bohr explore --time 10m -j 8 --config scenario.toml -- ./my-service
+```
+
+What `bohr explain` prints for a program that logs a fatal line and exits:
+
+```
+What was found
+  a guest failed: exit status 1 (GuestCrashed)
+
+Where it fell
+  n0 (start 1)  fatal line: ERROR: failed to open the store at height 41: entry point missing
+
+What the run was
+  seed 1 · 1 node · 0.000 s virtual · 7 events · 0 faults landed
 ```
 
 ## Scenarios

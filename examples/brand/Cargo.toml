@@ -1,0 +1,12 @@
+# Outside the tool's workspace: a program run by hand when the brand changes, not part of bohr.
+[workspace]
+
+[package]
+name = "brand"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bohr-tape = { path = "../../crates/bohr-tape" }
+bohr-types = { path = "../../crates/bohr-types" }

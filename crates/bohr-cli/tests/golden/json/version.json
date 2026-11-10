@@ -1,7 +1,8 @@
 {
-  "bundle_format": 2,
+  "bundle_format": 3,
   "schema": "bohr.version/1",
   "schemas": {
+    "ablate": "bohr.ablate/1",
     "check": "bohr.check/1",
     "confirm": "bohr.confirm/1",
     "doctor": "bohr.doctor/1",

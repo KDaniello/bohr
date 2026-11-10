@@ -117,6 +117,8 @@ fn all_of_it() -> Scenario {
             targeting: Targeting::Guided,
             restart_after: Tick(2 * Tick::MILLISECOND.get()),
             arm_after: Tick(0),
+            disarm_after: None,
+            suppressed: bohr_world::Suppressed::NONE,
             budget_per_run: None,
             kinds: bohr_world::DrawnFaults::default(),
         },

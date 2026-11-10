@@ -204,6 +204,61 @@ pub fn read_events_lossy(bytes: &[u8]) -> (Vec<Event>, Option<TraceError>) {
     (events, None)
 }
 
+/// Reads a framed log from `reader` one frame at a time, keeping the events `keep` accepts.
+///
+/// For a log too large to hold: a reader that needs only the rare events of a run, such as how its
+/// tasks exited, holds those and nothing else. A truncated log keeps its intact prefix.
+pub fn read_events_where(
+    mut reader: impl std::io::Read,
+    keep: impl Fn(&Event) -> bool,
+) -> (Vec<Event>, Option<TraceError>) {
+    let mut events = Vec::new();
+    let mut offset = 0u64;
+    let mut head = [0u8; 4];
+    let mut payload = Vec::new();
+    loop {
+        match read_full(&mut reader, &mut head) {
+            Ok(0) => return (events, None),
+            Ok(4) => {}
+            Ok(_) | Err(_) => return (events, Some(TraceError::TruncatedAt { offset })),
+        }
+        let len = u32::from_le_bytes(head);
+        if len > MAX_RECORD_BYTES {
+            return (events, Some(TraceError::RecordTooLarge));
+        }
+        payload.resize(len as usize, 0);
+        let mut trailer = [0u8; 4];
+        if read_full(&mut reader, &mut payload).ok() != Some(payload.len())
+            || read_full(&mut reader, &mut trailer).ok() != Some(4)
+        {
+            return (events, Some(TraceError::TruncatedAt { offset }));
+        }
+        if u32::from_le_bytes(trailer) != len {
+            return (events, Some(TraceError::FrameMismatch { offset }));
+        }
+        match ciborium::from_reader::<Event, _>(payload.as_slice()) {
+            Ok(event) if keep(&event) => events.push(event),
+            Ok(_) => {}
+            Err(e) => return (events, Some(TraceError::Decode(e.to_string()))),
+        }
+        offset += (FRAME_OVERHEAD + payload.len()) as u64;
+    }
+}
+
+/// Fills `buf` from `reader`, returning how many bytes came before the end.
+fn read_full(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 #[cfg(test)]
 mod tests {
     use bohr_types::{EventId, NodeId, TaskId, Tick};
@@ -236,6 +291,25 @@ mod tests {
         let back = read_events(&bytes).expect("intact log");
         assert_eq!(back.len(), 64);
         assert_eq!(digest_of(&back), digest);
+    }
+
+    #[test]
+    fn a_log_read_as_a_stream_keeps_what_is_asked_for_and_stops_at_a_cut() {
+        let (bytes, _, _) = log_of(40);
+        let (even, err) = read_events_where(bytes.as_slice(), |e| e.id.get() % 2 == 0);
+        assert!(err.is_none());
+        assert_eq!(even.len(), 20);
+        assert_eq!(
+            even,
+            read_events(&bytes)
+                .expect("intact")
+                .into_iter()
+                .filter(|e| e.id.get() % 2 == 0)
+                .collect::<Vec<_>>()
+        );
+        let (cut, err) = read_events_where(&bytes[..bytes.len() - 3], |_| true);
+        assert_eq!(cut.len(), 39);
+        assert!(matches!(err, Some(TraceError::TruncatedAt { .. })));
     }
 
     #[test]

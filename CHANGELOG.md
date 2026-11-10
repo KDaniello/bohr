@@ -6,6 +6,97 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.1 — honest findings
+
+v0.9's campaigns returned findings that took hours each to read, and some of them were the tool's
+own: a run in a mode nobody runs in production, a host confirmation whose node never started. v0.9.1
+makes every finding say what it is before anyone reads it: where the program fell, which faults it
+needed, how real those faults are, and a verdict that keeps everything but a defect of the target
+out of the count. A campaign stops when it has nothing new to say, and a campaign of a four-validator
+network no longer runs its host out of memory.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.1` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+Format 2 bundles still replay. A tool of format 2 refuses a format 3 bundle: format 3 adds the
+guests' output, which an older `--redact` would carry through unaware.
+
+### Where it fell
+
+- **Guest output in the bundle.** A run whose log is kept keeps the last 64 KiB each start of each
+  node wrote to standard output and error, in section `GUEST_OUTPUT` (13), outside the trace digest.
+  `--redact` removes it.
+- **The place, read from it.** A Go panic or runtime fatal error gives the first frame outside the
+  standard library, with its module and version; a Rust panic the line it was raised at, with its
+  crate and version; otherwise the last line logged at a fatal or error level, and otherwise the
+  failing node's last line. `bohr explain` prints it as `Where it fell`, and `--json` as `where`.
+- **Groups by place.** `bohr findings` groups by the programs, the violation and the place, so two
+  panics at two frames are two groups and one defect at two heights is one.
+
+### What a finding is
+
+- **`bohr ablate <bundle>`** repeats a finding once per kind of fault that landed, with that kind at
+  nought odds and every draw kept, and names the kinds the finding needed.
+- **Grades.** Every fault kind is graded `real`, `plausible`, `model-only` or `adversarial`, each
+  with its source in `docs/DETERMINISM.md` §5. A finding's grade is the weakest among the kinds it
+  needed.
+- **Verdicts.** `bohr findings --ablate`, and every `bohr hunt`, gives each group a verdict: a
+  target defect, a target defect under a plausible or adversarial condition, a model artefact, an
+  expected refusal, a bench failure (`[cluster] roles`), out of scope (a pack's
+  `[scope] nonproduction`), or a limit of bohr. The summary counts the groups that are a defect of
+  the target; every bundle stays and every group is printed.
+- **The Ethereum packs run in `--dev`.** geth, reth and op-reth declare it non-production, so their
+  findings are out of scope until they are run as a network runs them.
+
+### Campaigns that stop
+
+- **`--quiet-runs N`** stops a campaign N runs after its last new group. A hunt with no budget runs
+  `--quiet-runs 1000 --time 15m`. Each group's first run and its seconds into the campaign are
+  written to `first-seen.json` and printed by `bohr findings`.
+- **`--time` stops near its budget.** Past it no run is handed out, and a generation cut short is
+  folded as one cut by `--runs` is. A network whose runs take 26 s ran 28 minutes on a 15-minute
+  budget; it now stops at the budget.
+- **A fault window.** `faults.disarm_after_ticks` closes it for every drawn fault, node, disk,
+  memory and network, at nought odds with every draw kept. A probe times a stall from the close.
+
+### Large runs
+
+- **A campaign's memory.** A worker sent back the whole draw journal of each run and the campaign
+  held a generation of them. On four CometBFT validators the campaign grew by 250 MB a minute and
+  the kernel killed it at 3.3 GB; a worker now sends the 256 records the corpus uses, and the same
+  campaign stayed at 143 MB over 28 minutes.
+- **Streaming bundles.** A finding's events are compressed into a file as they are recorded, and the
+  bundle is written by copying it; the event log is never held whole. `EVENTS` may unpack to 64 GiB;
+  every other section keeps the 1 GiB bound.
+
+### The brand
+
+- **A mark, a wordmark and banners**, drawn by `examples/brand` (`make brand`) into `docs/assets`.
+  The README's banner draws the tape `bohr_tape::Tape::from_seed` gives for seed 1913, three bytes a
+  spectral line, beside hydrogen's four Balmer lines.
+
+### Fixed
+
+- **`bohr replay --binaries` across machines**, in the nightly: the traced guest travels with its
+  bundle and replays through `--binaries`, and the hunting job installs `protoc`.
+- **A network bundle written by an older release.** Every release builds a new probe, so such a
+  bundle is refused with `BOHR-4004`; the refusal now says to name the old probe in `BOHR_PROBE`.
+  `make bank` keeps each finding's probe beside its binaries. Two of five banked findings had
+  stopped replaying at the change of version.
+
+### What it does not do
+
+- **Reach a rare window in a quiet pass.** A group a v0.9 campaign first reached at 19% of its
+  run, about once in 18 000 runs, is missed by the default quiet budget. A scenario whose faults
+  can land only in that window reaches it; a longer campaign is not the remedy.
+- **Run op-reth.** It was not built on the 4 GB host, and its clean run and its hunt are not
+  measured.
+- **Read a large bundle in pieces.** A reader still unpacks `EVENTS` whole; only writing streams.
+
 ## v0.9.0 — the hunt
 
 Bohr ran campaigns on four targets and had no way to keep what it found, to check it outside its own

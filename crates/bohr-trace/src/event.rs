@@ -287,6 +287,117 @@ pub enum FaultKind {
     NetCorrupt,
 }
 
+/// How real a fault is: whether a stock host produces it, and so whether a finding that needs it
+/// is a defect of the target. `docs/DETERMINISM.md` gives the source behind each grade.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub enum FaultGrade {
+    /// A stock Linux host on stock hardware produces it.
+    Real,
+    /// A real host produces it on some file systems or devices, or an operator does.
+    Plausible,
+    /// No known host produces it; the model allows it for search.
+    ModelOnly,
+    /// An attacker produces it.
+    Adversarial,
+}
+
+impl FaultGrade {
+    /// The grade in words.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Plausible => "plausible",
+            Self::ModelOnly => "model-only",
+            Self::Adversarial => "adversarial",
+        }
+    }
+}
+
+impl FaultKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 19] = [
+        Self::NetDelay,
+        Self::NetDrop,
+        Self::NetDuplicate,
+        Self::NetReorder,
+        Self::NetPartition,
+        Self::DiskTear,
+        Self::DiskReorder,
+        Self::DiskStall,
+        Self::DiskFull,
+        Self::DiskError,
+        Self::NodeKill,
+        Self::NodeFreeze,
+        Self::NodeThaw,
+        Self::NodeRestart,
+        Self::ClockStep,
+        Self::ClockDrift,
+        Self::ChainReorg,
+        Self::MemoryExhausted,
+        Self::NetCorrupt,
+    ];
+
+    /// The name a configuration, a report and the event log's JSON use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NetDelay => "net_delay",
+            Self::NetDrop => "net_drop",
+            Self::NetDuplicate => "net_duplicate",
+            Self::NetReorder => "net_reorder",
+            Self::NetPartition => "net_partition",
+            Self::DiskTear => "disk_tear",
+            Self::DiskReorder => "disk_reorder",
+            Self::DiskStall => "disk_stall",
+            Self::DiskFull => "disk_full",
+            Self::DiskError => "disk_error",
+            Self::NodeKill => "node_kill",
+            Self::NodeFreeze => "node_freeze",
+            Self::NodeThaw => "node_thaw",
+            Self::NodeRestart => "node_restart",
+            Self::ClockStep => "clock_step",
+            Self::ClockDrift => "clock_drift",
+            Self::ChainReorg => "chain_reorg",
+            Self::MemoryExhausted => "memory_exhausted",
+            Self::NetCorrupt => "net_corrupt",
+        }
+    }
+
+    /// The kind a name names.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// How real this kind of fault is.
+    ///
+    /// The network kinds are drawn on datagrams only, where loss, duplication and reordering are
+    /// what the kernel delivers; a stream is never dropped, duplicated or reordered here.
+    #[must_use]
+    pub const fn grade(self) -> FaultGrade {
+        match self {
+            Self::DiskTear | Self::DiskReorder | Self::NodeRestart => FaultGrade::Plausible,
+            Self::NetCorrupt => FaultGrade::Adversarial,
+            Self::NetDelay
+            | Self::NetDrop
+            | Self::NetDuplicate
+            | Self::NetReorder
+            | Self::NetPartition
+            | Self::DiskStall
+            | Self::DiskFull
+            | Self::DiskError
+            | Self::NodeKill
+            | Self::NodeFreeze
+            | Self::NodeThaw
+            | Self::ClockStep
+            | Self::ClockDrift
+            | Self::ChainReorg
+            | Self::MemoryExhausted => FaultGrade::Real,
+        }
+    }
+}
+
 /// What a fault was applied to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum FaultTarget {

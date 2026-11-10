@@ -214,3 +214,32 @@ gate is for — the change is:
 
 The document is closed when every row is `solved`, `by design`, or a named honest hole. It is not
 closed today, and the status column is what states that.
+
+## 5. How real each fault is
+
+A finding is a defect of the target when the faults it needed are ones a real host produces. Each
+kind of fault the world draws carries a grade, `FaultKind::grade` in `bohr-trace`, and the source
+the grade rests on. `bohr ablate` finds which kinds a finding needed, and the weakest grade among
+them is the finding's (`API.md` §7.7).
+
+| Kind | Grade | Why |
+|---|---|---|
+| `node_kill` | real | a process killed, or a host losing power: under `sync_semantics = "strict"` everything the program synced survives and nothing else is promised, which is what `fsync(2)` promises |
+| `node_freeze` | real | `SIGSTOP`, a garbage-collection pause, a VM paused by its hypervisor |
+| `node_thaw` | real | the end of a freeze |
+| `net_partition` | real | a cut link or a node isolated by a switch or a firewall |
+| `net_drop`, `net_delay`, `net_duplicate`, `net_reorder` | real | drawn on datagrams only, which IP delivers at most once, late or out of order, and UDP does not repair (RFC 768); a stream is never dropped, duplicated or reordered here |
+| `disk_stall` | real | an `fsync` waiting behind other writeback on a loaded device |
+| `disk_full` | real | `write(2)` and `fallocate(2)` answer `ENOSPC` |
+| `disk_error` | real | `fsync(2)` answers `EIO` and Linux, since 4.13, reports the writeback error once and marks the failed pages clean, so the unsynced data is gone |
+| `memory_exhausted` | real | `mmap(2)` answers `ENOMEM` under a resource limit or strict overcommit |
+| `clock_step`, `clock_drift` | real, within the scenario's bound | NTP steps a clock it finds far off and slews one that drifts, by up to 500 ppm |
+| `chain_reorg` | real | a chain's fork choice replaces blocks it had made head |
+| `disk_tear` | plausible | a device promises atomic writes of one sector, 512 bytes or 4 KiB; a write spanning sectors can land partly when power fails |
+| `disk_reorder` | plausible | unsynced writes to different files reach the device in no promised order; a file system with delayed allocation lands them as its writeback chooses |
+| `node_restart` | plausible | an operator restoring a node from an older snapshot or backup |
+| `net_corrupt` | adversarial | the UDP checksum catches random corruption, so a datagram altered and still delivered is one an attacker altered |
+
+No current kind is graded model-only: each is something a host, a network or an operator does. A
+kind added later is graded when it is added, and a kind the model produces in a way no host does is
+graded model-only rather than given a grade it has not earned.

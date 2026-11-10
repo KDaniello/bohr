@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod ablate;
 mod check;
 mod confirm;
 mod disclose;
@@ -26,6 +27,7 @@ mod replay;
 mod subjects;
 mod survey;
 mod targets;
+mod triage;
 mod wire;
 
 use std::process::ExitCode;
@@ -198,6 +200,9 @@ enum Command {
         /// Run budget. The reproducible one.
         #[arg(long, value_name = "N")]
         runs: Option<u64>,
+        /// Stop after this many runs that added no new group of findings.
+        #[arg(long, value_name = "N")]
+        quiet_runs: Option<u64>,
         /// How many workers.
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
@@ -254,6 +259,10 @@ enum Command {
         /// Run budget, the one that reproduces.
         #[arg(long, value_name = "N")]
         runs: Option<u64>,
+        /// Stop after this many runs that added no new group of findings. Without any budget, a
+        /// hunt stops after 1000 such runs or 15 minutes, whichever comes first.
+        #[arg(long, value_name = "N")]
+        quiet_runs: Option<u64>,
         /// How many workers.
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
@@ -332,6 +341,10 @@ enum Command {
     Findings {
         /// The directory of bundles.
         dir: String,
+        /// Repeat each group's smallest bundle once per kind of fault it landed, to say which it
+        /// needed and how real they are (`bohr ablate`).
+        #[arg(long)]
+        ablate: bool,
     },
 
     /// Write a first scenario for a program, from what a survey of it finds.
@@ -413,6 +426,18 @@ enum Command {
         /// Write SARIF 2.1.0 instead of the page, one result per finding group.
         #[arg(long, conflicts_with = "redact")]
         sarif: bool,
+    },
+
+    /// Say which faults a stored finding needed, and how real they are.
+    ///
+    /// The run is repeated once per kind of fault that landed, with that kind at nought odds and
+    /// every draw kept. See `docs/API.md` §7.7.
+    Ablate {
+        /// The finding to ablate.
+        bundle: String,
+        /// Where to find the recorded objects if their paths moved.
+        #[arg(long)]
+        binaries: Option<String>,
     },
 
     /// Write a script that stages a stored finding on an ordinary Linux host, without bohr.
@@ -898,6 +923,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
         Command::Explore {
             time,
             runs,
+            quiet_runs,
             jobs,
             findings,
             corpus,
@@ -910,10 +936,11 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
         } => {
             let subject = subject_of(guest, program)?;
             let scenario = read_scenario(config.as_deref())?;
-            if time.is_none() && runs.is_none() {
+            if time.is_none() && runs.is_none() && quiet_runs.is_none() {
                 return Err(CliError::Usage(
                     "BOHR-1001: a campaign needs a budget: --runs for one that reproduces, \
-                     --time for one that does not"
+                     --time for one that does not, --quiet-runs for one that stops when it finds \
+                     nothing new"
                         .to_owned(),
                 ));
             }
@@ -921,6 +948,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                 master: Seed(master_seed),
                 runs,
                 time,
+                quiet_runs,
                 jobs,
                 findings: findings.into(),
                 corpus: corpus.map(Into::into),
@@ -937,6 +965,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                 master: Seed(0),
                 runs: None,
                 time: None,
+                quiet_runs: None,
                 jobs: 1,
                 findings: std::path::PathBuf::new(),
                 corpus: None,
@@ -956,6 +985,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             pack,
             time,
             runs,
+            quiet_runs,
             jobs,
             seeds,
             no_faults,
@@ -967,6 +997,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             pack,
             time,
             runs,
+            quiet_runs,
             jobs,
             seeds,
             no_faults,
@@ -1018,7 +1049,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                 program: program.into_iter().next(),
             })
         }
-        Command::Findings { dir } => findings::findings(&dir),
+        Command::Findings { dir, ablate } => findings::findings(&dir, ablate),
         Command::Init { nodes, out, program } => init::init(program, nodes, &out),
         Command::Reduce { bundle, out, budget, keep, binaries } => {
             reduce::reduce(&bundle, &out, budget, &keep, binaries.as_deref())
@@ -1054,6 +1085,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             survey::run(program, seed, config.as_deref(), max_events, patch_cpuid)
         }
         Command::Note { bundle, text } => note(&bundle, &text),
+        Command::Ablate { bundle, binaries } => ablate::ablate(&bundle, binaries.as_deref()),
         Command::Confirm { bundle, out, runs } => confirm::confirm(&bundle, &out, runs),
         Command::Trace { bundle, format, node, kind, from, to, around, squash } => {
             trace(&bundle, &format, &Selection { node, kind, from, to, around }, squash)

@@ -64,8 +64,10 @@ impl Completed {
 pub(crate) struct Completed {
     /// What the kernel reported.
     pub(crate) report: RunReport,
-    /// The framed event log.
+    /// The framed event log, where it was kept in memory.
     pub(crate) log: Vec<u8>,
+    /// The framed event log, where it was spooled to a file instead (`Record::Spool`).
+    pub(crate) spooled: Option<bohr_trace::Spooled>,
     /// Names of the components that produced it.
     pub(crate) provenance: Provenance,
     /// Conditions under which determinism was not fully guaranteed.
@@ -86,6 +88,8 @@ pub(crate) struct Completed {
     pub(crate) config_toml: String,
     /// Records the guests wrote about themselves, one per line.
     pub(crate) sdk_records: Vec<u8>,
+    /// The end of what each incarnation of each node wrote out. Empty unless the log was kept.
+    pub(crate) output_tails: Vec<bohr_trace::OutputTail>,
     /// What a survey found it could not model, by syscall number. Empty for an ordinary run.
     pub(crate) surveyed: Vec<(u32, u64)>,
     /// The values this run is compared by, where a differential scenario asked for any.
@@ -156,8 +160,18 @@ pub(crate) enum Output {
 pub(crate) enum Record {
     /// Keep every event.
     Log,
+    /// Keep every event, compressed into a file as it is recorded, for a run that only becomes a
+    /// bundle: a campaign's finding, whose log a cluster makes too large to hold.
+    Spool,
     /// Digest the events and keep none.
     DigestOnly,
+}
+
+impl Record {
+    /// Whether the events are kept, in memory or in a file.
+    pub(crate) const fn keeps_events(self) -> bool {
+        !matches!(self, Self::DigestOnly)
+    }
 }
 
 /// How execution is interleaved, by the name the command line accepts.
@@ -297,6 +311,11 @@ fn drive(
     // Two slots for one world; the scenario decides which model fills its slot.
     let mut minimal = bohr_world::MinimalWorld::new();
     let mut cluster = bohr_world::DistributedWorld::new();
+    // Only a kept log becomes a bundle, so only then is the guests' output kept for it.
+    if record.keeps_events() {
+        minimal = minimal.keeping_tails();
+        cluster = cluster.keeping_tails();
+    }
     let world: &mut dyn bohr_kernel::WorldModel = match scenario {
         None => {
             if output == Output::Deliver {
@@ -359,8 +378,8 @@ fn drive(
         bohr_world::panel(scenario.map(bohr_world::LoadedConfig::watching).unwrap_or_default());
     // An unread run is only digested; the digest comes from the event fields either way.
     let mut sink = match record {
-        Record::Log => TraceWriter::new(LogSink::new(record)),
-        Record::DigestOnly => TraceWriter::digest_only(LogSink::new(record)),
+        Record::Log | Record::Spool => TraceWriter::new(LogSink::new(record)?),
+        Record::DigestOnly => TraceWriter::digest_only(LogSink::new(record)?),
     };
 
     let provenance = Provenance {
@@ -418,8 +437,12 @@ fn drive(
         Some(_) => cluster.surveyed(),
         None => minimal.surveyed(),
     };
+    let output_tails = match scenario {
+        Some(_) => cluster.output_tails(),
+        None => minimal.output_tails(),
+    };
     let (sink, stats) = sink.into_parts();
-    let log = sink.into_bytes();
+    let (log, spooled) = sink.finish()?;
     let (counters, outcome_event) = count_from_stats(&stats, &report);
     let capabilities = backend.capabilities();
     // Read after the run, so the search never depends on when it sampled.
@@ -429,6 +452,7 @@ fn drive(
     Ok(Completed {
         report,
         log,
+        spooled,
         provenance,
         // Filled by whoever owns a backend that knows of any; nothing here can.
         degradations: Vec::new(),
@@ -452,10 +476,11 @@ fn drive(
             traps_rdrand: capabilities.traps_rdrand,
         },
         // Only a kept log becomes a bundle, and only a bundle carries fingerprints.
-        binaries: if matches!(record, Record::Log) { fingerprints(specs) } else { Vec::new() },
+        binaries: if record.keeps_events() { fingerprints(specs) } else { Vec::new() },
         stats,
         config_toml: config_toml.to_owned(),
         sdk_records,
+        output_tails,
         surveyed,
         projected,
         state_digest,
@@ -538,36 +563,68 @@ fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
     out
 }
 
-/// Collects the event log, or counts it and keeps nothing.
-struct LogSink {
-    bytes: Option<Vec<u8>>,
+/// Collects the event log in memory, spools it to a file, or counts it and keeps nothing.
+enum LogSink {
+    Memory(Vec<u8>),
+    Spool(Box<bohr_trace::Spool>),
+    Discard,
 }
 
 impl LogSink {
-    const fn new(record: Record) -> Self {
-        Self {
-            bytes: match record {
-                Record::Log => Some(Vec::new()),
-                Record::DigestOnly => None,
-            },
-        }
+    fn new(record: Record) -> Result<Self, CliError> {
+        Ok(match record {
+            Record::Log => Self::Memory(Vec::new()),
+            Record::Spool => {
+                let path = spool_path();
+                let spool = bohr_trace::Spool::create(&path).map_err(|e| {
+                    CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
+                })?;
+                Self::Spool(Box::new(spool))
+            }
+            Record::DigestOnly => Self::Discard,
+        })
     }
 
-    fn into_bytes(self) -> Vec<u8> {
-        self.bytes.unwrap_or_default()
+    /// The log kept in memory, and the spool where there is one instead.
+    fn finish(self) -> Result<(Vec<u8>, Option<bohr_trace::Spooled>), CliError> {
+        match self {
+            Self::Memory(bytes) => Ok((bytes, None)),
+            Self::Spool(spool) => {
+                let spooled = spool.finish().map_err(|e| {
+                    CliError::Usage(format!("BOHR-1002: cannot finish the event spool: {e}"))
+                })?;
+                Ok((Vec::new(), Some(spooled)))
+            }
+            Self::Discard => Ok((Vec::new(), None)),
+        }
     }
+}
+
+/// A file of this process's own for one run's spooled events, in the temporary directory.
+///
+/// Named by process and a counter, since several workers spool at once; the name never reaches
+/// the run.
+fn spool_path() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("bohr-events-{}-{n}.zst", std::process::id()))
 }
 
 impl std::io::Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(bytes) = self.bytes.as_mut() {
-            bytes.extend_from_slice(buf);
+        match self {
+            Self::Memory(bytes) => bytes.extend_from_slice(buf),
+            Self::Spool(spool) => spool.write_all(buf)?,
+            Self::Discard => {}
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        match self {
+            Self::Spool(spool) => spool.flush(),
+            Self::Memory(_) | Self::Discard => Ok(()),
+        }
     }
 }
 
@@ -681,6 +738,37 @@ pub(crate) fn to_bundle(
     tape: &Tape,
     reduced_from: Option<String>,
 ) -> Result<Vec<u8>, CliError> {
+    let (writer, run_id) = bundle_writer(completed, tape, reduced_from)?;
+    Ok(writer.finish(run_id))
+}
+
+/// Writes a completed run as a scenario bundle at `path`, streaming a spooled event log from its
+/// file, so the log is never held whole.
+pub(crate) fn write_bundle(
+    completed: &Completed,
+    tape: &Tape,
+    reduced_from: Option<String>,
+    path: &std::path::Path,
+) -> Result<(), CliError> {
+    let refused = |e: std::io::Error| {
+        CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
+    };
+    let (writer, run_id) = bundle_writer(completed, tape, reduced_from)?;
+    // Written beside and renamed, so a campaign stopped mid-copy leaves no bundle that looks saved.
+    let part = path.with_extension("bohr.part");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&part).map_err(refused)?);
+    writer.write_to(&mut file, run_id).map_err(refused)?;
+    std::io::Write::flush(&mut file).map_err(refused)?;
+    drop(file);
+    std::fs::rename(&part, path).map_err(refused)
+}
+
+/// Every section of a completed run's bundle, and the bundle's run identifier.
+fn bundle_writer(
+    completed: &Completed,
+    tape: &Tape,
+    reduced_from: Option<String>,
+) -> Result<(BundleWriter, [u8; 16]), CliError> {
     let run_id = derive_run_id(tape.seed(), completed.report.digest);
     let manifest = manifest_for(bohr_trace::ManifestInputs {
         reduced_from,
@@ -703,7 +791,6 @@ pub(crate) fn to_bundle(
             serde_json::to_vec_pretty(&manifest).map_err(|e| CliError::Internal(e.to_string()))?,
         )
         .section(SectionId::Tape, tape.to_container())
-        .section(SectionId::Events, completed.log.clone())
         .section(SectionId::DrawJournal, completed.report.journal.to_bytes())
         .section(
             SectionId::HostProfile,
@@ -716,8 +803,19 @@ pub(crate) fn to_bundle(
                 .map_err(|e| CliError::Internal(e.to_string()))?,
         )
         .section(SectionId::Config, completed.config_toml.clone().into_bytes());
+    match &completed.spooled {
+        Some(spooled) => writer.spooled_section(SectionId::Events, spooled),
+        None => writer.section(SectionId::Events, completed.log.clone()),
+    };
     if !completed.sdk_records.is_empty() {
         writer.section(SectionId::SdkRecords, completed.sdk_records.clone());
+    }
+    if !completed.output_tails.is_empty() {
+        writer.section(
+            SectionId::GuestOutput,
+            serde_json::to_vec(&completed.output_tails)
+                .map_err(|e| CliError::Internal(e.to_string()))?,
+        );
     }
     // The file list only; real state runs to gigabytes.
     if let Some(manifest) = &completed.state_manifest {
@@ -727,7 +825,7 @@ pub(crate) fn to_bundle(
     if let Some(map) = &completed.coverage {
         writer.section(SectionId::Coverage, map.as_bytes().to_vec());
     }
-    Ok(writer.finish(run_id))
+    Ok((writer, run_id))
 }
 
 /// One tape, several implementations, and what a group oracle made of them.

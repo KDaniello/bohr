@@ -12,5 +12,6 @@
   ],
   "run": "seed 0 · 1 node · 0.000 s virtual · 11 events · 0 faults landed",
   "schema": "bohr.explain/1",
-  "steps": []
+  "steps": [],
+  "where": null
 }

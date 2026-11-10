@@ -13,6 +13,11 @@ blake3 = "1d7726869529f4fa36d9e99b4b8364d0b47b422be5e37d26e9578c97d1e6eb1a"
 [run]
 scenario = "targets/op-reth/scenario.toml"
 
+# The developer mode mines on its own and is run by nobody in production; a finding of a run in it
+# is out of scope.
+[scope]
+nonproduction = ["--dev"]
+
 [judge]
 oracle = "crash"
 

@@ -273,6 +273,11 @@ pub(crate) struct Network {
     next_packet: u64,
     /// Delivery ticks of packets on the wire per directed link, for the reorder rule.
     on_link: BTreeMap<(NodeId, NodeId), Vec<(u64, Tick)>>,
+    /// The moment drawn faults stop, `faults.disarm_after_ticks`; packets sent from then on are
+    /// drawn at nought odds of being dropped, duplicated, reordered or corrupted.
+    window_closes: Option<Tick>,
+    /// Kinds an ablation suppresses; their draws happen at nought odds.
+    suppressed: super::Suppressed,
 }
 
 /// The virtual address node `n` owns: `10.66.0.(n+1)`.
@@ -297,6 +302,21 @@ fn node_behind(address: u32, own: NodeId) -> Option<NodeId> {
 impl Network {
     pub(crate) fn configure(&mut self, config: NetworkConfig) {
         self.config = config;
+    }
+
+    /// Stops drawn network faults from `at` on, and those of the suppressed kinds throughout.
+    pub(crate) const fn follow_policy(&mut self, at: Option<Tick>, suppressed: super::Suppressed) {
+        self.window_closes = at;
+        self.suppressed = suppressed;
+    }
+
+    /// `odds` of `kind` for a packet sent at `now`: nought once the window has closed, and
+    /// throughout where an ablation suppresses the kind.
+    fn windowed(&self, now: Tick, kind: FaultKind, odds: (u32, u32)) -> (u32, u32) {
+        match self.window_closes {
+            Some(closes) if now >= closes => (0, 1),
+            _ => self.suppressed.odds(kind, odds),
+        }
     }
 
     fn linked(&self, a: NodeId, b: NodeId) -> bool {
@@ -922,14 +942,22 @@ impl Network {
         };
 
         // The four draws, always, in order (API §5.3), at fixed width.
-        let dropped = draw_odds(ctx, drop_probability, DrawSite::NetDeliver)?;
-        let duplicated = draw_odds(ctx, self.config.duplicate_probability, DrawSite::NetDeliver)?;
-        let reordered = draw_odds(ctx, self.config.reorder_probability, DrawSite::NetReorder)?;
+        let now = ctx.world_now();
+        let drop_odds = self.windowed(now, FaultKind::NetDrop, drop_probability);
+        let duplicate_odds =
+            self.windowed(now, FaultKind::NetDuplicate, self.config.duplicate_probability);
+        let reorder_odds =
+            self.windowed(now, FaultKind::NetReorder, self.config.reorder_probability);
+        let dropped = draw_odds(ctx, drop_odds, DrawSite::NetDeliver)?;
+        let duplicated = draw_odds(ctx, duplicate_odds, DrawSite::NetDeliver)?;
+        let reordered = draw_odds(ctx, reorder_odds, DrawSite::NetReorder)?;
         let jitter = ctx.draw_exponential(self.config.latency_jitter_ticks, DrawSite::NetDelay)?;
         let delay = mean.saturating_add(jitter);
         // Corruption draws only when armed, and then always at full width.
         let flips = if self.config.corrupt_probability.0 > 0 {
-            let corrupted = draw_odds(ctx, self.config.corrupt_probability, DrawSite::NetCorrupt)?;
+            let corrupt_odds =
+                self.windowed(now, FaultKind::NetCorrupt, self.config.corrupt_probability);
+            let corrupted = draw_odds(ctx, corrupt_odds, DrawSite::NetCorrupt)?;
             let mut flips = Vec::with_capacity(self.config.corrupt_bytes as usize);
             for _ in 0..self.config.corrupt_bytes {
                 let mut drawn = [0u8; 8];

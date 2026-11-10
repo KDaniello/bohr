@@ -13,6 +13,7 @@ pub mod disclosure;
 mod escape;
 mod html;
 pub mod jsonl;
+pub mod locate;
 mod model;
 pub mod narrate;
 pub mod sarif;

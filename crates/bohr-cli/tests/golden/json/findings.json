@@ -10,8 +10,14 @@
       ],
       "code": "Clean",
       "count": 1,
+      "counts": false,
+      "first_after_s": null,
+      "first_run": null,
+      "grade": null,
+      "necessary": [],
       "signature": "builtin:clock-and-random: Clean: nothing was found",
       "smallest": "findings/clock-and-random-seed0.bohr",
+      "triage": "not ablated",
       "verdict": "nothing was found"
     },
     {
@@ -23,8 +29,14 @@
       ],
       "code": "Clean",
       "count": 1,
+      "counts": false,
+      "first_after_s": null,
+      "first_run": null,
+      "grade": null,
+      "necessary": [],
       "signature": "builtin:large-random: Clean: nothing was found",
       "smallest": "findings/large-random-seed0.bohr",
+      "triage": "not ablated",
       "verdict": "nothing was found"
     },
     {
@@ -36,10 +48,17 @@
       ],
       "code": "Clean",
       "count": 1,
+      "counts": false,
+      "first_after_s": null,
+      "first_run": null,
+      "grade": null,
+      "necessary": [],
       "signature": "builtin:two-tasks: Clean: nothing was found",
       "smallest": "findings/two-tasks-seed0.bohr",
+      "triage": "not ablated",
       "verdict": "nothing was found"
     }
   ],
-  "schema": "bohr.findings/1"
+  "schema": "bohr.findings/1",
+  "target_defect_groups": 0
 }

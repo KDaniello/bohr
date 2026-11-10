@@ -195,9 +195,16 @@ pub(crate) fn verify_binaries(bundle: &Bundle, dir: Option<&str>) -> Result<(), 
         })?;
         let actual = Digest::of(&bytes).to_string();
         if actual != record.blake3 {
+            // The probe ships with bohr, so every release changes it; the old one is named apart.
+            let remedy = if record.role == "probe" {
+                "\n  the probe is the one this bohr found; name the probe the bundle was written \
+                 with in BOHR_PROBE"
+            } else {
+                ""
+            };
             return Err(CliError::Usage(format!(
                 "BOHR-4004: {path} has changed since the bundle was written\n  \
-                 recorded {}\n  found    {actual}",
+                 recorded {}\n  found    {actual}{remedy}",
                 record.blake3
             )));
         }

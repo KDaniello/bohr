@@ -54,14 +54,20 @@ fn memory() -> Vec<bohr_testkit::Preload> {
 }
 
 fn run(arm_after: Tick) -> Judged {
+    run_window(arm_after, None, Tick(0))
+}
+
+fn run_window(arm_after: Tick, disarm_after: Option<Tick>, restart_after: Tick) -> Judged {
     let scenario = Scenario {
         network: NetworkConfig { nodes: 1, ..NetworkConfig::default() },
         fault_policy: FaultPolicy {
             kill: (1, 64),
             enomem: (0, 0),
             targeting: Targeting::Guided,
-            restart_after: Tick(0),
+            restart_after,
             arm_after,
+            disarm_after,
+            suppressed: bohr_world::Suppressed::NONE,
             budget_per_run: None,
             kinds: bohr_world::DrawnFaults::default(),
         },
@@ -96,4 +102,32 @@ fn a_fault_held_back_fires_after_it_is_armed() {
 
     let held = killed_at(&run(ARM_AT)).expect("a held policy still kills, later");
     assert!(held >= ARM_AT, "a held fault fired at {held:?}, before it was armed");
+}
+
+/// Kills of a run, by when they fired.
+fn kills(judged: &Judged) -> Vec<Tick> {
+    judged
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::FaultFired { fault: FaultKind::NodeKill, .. }))
+        .map(|e| e.tick)
+        .collect()
+}
+
+/// A closed window fires nothing more, and a node killed before it still comes back.
+#[test]
+fn no_fault_fires_once_the_window_closes() {
+    let restart = Tick(Tick::MILLISECOND.get() / 4);
+    let open = kills(&run_window(Tick(0), None, restart));
+    assert!(
+        open.iter().any(|t| *t >= ARM_AT),
+        "the open run should kill after {ARM_AT:?} too, and killed at {open:?}"
+    );
+
+    let closed = kills(&run_window(Tick(0), Some(ARM_AT), restart));
+    assert!(!closed.is_empty(), "the window was open until {ARM_AT:?} and fired nothing");
+    assert!(
+        closed.iter().all(|t| *t < ARM_AT),
+        "a fault fired at or after the window closed at {ARM_AT:?}: {closed:?}"
+    );
 }

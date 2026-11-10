@@ -255,6 +255,9 @@ pub struct Observer {
     down: BTreeSet<u32>,
     /// When the cluster last became whole: the last heal, or the last node coming back.
     whole_since: Tick,
+    /// The earliest moment a stall is timed from: where the scenario closes its fault window,
+    /// `faults.disarm_after_ticks`, a stall is judged only once nothing pushes the cluster down.
+    judged_from: Tick,
     /// Probe and node pairs already reported, so a run says each once.
     reported: BTreeSet<(usize, u32)>,
 }
@@ -284,8 +287,14 @@ impl Observer {
             learned,
             down: BTreeSet::new(),
             whole_since: Tick(0),
+            judged_from: Tick(0),
             reported: BTreeSet::new(),
         }
+    }
+
+    /// Times no stall from before `at`, the moment the scenario's fault window closes.
+    pub const fn judge_stalls_from(&mut self, at: Tick) {
+        self.judged_from = at;
     }
 
     /// How many requests the plan has.
@@ -505,7 +514,7 @@ impl Observer {
         if !whole {
             return Vec::new();
         }
-        let from = (*changed).max(*first).max(self.whole_since);
+        let from = (*changed).max(*first).max(self.whole_since).max(self.judged_from);
         let still = now.get().saturating_sub(from.get());
         if still < within.get() {
             return Vec::new();
@@ -663,6 +672,18 @@ mod tests {
         assert!(o.answer(Tick(300), false, 0, &block("0x2", "0xb")).is_empty(), "whole for 80");
         let broken = o.answer(Tick(330), false, 0, &Answer::Unanswered("refused".into()));
         assert_eq!(broken[0].code, ADVANCES_CODE);
+    }
+
+    /// Inside the fault window a stall is the faults'; it is timed from the window's close.
+    #[test]
+    fn a_stall_is_timed_from_the_close_of_the_fault_window() {
+        let mut o = Observer::new(vec![spec(Property::Advances)]);
+        o.judge_stalls_from(Tick(500));
+        assert!(o.answer(Tick(0), false, 0, &block("0x1", "0xa")).is_empty());
+        assert!(o.answer(Tick(450), false, 0, &block("0x1", "0xa")).is_empty(), "inside");
+        assert!(o.answer(Tick(590), false, 0, &block("0x1", "0xa")).is_empty(), "90 after");
+        let broken = o.answer(Tick(600), false, 0, &block("0x1", "0xa"));
+        assert_eq!(broken[0].code, ADVANCES_CODE, "100 after the close");
     }
 
     /// A node is compared by its latest answer.

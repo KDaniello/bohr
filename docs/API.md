@@ -422,7 +422,7 @@ independently hashed, so a truncated or corrupted bundle reports *which part* is
 ```
 Header (32 bytes)
   0   8   magic            b"BOHRBNDL"
-  8   2   bundle_format    u16, currently 2
+  8   2   bundle_format    u16, currently 3
  10   2   section_count    u16
  12   4   flags            u32, currently 0
  16   16  run_id           128-bit, identifies this bundle forever; see below
@@ -448,6 +448,9 @@ Section table, `section_count` entries of 64 bytes:
 | 8 | `HOST_PROFILE` | JSON: what we *presented* to the guest, §4.5 | yes |
 | 9 | `CONFIG` | the effective merged configuration, §5 | yes |
 | 10 | `NOTES` | free-form UTF-8 attached by `bohr note` | no |
+| 11 | `STATE_MANIFEST` | what the prepared filesystem held: paths, lengths and digests | no |
+| 12 | `EXECUTIONS` | each execution of a differential run, §4.2 | no |
+| 13 | `GUEST_OUTPUT` | JSON: the last 64 KiB each start of each node wrote to standard output and error, with the node, the start's number, the virtual moment it began and the bytes before the kept text; written only for a run whose log is kept, and outside the trace digest, since the events digest every byte written | no |
 
 **`run_id` is derived, not random**: `blake3(b"bohr/bundle/run-id/v1" ‖ seed_le ‖ trace_digest)`
 truncated to 16 bytes. A random identifier would be a nondeterminism source inside the supervisor,
@@ -464,6 +467,11 @@ rather than read therefore costs a refusal rather than a machine.
 **Unknown section ids are preserved, not dropped.** A tool that rewrites a bundle (`bohr reduce`)
 copies sections it does not understand. Dropping them would mean a newer bundle silently loses data
 when passed through an older tool.
+
+**A section that carries the guest's data comes with a new `bundle_format`.** A preserved section
+would pass through an older tool's `--redact`, which does not know to remove it, so such a section
+is never added under a format an older tool reads. Format 3 is `GUEST_OUTPUT`: a tool of format 2
+refuses the bundle instead of redacting it incompletely.
 
 ### 4.2 Manifest
 
@@ -676,6 +684,7 @@ attaches one to a public issue by accident:
 | guest memory read or written at intercepted calls (file contents, packet payloads) | **removed**, replaced by length + digest |
 | environment variables and argv of the guest | **removed** |
 | SDK record `details` payloads | **removed**, names kept |
+| what the guest printed (`GUEST_OUTPUT`) | **removed**; the events keep each write's length and digest |
 | the tape, the event structure, the timeline | unchanged — reduction still replays |
 
 `bohr replay` on a redacted bundle works and reproduces the same **structure and digest** as long as
@@ -717,6 +726,7 @@ programs = [
   ["./execution-client", "--datadir", "/data"],
   ["./driver"],
 ]
+roles = ["target", "driver"]    # target | load | driver; every node a target where left out
 
 [network]
 topology = "full"               # full | ring | star | file:<path>
@@ -747,6 +757,8 @@ fault_points = ["after_ack"]    # SDK fault points a run may arm, by name
 fault_point_probability = "1/2" # odds each is armed on a node, drawn once per run
 restart_after_ticks = 3_000_000 # 0 leaves a killed node dead, a cut standing, a link bad
 arm_after_ticks = 300_000_000   # nothing is drawn before here; 0 arms from the first instruction
+disarm_after_ticks = 45_000_000_000 # no drawn fault of any kind fires from here on
+ablate = ["disk_tear"]          # kinds drawn at nought odds, every draw kept; bohr ablate sets it
 draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade", "recover_from_snapshot",
         "clock_step", "clock_drift"]
 targeting = "guided"            # uniform | guided — guided prefers dangerous moments
@@ -781,6 +793,15 @@ and every host, so a clock stepped back in a run's first minute moves back rathe
 change and modification times are that date, so its age read against the clock is the run's own
 duration.
 
+**A window for faults.** `arm_after_ticks` opens the window for drawn node faults, and
+`disarm_after_ticks` closes it for every drawn fault: node kills, freezes, isolations and
+degradations, `EIO`, `ENOSPC` and stalls on the disk, refused allocations, and dropped, duplicated,
+reordered and corrupted datagrams. From the close, each draw still happens at nought odds, so the
+tape is consumed as before (§2.4). Recoveries already armed — a restart, a heal, a thaw — still
+happen. A probe's `advances` property times a stall from the close at the earliest, so a system is
+judged on coming back once nothing pushes it down. A window that closes at or before it opens, or at
+or after `run.horizon_ticks`, is refused (`BOHR-1002`).
+
 **Memory that runs out.** `enomem_probability` refuses an allocation — `brk`, `mremap`, `mmap` of
 anonymous memory — at drawn moments, each a `memory_exhausted` fault counted as adversity: `mmap` and
 `mremap` answer `ENOMEM`, `brk` leaves the break where it was, which is how the kernel refuses one.
@@ -792,8 +813,9 @@ fault.
 **What a build accepts is smaller than the shape, and says so.** Unknown keys are refused by name
 (`BOHR-1002`) rather than skipped, so a typo is never silently a default — and a section this build
 does not implement is refused by the same rule. Accepted today: `[cluster]`, `[network]`, `[disk]`,
-`[[partition]]`, `[[grey]]`, `[[fault]]`, under `[faults]` the six keys `kill_probability`,
-`targeting`, `restart_after_ticks`, `arm_after_ticks`, `budget_per_run` and `draw`, and under
+`[[partition]]`, `[[grey]]`, `[[fault]]`, under `[faults]` the keys `kill_probability`,
+`enomem_probability`, `targeting`, `restart_after_ticks`, `arm_after_ticks`, `disarm_after_ticks`, `ablate`,
+`budget_per_run`, `draw`, `fault_points` and `fault_point_probability`, and under
 `[run]` the four in §5.6, under `[coverage]` the key `shm_size`, and under `[linux]` the key
 `io_uring`. Everything else above —
 `[clock]`, `coverage.mode`, `faults.enabled` — is refused where it appears; what those describe is
@@ -1651,6 +1673,7 @@ bohr explore [OPTIONS] [--guest <name>] [-- <program> [args...]]
 
   --runs <n>              budget in runs; the reproducible one
   --time <duration>       budget in wall-clock time: 90s, 30m, 1h, 2d, or bare seconds
+  --quiet-runs <n>        stop after n runs that added no new group of findings
   -j, --jobs <n>          parallel workers
   --corpus <dir>          corpus carried in and written back out
   --resume <dir>          write the campaign down here, and carry on with it if it already is
@@ -1674,7 +1697,17 @@ the search a property of the machine.
 **`--time` cannot be reproducible and does not pretend to be.** Eight workers do more runs in
 thirty seconds than one does, so a time budget describes an effort rather than a campaign. It is
 kept because people think in "hunt overnight", and what it writes into the summary is the run count
-it reached — repeat that campaign exactly with `--runs`.
+it reached — repeat that campaign exactly with `--runs`. Once the time is spent no new run is
+handed out; the runs in flight finish, and a generation cut short is folded as one cut by `--runs`
+is, so a network whose runs take half a minute still stops near its budget.
+
+**`--quiet-runs N` stops a campaign that has nothing new to say.** A group is the signature
+`bohr findings` groups by, the place a run fell included (§7.7), so a new group is a new defect, and
+a new bundle of a known one is not. The campaign stops once N runs have passed since the last new
+group, checked after each generation. Each group's first run and the seconds since the campaign
+started are written to `first-seen.json` in the findings directory, and `bohr findings` prints them.
+When budgets are combined, the first one spent ends the campaign. Counted in runs, the quiet budget
+reproduces with the master seed as `--runs` does.
 
 **`--minimize` is not here yet.** Minimising a finding needs `bohr reduce`, which arrives with the
 reduction milestone; the flag is absent rather than accepted and ignored.
@@ -1829,9 +1862,14 @@ the file rather than a verdict about the host.
 ### 7.6 Target packs and `bohr hunt` — one command
 
 ```
-bohr hunt <pack> [--time <duration> | --runs <n> | --seeds <a..b>] [-j <n>] [-o <dir>]
-                 [--no-faults] [--resume] [--binary <path>] [--master-seed <u64>]
+bohr hunt <pack> [--time <duration>] [--runs <n>] [--quiet-runs <n>] [--seeds <a..b>] [-j <n>]
+                 [-o <dir>] [--no-faults] [--resume] [--binary <path>] [--master-seed <u64>]
 ```
+
+Without a budget a hunt is a short pass: `--quiet-runs 1000 --time 15m`, whichever ends first. Most
+of what a campaign finds it finds in its first runs, and a target that produced a finding earns the
+longer campaign, the reduction and the confirmation; one that produced none in a quiet pass has
+said what a short pass can say. Every group of findings is triaged and ablated at the end (§7.7).
 
 A **target pack** is `targets/<name>/target.toml` in this repository, or in the packs a release
 installed: a bare name is looked for under `targets/` here first, then under `$BOHR_HOME/packs` —
@@ -1849,6 +1887,9 @@ blake3 = "…"                               # the binary's digest
 
 [run]
 scenario = "targets/reth/scenario.toml"
+
+[scope]                                    # optional
+nonproduction = ["--dev"]                  # command-line words of modes nobody runs in production
 
 [judge]
 oracle = "crash"                           # crash | durability | liveness | property | chain
@@ -1891,6 +1932,48 @@ failure silenced. A hang is named by its words with the numbers taken out. Group
 largest first, each led by its smallest bundle, which is the one to reduce and to read. Two defects
 of one program that leave one signature are one group; that is what a reduction already treats as
 the same finding.
+
+**Where it fell is part of the signature**, where the bundle kept its guests' output (`GUEST_OUTPUT`,
+§4.1). The output of the failing nodes is read, latest start first: a Go panic or runtime fatal
+error gives the first frame outside the standard library, a Rust panic the line it was raised at,
+and otherwise the last line logged at a fatal or error level counts (`Fatal:`, `FATAL`, `ERROR`,
+`CRIT`, `E[`, `level=error`), and where there is none, the failing node's last line, which a program
+that exits with an error usually writes its reason on. A frame from a module or crate cache keeps the module and its
+version, `github.com/cosmos/cosmos-sdk@v0.53.4/baseapp/abci.go:812` or
+`kvstore-1.4.2/src/log/segment.rs:85:47`, so it names a file in a release. A
+fatal line is compared with its numbers, hexadecimal words and hashes replaced and its paths cut to
+their last element, so one defect at two heights is one group. Two panics at two frames are two
+groups. Where no node failed, only a panic counts, because a healthy node logs errors too. A bundle
+without the section is grouped as before.
+
+**`bohr ablate <bundle> [--binaries <dir>] [--json]`** says which faults a finding needed. The run
+is repeated once per kind of drawn fault that landed, with that kind at nought odds
+(`faults.ablate`, §5): every draw still happens, so the tape and every other fault stay where they
+were. A kind whose removal leaves the same signature was not needed; one whose removal makes the
+run clean, or fail otherwise, was. The finding's grade is the weakest grade among the kinds it
+needed — `real`, `plausible`, `model-only` or `adversarial`, the grade of each kind fixed in
+[`DETERMINISM.md`](./DETERMINISM.md). A torn and a reordered write come from one regime of a crash
+and are removed together. A kind the scenario writes down in `[[fault]]` or `[[partition]]` lands
+whatever the draws say and is not ablated. The JSON is `bohr.ablate/1`: the signature, each trial
+with its kind, grade and result, the necessary kinds and the grade.
+
+**Every group gets a verdict**, the first of these that applies:
+
+| Verdict | When | Counts |
+|---|---|---|
+| bohr limit | the run ended on an unmodelled call, the event budget, a supervisor error or a request | no |
+| bench failure | every failing node has a role other than `target` (`[cluster] roles`) | no |
+| out of scope | a command line of the run holds a word the binary's pack lists in `[scope] nonproduction` | no |
+| expected refusal | ablation shows the failure needed a node restored from an older snapshot, which loses synced data | no |
+| target defect | the faults it needed are graded `real`, or it needed none | yes |
+| target defect, plausible or adversarial | the weakest grade among them is `plausible` or `adversarial` | yes, marked |
+| model artefact | it needed a `model-only` fault | no |
+| not ablated | without `--ablate`, where none of the first three apply | no |
+
+`bohr findings --ablate` ablates each group's smallest bundle; `bohr hunt` always does. The summary
+line counts the groups that are a defect of the target, and the JSON gives each group's `triage`,
+`counts`, `necessary`, `grade`, `first_run` and `first_after_s`. A verdict describes a finding and
+never removes one: every bundle stays in its directory and every group is printed.
 
 **`bohr report <bundle> --disclosure [-o report.md]`** writes a disclosure draft in Markdown: what
 a maintainer receives. In order — the target (each program by name and blake3, and the source
@@ -1999,7 +2082,9 @@ Exit codes are the ordinary ones: `0` if every guest reproduced, `1` if any run 
 first repetition or produced a finding.
 
 **`bohr explain <bundle>`** tells how a stored run got to what it found: the verdict and
-its code, what the run was, the steps before the violation — the faults, the node changes, the
+its code, where it fell — the node, which of its starts, the panic or fatal line and the frame in
+the target's own code, read from `GUEST_OUTPUT` as `bohr findings` reads it (§7.7) and in the JSON as
+`where` — what the run was, the steps before the violation — the faults, the node changes, the
 tasks that failed, the diagnostics, nearest last, at most twelve — and the commands that show more.
 For a finding a probe reported, the violation is where the probe first saw it, not where the oracle
 judged the run. The steps are gathered by rule and without knowing the program; that they caused
