@@ -1454,7 +1454,7 @@ redb_64_runs_ms = { j1 = { v0_7 = 3_043, v0_8 = 3_102 }, j4 = { v0_7 = 1_027, v0
 peak_rss_mb = { v0_7 = 14.0, v0_8 = 14.4 }
 pr_s = 77
 
-# The campaigns of v0.9, master seed 0, on a 4 GB VM with 2 cores. A campaign counts runs and
+# The campaigns of v0.9, master seed 0, on a 4 GB VM with 8 cores. A campaign counts runs and
 # landed faults; it does not count runs the model refused, so no target has `refused`. What the
 # campaigns found is private until the maintainers have it, in findings/baseline.toml.
 [v0_9.hunts]

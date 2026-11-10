@@ -28,7 +28,7 @@ Every bundle of v0.8 replays to its digest. Figures are under `[v0_9.*]` in
 
 ### Campaigns
 
-- **Four targets, master seed 0, on a 4 GB host with two cores**: geth and CometBFT for an hour
+- **Four targets, master seed 0, on a 4 GB host with eight cores**: geth and CometBFT for an hour
   each (3,072 and 3,232 runs), redb and reth for thirty minutes (98,784 and 24,640 runs).
 - **`targets/cometbft-net`**: four `cometbft` validators at the addresses the world gives nodes
   0–3, with `examples/comet-driver`, a static client that sends transactions in rotation, waits for

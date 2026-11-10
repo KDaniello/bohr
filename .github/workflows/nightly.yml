@@ -75,6 +75,9 @@ jobs:
       # cannot be placed in its own namespaces without them.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # raft-toy builds raft-rs, whose messages prost-build compiles with protoc.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: make guests
       - run: make test-hunting
       - uses: actions/upload-artifact@v7
