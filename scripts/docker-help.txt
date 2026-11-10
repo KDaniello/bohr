@@ -1,0 +1,21 @@
+bohr in a container
+
+bohr runs a program under ptrace, in pid, mount and user namespaces of its own. A container
+started with the defaults allows none of that: Docker's seccomp profile refuses ptrace and
+unshare, and its AppArmor profile refuses the mounts. Start it with
+
+  docker run --rm -it \
+    --cap-add SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    -v "$PWD:/work" \
+    ghcr.io/kdaniello/bohr:<version> <command>
+
+and with no command it runs `bohr doctor`, which names any of these the container still lacks.
+
+The target packs are in /root/.bohr/packs, so `bohr hunt redb --time 5m` works from any
+directory; a pack builds its program with cargo, which this image does not carry, so mount a
+built binary and pass it with --binary, or build in an image of your own FROM this one.
+
+None of this is a sandbox. ptrace supervision is not a security boundary, and a container
+started with these flags is less confined than one started without them.

@@ -1825,7 +1825,9 @@ bohr hunt <pack> [--time <duration> | --runs <n> | --seeds <a..b>] [-j <n>] [-o 
                  [--no-faults] [--resume] [--binary <path>] [--master-seed <u64>]
 ```
 
-A **target pack** is `targets/<name>/target.toml` in this repository:
+A **target pack** is `targets/<name>/target.toml` in this repository, or in the packs a release
+installed: a bare name is looked for under `targets/` here first, then under `$BOHR_HOME/packs` —
+`~/.bohr/packs` where unset — which is where `bohrup` puts the packs of the release it installed.
 
 ```toml
 [source]
@@ -1988,7 +1990,7 @@ machine" wherever the binary runs — including hosts where the syscall backend 
 Exit codes are the ordinary ones: `0` if every guest reproduced, `1` if any run diverged from its
 first repetition or produced a finding.
 
-**`bohr explain <bundle> [--json]`** tells how a stored run got to what it found: the verdict and
+**`bohr explain <bundle>`** tells how a stored run got to what it found: the verdict and
 its code, what the run was, the steps before the violation — the faults, the node changes, the
 tasks that failed, the diagnostics, nearest last, at most twelve — and the commands that show more.
 For a finding a probe reported, the violation is where the probe first saw it, not where the oracle
@@ -2051,6 +2053,67 @@ call the program cannot make.
 
 `bohr corpus stat|minimize <dir>` · `bohr version --verbose` (tool, tape ABI, bundle format, SDK
 schema — the four numbers any bug report needs).
+
+### 7.12 `--json` — what a command came to, for a program
+
+**Not the text with braces round it, but a contract of its own.** Every command takes `--json`
+and then writes exactly one JSON object to standard output and nothing else; the text a person
+reads is not printed, progress and warnings stay on standard error, and the exit code is the one
+the command exits with anyway (§7.10). A guest's own output, which `bohr run` delivers to standard
+output, is not delivered under `--json`.
+
+Every object carries `"schema": "bohr.<command>/<n>"`. **A field removed, renamed or given another
+meaning is a new version; a field added is not**, so a reader skips what it does not know and
+refuses a version it was not written for. `bohr version --json` lists the schema of every command
+this build writes. A command that fails writes `bohr.error/1` — `code` (the `BOHR-` diagnostic the
+message opens with, or null), `message`, `exit` — with the exit code it would have had.
+
+| Schema | Fields a reader acts on |
+|---|---|
+| `bohr.run/1` | `found`, `headline`, `code`, `facts` (the `--facts` object), `saved`, `exit`; `repeated` false with `divergence` where a repeat diverged; `differential` for a group run |
+| `bohr.replay/1` | `bundles[]`: `bundle`, `result` (`matched`, `diverged`, `refused`), `digest`, `outcome`, `events`, `detail`; `exit`, the worst |
+| `bohr.explore/1` | the `--summary` account (§7.2), with `found`, `findings_dir`, `saved`, `elapsed_ms` |
+| `bohr.hunt/1` | the pack and its binary, `mode`, `campaign` (the summary) or `sweep`, `findings`, `groups[]` as `bohr findings` groups them |
+| `bohr.reduce/1` | `events` and `draws` before and after, `shrank`, `budget`, `replays_spent` per pass, `out`, `from_run` |
+| `bohr.report/1` | `kind` (`page`, `disclosure`, `sarif`), `bundle`, `written[]`; `results` for SARIF |
+| `bohr.findings/1` | `findings`, `groups[]`: `signature`, `verdict`, `code`, `count`, `smallest`, `bundles[]` |
+| `bohr.explain/1` | the story: `found`, `headline`, `code`, `run`, `steps[]`, `next[]`, `bundle` |
+| `bohr.trace/1` | `events[]`, each the JSON Lines record of §4.3; `truncated` |
+| `bohr.survey/1` | `outcome`, `events`, `completed`, `walls[]`: `nr`, `name`, `calls` |
+| `bohr.doctor/1` | `verdict`, `checks[]`: `name`, `status` (`pass`, `warn`, `fail`, `skip`), `detail`, `remedy` |
+| `bohr.check/1`, `bohr.sweep/1` | each subject's account as written to its file; a sweep's per-seed `facts` |
+| `bohr.init/1`, `bohr.note/1`, `bohr.selftest/1`, `bohr.version/1` | what was written, the notes, each guest's digest, the four contract numbers |
+
+The objects of the commands that need no backend — `version`, `explain`, `trace`, `findings`,
+`note`, `report`, `error` — are held to golden files in `crates/bohr-cli/tests/golden/json/`, and
+the test fails on any difference under the same schema name: a change is versioned or it does not
+merge. The others are built by the same code and checked by the tests that run them on Linux.
+Under `--json`, `bohr trace` writes every selected event, and `--format` and `--squash` do not
+apply.
+
+What it does not do: stream. A campaign's object arrives when the campaign ends; `bohr mcp` is
+where a long one is followed while it runs.
+
+### 7.13 `bohr mcp` — the commands as tools for a coding agent
+
+```
+bohr mcp
+```
+
+Serves the Model Context Protocol over standard input and output, one JSON-RPC message a line:
+the tools `run`, `survey`, `explore`, `replay`, `reduce`, `report` and `findings`, with arguments
+named as the command's options are, and `status` and `cancel`.
+
+**A tool is not a second implementation of its command but a way of starting it.** Each call runs
+this same binary with `--json` and answers with the object it wrote, as structured content and as
+its text, so what an agent is told and what a pipeline reads are one object by construction.
+`explore` and `reduce` take minutes, so they answer at once with a `handle`; `status` with that
+handle says whether it is still running, the last progress line the command wrote, and once it has
+ended its exit code and its object; `cancel` ends it. A status is answered from memory and takes
+well under a tenth of a second.
+
+What it does not do: run anything the command line could not, keep a job past the server's own
+life — closing its input ends every job it started — or decide for the agent what a finding means.
 
 ---
 

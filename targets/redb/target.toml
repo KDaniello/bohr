@@ -10,7 +10,7 @@ commit = "v2.6.3"
 [build]
 command = ["scripts/build-example.sh", "redb-hunt"]
 binary = "examples/redb-hunt/build/redb-hunt"
-blake3 = "b1f4569e5a08b13878c3e260266e5d1938673ac5f243327abc20e5f70434cecd"
+blake3 = "07c27bd71878543e737b0b2a4aacdaaf138e85158668cf5257119ef1015e6670"
 
 [run]
 scenario = "examples/redb-hunt/hunt.toml"

@@ -32,13 +32,39 @@ Minor versions may break the CLI and configuration. They may **not** break bundl
 6. If `tape_abi` moved: a **loud** section at the top of the notes, plus `bohr version` explaining
    the incompatibility in plain words when it refuses a bundle.
 7. Documentation matches the release: `docs/` updated, the `docs` CI job green.
-8. Tag `vX.Y.Z`, push. The release workflow builds artefacts, publishes `SHA256SUMS`, the container
-   image and the SDK packages.
+8. Tag `vX.Y.Z`, push. The release workflow builds the artefacts below, signs `SHA256SUMS`, and
+   publishes them with the container image.
 9. Verify the published artefacts from a clean machine: `bohrup` installs, `bohr doctor` passes,
    `bohr run --repeat 100` on the demo target is identical.
 
 Step 9 is done by hand, every time. An install script broken in packaging is otherwise discovered
 by a first-time user.
+
+## What a release is
+
+Not a binary but five files, and an image built from them:
+
+| File | What it is |
+|---|---|
+| `bohr-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` | the static binary, built with the `dist` profile: release code, symbol names kept, line tables stripped |
+| `bohr-packs-vX.Y.Z.tar.gz` | `targets/`, `examples/`, `sdk/c/`, `scripts/build-example.sh` and `rust-toolchain.toml`, so `bohr hunt <name>` works off a checkout |
+| `SHA256SUMS` | the two archives' hashes |
+| `SHA256SUMS.sig` | an `ssh-keygen -Y sign` signature over `SHA256SUMS`, namespace `bohr-release` |
+| `bohrup.sh` | the installer, with the release key written into it |
+
+The image is `ghcr.io/kdaniello/bohr:vX.Y.Z`, built from those files and not from source.
+
+**The signature is over the sums, and the sums are over the files.** `bohrup` refuses to install
+from a `SHA256SUMS` without the signature, and a file the sums do not list. The key is
+`ssh-keygen -Y` rather than anything a user installs first, because every host the installer
+runs on has OpenSSH. The private key is the repository secret `BOHR_RELEASE_KEY`, its public line
+the variable `BOHR_RELEASE_SIGNER` (`bohr-release namespaces="bohr-release" ssh-ed25519 …`); a tag
+in a repository without them fails the build rather than publishing a release nothing can verify.
+
+**A dispatch is the whole release without the publishing.** `workflow_dispatch` runs every job a
+tag runs — the two-runner hash comparison, the signature where the key exists, an install of what
+was built into a scratch home, the image built and started — and keeps the result as workflow
+artefacts. Only a `v*` tag pushes the image or writes a release page.
 
 ## Reproducing a build
 
@@ -50,8 +76,8 @@ hash you cannot independently arrive at only proves the file did not change in t
 git checkout vX.Y.Z
 export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
 export RUSTFLAGS="--remap-path-prefix=$PWD=/bohr --remap-path-prefix=$HOME/.cargo=/cargo"
-cargo build --release --locked --target x86_64-unknown-linux-musl --bin bohr
-sha256sum target/x86_64-unknown-linux-musl/release/bohr
+cargo build --profile dist --locked --target x86_64-unknown-linux-musl --bin bohr
+sha256sum target/x86_64-unknown-linux-musl/dist/bohr
 ```
 
 Three things and no more are pinned: the toolchain (`rust-toolchain.toml`), the dependency versions

@@ -93,6 +93,24 @@ fn refused(text: String) -> CliError {
     CliError::Usage(format!("BOHR-1002: {text}"))
 }
 
+/// Where a pack named bare is read from: `targets/` here, or else the packs a release installed.
+///
+/// Here first, so a checkout hunts its own packs as it edits them; then `$BOHR_HOME/packs`, or
+/// `~/.bohr/packs`, which is where `bohrup` puts the packs of the release it installed. A name in
+/// neither is reported where it was looked for first.
+fn installed(name: &str) -> PathBuf {
+    let here = Path::new("targets").join(name).join("target.toml");
+    if here.is_file() {
+        return here;
+    }
+    let home = std::env::var_os("BOHR_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bohr")));
+    home.map(|home| home.join("packs/targets").join(name).join("target.toml"))
+        .filter(|file| file.is_file())
+        .unwrap_or(here)
+}
+
 /// Finds a pack by name under `targets/`, or by the path of its directory or its file.
 pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
     // A bare name is a pack under `targets/`, even where a file of that name sits here: `reth` is
@@ -101,7 +119,7 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
     // A path by its components rather than by a slash, which a Windows path does not contain.
     let bare = given.components().count() == 1 && !name.ends_with(".toml");
     let file = if bare {
-        Path::new("targets").join(name).join("target.toml")
+        installed(name)
     } else if given.is_dir() {
         given.join("target.toml")
     } else {
@@ -191,11 +209,14 @@ pub(crate) fn binary_for(pack: &Pack, given: Option<&Path>) -> Result<PathBuf, C
 /// Runs the pack's build command in its repository.
 fn build(pack: &Pack) -> Result<(), CliError> {
     eprintln!("building {} from {} at {}", pack.name, pack.repository, pack.commit);
-    let status = std::process::Command::new(&pack.build[0])
-        .args(&pack.build[1..])
-        .current_dir(&pack.root)
-        .status()
-        .map_err(|e| refused(format!("cannot run {}: {e}", pack.build[0])))?;
+    let mut command = std::process::Command::new(&pack.build[0]);
+    command.args(&pack.build[1..]).current_dir(&pack.root);
+    // A build talks on standard output, which under `--json` belongs to the one object.
+    if crate::json::on() {
+        command.stdout(std::io::stderr());
+    }
+    let status =
+        command.status().map_err(|e| refused(format!("cannot run {}: {e}", pack.build[0])))?;
     if !status.success() {
         return Err(refused(format!("{}'s build failed: {status}", pack.name)));
     }

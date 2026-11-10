@@ -16,6 +16,8 @@ mod guests;
 mod handover;
 mod hunt;
 mod init;
+mod json;
+mod mcp;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod probe;
 mod reduce;
@@ -100,6 +102,9 @@ impl CliError {
 #[derive(Parser, Debug)]
 #[command(name = "bohr", version, about = "Deterministic simulation testing", long_about = None)]
 struct Cli {
+    /// Write what the command came to as one JSON object on standard output, and nothing else.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -331,9 +336,6 @@ enum Command {
     Findings {
         /// The directory of bundles.
         dir: String,
-        /// Print JSON rather than text.
-        #[arg(long)]
-        json: bool,
     },
 
     /// Write a first scenario for a program, from what a survey of it finds.
@@ -462,10 +464,13 @@ enum Command {
     Explain {
         /// The bundle to explain.
         bundle: String,
-        /// Print the same as one JSON object.
-        #[arg(long)]
-        json: bool,
     },
+
+    /// Serve the commands as tools to a coding agent, over the Model Context Protocol on stdio.
+    ///
+    /// Every tool runs this binary with `--json`, so an agent is told exactly what a pipeline
+    /// reads. A campaign or a reduction answers with a handle that `status` follows.
+    Mcp,
 
     /// Print the version, and the four contract numbers a bug report needs.
     Version {
@@ -695,18 +700,44 @@ fn compare_implementations(
         if !matches!(completed.report.outcome, Outcome::Clean) {
             let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
             eprintln!("{name}: {}    {}", verdict.headline, verdict.code);
+            if json::on() {
+                json::emit(
+                    "run",
+                    serde_json::json!({
+                        "differential": true, "found": true, "implementation": name,
+                        "headline": verdict.headline, "code": verdict.code, "exit": exit::FINDING,
+                    }),
+                );
+            }
             return Ok(exit::FINDING);
         }
     }
 
     match group.verdict {
         bohr_kernel::Verdict::Agree => {
-            println!("implementations agreed on every projection");
+            if json::on() {
+                json::emit(
+                    "run",
+                    serde_json::json!({ "differential": true, "found": false, "exit": exit::CLEAN }),
+                );
+            } else {
+                println!("implementations agreed on every projection");
+            }
             Ok(exit::CLEAN)
         }
         bohr_kernel::Verdict::Finding(outcome) => {
-            println!("{}", bohr_report::describe::outcome_word(&outcome));
             let verdict = bohr_report::narrate::verdict(&outcome);
+            if json::on() {
+                json::emit(
+                    "run",
+                    serde_json::json!({
+                        "differential": true, "found": true, "headline": verdict.headline,
+                        "code": verdict.code, "exit": exit::FINDING,
+                    }),
+                );
+            } else {
+                println!("{}", bohr_report::describe::outcome_word(&outcome));
+            }
             eprintln!("{}    {}", verdict.headline, verdict.code);
             Ok(exit::FINDING)
         }
@@ -720,21 +751,39 @@ fn compare_implementations(
 }
 
 fn main() -> ExitCode {
-    match dispatch() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A command line clap refuses is an error like any other, and under `--json` it is said
+        // as one; help and the version are what was asked for, and are printed as asked.
+        Err(e) if std::env::args().any(|a| a == "--json") && e.use_stderr() => {
+            let message = e.to_string();
+            let first = message.lines().next().unwrap_or("").trim_start_matches("error: ");
+            println!("{}", json::error(&format!("BOHR-1001: {first}"), exit::USAGE));
+            return ExitCode::from(exit::USAGE);
+        }
+        Err(e) => e.exit(),
+    };
+    json::set(cli.json);
+    match dispatch(cli.command) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("error: {e}");
+            if json::on() {
+                println!("{}", json::error(&e.to_string(), e.code()));
+            } else {
+                eprintln!("error: {e}");
+            }
             ExitCode::from(e.code())
         }
     }
 }
 
-fn dispatch() -> Result<u8, CliError> {
-    match Cli::parse().command {
+fn dispatch(command: Command) -> Result<u8, CliError> {
+    match command {
         Command::Version { verbose } => {
             version(verbose);
             Ok(exit::CLEAN)
         }
+        Command::Mcp => mcp::serve(),
         Command::Run {
             seed,
             tape,
@@ -846,6 +895,13 @@ fn dispatch() -> Result<u8, CliError> {
                     (false, at) => at,
                 };
             if break_at.is_some() {
+                if json::on() {
+                    return Err(CliError::Usage(
+                        "BOHR-1001: a hand-over is a world frozen for a person at a debugger; \
+                         --json has nothing to write about it"
+                            .to_owned(),
+                    ));
+                }
                 if verify_only {
                     return Err(CliError::Usage(
                         "BOHR-1001: --verify-only checks a digest, and a hand-over never reaches \
@@ -984,7 +1040,7 @@ fn dispatch() -> Result<u8, CliError> {
                 program: program.into_iter().next(),
             })
         }
-        Command::Findings { dir, json } => findings::findings(&dir, json),
+        Command::Findings { dir } => findings::findings(&dir),
         Command::Init { nodes, out, program } => init::init(program, nodes, &out),
         Command::Reduce { bundle, out, budget, keep, binaries } => {
             reduce::reduce(&bundle, &out, budget, &keep, binaries.as_deref())
@@ -1024,7 +1080,7 @@ fn dispatch() -> Result<u8, CliError> {
         Command::Trace { bundle, format, node, kind, from, to, around, squash } => {
             trace(&bundle, &format, &Selection { node, kind, from, to, around }, squash)
         }
-        Command::Explain { bundle, json } => explain(&bundle, json),
+        Command::Explain { bundle } => explain(&bundle),
         Command::Doctor { target, syscalls } => doctor::run(target.as_deref(), syscalls),
         Command::Selftest { seed, repeat, guest, save_dir } => {
             selftest(Seed(seed), repeat, guest, save_dir.as_deref())
@@ -1061,20 +1117,35 @@ fn replay_bundles(
     break_at: Option<u64>,
 ) -> u8 {
     let mut worst = exit::CLEAN;
+    let mut answers = Vec::new();
     for path in paths {
         // A bundle that cannot be read is reported like one that failed to replay, so a glob
         // with a hole in it still says what happened to every other bundle in it.
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("{path}: BOHR-1002: cannot read it: {e}");
+                let message = format!("BOHR-1002: cannot read it: {e}");
+                eprintln!("{path}: {message}");
+                answers.push(serde_json::json!({
+                    "bundle": path, "result": "refused", "exit": exit::USAGE, "detail": message,
+                }));
                 worst = worst.max(exit::USAGE);
                 continue;
             }
         };
         match replay::replay_to(&bytes, binaries, break_at) {
             Ok(replay::Verdict::Matched(manifest)) => {
-                if verify_only {
+                answers.push(serde_json::json!({
+                    "bundle": path,
+                    "result": "matched",
+                    "exit": exit::CLEAN,
+                    "digest": manifest.trace_digest.to_string(),
+                    "outcome": bohr_report::describe::outcome_word(&manifest.outcome),
+                    "events": manifest.counters.events,
+                    "seed": manifest.seed,
+                }));
+                if json::on() {
+                } else if verify_only {
                     println!("{path}: ok {}", manifest.trace_digest);
                 } else {
                     report_replay(path, &manifest);
@@ -1084,13 +1155,23 @@ fn replay_bundles(
             Ok(replay::Verdict::Diverged(detail)) => {
                 eprintln!("{path}: DIVERGED");
                 eprintln!("{detail}");
+                answers.push(serde_json::json!({
+                    "bundle": path, "result": "diverged", "exit": exit::INTERNAL,
+                    "detail": detail.to_string(),
+                }));
                 worst = worst.max(exit::INTERNAL);
             }
             Err(e) => {
                 eprintln!("{path}: {e}");
+                answers.push(serde_json::json!({
+                    "bundle": path, "result": "refused", "exit": e.code(), "detail": e.to_string(),
+                }));
                 worst = worst.max(e.code());
             }
         }
+    }
+    if json::on() {
+        json::emit("replay", serde_json::json!({ "bundles": answers, "exit": worst }));
     }
     worst
 }
@@ -1165,12 +1246,12 @@ fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
     }
     std::fs::write(out, &rendered.html)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {out}: {e}")))?;
-    println!("{out}");
+    let mut written = vec![out.to_owned()];
 
     if let Some(events) = &rendered.sidecar {
         std::fs::write(&sidecar_name, events)
             .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {sidecar_name}: {e}")))?;
-        println!("{sidecar_name}");
+        written.push(sidecar_name.clone());
     }
 
     if redact {
@@ -1180,9 +1261,24 @@ fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
         let name = format!("{}.redacted.bohr", path.trim_end_matches(".bohr"));
         std::fs::write(&name, cleaned)
             .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {name}: {e}")))?;
-        println!("{name}");
+        written.push(name);
     }
+    wrote("page", path, &written);
     Ok(exit::CLEAN)
+}
+
+/// Says which files a report wrote: their paths, one a line, or the `report` object.
+pub(crate) fn wrote(kind: &str, bundle: &str, written: &[String]) {
+    if json::on() {
+        json::emit(
+            "report",
+            serde_json::json!({ "kind": kind, "bundle": bundle, "written": written }),
+        );
+    } else {
+        for path in written {
+            println!("{path}");
+        }
+    }
 }
 
 /// Adds a line to a bundle's notes, in place.
@@ -1219,7 +1315,12 @@ fn note(path: &str, text: &str) -> Result<u8, CliError> {
         let _ = std::fs::remove_file(&staged);
         CliError::Usage(format!("BOHR-1002: cannot replace {path}: {e}"))
     })?;
-    print!("{notes}");
+    if json::on() {
+        let lines: Vec<&str> = notes.lines().collect();
+        json::emit("note", serde_json::json!({ "bundle": path, "notes": lines }));
+    } else {
+        print!("{notes}");
+    }
     Ok(exit::CLEAN)
 }
 
@@ -1298,6 +1399,18 @@ fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Resul
         bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
     model.events.retain(|e| selection.admits(e));
 
+    if json::on() {
+        let events: Vec<serde_json::Value> = bohr_report::jsonl::write_log(&model.events)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let truncated = model.truncated.as_ref().map(ToString::to_string);
+        json::emit(
+            "trace",
+            serde_json::json!({ "bundle": path, "events": events, "truncated": truncated }),
+        );
+        return Ok(exit::CLEAN);
+    }
     let written = match format {
         "text" if squash => bohr_report::text::write_squashed(&model.events, &model.records),
         "text" => bohr_report::text::write_log_with(&model.events, &model.records),
@@ -1319,14 +1432,16 @@ fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Resul
 }
 
 /// How a stored run got to what it found, from the bundle alone.
-fn explain(path: &str, json: bool) -> Result<u8, CliError> {
+fn explain(path: &str) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
     let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
     let model = bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
     let story = bohr_report::narrate::story(&model, path);
-    if json {
-        println!("{}", bohr_report::narrate::story_json(&story));
+    if json::on() {
+        let mut story = bohr_report::narrate::story_json(&story);
+        story["bundle"] = serde_json::Value::String(path.to_owned());
+        json::emit("explain", story);
     } else {
         print!("{}", bohr_report::narrate::write_story(&story));
     }
@@ -1344,6 +1459,23 @@ fn report_replay(path: &str, manifest: &Manifest) {
 
 fn version(verbose: bool) {
     let tool = env!("CARGO_PKG_VERSION");
+    if json::on() {
+        let schemas: serde_json::Map<String, serde_json::Value> = json::SCHEMAS
+            .iter()
+            .map(|(name, _)| (name.to_string(), json::schema(name).into()))
+            .collect();
+        json::emit(
+            "version",
+            serde_json::json!({
+                "tool_version": tool,
+                "tape_abi": TAPE_ABI,
+                "bundle_format": BUNDLE_FORMAT,
+                "sdk_schema": SDK_SCHEMA,
+                "schemas": schemas,
+            }),
+        );
+        return;
+    }
     if !verbose {
         println!("bohr {tool}");
         return;
@@ -1411,7 +1543,8 @@ fn run_program(
         target: &target,
         tape,
         config,
-        output: execute::Output::Deliver,
+        // A guest writing to standard output would break the one object `--json` promises there.
+        output: if json::on() { execute::Output::Discard } else { execute::Output::Deliver },
         policy: scheduler,
         record: execute::Record::Log,
         scenario: loaded,
@@ -1422,6 +1555,15 @@ fn run_program(
         Err(divergence) => {
             eprintln!("{path}: DIVERGED");
             eprintln!("{divergence}");
+            if json::on() {
+                json::emit(
+                    "run",
+                    serde_json::json!({
+                        "program": path, "repeat": repeat, "repeated": false,
+                        "divergence": divergence.to_string(), "exit": exit::FINDING,
+                    }),
+                );
+            }
             Ok(exit::FINDING)
         }
         Ok(completed) => {
@@ -1439,16 +1581,33 @@ fn run_program(
                 std::fs::write(file, line)
                     .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
             }
-            if !matches!(completed.report.outcome, Outcome::Clean) {
-                return Ok(exit::FINDING);
-            }
             // A degraded run is reported either way; the exit code changes only where the caller
             // asked for the guarantee rather than for the result.
-            Ok(if strict && !completed.degradations.is_empty() {
+            let code = if !matches!(completed.report.outcome, Outcome::Clean) {
+                exit::FINDING
+            } else if strict && !completed.degradations.is_empty() {
                 exit::DEGRADED
             } else {
                 exit::CLEAN
-            })
+            };
+            if json::on() {
+                let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+                json::emit(
+                    "run",
+                    serde_json::json!({
+                        "program": path,
+                        "repeat": repeat,
+                        "repeated": true,
+                        "found": verdict.found,
+                        "headline": verdict.headline,
+                        "code": verdict.code,
+                        "facts": crate::facts::Facts::of(&completed),
+                        "saved": save,
+                        "exit": code,
+                    }),
+                );
+            }
+            Ok(code)
         }
     }
 }
@@ -1625,6 +1784,7 @@ fn selftest(
     let config = RunConfig::default();
     let guests: Vec<Demo> = only.map_or_else(|| Demo::all().to_vec(), |g| vec![g]);
     let mut worst = exit::CLEAN;
+    let mut answers = Vec::new();
 
     let tape = Tape::from_seed(seed);
     for guest in guests {
@@ -1633,7 +1793,7 @@ fn selftest(
             target: &target,
             tape: &tape,
             config,
-            output: execute::Output::Deliver,
+            output: if json::on() { execute::Output::Discard } else { execute::Output::Deliver },
             policy: SELFTEST_SCHEDULER,
             record: execute::Record::Log,
             scenario: None,
@@ -1643,6 +1803,9 @@ fn selftest(
             Err(divergence) => {
                 eprintln!("{:<18} DIVERGED", guest.name());
                 eprintln!("{divergence}");
+                answers.push(serde_json::json!({
+                    "guest": guest.name(), "repeated": false, "divergence": divergence.to_string(),
+                }));
                 worst = worst.max(exit::FINDING);
             }
             Ok(completed) => {
@@ -1651,6 +1814,7 @@ fn selftest(
                 if !matches!(completed.report.outcome, Outcome::Clean) {
                     worst = worst.max(exit::FINDING);
                 }
+                let mut saved = None;
                 if let Some(dir) = save_dir {
                     let path = format!("{dir}/{}.bohr", guest.name());
                     let bytes = execute::to_bundle(&completed, &tape, None)?;
@@ -1658,11 +1822,27 @@ fn selftest(
                         CliError::Usage(format!("BOHR-1002: cannot write {path}: {e}"))
                     })?;
                     eprintln!("  saved {path}");
+                    saved = Some(path);
                 }
+                let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+                answers.push(serde_json::json!({
+                    "guest": guest.name(),
+                    "repeated": true,
+                    "found": verdict.found,
+                    "code": verdict.code,
+                    "digest": completed.report.digest.to_string(),
+                    "events": completed.report.events,
+                    "saved": saved,
+                }));
             }
         }
     }
-
+    if json::on() {
+        json::emit(
+            "selftest",
+            serde_json::json!({ "seed": seed.0, "repeat": repeat, "guests": answers, "exit": worst }),
+        );
+    }
     Ok(worst)
 }
 

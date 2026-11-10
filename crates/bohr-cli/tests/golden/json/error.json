@@ -1,0 +1,6 @@
+{
+  "code": "BOHR-1004",
+  "exit": 2,
+  "message": "BOHR-1004: --seed and --tape name different runs; give one",
+  "schema": "bohr.error/1"
+}

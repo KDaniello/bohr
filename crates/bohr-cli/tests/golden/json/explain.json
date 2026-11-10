@@ -1,0 +1,16 @@
+{
+  "bundle": "findings/two-tasks-seed0.bohr",
+  "code": "Clean",
+  "elided": 0,
+  "found": false,
+  "headline": "nothing was found",
+  "next": [
+    {
+      "command": "bohr replay findings/two-tasks-seed0.bohr",
+      "shows": "the same run again, checked against its digest"
+    }
+  ],
+  "run": "seed 0 · 1 node · 0.000 s virtual · 11 events · 0 faults landed",
+  "schema": "bohr.explain/1",
+  "steps": []
+}

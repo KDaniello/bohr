@@ -199,9 +199,12 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
 
     let me = std::env::current_exe().map_err(|e| refused(format!("cannot find bohr: {e}")))?;
     let findings = request.out.join("findings");
-    let code = match request.seeds {
+    let summary = request.out.join("summary.json");
+    let (code, swept) = match request.seeds {
         Some((from, to)) => {
-            sweep(&me, &scenario, &binary, &pack.root, &findings, from, to, request.jobs)?
+            let swept =
+                sweep(&me, &scenario, &binary, &pack.root, &findings, from, to, request.jobs)?;
+            (swept.code(), Some(swept))
         }
         None => {
             let mut args: Vec<String> = vec![
@@ -215,7 +218,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
                 "--resume".into(),
                 absolute(&state),
                 "--summary".into(),
-                absolute(&request.out.join("summary.json")),
+                absolute(&summary),
                 "--config".into(),
                 absolute(&scenario),
             ];
@@ -231,22 +234,111 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
                 ));
             }
             args.extend(["--".into(), absolute(&binary)]);
-            let status = Command::new(&me)
-                .args(&args)
-                .current_dir(&pack.root)
+            let mut campaign = Command::new(&me);
+            campaign.args(&args).current_dir(&pack.root);
+            // Standard output belongs to the one object, so whatever the campaign prints goes
+            // where its progress goes.
+            if crate::json::on() {
+                campaign.stdout(std::io::stderr());
+            }
+            let status = campaign
                 .status()
                 .map_err(|e| refused(format!("cannot start the campaign: {e}")))?;
-            status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(crate::exit::INTERNAL)
+            let code =
+                status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(crate::exit::INTERNAL);
+            (code, None)
         }
     };
-    if findings.is_dir() {
-        crate::findings::findings(&findings.to_string_lossy(), false)?;
+    if !crate::json::on() {
+        if findings.is_dir() {
+            crate::findings::findings(&findings.to_string_lossy())?;
+        }
+        return Ok(code);
     }
+
+    // The campaign's own account, where it wrote one: a campaign that stopped before it wrote
+    // anything has a null here rather than an account of nothing.
+    let campaign = request.seeds.is_none().then(|| {
+        std::fs::read_to_string(&summary)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    });
+    let mut body = serde_json::json!({
+        "pack": pack.name,
+        "repository": pack.repository,
+        "commit": pack.commit,
+        "digest": pack.digest,
+        "oracle": pack.oracle,
+        "binary": binary.display().to_string(),
+        "scenario": scenario.display().to_string(),
+        "out": request.out.display().to_string(),
+        "mode": if request.seeds.is_some() { "seeds" } else { "campaign" },
+        "campaign": campaign.flatten(),
+        "summary": request.seeds.is_none().then(|| summary.display().to_string()),
+        "sweep": swept.as_ref().map(Swept::to_json),
+        "findings_dir": findings.display().to_string(),
+        "findings": 0,
+        "groups": [],
+        "exit": code,
+    });
+    // The groups `bohr findings` would print, inside this object rather than as a second one.
+    if findings.is_dir()
+        && let (serde_json::Value::Object(fields), serde_json::Value::Object(groups)) =
+            (&mut body, crate::findings::groups_json(&findings.to_string_lossy())?)
+    {
+        fields.extend(groups);
+    }
+    crate::json::emit("hunt", body);
     Ok(code)
 }
 
 fn absolute(path: &Path) -> String {
     std::path::absolute(path).unwrap_or_else(|_| path.to_owned()).to_string_lossy().into_owned()
+}
+
+/// What a sweep of a seed range came to, seed by seed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Swept {
+    from: u64,
+    to: u64,
+    /// Seeds whose run found something; their bundles are kept.
+    found: Vec<u64>,
+    /// Seeds whose run did not complete.
+    incomplete: Vec<u64>,
+    /// Why the first seed that did not complete did not, in its own last line.
+    why: Option<String>,
+}
+
+impl Swept {
+    fn seeds(&self) -> u64 {
+        self.to - self.from + 1
+    }
+
+    fn clean(&self) -> u64 {
+        self.seeds() - self.found.len() as u64 - self.incomplete.len() as u64
+    }
+
+    fn code(&self) -> u8 {
+        if !self.incomplete.is_empty() {
+            crate::exit::INTERNAL
+        } else if !self.found.is_empty() {
+            crate::exit::FINDING
+        } else {
+            crate::exit::CLEAN
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "from": self.from,
+            "to": self.to,
+            "seeds": self.seeds(),
+            "clean": self.clean(),
+            "found": self.found,
+            "incomplete": self.incomplete,
+            "first_incomplete": self.why,
+        })
+    }
 }
 
 /// Runs each seed of a range once, keeping the bundle of every run that found something.
@@ -260,13 +352,13 @@ fn sweep(
     from: u64,
     to: u64,
     jobs: usize,
-) -> Result<u8, CliError> {
+) -> Result<Swept, CliError> {
     std::fs::create_dir_all(findings)
         .map_err(|e| refused(format!("cannot use {}: {e}", findings.display())))?;
     let seeds: Vec<u64> = (from..=to).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let found = std::sync::atomic::AtomicU64::new(0);
-    let other = std::sync::atomic::AtomicU64::new(0);
+    let found: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let other: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     // Why the first seed that did not complete did not, because a count alone sends a reader off
     // to rerun a seed by hand to learn what one line would have said.
     let why: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -306,13 +398,17 @@ fn sweep(
                         .and_then(|c| u8::try_from(c).ok())
                     {
                         Some(crate::exit::FINDING) => {
-                            found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if let Ok(mut found) = found.lock() {
+                                found.push(*seed);
+                            }
                         }
                         Some(crate::exit::CLEAN) => {
                             let _ = std::fs::remove_file(&bundle);
                         }
                         _ => {
-                            other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if let Ok(mut other) = other.lock() {
+                                other.push(*seed);
+                            }
                             if let Ok(mut first) = why.lock() {
                                 first.get_or_insert_with(|| format!("seed {seed}: {said}"));
                             }
@@ -323,21 +419,26 @@ fn sweep(
             });
         }
     });
-    let (found, other) = (found.into_inner(), other.into_inner());
-    if let Some(said) = why.into_inner().ok().flatten() {
+    let mut swept = Swept {
+        from,
+        to,
+        found: found.into_inner().unwrap_or_default(),
+        incomplete: other.into_inner().unwrap_or_default(),
+        why: why.into_inner().ok().flatten(),
+    };
+    // Sorted, because the threads finish seeds in whatever order the host ran them.
+    swept.found.sort_unstable();
+    swept.incomplete.sort_unstable();
+    if let Some(said) = &swept.why {
         eprintln!("  {said}");
     }
     eprintln!(
-        "swept {from}..{to}: {} clean, {found} findings, {other} that did not complete",
-        seeds.len() as u64 - found - other
+        "swept {from}..{to}: {} clean, {} findings, {} that did not complete",
+        swept.clean(),
+        swept.found.len(),
+        swept.incomplete.len()
     );
-    Ok(if other > 0 {
-        crate::exit::INTERNAL
-    } else if found > 0 {
-        crate::exit::FINDING
-    } else {
-        crate::exit::CLEAN
-    })
+    Ok(swept)
 }
 
 #[cfg(test)]
@@ -350,6 +451,28 @@ mod tests {
         assert_eq!(parse_seeds("7..7"), Ok((7, 7)));
         assert!(parse_seeds("9..3").is_err());
         assert!(parse_seeds("9").is_err());
+    }
+
+    /// A sweep's object names every seed that found something and every one that did not complete,
+    /// and a seed that did not complete outranks a finding in the exit code.
+    #[test]
+    fn a_sweep_reads_seed_by_seed() {
+        let swept = Swept {
+            from: 1,
+            to: 6,
+            found: vec![2, 5],
+            incomplete: vec![4],
+            why: Some("seed 4: killed".to_owned()),
+        };
+        let value = crate::json::object("hunt", serde_json::json!({ "sweep": swept.to_json() }));
+        assert_eq!(value["schema"], "bohr.hunt/1");
+        assert_eq!(value["sweep"]["seeds"], 6);
+        assert_eq!(value["sweep"]["clean"], 3);
+        assert_eq!(value["sweep"]["found"], serde_json::json!([2, 5]));
+        assert_eq!(value["sweep"]["incomplete"], serde_json::json!([4]));
+        assert_eq!(value["sweep"]["first_incomplete"], "seed 4: killed");
+        assert_eq!(swept.code(), crate::exit::INTERNAL);
+        assert_eq!(Swept { incomplete: vec![], ..swept }.code(), crate::exit::FINDING);
     }
 
     /// Every way a scenario arms adversity is taken out, and nothing else is.

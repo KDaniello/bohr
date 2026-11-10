@@ -24,6 +24,12 @@ use bohr_types::{GuestAddr, NodeId, TaskId};
 /// the underlying register, which is reported rather than worked around.
 const ARCH_SET_CPUID: libc::c_int = 0x1012;
 
+/// A ptrace request as the C library declares it: unsigned in glibc, signed in musl.
+#[cfg(target_env = "musl")]
+type Request = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type Request = libc::c_uint;
+
 /// The event a group-stop arrives as under `PTRACE_SEIZE`. Absent from `libc`.
 const PTRACE_EVENT_STOP: libc::c_int = 128;
 
@@ -329,7 +335,7 @@ impl PtraceBackend {
     fn release(
         &mut self,
         id: TaskId,
-        request: libc::c_uint,
+        request: Request,
         signal: libc::c_long,
     ) -> Result<(), BackendError> {
         let task = self.task_mut(id)?;
@@ -338,7 +344,7 @@ impl PtraceBackend {
         // A job-control stop is left as one. The guest is stopped because it asked to be, and the
         // request that resumes an ordinary stop would take that away from it.
         let request = if std::mem::take(&mut task.group_stopped) {
-            libc::PTRACE_LISTEN as libc::c_uint
+            libc::PTRACE_LISTEN as Request
         } else {
             request
         };

@@ -119,6 +119,7 @@ pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, Cl
 
     // A dynamic binary runs with the libraries it was written against, pinned.
     let mut state_text = String::new();
+    let mut prepared = serde_json::Value::Null;
     if let Some(loader) = interpreter(&bytes) {
         let stem =
             out.file_stem().map_or_else(|| "scenario".into(), |s| s.to_string_lossy().into_owned());
@@ -139,6 +140,12 @@ pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, Cl
             state.to_string_lossy(),
             image.digest().to_hex()
         );
+        prepared = serde_json::json!({
+            "loader": loader,
+            "dir": state.display().to_string(),
+            "digest": image.digest().to_hex(),
+            "libraries": copied,
+        });
     }
 
     // One survey in the world written so far, with the log kept, to learn what it calls.
@@ -208,6 +215,29 @@ pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, Cl
         if syncs { "on" } else { "off" },
         if talks && nodes > 1 { "on" } else { "off" }
     );
+    if crate::json::on() {
+        let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+        crate::json::emit(
+            "init",
+            serde_json::json!({
+                "path": out.display().to_string(),
+                "program": program,
+                "nodes": nodes,
+                "state": prepared,
+                "faults": {
+                    "disk": syncs,
+                    "network": talks && nodes > 1,
+                    "crashes": syncs || nodes > 1,
+                },
+                "survey": {
+                    "events": completed.counters.events,
+                    "completed": completed.report.outcome == bohr_trace::Outcome::Clean,
+                    "outcome": verdict.code,
+                    "walls": survey::walls_json(&completed.surveyed),
+                },
+            }),
+        );
+    }
     Ok(crate::exit::CLEAN)
 }
 

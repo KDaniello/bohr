@@ -624,7 +624,8 @@ impl std::fmt::Display for Divergence {
     }
 }
 
-/// Runs `target` `times` times under one seed and checks every run agrees.
+/// Runs `target` `times` times under one seed and checks every run agrees; the first run's output
+/// goes where `exec` says, every repetition's nowhere.
 ///
 /// Reports the first event where a run differs rather than that the digests differ: the difference
 /// is the whole diagnosis, and "digests differ" leaves the reader with nowhere to go.
@@ -632,7 +633,7 @@ pub(crate) fn repeat(
     exec: Execution<'_>,
     times: usize,
 ) -> Result<Result<Completed, Divergence>, CliError> {
-    let first = once(Execution { output: Output::Deliver, ..exec })?;
+    let first = once(exec)?;
     if times <= 1 {
         return Ok(Ok(first));
     }

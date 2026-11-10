@@ -95,6 +95,18 @@ command line all change.
 Requirements: Linux x86-64, kernel 5.4 or newer, an ordinary unprivileged user.
 Full matrix in [PLATFORMS.md](./docs/PLATFORMS.md).
 
+Install from a release: the installer checks the signature on `SHA256SUMS` and every file against
+it before anything runs, puts `bohr` and the target packs in `~/.bohr`, and runs `bohr doctor`.
+
+```bash
+curl -sSf https://github.com/KDaniello/bohr/releases/latest/download/bohrup.sh | sh
+bohr doctor
+bohr hunt redb --time 5m
+```
+
+On Ubuntu 23.10 and later, `bohr doctor` fails on `namespaces` until AppArmor lets the installed
+binary make them, and prints the one `sudo` command that does ([PLATFORMS.md](./docs/PLATFORMS.md) §7).
+
 ```bash
 # Hunt a target from its pack: build or check the pinned binary, run its campaign, group findings.
 bohr hunt reth --time 1h -j 8 -o hunt-reth
@@ -126,11 +138,22 @@ bohr reduce findings/finding-9c2d.bohr -o minimal.bohr
 bohr report minimal.bohr -o report.html
 ```
 
-In Docker, `ptrace` is blocked by the default seccomp profile:
+In Docker, `ptrace` and the namespaces a guest is isolated in are blocked by the default
+profiles; with no command the image runs `bohr doctor`, which names what is still missing:
 
 ```bash
-docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined ghcr.io/kdaniello/bohr ...
+docker run --cap-add SYS_PTRACE --security-opt seccomp=unconfined   --security-opt apparmor=unconfined -v "$PWD:/work" ghcr.io/kdaniello/bohr:<version> <command>
 ```
+
+In CI, a pull request fails on a finding, with the bundle, a report and SARIF attached:
+
+```yaml
+- uses: KDaniello/bohr/action@v1.0.0
+  with: { pack: redb, time: 5m }
+```
+
+For a coding agent, `bohr mcp` serves the commands as tools over stdio; every tool answers with
+the object `--json` writes ([API.md](./docs/API.md) §7.12–7.13). Every command takes `--json`.
 
 ### The optional SDK
 

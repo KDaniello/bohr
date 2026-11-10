@@ -6,6 +6,97 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.8.0 — where it runs
+
+Bohr was built from source by someone who had this repository, and read by a person at a terminal.
+v0.8 makes the artefacts v1.0 ships and checks each from an empty home: a static binary that
+reproduces, a signed installer, an image, a GitHub Action, and an interface for coding agents; and
+every command answers a program in JSON. Nothing is published: no tag, no image, no release page.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.8.0` |
+| `tape_abi` | `2` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every bundle of v0.7 replays to its digest. Figures are under `[v0_8.*]` in
+[`benches/baseline.toml`](./benches/baseline.toml). `make pr`, `make gate` (13 of 13) and the
+mutation harness (13 of 13) are green on Ubuntu 24.04, with 740 tests; three gates were measured
+short of how they are written, and are listed below with what was measured instead.
+
+### JSON, for a program
+
+- **`--json` on every command**: one object on standard output and nothing else, its schema named
+  in it — `"schema": "bohr.run/1"` — and moved only when a field is removed, renamed or changes
+  meaning. A failure is a `bohr.error/1` object with the exit code it would have had, a command
+  line clap refuses included. A guest's own output is not delivered under `--json`.
+- `bohr version --json` lists the schema of every command; the objects of the commands that need no
+  backend are held to golden files, and a change under the same schema name fails the build.
+- `bohr findings --json` and `bohr explain --json` are the same flag as before, now global.
+
+### For a coding agent
+
+- **`bohr mcp`** serves `run`, `survey`, `explore`, `replay`, `reduce`, `report` and `findings` as
+  Model Context Protocol tools over stdio. Each runs this binary with `--json`, so an agent is told
+  exactly what a pipeline reads. A campaign and a reduction answer with a handle; `status` gives the
+  last progress line and, at the end, the object, and `cancel` ends the job's whole process group.
+  Each request is answered on its own thread, so a long `run` does not hold up a `status`.
+
+### A release, built and checked here
+
+- **A static binary that reproduces.** The `dist` profile keeps symbol names and strips line
+  tables: 8,406,368 bytes against P8.1's 20 MB. Built twice, from two directories, with the
+  environment `release.yml` sets, it is one SHA-256, `70f6c8a7…`.
+- **`bohrup`.** Refuses a host other than Linux on x86-64 before any download; checks an
+  `ssh-keygen -Y` signature over `SHA256SUMS`, then every file against it; installs the binary and
+  the target packs to `~/.bohr` and links `~/.local/bin/bohr`; runs `bohr doctor`. From a local
+  release into an empty home it took 112 ms; with one checksum line altered, and with the packs
+  archive altered, it installed nothing and said which.
+- **Packs off a checkout.** `bohr hunt <name>` looks under `targets/` here, then under
+  `~/.bohr/packs`, where the release's `bohr-packs-<version>.tar.gz` goes.
+- **An image**, `ghcr.io/kdaniello/bohr:<version>`, built from the release's own files on
+  `debian:12.8-slim`: 127 MB. With no command it runs `bohr doctor`, which under Docker's defaults
+  fails on namespaces and address layout and with the documented flags passes both.
+- **A GitHub Action**, `KDaniello/bohr/action`: installs with `bohrup`, hunts a pack, and on a
+  finding attaches the bundles, a page, a disclosure draft and SARIF and fails the job. Its own
+  hunt step, run as written on `chain-toy` over seeds 1–20: with `--revert-finality` it exits 1
+  with 15 findings in 3,983 ms; without it exits 0 with none in 3,374 ms.
+- **`release.yml`** runs the whole of this on `workflow_dispatch` and keeps it as artefacts; only
+  a pushed `v*` tag publishes, refuses to without the release key, and checks the tag against the
+  workspace version.
+
+### Fixed
+
+- **The redb pack named a binary its own build no longer produced.** Two builds, from the
+  repository and from the installed packs, agree on `07c27bd7…`; the pack named `b1f4569e…`, so
+  `bohr hunt redb` refused its own build. It names the one that reproduces.
+- **The musl build did not compile.** glibc declares a ptrace request unsigned and musl signed;
+  `make build-musl` had never been run.
+
+### Speed
+
+Against v0.7.0's binary on one host, alternately, the mean of two rounds and of three for the
+campaign: an intercepted call costs 4.25 µs against 4.15, a guest starts in 3.07 ms against 2.91,
+a 64-run campaign takes 3,102 ms against 3,043 at one worker and 1,037 against 1,027 at four, and a
+worker peaks at 14.4 MB against 14.0. Each is within the 10% P8.4 allows.
+
+### What it does not do
+
+- **Go from nothing to a campaign in three commands on a stock Ubuntu 24.04 (G8.2).** Ubuntu
+  refuses user namespaces to any program no AppArmor profile names, so `bohr doctor` fails on
+  `namespaces` after the install and prints the one `sudo` command that allows the installed
+  binary. Without it the rest still ran from an empty home — the pack built its target from the
+  installed packs to the digest it names, and `bohr hunt redb --time 5m` ran to its report in
+  303 s — with every run degraded, a guest not isolated.
+- **Build on two runners (G8.1).** The two builds were two directories on one host; the
+  two-runner comparison is in `release.yml` and has not run, because nothing here was dispatched.
+- **Fail a pull request (G8.3).** The action's step was run as written, outside GitHub; no test
+  repository and no pull request were made.
+- **Publish anything.** No release key exists: it is the repository secret `BOHR_RELEASE_KEY`, and
+  a person makes it. There is no `bohr-action` repository; the action is `KDaniello/bohr/action`.
+- **Stream.** A campaign's object arrives when it ends; an agent asks `status` for the rest.
+
 ## v0.7.0 — findings at real scale
 
 A finding against a real client is not yet something to send: the bundle holds the whole run, and
