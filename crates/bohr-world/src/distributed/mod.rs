@@ -498,17 +498,14 @@ fn opened_path(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<Option<Str
 ///
 /// Not [`WorldCtx::draw_bool`]: its certainty shortcut consumes nothing for 0 and 1, which is
 /// right for configuration that never changes mid-run and wrong for the network and the disk,
-/// where an override or a zeroed default must not change what a request costs in tape.
+/// where an override or a zeroed default must not change what a request costs in tape. The
+/// journal records whether it fired, which is how a reduction finds the faults a run drew.
 pub(crate) fn draw_odds(
     ctx: &mut WorldCtx<'_, '_>,
     (num, den): (u32, u32),
     site: bohr_tape::DrawSite,
 ) -> Result<bool, KernelError> {
-    let raw = ctx.draw_range(1 << 16, site)?;
-    if den == 0 {
-        return Ok(false);
-    }
-    Ok(raw < (u64::from(num) << 16) / u64::from(den))
+    Ok(ctx.draw_odds(num, den, site))
 }
 
 /// Answers every node's syscalls from that node's own world, and owns the cluster's timers.

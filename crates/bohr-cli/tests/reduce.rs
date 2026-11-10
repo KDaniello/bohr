@@ -80,41 +80,50 @@ fn a_bundle_that_is_not_there_is_a_usage_error() {
 /// The one that matters: a finding reduces, and what comes out is a bundle the tool still accepts.
 /// A reduction that produced something unreplayable would have made the finding harder to hand on
 /// rather than easier.
+///
+/// A real program's finding, found on every seed: a finding that a campaign may or may not make
+/// would leave this test checking nothing on the runs where it made none.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn a_finding_reduces_to_a_bundle_that_still_replays() {
-    let dir = scratch("finding");
-    let findings = dir.join("findings");
-    let (code, _, err) = bohr(&[
-        "explore",
-        "--guest",
-        "many-flips",
-        "--runs",
-        "64",
-        "--master-seed",
-        "11",
-        "--findings",
-        &findings.to_string_lossy(),
-    ]);
-    assert!(matches!(code, 0 | 1), "the campaign did not complete: {err}");
-
-    let Some(found) = std::fs::read_dir(&findings)
-        .ok()
-        .and_then(|entries| entries.flatten().map(|e| e.path()).find(|p| p.is_file()))
-    else {
-        // The demo guest is not always made to fail by a short campaign, and inventing a finding
-        // here would test the fixture rather than the command.
-        eprintln!("the campaign found nothing to reduce; nothing to check");
+    const GUEST: &str = "testdata/guests/build/lease_clock";
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if !root.join(GUEST).is_file() {
         return;
+    }
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bohr"))
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .expect("the binary under test must be runnable");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
+    let dir = scratch("finding");
+    let found = dir.join("found.bohr").to_string_lossy().into_owned();
+    let (code, _, err) = run(&[
+        "run",
+        "--seed",
+        "1",
+        "--config",
+        "testdata/bugs/lease_clock/scenario.toml",
+        "--save",
+        &found,
+        "--",
+        GUEST,
+    ]);
+    assert_eq!(code, 1, "the stepped clock must be found: {err}");
 
-    let out = dir.join("smaller.bohr");
-    let (code, said, err) =
-        bohr(&["reduce", &found.to_string_lossy(), "-o", &out.to_string_lossy(), "--budget", "40"]);
+    let out = dir.join("smaller.bohr").to_string_lossy().into_owned();
+    let (code, said, err) = run(&["reduce", &found, "-o", &out, "--budget", "40"]);
     assert_eq!(code, 0, "{err}");
     assert!(said.contains("events:"), "the result was not reported: {said}{err}");
-    assert!(out.is_file(), "no bundle was written");
 
-    let (code, _, err) = bohr(&["replay", "--verify-only", &out.to_string_lossy()]);
+    let (code, _, err) = run(&["replay", "--verify-only", &out]);
     assert_eq!(code, 0, "the reduced bundle no longer replays: {err}");
 }
 

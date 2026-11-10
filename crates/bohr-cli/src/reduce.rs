@@ -167,9 +167,9 @@ pub(crate) fn reduce(
     );
     let spent = reduction.spent();
     eprintln!(
-        "  replays spent: {} verifying, {} on the configuration, {} on deliveries, {} on the tape · \
-         written to {out}, reduced from run {}",
-        spent.verifying, spent.config, spent.events, spent.tape, manifest.run_id
+        "  replays spent: {} verifying, {} on faults, {} on the configuration, {} on deliveries, \
+         {} on the tape · written to {out}, reduced from run {}",
+        spent.verifying, spent.faults, spent.config, spent.events, spent.tape, manifest.run_id
     );
     Ok(crate::exit::CLEAN)
 }
@@ -235,7 +235,8 @@ fn reach_of(section: &[u8]) -> Result<u64, CliError> {
 /// What a reduction pass is doing, in words.
 const fn pass_word(pass: bohr_reducer::Pass) -> &'static str {
     match pass {
-        bohr_reducer::Pass::Config => "dropping faults",
+        bohr_reducer::Pass::Faults => "dropping and moving faults",
+        bohr_reducer::Pass::Config => "dropping scheduled faults",
         bohr_reducer::Pass::Events => "dropping deliveries",
         bohr_reducer::Pass::Tape => "plainer draws",
         bohr_reducer::Pass::Done => "done",

@@ -64,6 +64,15 @@ fn programs_of(bundle: &Bundle) -> String {
     if names.is_empty() { "?".to_owned() } else { names.join("+") }
 }
 
+/// What a bundle is grouped by: the programs it ran and its violation's signature.
+pub(crate) fn signature(
+    bundle: &Bundle,
+    outcome: &Outcome,
+    events: &[bohr_trace::Event],
+) -> String {
+    format!("{}: {}", programs_of(bundle), signature_of(outcome, events))
+}
+
 fn read(path: &Path) -> Result<Read, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {}: {e}", path.display())))?;
@@ -75,11 +84,7 @@ fn read(path: &Path) -> Result<Read, CliError> {
     Ok(Read {
         path: path.to_owned(),
         events: manifest.counters.events,
-        signature: format!(
-            "{}: {}",
-            programs_of(&bundle),
-            signature_of(&manifest.outcome, &events)
-        ),
+        signature: signature(&bundle, &manifest.outcome, &events),
         verdict: bohr_report::narrate::verdict(&manifest.outcome),
     })
 }

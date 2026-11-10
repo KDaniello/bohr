@@ -1399,6 +1399,33 @@ gibibyte_crash_run_ms = { calm = 37, crashed = 37 }                      # P6.2,
 gate_s = 118
 pr_s = 45
 
+# What v0.7.0 was measured to do, on 2026-11-10, on the Ubuntu 24.04 VM, v0.6.0's binary beside it.
+# The two reduced findings are against real clients and stay unnamed here until their maintainers
+# have them; the private findings directory says which.
+[v0_7.reduction]                                                                     # G7.1, G7.2, P7.2
+client_a = { events = "27_577 -> 5_923", kept = 0.215, replays = 200, wall_s = 471, replays_reproduce = "100 of 100" }
+client_b = { events = "1_278 -> 1_267", kept = 0.991, replays = 200, wall_s = 688, replays_reproduce = "100 of 100" }
+client_a_v0_6 = { events = "27_577 -> 5_847", replays = 25 }
+bound_kept = 0.10                                                                    # G7.1: fails
+
+[v0_7.gates]
+fixture_reduction = "the PingPong fixture's test, green"                             # G7.3
+disclosure_drafts = "6 of 6: the command reproduces, the digest is the one the draft names"  # G7.4
+sarif = "valid against the 2.1.0 schema, 5 results; not uploaded"                    # G7.5
+cross_vendor = "not measured: no AMD runner"                                         # G7.6
+checkpoint_replay = "not built: the ptrace backend has no checkpoint"                # P7.1
+make_pr = "green"                                                                    # G7.7
+make_gate = "green, 13 of 13"
+mutation_injections_caught = "13 of 13"
+tests = 715
+
+[v0_7.perf]                                                                          # P7.3, means of 4 rounds, 6 for redb
+per_call_us = { v0_6 = 4.0, v0_7 = 4.1 }
+startup_ms = { v0_6 = 2.63, v0_7 = 2.78 }
+redb_64_runs_ms = { j1 = { v0_6 = 2_887, v0_7 = 2_926 }, j4 = { v0_6 = 851, v0_7 = 893 } }
+peak_rss_mb = { v0_6 = 14.1, v0_7 = 14.2 }
+pr_s = 78
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

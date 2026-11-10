@@ -418,6 +418,14 @@ probability, its candidate moments being a subset of uniform's and on that targe
 §5.4 withdraws the claim rather than softening it. The job stays, because the mechanism is sound and
 the heuristic choosing its moments is what needs the work — this is where that will show.
 
+**Reduction on a real client.** A fixture's ratio is not a reducer's ratio: `PingPong` shrinks from
+49,477 events to 18 because nothing in it costs events but the faults, and a real client spends
+thousands on starting. So the reducer is judged on findings the target packs produce, each reduced
+with `--budget 200`, by three numbers: the share of events kept, the wall time, and how many of 100
+replays of the result reproduce the same violation signature. The last is the contract; the first
+two are measured and published, and which client and seed each finding is stays out of the tree
+until its maintainers have it. Figures under `[v0_7.reduction]`.
+
 ---
 
 ## 9. Flaky tests

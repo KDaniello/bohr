@@ -31,6 +31,7 @@ nothing, and the harness is what shows each one can.
 | A run repeats | 100 runs of a five-node `raft-rs` cluster through a partition, 16,016 events, one digest | `[cluster.split_brain]` |
 | A run travels | 9 of 9 bundles written by a Windows build replayed by a Linux one | `[m2.gates]` |
 | A finding shrinks | a fixture's 49,477 events reduced to 18 in 20 replays, reproducing 100 times of 100 | `[m4.reduction]` |
+| A real finding shrinks | a real client's 27,577 events reduced to 5,923 in 200 replays and 471 s, reproducing 100 times of 100 | `[v0_7.reduction]` |
 | PCT earns its default | a depth-2 race reached on 60 of 60 seeds under PCT, 47 of 60 under uniform choice | `[policies.race_init]` |
 | Interception cost | 7.7 µs per intercepted syscall, against a ceiling of 120, with the supervisor on its guest's core | `[v0_3.perf]` |
 | The suite can fail | 13 of 13 injections turn the determinism suite red; 12 of 12 product scenarios pass | `[v0_1.gates]` |
@@ -52,9 +53,11 @@ Recorded as measured, with the same weight as the rows above.
   (`[targeting.v0_6]`): guided finds a header outliving its record on 15 of 60 seeds against 11, and
   a lease outliving a stepped clock on none of 60 against 23 — it fires only on a node holding
   unsynced writes, and that node writes nothing. It stays opt-in.
-- **Reduction does not reach real-client scale within a small budget.** Against a real execution
-  client, 20 replays at 75 s each took 1,222,888 events to 1,189,704 (`[m5.op_reth.reduction]`). The
-  fixture's ratio does not transfer.
+- **Reduction does not reach tenfold on a real client.** At 200 replays a finding against a real
+  client keeps 5,923 of 27,577 events (21.5%) and a second 1,267 of 1,278 (`[v0_7.reduction]`):
+  every fault the failure needs stays, and what a real node does between them is thousands of
+  events no edit of the tape removes. v0.6's reducer reaches 5,847 on the first in 25 replays. An execution client at 75 s a replay is
+  past the budget's hour before the first result (`[m5.op_reth.reduction]`).
 - **A guest that lives a millisecond is measured by its startup.** Starting under the supervisor
   costs about 3 ms on the host of `[v0_1.gates]`, so `cat` runs at 4.9× native against a ceiling of
   4.0×, and `make gate` is red there on that row alone.

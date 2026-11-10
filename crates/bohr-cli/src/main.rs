@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod check;
+mod disclose;
 mod doctor;
 mod execute;
 mod explore;
@@ -401,14 +402,20 @@ enum Command {
 
     /// Write a stored run as one page a person can read.
     Report {
-        /// The bundle to render.
+        /// The bundle to render; for `--sarif`, a directory of them as well.
         bundle: String,
-        /// Where the page is written.
-        #[arg(short = 'o', long, value_name = "PATH", default_value = "report.html")]
-        out: String,
+        /// Where the page is written: `report.html`, or `report.md` and `finding.sarif`.
+        #[arg(short = 'o', long, value_name = "PATH")]
+        out: Option<String>,
         /// Also write a bundle without what a customer would not want published.
         #[arg(long)]
         redact: bool,
+        /// Write a disclosure draft in Markdown instead of the page.
+        #[arg(long, conflicts_with_all = ["sarif", "redact"])]
+        disclosure: bool,
+        /// Write SARIF 2.1.0 instead of the page, one result per finding group.
+        #[arg(long, conflicts_with = "redact")]
+        sarif: bool,
     },
 
     /// Write a line on a stored run, for whoever opens it next.
@@ -982,7 +989,15 @@ fn dispatch() -> Result<u8, CliError> {
         Command::Reduce { bundle, out, budget, keep, binaries } => {
             reduce::reduce(&bundle, &out, budget, &keep, binaries.as_deref())
         }
-        Command::Report { bundle, out, redact } => report(&bundle, &out, redact),
+        Command::Report { bundle, out, redact, disclosure, sarif } => {
+            if disclosure {
+                disclose::disclosure(&bundle, out.as_deref().unwrap_or("report.md"))
+            } else if sarif {
+                disclose::sarif(&bundle, out.as_deref().unwrap_or("finding.sarif"))
+            } else {
+                report(&bundle, out.as_deref().unwrap_or("report.html"), redact)
+            }
+        }
         Command::Survey { seed, config, max_events, patch_cpuid, program } => {
             if program.is_empty() {
                 return Err(CliError::Usage(

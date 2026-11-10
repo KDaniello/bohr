@@ -1,10 +1,12 @@
 //! A reduction in progress: what has been proven smaller, and what to try next.
 
+use std::collections::BTreeSet;
+
 use bohr_tape::Journal;
 
 use crate::{
     ReducerError,
-    bytes::{Target, decisions},
+    bytes::{Target, decisions, fired_at, fired_node_faults, movable, sooner},
     config::ConfigDoc,
     ddmin::DdMin,
     scenario::{Scenario, Size},
@@ -42,10 +44,16 @@ pub enum Keep {
 }
 
 /// Which pass is running.
+///
+/// In the order that removes most per replay. The configuration goes first because it is read
+/// before the tape: an entry removed shifts every draw after it, so faults moved before that would
+/// be moved again by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pass {
     /// Removing what the world was told to do, and bringing forward what is left.
     Config,
+    /// Removing the faults the run drew and that fired, and firing the node faults left sooner.
+    Faults,
     /// Not delivering what the world chose to deliver.
     Events,
     /// Replacing what one decision drew with the plainest bytes it could have drawn.
@@ -59,6 +67,8 @@ pub enum Pass {
 pub struct Spent {
     /// Establishing what is being reduced, and confirming the result.
     pub verifying: u32,
+    /// On the faults the run drew.
+    pub faults: u32,
     /// On the configuration.
     pub config: u32,
     /// On deliveries.
@@ -71,7 +81,7 @@ impl Spent {
     /// Replays spent altogether.
     #[must_use]
     pub const fn total(self) -> u32 {
-        self.verifying + self.config + self.events + self.tape
+        self.verifying + self.faults + self.config + self.events + self.tape
     }
 }
 
@@ -123,12 +133,15 @@ const RESERVED: u32 = 2;
 
 /// How the remaining budget is divided.
 ///
-/// The event pass is where the collapse happens, so it gets half. The configuration pass is cheap
-/// per candidate and enormous per success, and there are few entries to try, so it needs little.
-/// The tape pass is the long tail: it improves the number and rarely changes the answer, so it
-/// runs last on what is left.
+/// The fault pass goes first and gets a fifth: a run against a real client carries a handful of
+/// fired faults, and one kill fired at an earlier chance removes more of the run than anything
+/// else can. The configuration pass is cheap per candidate and enormous per success, and there
+/// are few entries to try, so it needs little. The event pass is where a cluster's collapse
+/// happens. The tape pass is the long tail: it improves the number and rarely changes the answer,
+/// so it runs last on what is left.
+const SHARE_FAULTS: u32 = 20;
 const SHARE_CONFIG: u32 = 15;
-const SHARE_EVENTS: u32 = 50;
+const SHARE_EVENTS: u32 = 40;
 
 /// A reduction in progress.
 ///
@@ -149,6 +162,28 @@ pub struct Reduction {
     /// The candidate proposed and not yet answered, with what accepting it would mean.
     outstanding: Option<(Candidate, Move)>,
     config: PassState,
+    faults: FaultState,
+    /// Scenarios already answered, by fingerprint, so none is replayed twice.
+    ///
+    /// A minimisation that restarts after a success re-proposes subsets it has already been
+    /// refused, and two passes can arrive at one scenario. Each of those is a replay that would
+    /// learn an answer this reduction holds; on a client whose replay takes a minute, that is the
+    /// budget. A collision costs a candidate that is never tried, never a wrong answer.
+    answered: BTreeSet<u64>,
+}
+
+/// Where the fault pass has got to.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct FaultState {
+    /// Whether removing faults has converged and moving them has begun.
+    removed: bool,
+    /// Which fired node fault is being moved, counted from the first; moved from the last back.
+    nth: Option<usize>,
+    /// Chances still to try for it, as positions among its earlier chances, soonest last.
+    /// Nothing until its ladder is built.
+    ladder: Option<Vec<usize>>,
+    /// Positions this fault has already been refused at.
+    refused: Vec<usize>,
 }
 
 /// What accepting the outstanding candidate would do to the reduction.
@@ -160,6 +195,8 @@ enum Move {
     Sooner { at: usize, to: u64 },
     /// Leave these decisions alone and make the rest go the dull way.
     KeepDecisions,
+    /// Fire the node fault being moved at this position among its earlier chances, at this offset.
+    FaultSooner { to: usize, at: u64 },
 }
 
 /// Where the configuration pass has got to.
@@ -215,7 +252,10 @@ impl Reduction {
                 refused: Vec::new(),
                 decisions: None,
             },
+            faults: FaultState::default(),
+            answered: BTreeSet::new(),
         };
+        reduction.answered.insert(fingerprint(&reduction.best));
         reduction.propose();
         Ok(reduction)
     }
@@ -266,6 +306,7 @@ impl Reduction {
         assert_eq!(candidate.id, outcome.id, "an outcome answered a candidate nobody proposed");
 
         match self.pass {
+            Pass::Faults => self.spent.faults += 1,
             Pass::Config => self.spent.config += 1,
             Pass::Events => self.spent.events += 1,
             Pass::Tape => self.spent.tape += 1,
@@ -277,6 +318,7 @@ impl Reduction {
         let kept =
             outcome.violation.as_ref().is_some_and(|found| self.baseline.reproduced_by(found))
                 && outcome.size <= self.best_size;
+        self.answered.insert(fingerprint(&candidate.scenario));
         if kept {
             self.best = candidate.scenario;
             self.best_size = outcome.size;
@@ -308,6 +350,23 @@ impl Reduction {
                 // something else and the working set has to be read from the new journal.
                 if kept {
                     self.config.decisions = None;
+                }
+            }
+            Move::FaultSooner { to, at } => {
+                // Nothing before the chance it now fires at changed, so the chances before it are
+                // the same chances, and what it was refused at among them is still an answer. A
+                // candidate kept without a fault at that chance -- zero odds there, or the bytes
+                // after it moved something else -- is smaller, and is not a move: its rung is
+                // spent as a refusal.
+                if kept && fired_at(&self.journal, *at) {
+                    let refused = self.faults.refused.clone();
+                    let mut ladder = rungs_below(*to);
+                    ladder.retain(|rung| !refused.contains(rung));
+                    self.faults.ladder = Some(ladder);
+                } else if let Some(ladder) = self.faults.ladder.as_mut()
+                    && let Some(rung) = ladder.pop()
+                {
+                    self.faults.refused.push(rung);
                 }
             }
             Move::Sooner { .. } => {
@@ -349,41 +408,34 @@ impl Reduction {
                 self.outstanding = None;
                 return;
             }
-            match self.pass {
-                Pass::Config => {
-                    if self.spent.config >= self.share(SHARE_CONFIG) {
-                        self.enter_next_pass();
-                        continue;
-                    }
-                    if let Some(proposal) = self.propose_config() {
-                        self.outstanding = Some(proposal);
-                        return;
-                    }
-                    self.enter_next_pass();
+            let proposal = match self.pass {
+                Pass::Faults if self.spent.faults < self.share(SHARE_FAULTS) => {
+                    self.propose_faults()
                 }
-                Pass::Events => {
-                    if self.spent.events >= self.share(SHARE_EVENTS) {
-                        self.enter_next_pass();
-                        continue;
-                    }
-                    if let Some(proposal) = self.propose_bytes(Target::Deliveries) {
-                        self.outstanding = Some(proposal);
-                        return;
-                    }
-                    self.enter_next_pass();
+                Pass::Config if self.spent.config < self.share(SHARE_CONFIG) => {
+                    self.propose_config()
                 }
-                Pass::Tape => {
-                    if let Some(proposal) = self.propose_bytes(Target::Everything) {
-                        self.outstanding = Some(proposal);
-                        return;
-                    }
-                    self.enter_next_pass();
+                Pass::Events if self.spent.events < self.share(SHARE_EVENTS) => {
+                    self.propose_bytes(Target::Deliveries)
                 }
+                Pass::Tape => self.propose_bytes(Target::Everything),
                 Pass::Done => {
                     self.outstanding = None;
                     return;
                 }
+                Pass::Faults | Pass::Config | Pass::Events => None,
+            };
+            let Some((candidate, applied)) = proposal else {
+                self.enter_next_pass();
+                continue;
+            };
+            // An answer already held is folded in as the refusal it was, without a replay.
+            if self.answered.contains(&fingerprint(&candidate.scenario)) {
+                self.fold_move(&applied, false);
+                continue;
             }
+            self.outstanding = Some((candidate, applied));
+            return;
         }
     }
 
@@ -396,7 +448,8 @@ impl Reduction {
     /// The pass after this one, given what the caller asked to minimise.
     fn enter_next_pass(&mut self) {
         self.pass = match (self.pass, self.limits.keep) {
-            (Pass::Config, _) => Pass::Events,
+            (Pass::Config, _) => Pass::Faults,
+            (Pass::Faults, _) => Pass::Events,
             (Pass::Events, Keep::Events) => Pass::Done,
             (Pass::Events, _) => Pass::Tape,
             _ => Pass::Done,
@@ -446,6 +499,53 @@ impl Reduction {
         }
     }
 
+    /// The next fault candidate: faults to stop firing, then a node fault to fire sooner.
+    fn propose_faults(&mut self) -> Option<(Candidate, Move)> {
+        if !self.faults.removed {
+            if let Some(proposal) = self.propose_bytes(Target::Faults) {
+                return Some(proposal);
+            }
+            self.faults.removed = true;
+            self.config.decisions = None;
+        }
+
+        // From the last fault back. Moving the last one leaves nothing after it to land on bytes
+        // that now mean something else; moving an earlier one does, and the signature check
+        // refuses the candidates that broke.
+        loop {
+            let nth = match self.faults.nth {
+                Some(nth) => nth,
+                None => {
+                    let count = fired_node_faults(&self.journal);
+                    let last = count.checked_sub(1)?;
+                    self.faults.nth = Some(last);
+                    last
+                }
+            };
+            let Some(fault) = movable(&self.journal, self.best.prefix(), nth) else {
+                self.faults.nth = Some(nth.checked_sub(1)?);
+                self.faults.ladder = None;
+                self.faults.refused.clear();
+                continue;
+            };
+            let refused = self.faults.refused.clone();
+            let ladder = self.faults.ladder.get_or_insert_with(|| {
+                let mut ladder = rungs_below(fault.chances.len());
+                ladder.retain(|rung| !refused.contains(rung));
+                ladder
+            });
+            let Some(&to) = ladder.last() else {
+                self.faults.nth = Some(nth.checked_sub(1)?);
+                self.faults.ladder = None;
+                self.faults.refused.clear();
+                continue;
+            };
+            let at = *fault.chances.get(to)?;
+            let scenario = self.best.with_bytes(&sooner(at, &fault.body));
+            return Some((self.candidate(scenario), Move::FaultSooner { to, at }));
+        }
+    }
+
     /// The next candidate for a pass that rewrites decisions on the tape.
     ///
     /// The working set is read from the journal of the run that is currently best, so a success
@@ -483,6 +583,27 @@ impl Reduction {
         self.next_id += 1;
         Candidate { id, scenario }
     }
+}
+
+/// Positions to try among `count` earlier chances, soonest last.
+///
+/// The same geometric ladder a moment descends, for the same reason: what matters is whether the
+/// fault can fire near the start, and four probes answer that.
+fn rungs_below(count: usize) -> Vec<usize> {
+    let mut rungs: Vec<usize> =
+        [count / 2, count / 4, count / 8, 0].into_iter().filter(|rung| *rung < count).collect();
+    rungs.dedup();
+    rungs
+}
+
+/// A scenario's identity, for knowing it has been answered.
+fn fingerprint(scenario: &Scenario) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    scenario.seed().get().hash(&mut hasher);
+    scenario.prefix().hash(&mut hasher);
+    scenario.config().hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The ticks to try for a moment, soonest last.
