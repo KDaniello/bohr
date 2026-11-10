@@ -2,8 +2,7 @@
 
 # bohr
 
-**Deterministic simulation testing for unmodified Linux programs.
-Same seed, same bytes, every time.**
+**Deterministic simulation testing for unmodified Linux programs.**
 
 [![CI](https://github.com/KDaniello/bohr/actions/workflows/test.yml/badge.svg)](https://github.com/KDaniello/bohr/actions/workflows/test.yml)
 [![Lint](https://github.com/KDaniello/bohr/actions/workflows/lint.yml/badge.svg)](https://github.com/KDaniello/bohr/actions/workflows/lint.yml)
