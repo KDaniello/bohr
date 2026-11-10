@@ -76,8 +76,7 @@ fn signal_name(signal: u32) -> Option<&'static str> {
 
 /// The `BOHR-NNNN` an outcome's words start with, where they do.
 fn leading_code(detail: &str) -> Option<&str> {
-    let code = detail.get(..9)?;
-    (code.starts_with("BOHR-") && code[5..].chars().all(|c| c.is_ascii_digit())).then_some(code)
+    bohr_types::Code::leading(detail).map(|_| &detail[..9])
 }
 
 /// A probe's own words, `probe "name": rest`, as the name and the rest.
@@ -92,8 +91,7 @@ fn probe_words(message: &str) -> Option<(&str, &str)> {
 /// One place for every kind, so a summary, a story and a page never word one finding two ways.
 #[must_use]
 pub fn verdict(outcome: &Outcome) -> Verdict {
-    let kind = format!("{outcome:?}");
-    let kind = kind.split('(').next().unwrap_or("").to_owned();
+    let kind = outcome.kind().name().to_owned();
     let detail = describe::outcome_detail(outcome).unwrap_or("");
     let (headline, code) = match outcome {
         Outcome::Clean => ("nothing was found".to_owned(), kind),
@@ -186,7 +184,7 @@ pub fn story(model: &RunModel, bundle: &str) -> Story {
     let manifest = &model.manifest;
     let verdict = verdict(&manifest.outcome);
     // Where the violation was seen: the first diagnostic with its code.
-    let seen = verdict.code.starts_with("BOHR-").then(|| {
+    let seen = bohr_types::Code::leading(&verdict.code).is_some().then(|| {
         model.events.iter().find_map(|e| match &e.kind {
             EventKind::Diagnostic { code, .. } if *code == verdict.code => Some(e.id.get()),
             _ => None,
@@ -346,7 +344,7 @@ pub fn write_story(story: &Story) -> String {
         "\nThe steps are what came before the violation and touched the run, gathered by rule;\n\
          that they caused it is not shown, only that they came first.\n",
     );
-    out
+    crate::text::printable(&out).into_owned()
 }
 
 /// A story as one JSON object, with the same fields the text is written from.

@@ -1,0 +1,23 @@
+[package]
+name = "bohr-findings"
+description = "What a finding is: its group, its ablation, its triage, its staging and its facts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bohr-kernel.workspace = true
+bohr-reducer.workspace = true
+bohr-sdk-proto.workspace = true
+bohr-report.workspace = true
+bohr-trace.workspace = true
+bohr-types.workspace = true
+bohr-world.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

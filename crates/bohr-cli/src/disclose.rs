@@ -12,13 +12,13 @@ use crate::CliError;
 
 fn read(path: &Path) -> Result<Bundle, CliError> {
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {}: {e}", path.display())))?;
-    Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {}: {e}", path.display())))?;
+    Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))
 }
 
 fn write(out: &str, text: &str) -> Result<(), CliError> {
     std::fs::write(out, text)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {out}: {e}")))
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {out}: {e}")))
 }
 
 /// The pack under `targets/` whose build has one of these digests, where one does.
@@ -36,9 +36,9 @@ fn source_of(model: &RunModel) -> Option<Source> {
 /// Writes the disclosure draft for one bundle.
 pub(crate) fn disclosure(path: &str, out: &str) -> Result<u8, CliError> {
     let bundle = read(Path::new(path))?;
-    let model = RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+    let model = RunModel::of(&bundle).map_err(|e| CliError::usage(e.to_string()))?;
     if !bohr_report::narrate::verdict(&model.manifest.outcome).found {
-        return Err(CliError::Usage(format!(
+        return Err(CliError::usage(format!(
             "BOHR-5003: {path} records nothing going wrong, so there is nothing to disclose"
         )));
     }
@@ -53,14 +53,14 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
     let given = Path::new(path);
     let mut paths: Vec<PathBuf> = if given.is_dir() {
         std::fs::read_dir(given)
-            .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?
+            .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "bohr"))
             .collect()
     } else {
         // A single named bundle must read; a typo is an error.
-        RunModel::of(&read(given)?).map_err(|e| CliError::Usage(e.to_string()))?;
+        RunModel::of(&read(given)?).map_err(|e| CliError::usage(e.to_string()))?;
         vec![given.to_owned()]
     };
     paths.sort();
@@ -70,10 +70,13 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
     for path in &paths {
         // An unreadable bundle is named and skipped, as in `bohr findings`.
         let read = read(path).and_then(|bundle| {
-            let model = RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
-            Ok((bundle, model))
+            let model = RunModel::of(&bundle).map_err(|e| CliError::usage(e.to_string()))?;
+            let signature =
+                bohr_findings::group::signature(&bundle, &model.manifest.outcome, &model.events)
+                    .map_err(|e| CliError::usage(e.to_string()))?;
+            Ok((signature, model))
         });
-        let (bundle, model) = match read {
+        let (signature, model) = match read {
             Ok(both) => both,
             Err(e) => {
                 eprintln!("unreadable, left out: {}: {e}", path.display());
@@ -83,7 +86,6 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
         if !bohr_report::narrate::verdict(&model.manifest.outcome).found {
             continue;
         }
-        let signature = crate::findings::signature(&bundle, &model.manifest.outcome, &model.events);
         groups.entry(signature).or_default().push((
             model.manifest.counters.events,
             path.clone(),

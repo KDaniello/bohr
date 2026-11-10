@@ -10,7 +10,6 @@ authors.workspace = true
 
 [dependencies]
 bohr-kernel.workspace = true
-bohr-sdk-proto.workspace = true
 bohr-tape.workspace = true
 bohr-trace.workspace = true
 bohr-types.workspace = true

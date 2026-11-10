@@ -7,7 +7,7 @@
 //! Hit counts are compared in buckets. 100 iterations instead of 99 is the same behaviour; two
 //! instead of one is not. See `docs/API.md` §5.5.
 
-use bohr_types::Digest;
+use crate::Digest;
 
 /// Default number of counters in a map.
 ///

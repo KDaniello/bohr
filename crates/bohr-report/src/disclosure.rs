@@ -63,7 +63,8 @@ pub fn disclosure(model: &RunModel, bundle: &str, source: Option<&Source>) -> St
 /// The programs the run started, by file name, with their digests, in the order they started.
 fn programs(model: &RunModel) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = Vec::new();
-    for record in model.binaries.iter().filter(|r| r.role != "library" && r.role != "loader") {
+    // The programs under test; the probe is the bench's own.
+    for record in model.binaries.iter().filter(|r| r.role.under_test()) {
         let name = record.path.rsplit('/').next().unwrap_or(&record.path).to_owned();
         if !found.iter().any(|(seen, _)| *seen == name) {
             found.push((name, record.blake3.clone()));

@@ -24,7 +24,7 @@ pub(crate) fn reduce(
         "tape" => Keep::Tape,
         "both" => Keep::Both,
         other => {
-            return Err(CliError::Usage(format!(
+            return Err(CliError::usage(format!(
                 "BOHR-1001: no such thing to keep as {other:?}; this build minimises \
                  events, tape or both"
             )));
@@ -32,26 +32,27 @@ pub(crate) fn reduce(
     };
 
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    let bundle = Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
-    let manifest = bundle.manifest().map_err(|e| CliError::Usage(e.to_string()))?;
-    manifest.check_tape_abi(TAPE_ABI).map_err(|e| CliError::Usage(e.to_string()))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let bundle = Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))?;
+    let manifest = bundle.manifest().map_err(|e| CliError::usage(e.to_string()))?;
+    manifest.check_tape_abi(TAPE_ABI).map_err(|e| CliError::usage(e.to_string()))?;
     // Every candidate runs the recorded programs, so a changed one is refused before the first.
-    replay::verify_binaries(&bundle, binaries)?;
+    replay::verify_binaries(&bundle, &manifest, binaries)?;
     // Candidates are judged by this build's oracle. A bundle recorded under another one is refused
     // with that reason, instead of reporting that the baseline reproduces nothing.
     let stored_config = bundle
-        .section(SectionId::Config)
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
+        .config_text()
+        .map_err(|e| CliError::usage(format!("BOHR-4002: config section: {e}")))?
+        .to_owned();
     let stored = optional_config(&stored_config)?;
+    replay::verify_state(&manifest, stored.as_ref())?;
     let (world, oracle) = crate::identities(stored.as_ref());
-    manifest.check_provenance(&world, &oracle).map_err(|e| CliError::Usage(e.to_string()))?;
+    manifest.check_provenance(&world, &oracle).map_err(|e| CliError::usage(e.to_string()))?;
 
     let tape_bytes = bundle
         .section(SectionId::Tape)
-        .ok_or_else(|| CliError::Usage("BOHR-4002: bundle is missing required section 2".into()))?;
-    let tape = Tape::from_container(tape_bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+        .ok_or_else(|| CliError::usage("BOHR-4002: bundle is missing required section 2"))?;
+    let tape = Tape::from_container(tape_bytes).map_err(|e| CliError::usage(e.to_string()))?;
     // The prefix is written out once to cover every byte the run read, as its journal records.
     // The keystream is counted from the end of the prefix, so a fixed prefix length makes each
     // later edit change one decision instead of shifting all of them.
@@ -59,46 +60,75 @@ pub(crate) fn reduce(
         bundle.section(SectionId::DrawJournal).map(reach_of).transpose()?.unwrap_or_default();
     let start = Scenario::new(tape.seed(), materialise(&tape, reach, path)?, stored_config);
 
-    let carry_out =
-        |scenario: &Scenario| -> Result<(Option<Violation>, Size, bohr_tape::Journal), CliError> {
-            let tape = Tape::with_prefix(scenario.seed(), scenario.prefix().to_vec());
-            let loaded = if scenario.config().trim().is_empty() {
-                None
-            } else {
-                match bohr_world::config::load(scenario.config()) {
-                    Ok(loaded) => Some(loaded),
-                    // A candidate the world refuses (for example a liveness scenario left without
-                    // its `[[partition]]`) counts as not reproduced. Its size is never read.
-                    Err(_) => {
-                        let nothing = Size { events: 0, draws: 0 };
-                        return Ok((None, nothing, bohr_tape::Journal::new()));
-                    }
+    // What a candidate came to: its violation, its size, its draws, and the digest of its run.
+    type Carried = (Option<Violation>, Size, bohr_tape::Journal, bohr_types::Digest);
+    let carry_out = |scenario: &Scenario| -> Result<Carried, CliError> {
+        let tape = Tape::with_prefix(scenario.seed(), scenario.prefix().to_vec());
+        let loaded = if scenario.config().trim().is_empty() {
+            None
+        } else {
+            match crate::state_dir::load(scenario.config()) {
+                Ok(loaded) => Some(loaded),
+                // A candidate the world refuses (for example a liveness scenario left without
+                // its `[[partition]]`) counts as not reproduced. Its size is never read.
+                Err(_) => {
+                    let nothing = Size { events: 0, draws: 0 };
+                    let none = bohr_types::Digest::of(&[]);
+                    return Ok((None, nothing, bohr_tape::Journal::new(), none));
                 }
-            };
-            let target = replay::target_from(&bundle, &manifest, loaded.as_ref(), binaries)?;
-            let completed = execute::once(execute::Execution {
-                target: &target,
-                tape: &tape,
-                config: crate::run_config_for(loaded.as_ref(), None),
-                output: execute::Output::Discard,
-                policy: &manifest.policy.scheduler,
-                record: execute::Record::Log,
-                scenario: loaded.as_ref(),
-                config_toml: scenario.config(),
-            })?;
-            let (events, _) = bohr_trace::read_events_lossy(&completed.log);
-            let violation =
-                Violation::of(&completed.report.outcome, completed.report.stop_reason, &events);
-            let size = Size {
-                events: completed.report.events,
-                draws: completed.report.journal.len() as u64,
-            };
-            Ok((violation, size, completed.report.journal))
+            }
         };
+        let target = replay::target_from(&bundle, &manifest, loaded.as_ref(), binaries)?;
+        let completed = execute::once(execute::Execution {
+            target: &target,
+            tape: &tape,
+            config: {
+                let mut config = crate::run_config_for(loaded.as_ref(), None);
+                config.max_events = replay::budget_for(&manifest, config.max_events);
+                config
+            },
+            output: execute::Output::Discard,
+            policy: &manifest.policy.scheduler,
+            // Spooled and read for the events a violation and its place are told by, so a
+            // candidate holds none of its log.
+            record: execute::Record::Spool,
+            scenario: loaded.as_ref(),
+            config_toml: scenario.config(),
+        })?;
+        let events = match completed.spooled.as_ref() {
+            Some(spooled) => {
+                spooled
+                    .events_where(bohr_findings::group::telling)
+                    .map_err(|e| {
+                        CliError::internal(format!("a candidate's spooled log is unreadable: {e}"))
+                    })?
+                    .0
+            }
+            None => Vec::new(),
+        };
+        // Where it fell is part of what it is: a candidate that falls elsewhere is another
+        // finding, as `bohr findings` groups them.
+        let place = bohr_findings::group::place_of(&events, &completed.output_tails);
+        let violation =
+            Violation::of(&completed.report.outcome, completed.report.stop_reason, &events)
+                .map(|violation| violation.at(place));
+        let size =
+            Size { events: completed.report.events, draws: completed.report.journal.len() as u64 };
+        Ok((violation, size, completed.report.journal, completed.report.digest))
+    };
 
-    let (violation, size, journal) = carry_out(&start)?;
+    // The baseline is the stored run itself; one that goes elsewhere under this build would
+    // reduce another finding under this one's name.
+    let (violation, size, journal, digest) = carry_out(&start)?;
+    if digest.to_string() != manifest.trace_digest {
+        return Err(CliError::internal(format!(
+            "BOHR-2011: {path} did not reproduce its own finding under this build: it ran to {digest} \
+             where it recorded {}. bohr replay reads the same disagreement.",
+            manifest.trace_digest
+        )));
+    }
     let Some(violation) = violation else {
-        return Err(CliError::Usage(format!(
+        return Err(CliError::usage(format!(
             "BOHR-5003: {path} replayed clean, so there is nothing to reduce. A bundle reduces \
              what went wrong in it, and this one records nothing going wrong."
         )));
@@ -111,12 +141,16 @@ pub(crate) fn reduce(
 
     let baseline = Baseline { violation, size, journal };
     let before = size;
-    let mut reduction = Reduction::new(start, baseline, Limits { replays: budget, keep })
-        .map_err(|e| CliError::Usage(e.to_string()))?;
+    let mut reduction = Reduction::new(
+        start,
+        baseline,
+        Limits { replays: budget, keep, moments: &bohr_world::config::MOMENT_KEYS },
+    )
+    .map_err(|e| CliError::usage(e.to_string()))?;
 
     while let Some(candidate) = reduction.next() {
         let id = candidate.id;
-        let (violation, size, journal) = carry_out(&candidate.scenario)?;
+        let (violation, size, journal, _) = carry_out(&candidate.scenario)?;
         reduction.accept(&CandidateOutcome { id, violation, size, journal });
         // One redrawn line on stderr.
         eprint!(
@@ -137,7 +171,12 @@ pub(crate) fn reduce(
     let completed = execute::once(execute::Execution {
         target: &replay::target_from(&bundle, &manifest, reduced.as_ref(), binaries)?,
         tape: &tape,
-        config: crate::run_config_for(reduced.as_ref(), None),
+        // The budget its candidates ran under, or the finding it reduced may end elsewhere.
+        config: {
+            let mut config = crate::run_config_for(reduced.as_ref(), None);
+            config.max_events = replay::budget_for(&manifest, config.max_events);
+            config
+        },
         output: execute::Output::Discard,
         policy: &manifest.policy.scheduler,
         record: execute::Record::Log,
@@ -146,7 +185,7 @@ pub(crate) fn reduce(
     })?;
     let written = execute::to_bundle(&completed, &tape, Some(manifest.run_id.clone()))?;
     std::fs::write(out, written)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {out}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {out}: {e}")))?;
 
     let spent = reduction.spent();
     if crate::json::on() {
@@ -206,7 +245,7 @@ fn account(
 
 /// The configuration, where there is one.
 fn optional_config(text: &str) -> Result<Option<bohr_world::LoadedConfig>, CliError> {
-    if text.trim().is_empty() { Ok(None) } else { Ok(Some(bohr_world::config::load(text)?)) }
+    if text.trim().is_empty() { Ok(None) } else { Ok(Some(crate::state_dir::load(text)?)) }
 }
 
 /// Writes the tape's first bytes down so every decision the run made sits inside the prefix.
@@ -224,7 +263,7 @@ fn materialise(tape: &Tape, reach: u64, path: &str) -> Result<Vec<u8>, CliError>
     // out less than the run read would shift every later decision.
     let wanted = (tape.prefix().len() as u64).max(reach);
     if wanted > MOST {
-        return Err(CliError::Usage(format!(
+        return Err(CliError::usage(format!(
             "BOHR-3006: {path} read {wanted} bytes of tape and a reduction writes out at most \
              {MOST}. Reducing it would minimise a different run, so it is refused instead."
         )));
@@ -317,10 +356,11 @@ mod tests {
     fn a_run_too_long_to_write_out_is_refused_and_says_why() {
         let tape = Tape::from_seed(Seed(7));
         let refused = materialise(&tape, 512 * 1024 * 1024, "big.bohr");
-        let Err(CliError::Usage(said)) = refused else {
+        let Err(refusal) = refused else {
             panic!("a run past the bound was not refused");
         };
-        assert!(said.contains("BOHR-3006"), "{said}");
+        let said = refusal.to_string();
+        assert_eq!(refusal.code, Some(bohr_types::Code(3006)), "{said}");
         assert!(said.contains("different run"), "the refusal must say what it is avoiding: {said}");
     }
 }

@@ -6,30 +6,54 @@
 //!
 //! A datagram may be lost, doubled, overtaken or late. A stream makes no draws, since its
 //! transport hides all four; only partitions affect it, so streams cost no tape.
+//!
+//! A stream carries every byte in order. Each end has a send buffer and a receive buffer; a write
+//! fills the writer's send buffer, which drains into the reader's receive buffer while that has
+//! room and the link carries. A writer that finds both full waits, or is told so if it may not
+//! wait. Nothing is dropped: back-pressure reaches the writer as it does on Linux.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use bohr_kernel::{KernelError, Wake, WorldCtx};
+use bohr_kernel::{DeadlineCtx, KernelError, StopCtx, Wake};
 use bohr_tape::DrawSite;
 use bohr_trace::{Endpoint, EventKind, FaultKind, FaultTarget, PacketFate};
 use bohr_types::{GuestAddr, NodeId, TaskId, Tick};
 
-use super::draw_odds;
+use super::{FIRST_DESCRIPTOR, Numbers, draw_odds};
 use crate::nums::errno;
 
-/// First descriptor handed out for a socket.
+/// First identity a socket is kept under, past every number a guest's descriptor can hold.
 ///
-/// Disjoint from file descriptors, so descriptors are unambiguous.
-pub(crate) const SOCKET_FD_BASE: i64 = 4096;
+/// A guest names a socket by a descriptor number from its process's one table; the network keeps
+/// the socket under an identity of its own, so a `dup` or a close of one number never moves it.
+const ID_BASE: i64 = 1 << 32;
 
 /// Datagrams a receive queue holds; an arrival past this is dropped (API §5.3).
 const RECV_QUEUE_LIMIT: usize = 64;
 
-/// Bytes a stream will hold on either side before a write stops being accepted.
+/// Bytes each buffer of a stream holds: the send buffer at the writing end, the receive buffer at
+/// the reading end.
 ///
-/// Bounded so supervisor memory stays flat (§4.4); a full stream gives back-pressure like a full
-/// socket buffer.
+/// Bounded so supervisor memory stays flat (§4.4); a writer past both is held back, as a full
+/// socket buffer holds it.
 const STREAM_BUFFER_LIMIT: usize = 1 << 20;
+
+/// The `recvfrom` and `sendto` flags the model answers; Linux ignores the others it does not know,
+/// and so does the model.
+pub(crate) mod msg {
+    /// Out-of-band data, which no stream here carries.
+    pub(crate) const OOB: u64 = 0x1;
+    /// Read without taking.
+    pub(crate) const PEEK: u64 = 0x2;
+    /// Answer a datagram's whole length, even past the buffer.
+    pub(crate) const TRUNC: u64 = 0x20;
+    /// Answer `EAGAIN` instead of waiting, on a blocking socket too.
+    pub(crate) const DONTWAIT: u64 = 0x40;
+    /// Wait until the whole buffer is filled, the stream ends, or nothing more can come.
+    pub(crate) const WAITALL: u64 = 0x100;
+    /// The socket's error queue, which is always empty here.
+    pub(crate) const ERRQUEUE: u64 = 0x2000;
+}
 
 /// First ephemeral port, handed out upward in binding order.
 const FIRST_EPHEMERAL_PORT: u16 = 32768;
@@ -39,6 +63,9 @@ const AF_INET: u16 = 2;
 
 /// Size of `struct sockaddr_in`.
 const SOCKADDR_IN_BYTES: usize = 16;
+
+/// The options a guest set on one socket, by level and name, as it set them.
+type SocketOptions = BTreeMap<(u64, u64), Vec<u8>>;
 
 /// How links are laid out (API §5.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -150,6 +177,44 @@ struct PendingRecv {
     len: usize,
     /// Where the sender's address is written, when the guest asked for one. Zero for none.
     src_addr: u64,
+    /// The receive's `msg` flags.
+    flags: u64,
+    /// Bytes already written into `buf` by a receive waiting for all of them.
+    got: usize,
+    /// When it parked, on the world clock; a socket timeout fires only into the wait that armed
+    /// it.
+    since: Tick,
+}
+
+impl PendingRecv {
+    const fn peeks(&self) -> bool {
+        self.flags & msg::PEEK != 0
+    }
+
+    /// Whether it waits for the whole buffer; a peek never does.
+    const fn waits_for_all(&self) -> bool {
+        self.flags & msg::WAITALL != 0 && !self.peeks()
+    }
+}
+
+/// A task parked in a stream write until the send buffer has room for the rest of it.
+#[derive(Clone, Debug)]
+struct PendingWrite {
+    task: TaskId,
+    /// What it has yet to hand over, in order.
+    rest: VecDeque<u8>,
+    /// What it has handed over so far; the answer once `rest` is empty.
+    written: usize,
+    /// When it parked, on the world clock; a socket timeout fires only into the wait that armed
+    /// it.
+    since: Tick,
+}
+
+impl PendingWrite {
+    /// The answer of a write cut short: what it handed over, or `EPIPE` for nothing.
+    const fn cut_short(&self) -> i64 {
+        if self.written > 0 { self.written as i64 } else { -errno::EPIPE }
+    }
 }
 
 /// A task parked in `accept`, and where the caller's address goes.
@@ -162,19 +227,9 @@ struct PendingAccept {
     addr_len: u64,
     /// Whether the descriptor handed out starts non-blocking, from `accept4`'s flags.
     nonblocking: bool,
-}
-
-/// A stream a cut had stopped, and what it was stopped in the middle of.
-#[derive(Clone, Copy, Debug)]
-struct Stalled {
-    /// Which socket.
-    at: (NodeId, i64),
-    /// The other end, where the connection was made before the cut fell.
-    peer: Option<(NodeId, i64)>,
-    /// Where it is connected, or was trying to be.
-    remote: Option<Endpoint>,
-    /// How many bytes are waiting to go.
-    held: usize,
+    /// When it parked, on the world clock; a socket timeout fires only into the wait that armed
+    /// it.
+    since: Tick,
 }
 
 /// A connection made and waiting to be accepted.
@@ -216,14 +271,26 @@ enum Socket {
         /// Where this end is connected or is trying to be. A `socketpair` has none: its two ends
         /// have no addresses at all.
         remote: Option<Endpoint>,
-        /// Bytes that arrived and have not been read.
+        /// The receive buffer: bytes that arrived and have not been read.
         inbox: VecDeque<u8>,
-        /// Bytes written while the link was cut, waiting for it to come back.
+        /// The send buffer: bytes written and not yet in the peer's receive buffer, because it is
+        /// full or the link is cut.
         outbox: VecDeque<u8>,
-        /// The peer will send nothing more, so a read returns end-of-stream.
+        /// The peer will send nothing more, so a read returns end-of-stream once `inbox` is empty.
         finished: bool,
+        /// `SHUT_RD`: reads end here, and the peer is told nothing.
+        read_shut: bool,
+        /// `SHUT_WR`: writes fail, and the peer reads the end once the send buffer is delivered.
+        write_shut: bool,
+        /// The end has been delivered to the peer.
+        end_sent: bool,
         waiting: VecDeque<PendingRecv>,
+        /// Writers held back by full buffers, oldest first.
+        writers: VecDeque<PendingWrite>,
         nonblocking: bool,
+        /// For a pair of `SOCK_DGRAM` or `SOCK_SEQPACKET`, the lengths of the messages in
+        /// `inbox`, oldest first: each write is one message, and each read takes one.
+        messages: Option<VecDeque<usize>>,
     },
     /// A socket that accepts connections instead of carrying one.
     Listener {
@@ -245,15 +312,50 @@ pub(crate) enum Transport {
     Stream,
 }
 
+/// The socket calls this part answers, whatever their descriptor.
+pub(crate) const HANDLES: &[u32] = &[
+    super::socket_sys::SOCKET,
+    super::socket_sys::CONNECT,
+    super::socket_sys::SENDTO,
+    super::socket_sys::RECVFROM,
+    super::socket_sys::SHUTDOWN,
+    super::socket_sys::BIND,
+    super::socket_sys::GETSOCKNAME,
+    super::socket_sys::GETPEERNAME,
+    super::socket_sys::SOCKETPAIR,
+    super::socket_sys::SETSOCKOPT,
+    super::socket_sys::GETSOCKOPT,
+    super::socket_sys::SENDMSG,
+    super::socket_sys::RECVMSG,
+    super::socket_sys::LISTEN,
+    super::socket_sys::ACCEPT,
+    super::socket_sys::ACCEPT4,
+];
+
 /// The cluster's links, sockets and packets on the wire.
 #[derive(Debug, Default)]
 pub(crate) struct Network {
     config: NetworkConfig,
     sockets: BTreeMap<(NodeId, i64), Socket>,
-    /// Descriptors that are copies, each naming the socket it was copied from.
+    /// Streams closed with bytes still in their send buffer, which go before the end, as a closed
+    /// socket on Linux sends what it held. No descriptor names them; each is forgotten once its
+    /// end is delivered.
+    lingering: BTreeMap<(NodeId, i64), Socket>,
+    /// Each socket's edges, by identity, for edge-triggered watches.
+    edges: BTreeMap<(NodeId, i64), super::epoll::Edges>,
+    /// Options a guest set with `setsockopt`, by socket and then by level and name, as it set
+    /// them.
+    options: BTreeMap<(NodeId, i64), SocketOptions>,
+    /// The error a socket holds for `SO_ERROR`: a connection started across a cut and refused at
+    /// the heal. Read once.
+    errors: BTreeMap<(NodeId, i64), i64>,
+    /// Sockets made by `socketpair` or `pipe2`, which are `AF_UNIX`.
+    local_pairs: BTreeSet<(NodeId, i64)>,
+    /// Every descriptor a guest holds on a socket, and the identity of the socket it names.
     ///
-    /// Aliases, since a copy names the same socket and queue.
-    aliases: BTreeMap<(NodeId, i64), i64>,
+    /// A `dup` adds a second number for one socket, sharing its queues and flags; the socket
+    /// closes with its last number.
+    descriptors: BTreeMap<(NodeId, i64), i64>,
     /// Which descriptors hold each port, in the order they took it.
     ///
     /// Several under `SO_REUSEPORT`.
@@ -262,10 +364,12 @@ pub(crate) struct Network {
     ///
     /// Kept by descriptor, since both socket kinds carry the option.
     shareable: BTreeSet<(NodeId, i64)>,
-    next_fd: BTreeMap<NodeId, i64>,
+    /// The next socket identity; never reused, so a stale reference finds nothing.
+    next_id: i64,
     next_ephemeral: BTreeMap<NodeId, u16>,
-    /// Directed pairs currently cut.
-    cuts: BTreeSet<(NodeId, NodeId)>,
+    /// Directed pairs currently cut, and by how many partitions; a heal lifts only its own, so a
+    /// pair two partitions cut stays cut until both heal.
+    cuts: BTreeMap<(NodeId, NodeId), u32>,
     /// Open grey windows per directed link, by index into the configuration.
     grey_open: BTreeMap<(NodeId, NodeId), usize>,
     /// Packets on the wire, by the identifier their delivery timer carries.
@@ -320,6 +424,10 @@ impl Network {
     }
 
     fn linked(&self, a: NodeId, b: NodeId) -> bool {
+        // A node always reaches itself, over loopback, whatever the topology.
+        if a == b {
+            return true;
+        }
         let n = self.config.nodes.max(1);
         // The probe, past the cluster count, reaches every node.
         if a.get() >= n || b.get() >= n {
@@ -340,7 +448,7 @@ impl Network {
         &mut self,
         index: usize,
         open: bool,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
     ) -> Result<(), KernelError> {
         let Some(window) = self.config.grey.get(index).cloned() else {
             return Err(KernelError::Invariant("a grey timer names a missing window"));
@@ -411,7 +519,8 @@ impl Network {
         &mut self,
         index: usize,
         raise: bool,
-        ctx: &mut WorldCtx<'_, '_>,
+        numbers: &mut Numbers<'_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
         let Some(partition) = self.config.partitions.get(index).cloned() else {
@@ -419,9 +528,12 @@ impl Network {
         };
         for (from, to) in partition.cut {
             if raise {
-                self.cuts.insert((from, to));
-            } else {
-                self.cuts.remove(&(from, to));
+                *self.cuts.entry((from, to)).or_insert(0) += 1;
+            } else if let Some(held) = self.cuts.get_mut(&(from, to)) {
+                *held -= 1;
+                if *held == 0 {
+                    self.cuts.remove(&(from, to));
+                }
             }
             // The `from` node carries the event.
             ctx.emit_for(
@@ -434,63 +546,76 @@ impl Network {
             )?;
         }
         if !raise {
-            self.resume_streams(ctx, wakes)?;
+            self.resume_streams(numbers, ctx, wakes)?;
         }
         Ok(())
     }
 
     /// Carries on every stream the partition had stopped.
     ///
-    /// Held bytes and pending handshakes go now, in socket order; each stream keeps its own
-    /// order.
+    /// Held bytes, held ends and pending handshakes go now, in socket order; each stream keeps its
+    /// own order.
     fn resume_streams(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        numbers: &mut Numbers<'_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
-        let stalled: Vec<Stalled> = self
+        let connecting: Vec<((NodeId, i64), Endpoint)> = self
             .sockets
             .iter()
             .filter_map(|(at, socket)| match socket {
-                Socket::Stream { peer, remote, outbox, .. } if !outbox.is_empty() => {
-                    Some(Stalled { at: *at, peer: *peer, remote: *remote, held: outbox.len() })
-                }
                 Socket::Stream { peer: None, remote: Some(to), finished: false, .. } => {
-                    Some(Stalled { at: *at, peer: None, remote: Some(*to), held: 0 })
+                    Some((*at, *to))
                 }
                 _ => None,
             })
             .collect();
-
-        for stream in stalled {
-            match (stream.peer, stream.remote) {
-                (Some(peer), _) if stream.held > 0 && self.reaches(stream.at.0, peer.0) => {
-                    let Some(Socket::Stream { outbox, .. }) = self.sockets.get_mut(&stream.at)
-                    else {
-                        continue;
-                    };
-                    let bytes: Vec<u8> = outbox.drain(..).collect();
-                    Self::land(&mut self.sockets, peer, &bytes, ctx, wakes)?;
-                }
-                (None, Some(to)) if self.reaches(stream.at.0, to.node) => {
-                    let port = self.local_port(stream.at.0, stream.at.1);
-                    let from = Endpoint { node: stream.at.0, port };
-                    if self.complete_connect(stream.at.0, stream.at.1, from, to, ctx, wakes)? != 0 {
-                        // No listener: the started connection ends as an empty stream.
-                        self.finish_peer(stream.at, wakes);
-                    }
-                }
-                _ => {}
+        for (at, to) in connecting {
+            if !self.reaches(at.0, to.node) {
+                continue;
             }
+            let port = self.local_port(at.0, at.1);
+            let from = Endpoint { node: at.0, port };
+            if self.complete_connect(at.0, at.1, from, to, numbers, ctx, wakes)? != 0 {
+                // No listener: the started connection ends as an empty stream, and `SO_ERROR`
+                // says why, as a non-blocking connect learns it.
+                self.finish_peer(at, wakes);
+                self.errors.insert(at, errno::ECONNREFUSED);
+                self.arrived(at);
+            }
+        }
+
+        let holding: Vec<(NodeId, i64)> = self
+            .sockets
+            .iter()
+            .chain(self.lingering.iter())
+            .filter_map(|(at, socket)| match socket {
+                Socket::Stream { peer: Some(_), outbox, write_shut, end_sent, .. }
+                    if !outbox.is_empty() || (*write_shut && !*end_sent) =>
+                {
+                    Some(*at)
+                }
+                _ => None,
+            })
+            .collect();
+        for at in holding {
+            self.pump(at, ctx, wakes)?;
         }
         Ok(())
     }
 
     /// Opens a datagram socket and returns its descriptor.
-    pub(crate) fn open_udp(&mut self, node: NodeId, owner: TaskId, nonblocking: bool) -> i64 {
-        let fd = self.allocate_fd(node);
+    pub(crate) fn open_udp(
+        &mut self,
+        node: NodeId,
+        owner: TaskId,
+        nonblocking: bool,
+        numbers: &mut Numbers<'_>,
+    ) -> i64 {
+        let id = self.new_id();
         self.sockets.insert(
-            (node, fd),
+            (node, id),
             Socket::Udp {
                 owner,
                 port: None,
@@ -500,7 +625,7 @@ impl Network {
                 nonblocking,
             },
         );
-        fd
+        self.name(node, id, numbers)
     }
 
     /// Whether a descriptor is a stream, which decides what a connect on it means.
@@ -510,19 +635,39 @@ impl Network {
     }
 
     /// Opens an unconnected stream socket.
-    pub(crate) fn open_stream(&mut self, node: NodeId, nonblocking: bool) -> i64 {
-        let fd = self.allocate_fd(node);
-        self.sockets.insert((node, fd), Self::stream(0, None, None, nonblocking));
-        fd
+    pub(crate) fn open_stream(
+        &mut self,
+        node: NodeId,
+        nonblocking: bool,
+        numbers: &mut Numbers<'_>,
+    ) -> i64 {
+        let id = self.new_id();
+        self.sockets.insert((node, id), Self::stream(0, None, None, nonblocking));
+        self.name(node, id, numbers)
     }
 
-    /// Opens a connected pair of intra-node stream sockets.
-    pub(crate) fn open_pair(&mut self, node: NodeId) -> (i64, i64) {
-        let a = self.allocate_fd(node);
-        let b = self.allocate_fd(node);
-        self.sockets.insert((node, a), Self::stream(0, Some((node, b)), None, false));
-        self.sockets.insert((node, b), Self::stream(0, Some((node, a)), None, false));
-        (a, b)
+    /// Opens a connected pair of intra-node sockets, both non-blocking under `SOCK_NONBLOCK`.
+    ///
+    /// A pair of `SOCK_DGRAM` or `SOCK_SEQPACKET` keeps each write a message of its own; a stream
+    /// pair, and a pipe, carries bytes.
+    pub(crate) fn open_pair(
+        &mut self,
+        node: NodeId,
+        nonblocking: bool,
+        messages: bool,
+        numbers: &mut Numbers<'_>,
+    ) -> (i64, i64) {
+        let a = self.new_id();
+        let b = self.new_id();
+        for (end, other) in [(a, b), (b, a)] {
+            let mut socket = Self::stream(0, Some((node, other)), None, nonblocking);
+            if messages && let Socket::Stream { messages, .. } = &mut socket {
+                *messages = Some(VecDeque::new());
+            }
+            self.sockets.insert((node, end), socket);
+            self.local_pairs.insert((node, end));
+        }
+        (self.name(node, a, numbers), self.name(node, b, numbers))
     }
 
     /// One end of a stream, in whichever of its states the caller needs.
@@ -539,33 +684,75 @@ impl Network {
             inbox: VecDeque::new(),
             outbox: VecDeque::new(),
             finished: false,
+            read_shut: false,
+            write_shut: false,
+            end_sent: false,
             waiting: VecDeque::new(),
+            writers: VecDeque::new(),
             nonblocking,
+            messages: None,
         }
     }
 
-    /// The socket a descriptor really names, following a copy.
+    /// The identity of the socket a descriptor names.
     ///
-    /// Applied once per guest call.
+    /// Applied once per guest call. An identity passes through, so internal callers may hand one
+    /// in; a number no socket descriptor holds answers -1, which names nothing.
     pub(crate) fn resolve(&self, node: NodeId, fd: i64) -> i64 {
-        self.aliases.get(&(node, fd)).copied().unwrap_or(fd)
+        if fd >= ID_BASE {
+            return fd;
+        }
+        self.descriptors.get(&(node, fd)).copied().unwrap_or(-1)
     }
 
-    /// Copies a descriptor, answering with the new one, or nothing where it is not a socket.
-    pub(crate) fn dup(&mut self, node: NodeId, fd: i64) -> Option<i64> {
-        let original = self.resolve(node, fd);
-        if !self.sockets.contains_key(&(node, original)) {
+    /// Copies a descriptor to the lowest free number at or above `at_least`, answering with it,
+    /// or nothing where it is not a socket.
+    pub(crate) fn dup(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        at_least: i64,
+        numbers: &mut Numbers<'_>,
+    ) -> Option<i64> {
+        let id = self.resolve(node, fd);
+        if !self.sockets.contains_key(&(node, id)) {
             return None;
         }
-        let copy = self.allocate_fd(node);
-        self.aliases.insert((node, copy), original);
+        let copy = numbers.claim(node, at_least);
+        self.descriptors.insert((node, copy), id);
         Some(copy)
     }
 
-    fn allocate_fd(&mut self, node: NodeId) -> i64 {
-        let next = self.next_fd.entry(node).or_insert(SOCKET_FD_BASE);
-        let fd = *next;
-        *next += 1;
+    /// Copies a descriptor onto exactly `onto`, as `dup2` does; the caller has closed whatever
+    /// `onto` held. False where `fd` is not a socket.
+    pub(crate) fn dup_onto(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        onto: i64,
+        numbers: &mut Numbers<'_>,
+    ) -> bool {
+        let id = self.resolve(node, fd);
+        if !self.sockets.contains_key(&(node, id)) {
+            return false;
+        }
+        numbers.claim_exact(node, onto);
+        self.descriptors.insert((node, onto), id);
+        true
+    }
+
+    /// A fresh socket identity.
+    fn new_id(&mut self) -> i64 {
+        self.next_id = self.next_id.max(ID_BASE);
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Gives a socket a descriptor number, the lowest free one in its process's table.
+    fn name(&mut self, node: NodeId, id: i64, numbers: &mut Numbers<'_>) -> i64 {
+        let fd = numbers.claim(node, FIRST_DESCRIPTOR);
+        self.descriptors.insert((node, fd), id);
         fd
     }
 
@@ -623,7 +810,7 @@ impl Network {
     /// One holder costs no draw; among several the tape chooses.
     fn holder(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         node: NodeId,
         transport: Transport,
         port: u16,
@@ -731,7 +918,8 @@ impl Network {
         node: NodeId,
         fd: i64,
         to: Endpoint,
-        ctx: &mut WorldCtx<'_, '_>,
+        numbers: &mut Numbers<'_>,
+        ctx: &mut StopCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<i64, KernelError> {
         let fd = self.resolve(node, fd);
@@ -747,17 +935,23 @@ impl Network {
         if !self.reaches(node, to.node) {
             return Ok(-errno::EINPROGRESS);
         }
-        self.complete_connect(node, fd, Endpoint { node, port: source }, to, ctx, wakes)
+        let from = Endpoint { node, port: source };
+        self.complete_connect(node, fd, from, to, numbers, ctx, wakes)
     }
 
     /// Joins a caller to the listener it named, or refuses where nobody is listening.
+    ///
+    /// The accepted end exists from now, under an identity; it takes a descriptor number when it
+    /// is accepted.
+    #[allow(clippy::too_many_arguments)]
     fn complete_connect(
         &mut self,
         node: NodeId,
         fd: i64,
         from: Endpoint,
         to: Endpoint,
-        ctx: &mut WorldCtx<'_, '_>,
+        numbers: &mut Numbers<'_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<i64, KernelError> {
         let listener = self.holder(ctx, to.node, Transport::Stream, to.port)?;
@@ -768,7 +962,7 @@ impl Network {
         let listener = listener.unwrap_or_default();
 
         // Made now, since the caller may write before the accept.
-        let accepted = self.allocate_fd(to.node);
+        let accepted = self.new_id();
         self.sockets.insert(
             (to.node, accepted),
             Self::stream(to.port, Some((node, fd)), Some(from), false),
@@ -776,6 +970,8 @@ impl Network {
         if let Some(Socket::Stream { peer, .. }) = self.sockets.get_mut(&(node, fd)) {
             *peer = Some((to.node, accepted));
         }
+        // A connecting stream took no write; connected, it takes one, which is an edge.
+        self.edges.entry((node, fd)).or_default().filled += 1;
 
         let Some(Socket::Listener { pending, waiting, .. }) =
             self.sockets.get_mut(&(to.node, listener))
@@ -791,10 +987,14 @@ impl Network {
                 {
                     *nonblocking = true;
                 }
-                wakes.push(Wake { task: parked.task, ret: accepted });
+                let fd = self.name(to.node, accepted, numbers);
+                wakes.push(Wake { task: parked.task, ret: fd });
             }
             None => pending.push_back(Pending { fd: accepted, peer: from }),
         }
+        self.arrived((to.node, listener));
+        // A writer that waited for the connection goes now.
+        self.pump((node, fd), ctx, wakes)?;
         Ok(0)
     }
 
@@ -806,20 +1006,23 @@ impl Network {
         node: NodeId,
         fd: i64,
         want: PendingAcceptArgs,
-        ctx: &mut WorldCtx<'_, '_>,
+        numbers: &mut Numbers<'_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Option<i64>, KernelError> {
         let fd = self.resolve(node, fd);
         let task = ctx.task();
         let Some(Socket::Listener { pending, waiting, nonblocking, .. }) =
             self.sockets.get_mut(&(node, fd))
         else {
-            return Ok(Some(-errno::EINVAL));
+            let not_listening = self.sockets.contains_key(&(node, fd));
+            return Ok(Some(if not_listening { -errno::EINVAL } else { -errno::EBADF }));
         };
         let parked = PendingAccept {
             task,
             addr: want.addr,
             addr_len: want.addr_len,
             nonblocking: want.nonblocking,
+            since: ctx.world_now(),
         };
         let Some(ready) = pending.pop_front() else {
             if *nonblocking {
@@ -835,12 +1038,12 @@ impl Network {
         {
             *nonblocking = true;
         }
-        Ok(Some(ready.fd))
+        Ok(Some(self.name(node, ready.fd, numbers)))
     }
 
     /// Writes the caller's address where an accept asked for it.
     fn hand_over(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         parked: &PendingAccept,
         peer: Endpoint,
     ) -> Result<(), KernelError> {
@@ -877,7 +1080,7 @@ impl Network {
 
     /// Whether one node can reach another right now: the topology, then the partition matrix.
     fn reaches(&self, from: NodeId, to: NodeId) -> bool {
-        from == to || (self.linked(from, to) && !self.cuts.contains(&(from, to)))
+        from == to || (self.linked(from, to) && !self.cuts.contains_key(&(from, to)))
     }
 
     /// The port a socket is bound to, binding it ephemerally on first need.
@@ -910,7 +1113,7 @@ impl Network {
         payload: Vec<u8>,
         dest_node: NodeId,
         dest_port: u16,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         arm: &mut impl FnMut(Tick, NodeId, u64),
     ) -> Result<i64, KernelError> {
         let len = payload.len() as i64;
@@ -970,9 +1173,12 @@ impl Network {
         };
 
         let unreachable = !self.linked(node, dest_node);
-        let cut = self.cuts.contains(&(node, dest_node));
+        let cut = self.cuts.contains_key(&(node, dest_node));
         if dropped || unreachable || cut {
             ctx.emit(EventKind::PacketFate { fate: PacketFate::Dropped, delay_ticks: delay })?;
+            // A drop lands on the guest as a fault would; duplicated, reordered or altered packets
+            // fire their own fault and count there.
+            ctx.landed();
             return Ok(len);
         }
 
@@ -1053,7 +1259,7 @@ impl Network {
     pub(crate) fn deliver(
         &mut self,
         id: u64,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
         let Some(packet) = self.in_flight.remove(&id) else {
@@ -1081,6 +1287,7 @@ impl Network {
                 TaskId::ZERO,
                 EventKind::PacketFate { fate: PacketFate::Dropped, delay_ticks: packet.delay },
             )?;
+            ctx.landed();
             return Ok(());
         };
         let Some(Socket::Udp { owner, queue, waiting, .. }) = self.sockets.get_mut(&(dest, fd))
@@ -1089,20 +1296,24 @@ impl Network {
         };
         let owner = *owner;
 
-        if let Some(recv) = waiting.pop_front() {
-            let taken = packet.payload.len().min(recv.len);
-            ctx.write_mem_for(recv.task, recv.buf, &packet.payload[..taken])?;
-            if recv.src_addr != 0 {
-                let addr = encode_sockaddr(packet.from);
-                ctx.write_mem_for(recv.task, GuestAddr(recv.src_addr), &addr)?;
+        // Parked receives take it in order: one that peeks is handed a copy and the datagram
+        // stays for the next; the first that takes it ends the search.
+        let arrived = Arrived { from: packet.from, payload: packet.payload };
+        let mut fated = false;
+        while let Some(recv) = waiting.pop_front() {
+            let answer = Self::hand_datagram(ctx, &recv, &arrived)?;
+            if !fated {
+                ctx.emit_for(
+                    dest,
+                    recv.task,
+                    EventKind::PacketFate { fate, delay_ticks: packet.delay },
+                )?;
+                fated = true;
             }
-            ctx.emit_for(
-                dest,
-                recv.task,
-                EventKind::PacketFate { fate, delay_ticks: packet.delay },
-            )?;
-            wakes.push(Wake { task: recv.task, ret: taken as i64 });
-            return Ok(());
+            wakes.push(Wake { task: recv.task, ret: answer });
+            if !recv.peeks() {
+                return Ok(());
+            }
         }
 
         if queue.len() >= RECV_QUEUE_LIMIT {
@@ -1111,10 +1322,14 @@ impl Network {
                 owner,
                 EventKind::PacketFate { fate: PacketFate::Dropped, delay_ticks: packet.delay },
             )?;
+            ctx.landed();
             return Ok(());
         }
-        queue.push_back(Arrived { from: packet.from, payload: packet.payload });
-        ctx.emit_for(dest, owner, EventKind::PacketFate { fate, delay_ticks: packet.delay })?;
+        queue.push_back(arrived);
+        self.edges.entry((dest, fd)).or_default().arrived += 1;
+        if !fated {
+            ctx.emit_for(dest, owner, EventKind::PacketFate { fate, delay_ticks: packet.delay })?;
+        }
         Ok(())
     }
 
@@ -1126,140 +1341,570 @@ impl Network {
         node: NodeId,
         fd: i64,
         recv: PendingRecvArgs,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
     ) -> Result<Option<i64>, KernelError> {
         let fd = self.resolve(node, fd);
         let task = ctx.task();
-        match self.sockets.get_mut(&(node, fd)) {
+        // An error queue is always empty here, and no stream carries urgent data.
+        if recv.flags & msg::ERRQUEUE != 0 {
+            return Ok(Some(-errno::EAGAIN));
+        }
+        let mut parked = PendingRecv {
+            task,
+            buf: recv.buf,
+            len: recv.len,
+            src_addr: recv.src_addr,
+            flags: recv.flags,
+            got: 0,
+            since: ctx.world_now(),
+        };
+        let (may_wait, writer) = match self.sockets.get_mut(&(node, fd)) {
             Some(Socket::Udp { queue, waiting, nonblocking, .. }) => {
-                if queue.is_empty() && *nonblocking {
-                    return Ok(Some(-errno::EAGAIN));
-                }
-                if let Some(arrived) = queue.pop_front() {
-                    let taken = arrived.payload.len().min(recv.len);
-                    ctx.write_mem(recv.buf, &arrived.payload[..taken])?;
-                    if recv.src_addr != 0 {
-                        let addr = encode_sockaddr(arrived.from);
-                        ctx.write_mem(GuestAddr(recv.src_addr), &addr)?;
-                    }
-                    return Ok(Some(taken as i64));
-                }
-                waiting.push_back(PendingRecv {
-                    task,
-                    buf: recv.buf,
-                    len: recv.len,
-                    src_addr: recv.src_addr,
-                });
-                Ok(None)
-            }
-            // An empty inbox on a finished stream reads 0.
-            Some(Socket::Stream { inbox, waiting, finished, nonblocking, .. }) => {
-                if inbox.is_empty() {
-                    if *finished {
-                        return Ok(Some(0));
-                    }
-                    if *nonblocking {
+                let Some(arrived) = queue.front() else {
+                    if *nonblocking || recv.flags & msg::DONTWAIT != 0 {
                         return Ok(Some(-errno::EAGAIN));
                     }
-                    waiting.push_back(PendingRecv {
-                        task,
-                        buf: recv.buf,
-                        len: recv.len,
-                        src_addr: 0,
-                    });
+                    waiting.push_back(parked);
+                    return Ok(None);
+                };
+                let answer = Self::hand_datagram(ctx, &parked, arrived)?;
+                if !parked.peeks() {
+                    queue.pop_front();
+                }
+                return Ok(Some(answer));
+            }
+            Some(Socket::Stream {
+                inbox,
+                waiting,
+                finished,
+                read_shut,
+                nonblocking,
+                peer,
+                messages,
+                ..
+            }) => {
+                if recv.flags & msg::OOB != 0 {
+                    return Ok(Some(-errno::EINVAL));
+                }
+                let may_wait = !*nonblocking && recv.flags & msg::DONTWAIT == 0;
+                let ended = *finished || *read_shut;
+                if inbox.is_empty() {
+                    if ended {
+                        return Ok(Some(0));
+                    }
+                    if !may_wait {
+                        return Ok(Some(-errno::EAGAIN));
+                    }
+                    waiting.push_back(parked);
                     return Ok(None);
                 }
-                let taken = inbox.len().min(recv.len);
-                let bytes: Vec<u8> = inbox.drain(..taken).collect();
-                ctx.write_mem(recv.buf, &bytes)?;
-                Ok(Some(taken as i64))
+                if let Some(messages) = messages {
+                    let answer = Self::take_message(inbox, messages, &parked, ctx)?.unwrap_or(0);
+                    if let Some(writer) = *peer
+                        && !parked.peeks()
+                    {
+                        self.pump(writer, ctx, wakes)?;
+                    }
+                    return Ok(Some(answer));
+                }
+                if parked.peeks() {
+                    let taken = inbox.len().min(recv.len);
+                    let bytes: Vec<u8> = inbox.range(..taken).copied().collect();
+                    ctx.write_mem(recv.buf, &bytes)?;
+                    return Ok(Some(taken as i64));
+                }
+                (may_wait, *peer)
             }
-            Some(Socket::Listener { .. }) => Ok(Some(-errno::ENOTCONN)),
-            None => Ok(Some(-errno::EBADF)),
+            Some(Socket::Listener { .. }) => return Ok(Some(-errno::ENOTCONN)),
+            None => return Ok(Some(-errno::EBADF)),
+        };
+
+        // Take what is there; each take makes room for the other end's held bytes, which may
+        // arrive at once. A receive waiting for all of it goes on taking until it has all or
+        // nothing more is there, and only then waits for the rest.
+        while let Some(Socket::Stream { inbox, .. }) = self.sockets.get_mut(&(node, fd)) {
+            let taken = inbox.len().min(recv.len - parked.got);
+            if taken == 0 {
+                break;
+            }
+            let bytes: Vec<u8> = inbox.drain(..taken).collect();
+            ctx.write_mem(GuestAddr(recv.buf.0 + parked.got as u64), &bytes)?;
+            parked.got += taken;
+            if let Some(writer) = writer {
+                self.pump(writer, ctx, wakes)?;
+            }
+            if !parked.waits_for_all() || parked.got == recv.len {
+                break;
+            }
         }
+        if parked.waits_for_all()
+            && parked.got < recv.len
+            && may_wait
+            && let Some(Socket::Stream { waiting, finished, read_shut, .. }) =
+                self.sockets.get_mut(&(node, fd))
+            && !*finished
+            && !*read_shut
+        {
+            waiting.push_back(parked);
+            return Ok(None);
+        }
+        Ok(Some(parked.got as i64))
     }
 
-    /// Writes into a stream, waking a parked reader on the other end.
+    /// Writes a datagram into a receive's buffer and answers its length: what fitted, or the
+    /// whole datagram's under `MSG_TRUNC`.
+    fn hand_datagram(
+        ctx: &mut DeadlineCtx<'_, '_>,
+        recv: &PendingRecv,
+        arrived: &Arrived,
+    ) -> Result<i64, KernelError> {
+        let taken = arrived.payload.len().min(recv.len);
+        ctx.write_mem_for(recv.task, recv.buf, &arrived.payload[..taken])?;
+        if recv.src_addr != 0 {
+            let addr = encode_sockaddr(arrived.from);
+            ctx.write_mem_for(recv.task, GuestAddr(recv.src_addr), &addr)?;
+        }
+        let whole = recv.flags & msg::TRUNC != 0;
+        Ok(if whole { arrived.payload.len() } else { taken } as i64)
+    }
+
+    /// Notes that something arrived at a socket: bytes, a message, a datagram, a connection, an
+    /// end or an error.
+    fn arrived(&mut self, at: (NodeId, i64)) {
+        self.edges.entry(at).or_default().arrived += 1;
+    }
+
+    /// A socket's edges, or nothing where the descriptor is not a socket.
+    pub(crate) fn edges(&self, node: NodeId, fd: i64) -> Option<super::epoll::Edges> {
+        let at = (node, self.resolve(node, fd));
+        self.sockets.contains_key(&at).then(|| self.edges.get(&at).copied().unwrap_or_default())
+    }
+
+    /// Writes into a stream: what fits in the send buffer at once, the rest when room appears.
     ///
-    /// A cut link holds the bytes on this side.
+    /// `None` means the writer waits for room. One that may not wait is answered what fitted, or
+    /// `EAGAIN` for nothing. Under `may_wait` false, as `MSG_DONTWAIT` asks, a blocking socket
+    /// answers as a non-blocking one.
+    ///
+    /// A write that does not go whole found the stream full, which the next room answers as an
+    /// edge.
     pub(crate) fn stream_write(
         &mut self,
         node: NodeId,
         fd: i64,
         payload: &[u8],
-        ctx: &mut WorldCtx<'_, '_>,
+        may_wait: bool,
+        ctx: &mut StopCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
-    ) -> Result<i64, KernelError> {
-        let fd = self.resolve(node, fd);
-        let Some(Socket::Stream { peer, finished, .. }) = self.sockets.get(&(node, fd)) else {
-            return Ok(-errno::EBADF);
+    ) -> Result<Option<i64>, KernelError> {
+        let at = (node, self.resolve(node, fd));
+        let done = self.write_stream(node, fd, payload, may_wait, ctx, wakes)?;
+        let short = match done {
+            None => true,
+            Some(n) => n == -errno::EAGAIN || (0..payload.len() as i64).contains(&n),
         };
-        let Some(peer) = *peer else {
-            // Gone means the other end closed; still connecting means it never arrived.
-            return Ok(if *finished { -errno::EPIPE } else { -errno::ENOTCONN });
-        };
-        if !self.reaches(node, peer.0) {
-            if let Some(Socket::Stream { outbox, nonblocking, .. }) =
-                self.sockets.get_mut(&(node, fd))
-            {
-                // A full outbox answers `EAGAIN`, even when blocking.
-                let room = STREAM_BUFFER_LIMIT.saturating_sub(outbox.len());
-                if room == 0 {
-                    let _ = nonblocking;
-                    return Ok(-errno::EAGAIN);
-                }
-                let take = room.min(payload.len());
-                outbox.extend(payload[..take].iter().copied());
-                return Ok(take as i64);
-            }
-            return Ok(payload.len() as i64);
+        if short {
+            self.edges.entry(at).or_default().filled += 1;
         }
-        Self::land(&mut self.sockets, peer, payload, ctx, wakes)?;
-        Ok(payload.len() as i64)
+        Ok(done)
     }
 
-    /// Puts bytes into a stream's inbox and releases whoever was waiting for them.
+    /// [`Self::stream_write`], without the edge it leaves.
+    fn write_stream(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        payload: &[u8],
+        may_wait: bool,
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<Option<i64>, KernelError> {
+        let at = (node, self.resolve(node, fd));
+        let task = ctx.task();
+        let Some(Socket::Stream {
+            peer, remote, finished, write_shut, nonblocking, writers, ..
+        }) = self.sockets.get_mut(&at)
+        else {
+            return Ok(Some(-errno::EBADF));
+        };
+        let may_wait = may_wait && !*nonblocking;
+        // Shut for writing, ended by the other side, or never connected.
+        if *write_shut || (peer.is_none() && (*finished || remote.is_none())) {
+            return Ok(Some(-errno::EPIPE));
+        }
+        // Still connecting, or behind writers already waiting: nothing goes before them.
+        if peer.is_none() || !writers.is_empty() {
+            if !may_wait {
+                return Ok(Some(-errno::EAGAIN));
+            }
+            writers.push_back(PendingWrite {
+                task,
+                rest: payload.iter().copied().collect(),
+                written: 0,
+                since: ctx.world_now(),
+            });
+            return Ok(None);
+        }
+        if let Some(Socket::Stream { messages: Some(_), .. }) = self.sockets.get(&at) {
+            return self.message_write(at, payload, may_wait, task, ctx, wakes);
+        }
+
+        let mut written = 0;
+        while let Some(Socket::Stream { outbox, .. }) = self.sockets.get_mut(&at) {
+            let take =
+                STREAM_BUFFER_LIMIT.saturating_sub(outbox.len()).min(payload.len() - written);
+            outbox.extend(payload[written..written + take].iter().copied());
+            written += take;
+            let held = outbox.len();
+            self.pump(at, ctx, wakes)?;
+            // Done, or the send buffer did not drain: nothing more fits now.
+            if written == payload.len() || self.held(at) == held {
+                break;
+            }
+        }
+        if written == payload.len() {
+            return Ok(Some(written as i64));
+        }
+        if !may_wait {
+            return Ok(Some(if written == 0 { -errno::EAGAIN } else { written as i64 }));
+        }
+        if let Some(Socket::Stream { writers, .. }) = self.sockets.get_mut(&at) {
+            writers.push_back(PendingWrite {
+                task,
+                rest: payload[written..].iter().copied().collect(),
+                written,
+                since: ctx.world_now(),
+            });
+        }
+        Ok(None)
+    }
+
+    /// Writes one message of a message pair: whole into the peer's receive buffer, or not yet.
+    ///
+    /// A message larger than a buffer can ever hold is `EMSGSIZE`; one that does not fit now
+    /// waits, or is `EAGAIN` for a writer that may not wait.
+    #[allow(clippy::too_many_arguments)]
+    fn message_write(
+        &mut self,
+        at: (NodeId, i64),
+        payload: &[u8],
+        may_wait: bool,
+        task: TaskId,
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<Option<i64>, KernelError> {
+        if payload.len() > STREAM_BUFFER_LIMIT {
+            return Ok(Some(-errno::EMSGSIZE));
+        }
+        let Some(Socket::Stream { peer: Some(peer), .. }) = self.sockets.get(&at) else {
+            return Ok(Some(-errno::EPIPE));
+        };
+        let peer = *peer;
+        if self.inbox_room(peer) >= payload.len() {
+            Self::land_message(&mut self.sockets, peer, payload, ctx, wakes)?;
+            self.arrived(peer);
+            return Ok(Some(payload.len() as i64));
+        }
+        if !may_wait {
+            return Ok(Some(-errno::EAGAIN));
+        }
+        if let Some(Socket::Stream { writers, .. }) = self.sockets.get_mut(&at) {
+            writers.push_back(PendingWrite {
+                task,
+                rest: payload.iter().copied().collect(),
+                written: 0,
+                since: ctx.world_now(),
+            });
+        }
+        Ok(None)
+    }
+
+    /// Room in a stream's receive buffer; an end that is gone takes anything and keeps nothing.
+    fn inbox_room(&self, at: (NodeId, i64)) -> usize {
+        match self.sockets.get(&at) {
+            Some(Socket::Stream { inbox, .. }) => STREAM_BUFFER_LIMIT.saturating_sub(inbox.len()),
+            _ => usize::MAX,
+        }
+    }
+
+    /// Lands the waiting writers of a message pair, each message whole, while they fit.
+    fn pump_messages(
+        &mut self,
+        at: (NodeId, i64),
+        ctx: &mut DeadlineCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<(), KernelError> {
+        loop {
+            let Some(Socket::Stream { peer: Some(peer), writers, .. }) = self.sockets.get(&at)
+            else {
+                return Ok(());
+            };
+            let peer = *peer;
+            let Some(next) = writers.front().map(|writer| writer.rest.len()) else {
+                return Ok(());
+            };
+            if next > self.inbox_room(peer) {
+                return Ok(());
+            }
+            let Some(Socket::Stream { writers, .. }) = self.sockets.get_mut(&at) else {
+                return Ok(());
+            };
+            let Some(writer) = writers.pop_front() else { return Ok(()) };
+            let message: Vec<u8> = writer.rest.into_iter().collect();
+            Self::land_message(&mut self.sockets, peer, &message, ctx, wakes)?;
+            self.arrived(peer);
+            wakes.push(Wake { task: writer.task, ret: message.len() as i64 });
+        }
+    }
+
+    /// Puts one message into a message pair's receive buffer and hands messages to the receives
+    /// waiting there, one each.
+    fn land_message(
+        sockets: &mut BTreeMap<(NodeId, i64), Socket>,
+        at: (NodeId, i64),
+        payload: &[u8],
+        ctx: &mut DeadlineCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<(), KernelError> {
+        let Some(Socket::Stream { inbox, waiting, messages: Some(messages), .. }) =
+            sockets.get_mut(&at)
+        else {
+            return Ok(());
+        };
+        inbox.extend(payload.iter().copied());
+        messages.push_back(payload.len());
+        while let Some(recv) = waiting.pop_front() {
+            let Some(answer) = Self::take_message(inbox, messages, &recv, ctx)? else {
+                waiting.push_front(recv);
+                break;
+            };
+            wakes.push(Wake { task: recv.task, ret: answer });
+        }
+        Ok(())
+    }
+
+    /// Hands the oldest message to a receive and answers its length, or nothing where none is
+    /// buffered.
+    ///
+    /// What does not fit the receive's buffer is lost with the message, as Linux loses it;
+    /// `MSG_TRUNC` answers the whole length. A peek leaves the message buffered.
+    fn take_message(
+        inbox: &mut VecDeque<u8>,
+        messages: &mut VecDeque<usize>,
+        recv: &PendingRecv,
+        ctx: &mut DeadlineCtx<'_, '_>,
+    ) -> Result<Option<i64>, KernelError> {
+        let Some(&length) = messages.front() else {
+            return Ok(None);
+        };
+        let taken = length.min(recv.len);
+        let bytes: Vec<u8> = inbox.range(..taken).copied().collect();
+        ctx.write_mem_for(recv.task, recv.buf, &bytes)?;
+        if !recv.peeks() {
+            inbox.drain(..length);
+            messages.pop_front();
+        }
+        let whole = recv.flags & msg::TRUNC != 0;
+        Ok(Some(if whole { length } else { taken } as i64))
+    }
+
+    /// Bytes in a stream's send buffer.
+    fn held(&self, at: (NodeId, i64)) -> usize {
+        match self.sockets.get(&at).or_else(|| self.lingering.get(&at)) {
+            Some(Socket::Stream { outbox, .. }) => outbox.len(),
+            _ => 0,
+        }
+    }
+
+    /// The stream at `at`, open or lingering after its close.
+    fn stream_mut(&mut self, at: (NodeId, i64)) -> Option<&mut Socket> {
+        if self.sockets.contains_key(&at) {
+            self.sockets.get_mut(&at)
+        } else {
+            self.lingering.get_mut(&at)
+        }
+    }
+
+    /// Moves what one end holds toward the other.
+    ///
+    /// The send buffer drains into the peer's receive buffer while that has room and the link
+    /// carries, and waiting writers refill it; a writer is released once all it offered is
+    /// buffered. Each move may let a reader take bytes and free room, so it repeats until nothing
+    /// moves. A stream shut for writing delivers its end once nothing is held.
+    fn pump(
+        &mut self,
+        at: (NodeId, i64),
+        ctx: &mut DeadlineCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<(), KernelError> {
+        if let Some(Socket::Stream { messages: Some(_), .. }) = self.sockets.get(&at) {
+            return self.pump_messages(at, ctx, wakes);
+        }
+        loop {
+            let Some(Socket::Stream { peer, .. }) = self.stream_mut(at) else {
+                return Ok(());
+            };
+            let Some(peer) = *peer else {
+                return Ok(());
+            };
+            let mut moved = false;
+            if self.reaches(at.0, peer.0) {
+                // An end that is closed takes nothing, and what is sent to it is lost.
+                let room = match self.sockets.get(&peer) {
+                    Some(Socket::Stream { inbox, .. }) => {
+                        STREAM_BUFFER_LIMIT.saturating_sub(inbox.len())
+                    }
+                    _ => usize::MAX,
+                };
+                let bytes: Vec<u8> = match self.stream_mut(at) {
+                    Some(Socket::Stream { outbox, .. }) => {
+                        let take = room.min(outbox.len());
+                        outbox.drain(..take).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                if !bytes.is_empty() {
+                    Self::land(&mut self.sockets, peer, &bytes, ctx, wakes)?;
+                    self.arrived(peer);
+                    moved = true;
+                }
+            }
+            if let Some(Socket::Stream { outbox, writers, .. }) = self.stream_mut(at) {
+                while let Some(writer) = writers.front_mut() {
+                    let take =
+                        STREAM_BUFFER_LIMIT.saturating_sub(outbox.len()).min(writer.rest.len());
+                    if take == 0 {
+                        break;
+                    }
+                    outbox.extend(writer.rest.drain(..take));
+                    writer.written += take;
+                    moved = true;
+                    if !writer.rest.is_empty() {
+                        break;
+                    }
+                    let Some(done) = writers.pop_front() else { break };
+                    wakes.push(Wake { task: done.task, ret: done.written as i64 });
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        self.send_end_when_drained(at, wakes);
+        Ok(())
+    }
+
+    /// Delivers a stream's end once it is shut for writing, holds nothing and the link carries.
+    ///
+    /// A shutdown leaves the other direction open; a lingering close ends the stream and is
+    /// forgotten.
+    fn send_end_when_drained(&mut self, at: (NodeId, i64), wakes: &mut Vec<Wake>) {
+        let Some(Socket::Stream { peer, outbox, writers, write_shut, end_sent, .. }) =
+            self.stream_mut(at)
+        else {
+            return;
+        };
+        if !*write_shut || *end_sent || !outbox.is_empty() || !writers.is_empty() {
+            return;
+        }
+        let peer = *peer;
+        if peer.is_some_and(|peer| !self.reaches(at.0, peer.0)) {
+            return;
+        }
+        if let Some(Socket::Stream { end_sent, .. }) = self.stream_mut(at) {
+            *end_sent = true;
+        }
+        let closed = self.lingering.remove(&at).is_some();
+        if let Some(peer) = peer {
+            if closed {
+                self.finish_peer(peer, wakes);
+            } else {
+                self.half_finish(peer, wakes);
+            }
+        }
+    }
+
+    /// Puts bytes into a stream's receive buffer and hands them to the receives waiting there.
+    ///
+    /// The caller brings no more than the buffer has room for. A receive waiting for all of its
+    /// buffer takes what came and waits on; one that peeks is handed a copy.
     fn land(
         sockets: &mut BTreeMap<(NodeId, i64), Socket>,
         at: (NodeId, i64),
         payload: &[u8],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
         let Some(Socket::Stream { inbox, waiting, .. }) = sockets.get_mut(&at) else {
             return Ok(());
         };
-        // Bounded like the outbox; overflow is dropped.
-        let room = STREAM_BUFFER_LIMIT.saturating_sub(inbox.len());
-        inbox.extend(payload[..room.min(payload.len())].iter().copied());
-        while let Some(recv) = waiting.pop_front() {
+        inbox.extend(payload.iter().copied());
+        while let Some(recv) = waiting.front_mut() {
             if inbox.is_empty() {
-                waiting.push_front(recv);
                 break;
             }
-            let taken = inbox.len().min(recv.len);
+            let taken = inbox.len().min(recv.len - recv.got);
+            let into = GuestAddr(recv.buf.0 + recv.got as u64);
+            if recv.peeks() {
+                let bytes: Vec<u8> = inbox.range(..taken).copied().collect();
+                ctx.write_mem_for(recv.task, into, &bytes)?;
+                wakes.push(Wake { task: recv.task, ret: taken as i64 });
+                waiting.pop_front();
+                continue;
+            }
             let bytes: Vec<u8> = inbox.drain(..taken).collect();
-            ctx.write_mem_for(recv.task, recv.buf, &bytes)?;
-            wakes.push(Wake { task: recv.task, ret: taken as i64 });
+            ctx.write_mem_for(recv.task, into, &bytes)?;
+            recv.got += taken;
+            if recv.waits_for_all() && recv.got < recv.len {
+                break;
+            }
+            wakes.push(Wake { task: recv.task, ret: recv.got as i64 });
+            waiting.pop_front();
         }
         Ok(())
     }
 
-    /// Tells a stream's peer that nothing further is coming, releasing any reader parked on it.
+    /// Releases every receive waiting on a stream that will get nothing more, with what each
+    /// already took.
+    fn release_readers(waiting: &mut VecDeque<PendingRecv>, wakes: &mut Vec<Wake>) {
+        for recv in waiting.drain(..) {
+            wakes.push(Wake { task: recv.task, ret: recv.got as i64 });
+        }
+    }
+
+    /// Tells a stream that its peer sends nothing more, while the peer still reads.
     ///
-    /// How a guest learns its peer is gone.
+    /// The reader takes what is buffered, then reads the end; its own writes still go.
+    fn half_finish(&mut self, at: (NodeId, i64), wakes: &mut Vec<Wake>) {
+        if let Some(Socket::Stream { finished, waiting, .. }) = self.sockets.get_mut(&at) {
+            *finished = true;
+            Self::release_readers(waiting, wakes);
+            self.arrived(at);
+        }
+    }
+
+    /// Tells a stream its peer is gone, releasing any reader and writer parked on it.
+    ///
+    /// How a guest learns its peer is gone. Bytes this end still held for the peer have nowhere
+    /// to go and are dropped; a waiting writer is answered what it handed over, or `EPIPE`.
     fn finish_peer(&mut self, peer: (NodeId, i64), wakes: &mut Vec<Wake>) {
-        let Some(Socket::Stream { finished, peer: theirs, waiting, .. }) =
+        if self.lingering.remove(&peer).is_some() {
+            return;
+        }
+        let Some(Socket::Stream { finished, peer: theirs, waiting, writers, outbox, .. }) =
             self.sockets.get_mut(&peer)
         else {
             return;
         };
         *finished = true;
         *theirs = None;
-        // End-of-stream writes nothing to the reader's buffer.
-        for recv in waiting.drain(..) {
-            wakes.push(Wake { task: recv.task, ret: 0 });
+        outbox.clear();
+        Self::release_readers(waiting, wakes);
+        for writer in writers.drain(..) {
+            wakes.push(Wake { task: writer.task, ret: writer.cut_short() });
         }
+        self.arrived(peer);
     }
 
     /// Forgets everything a node's process held: its sockets and its ports. Packets already
@@ -1270,6 +1915,7 @@ impl Network {
         let bereaved: Vec<(NodeId, i64)> = self
             .sockets
             .iter()
+            .chain(self.lingering.iter())
             .filter(|((owner, _), _)| *owner == node)
             .filter_map(|(_, socket)| match socket {
                 Socket::Stream { peer: Some(peer), .. } if peer.0 != node => Some(*peer),
@@ -1277,10 +1923,14 @@ impl Network {
             })
             .collect();
         self.sockets.retain(|(owner, _), _| *owner != node);
+        self.lingering.retain(|(owner, _), _| *owner != node);
         self.ports.retain(|(owner, _, _), _| *owner != node);
         self.shareable.retain(|(owner, _)| *owner != node);
-        self.aliases.retain(|(owner, _), _| *owner != node);
-        self.next_fd.remove(&node);
+        self.descriptors.retain(|(owner, _), _| *owner != node);
+        self.options.retain(|(owner, _), _| *owner != node);
+        self.errors.retain(|(owner, _), _| *owner != node);
+        self.edges.retain(|(owner, _), _| *owner != node);
+        self.local_pairs.retain(|(owner, _)| *owner != node);
         self.next_ephemeral.remove(&node);
         for peer in bereaved {
             self.finish_peer(peer, wakes);
@@ -1289,29 +1939,209 @@ impl Network {
 
     /// Whether a socket has something to give a reader, or nothing where it is not a socket.
     ///
-    /// Writability is not asked, since there are no send buffers. End-of-stream counts as
-    /// readable.
+    /// End-of-stream counts as readable, as a read shut by `SHUT_RD` does.
     pub(crate) fn readable(&self, node: NodeId, fd: i64) -> Option<bool> {
         let fd = self.resolve(node, fd);
         match self.sockets.get(&(node, fd))? {
             Socket::Udp { queue, .. } => Some(!queue.is_empty()),
-            Socket::Stream { inbox, finished, .. } => Some(!inbox.is_empty() || *finished),
+            Socket::Stream { inbox, finished, read_shut, .. } => {
+                Some(!inbox.is_empty() || *finished || *read_shut)
+            }
             Socket::Listener { pending, .. } => Some(!pending.is_empty()),
         }
     }
 
-    /// Forgets every receive a task was parked in, because the task has ended.
+    /// Whether a write on a socket would be answered at once, or nothing where it is not a socket.
+    ///
+    /// A stream takes a write while its send buffer has room and no writer waits before it; one
+    /// still connecting takes none. A write that fails at once, on a stream shut or ended, counts
+    /// as writable, as Linux reports it. A datagram socket always is; a listener never.
+    pub(crate) fn writable(&self, node: NodeId, fd: i64) -> Option<bool> {
+        let fd = self.resolve(node, fd);
+        match self.sockets.get(&(node, fd))? {
+            Socket::Udp { .. } => Some(true),
+            Socket::Stream { peer, remote, finished, write_shut, outbox, writers, .. } => {
+                if *write_shut || (peer.is_none() && (*finished || remote.is_none())) {
+                    return Some(true);
+                }
+                Some(peer.is_some() && writers.is_empty() && outbox.len() < STREAM_BUFFER_LIMIT)
+            }
+            Socket::Listener { .. } => Some(false),
+        }
+    }
+
+    /// Forgets every receive and write a task was parked in, because the task has ended.
     ///
     /// A delivery would otherwise write into a task the backend no longer has. The socket stays
-    /// open.
+    /// open, and the bytes a forgotten writer had yet to hand over are never sent.
     pub(crate) fn forget_task(&mut self, task: TaskId) {
         for socket in self.sockets.values_mut() {
             match socket {
-                Socket::Udp { waiting, .. } | Socket::Stream { waiting, .. } => {
+                Socket::Udp { waiting, .. } => waiting.retain(|recv| recv.task != task),
+                Socket::Stream { waiting, writers, .. } => {
                     waiting.retain(|recv| recv.task != task);
+                    writers.retain(|writer| writer.task != task);
                 }
                 Socket::Listener { waiting, .. } => waiting.retain(|parked| parked.task != task),
             }
+        }
+    }
+
+    /// Keeps an option a guest set, as it set it; `EBADF` where `fd` is not a socket.
+    pub(crate) fn set_option(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        level: u64,
+        name: u64,
+        value: Vec<u8>,
+    ) -> i64 {
+        let id = self.resolve(node, fd);
+        if !self.sockets.contains_key(&(node, id)) {
+            return -errno::EBADF;
+        }
+        self.options.entry((node, id)).or_default().insert((level, name), value);
+        0
+    }
+
+    /// What `getsockopt` reads: what the socket is, what was set, or Linux's default.
+    ///
+    /// The type, domain, protocol and listening state are read off the socket; `SO_ERROR` is
+    /// read once. A buffer size reads back doubled, as Linux keeps it. An option nobody set and
+    /// the model does not know is `ENOPROTOOPT`.
+    pub(crate) fn get_option(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        level: u64,
+        name: u64,
+    ) -> Result<Vec<u8>, i64> {
+        const SOL_SOCKET: u64 = 1;
+        const IPPROTO_TCP: u64 = 6;
+        let int = |value: i32| value.to_le_bytes().to_vec();
+        let id = self.resolve(node, fd);
+        let Some(socket) = self.sockets.get(&(node, id)) else {
+            return Err(-errno::EBADF);
+        };
+        let local = self.local_pairs.contains(&(node, id));
+        let (kind, protocol, listening) = match socket {
+            Socket::Udp { .. } => (2, 17, false),
+            Socket::Stream { messages, .. } => {
+                (if messages.is_some() { 2 } else { 1 }, if local { 0 } else { 6 }, false)
+            }
+            Socket::Listener { .. } => (1, 6, true),
+        };
+        match (level, name) {
+            (SOL_SOCKET, 3) => return Ok(int(kind)),
+            (SOL_SOCKET, 4) => {
+                let held = self.errors.remove(&(node, id)).unwrap_or(0);
+                return Ok(int(i32::try_from(held).unwrap_or(0)));
+            }
+            (SOL_SOCKET, 30) => return Ok(int(i32::from(listening))),
+            (SOL_SOCKET, 38) => return Ok(int(protocol)),
+            (SOL_SOCKET, 39) => return Ok(int(if local { 1 } else { 2 })),
+            _ => {}
+        }
+        if let Some(value) = self.options.get(&(node, id)).and_then(|set| set.get(&(level, name))) {
+            if level == SOL_SOCKET
+                && matches!(name, 7 | 8)
+                && let Some(size) = value.first_chunk::<4>()
+            {
+                return Ok(int(i32::from_le_bytes(*size).saturating_mul(2)));
+            }
+            return Ok(value.clone());
+        }
+        match (level, name) {
+            // `SO_RCVBUF` and `SO_SNDBUF` start where Linux's TCP starts them.
+            (SOL_SOCKET, 8) => Ok(int(131_072)),
+            (SOL_SOCKET, 7) => Ok(int(16_384)),
+            // Flags nobody set: `SO_REUSEADDR`, `SO_DONTROUTE`, `SO_BROADCAST`, `SO_KEEPALIVE`,
+            // `SO_OOBINLINE`, `SO_REUSEPORT`.
+            (SOL_SOCKET, 2 | 5 | 6 | 9 | 10 | 15) => Ok(int(0)),
+            // `SO_LINGER` off.
+            (SOL_SOCKET, 13) => Ok(vec![0; 8]),
+            // `SO_RCVLOWAT`, `SO_SNDLOWAT`.
+            (SOL_SOCKET, 18 | 19) => Ok(int(1)),
+            // `SO_RCVTIMEO` and `SO_SNDTIMEO`, old and new spellings: no timeout.
+            (SOL_SOCKET, 20 | 21 | 66 | 67) => Ok(vec![0; 16]),
+            // `TCP_NODELAY` off.
+            (IPPROTO_TCP, 1) => Ok(int(0)),
+            _ => Err(-errno::ENOPROTOOPT),
+        }
+    }
+
+    /// How long a call on `fd` may wait, in ticks: `SO_SNDTIMEO` for a write, `SO_RCVTIMEO` for a
+    /// read or an accept; nothing where none was set or it is nought.
+    pub(crate) fn timeout(&self, node: NodeId, fd: i64, sending: bool) -> Option<u64> {
+        const SOL_SOCKET: u64 = 1;
+        let set = self.options.get(&(node, self.resolve(node, fd)))?;
+        let names: [u64; 2] = if sending { [21, 67] } else { [20, 66] };
+        let value = names.iter().find_map(|name| set.get(&(SOL_SOCKET, *name)))?;
+        let seconds = i64::from_le_bytes(*value.first_chunk::<8>()?);
+        let micros = i64::from_le_bytes(*value.get(8..16)?.first_chunk::<8>()?);
+        if seconds < 0 || micros < 0 {
+            return None;
+        }
+        let ticks = (seconds as u64)
+            .saturating_mul(Tick::SECOND.get())
+            .saturating_add((micros as u64).saturating_mul(1_000));
+        (ticks > 0).then_some(ticks)
+    }
+
+    /// Ends the wait a socket timeout was armed for, where the task still waits there.
+    ///
+    /// The call answers `EAGAIN`, or what it moved before the time ran out. A wait is known by
+    /// its task and the moment it parked, so a timer its wait outlived fires into nothing.
+    pub(crate) fn time_out(
+        &mut self,
+        node: NodeId,
+        socket: i64,
+        task: TaskId,
+        since: Tick,
+        wakes: &mut Vec<Wake>,
+    ) {
+        let moved_or_again = |moved: usize| if moved > 0 { moved as i64 } else { -errno::EAGAIN };
+        let ret = match self.sockets.get_mut(&(node, socket)) {
+            Some(Socket::Udp { waiting, .. }) => {
+                let Some(at) = waiting.iter().position(|r| r.task == task && r.since == since)
+                else {
+                    return;
+                };
+                waiting.remove(at);
+                -errno::EAGAIN
+            }
+            Some(Socket::Stream { waiting, writers, .. }) => {
+                if let Some(at) = waiting.iter().position(|r| r.task == task && r.since == since) {
+                    let Some(recv) = waiting.remove(at) else { return };
+                    moved_or_again(recv.got)
+                } else if let Some(at) =
+                    writers.iter().position(|w| w.task == task && w.since == since)
+                {
+                    let Some(writer) = writers.remove(at) else { return };
+                    moved_or_again(writer.written)
+                } else {
+                    return;
+                }
+            }
+            Some(Socket::Listener { waiting, .. }) => {
+                let Some(at) = waiting.iter().position(|p| p.task == task && p.since == since)
+                else {
+                    return;
+                };
+                waiting.remove(at);
+                -errno::EAGAIN
+            }
+            None => return,
+        };
+        wakes.push(Wake { task, ret });
+    }
+
+    /// Whether a socket answers `EAGAIN` instead of waiting, or nothing where it is not a socket.
+    pub(crate) fn is_nonblocking(&self, node: NodeId, fd: i64) -> Option<bool> {
+        match self.sockets.get(&(node, self.resolve(node, fd)))? {
+            Socket::Udp { nonblocking, .. }
+            | Socket::Stream { nonblocking, .. }
+            | Socket::Listener { nonblocking, .. } => Some(*nonblocking),
         }
     }
 
@@ -1331,54 +2161,138 @@ impl Network {
         }
     }
 
-    /// Closes a socket, releasing its port and ending whatever stream it carried.
-    pub(crate) fn close(&mut self, node: NodeId, fd: i64, wakes: &mut Vec<Wake>) -> i64 {
-        // Closing an alias removes only the alias.
-        if self.aliases.remove(&(node, fd)).is_some() {
-            return 0;
-        }
-        let removed = match self.sockets.remove(&(node, fd)) {
-            Some(removed) => removed,
-            None => return -errno::EBADF,
+    /// Closes a descriptor, and the socket it names once no other descriptor names it.
+    ///
+    /// The number is free at once. Closing the socket releases its port and ends whatever stream
+    /// it carried; a stream closed with bytes in its send buffer lingers until they are
+    /// delivered, and its peer reads the end after them.
+    pub(crate) fn close(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        numbers: &mut Numbers<'_>,
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<i64, KernelError> {
+        let Some(id) = self.descriptors.remove(&(node, fd)) else {
+            return Ok(-errno::EBADF);
         };
-        match removed {
-            Socket::Udp { port: Some(port), .. } => {
-                self.release_port(node, Transport::Datagram, port, fd);
-            }
-            Socket::Listener { port, pending, .. } => {
-                self.release_port(node, Transport::Stream, port, fd);
-                // Connections made and never accepted are dropped, and their callers hear it.
-                for waiting in pending {
-                    self.close(node, waiting.fd, wakes);
-                }
-            }
-            Socket::Stream { local, peer, .. } => {
-                // Only the holder releases a port; an accepted connection is not one.
-                if local != 0 {
-                    self.release_port(node, Transport::Stream, local, fd);
-                }
-                if let Some(peer) = peer {
-                    self.finish_peer(peer, wakes);
-                }
-            }
-            Socket::Udp { .. } => {}
+        numbers.release(node, fd);
+        let still_named =
+            self.descriptors.iter().any(|((at, _), named)| *at == node && *named == id);
+        if still_named {
+            return Ok(0);
         }
-        0
+        self.close_socket(node, id, ctx, wakes)
     }
 
-    /// Ends the sending half of a stream, which the other end reads as the end of it.
-    pub(crate) fn shutdown(&mut self, node: NodeId, fd: i64, wakes: &mut Vec<Wake>) -> i64 {
-        let fd = self.resolve(node, fd);
-        match self.sockets.get(&(node, fd)) {
-            Some(Socket::Stream { peer: Some(peer), .. }) => {
-                let peer = *peer;
-                self.finish_peer(peer, wakes);
-                0
+    /// Closes the socket kept under `id`, which no descriptor names any more.
+    fn close_socket(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<i64, KernelError> {
+        let mut removed = match self.sockets.remove(&(node, fd)) {
+            Some(removed) => removed,
+            None => return Ok(-errno::EBADF),
+        };
+        self.options.remove(&(node, fd));
+        self.errors.remove(&(node, fd));
+        self.edges.remove(&(node, fd));
+        self.local_pairs.remove(&(node, fd));
+        let Socket::Stream { local, peer, outbox, waiting, writers, write_shut, .. } = &mut removed
+        else {
+            match removed {
+                Socket::Udp { port: Some(port), .. } => {
+                    self.release_port(node, Transport::Datagram, port, fd);
+                }
+                Socket::Listener { port, pending, .. } => {
+                    self.release_port(node, Transport::Stream, port, fd);
+                    // Connections made and never accepted are dropped, and their callers hear it.
+                    for waiting in pending {
+                        self.close_socket(node, waiting.fd, ctx, wakes)?;
+                    }
+                }
+                Socket::Udp { .. } | Socket::Stream { .. } => {}
             }
-            // A datagram socket accepts `shutdown` and nothing changes.
-            Some(_) => 0,
-            None => -errno::EBADF,
+            return Ok(0);
+        };
+        // Only the holder releases a port; an accepted connection is not one.
+        if *local != 0 {
+            self.release_port(node, Transport::Stream, *local, fd);
         }
+        // Other tasks parked on the descriptor get what they had, and nothing more.
+        Self::release_readers(waiting, wakes);
+        for writer in writers.drain(..) {
+            wakes.push(Wake { task: writer.task, ret: writer.cut_short() });
+        }
+        *write_shut = true;
+        let peer = *peer;
+        match peer {
+            Some(_) if !outbox.is_empty() => {
+                self.lingering.insert((node, fd), removed);
+                self.pump((node, fd), ctx, wakes)?;
+            }
+            Some(peer) => self.finish_peer(peer, wakes),
+            None => {}
+        }
+        Ok(0)
+    }
+
+    /// Shuts one or both directions of a stream, as `shutdown(how)` asks.
+    ///
+    /// `SHUT_RD` ends this side's reads and tells the peer nothing; `SHUT_WR` fails this side's
+    /// writes and the peer reads the end once the send buffer is delivered, while the other
+    /// direction stays open. A datagram socket or a listener accepts it and nothing changes.
+    pub(crate) fn shutdown(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        how: u64,
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<i64, KernelError> {
+        const SHUT_RD: u64 = 0;
+        const SHUT_WR: u64 = 1;
+        const SHUT_RDWR: u64 = 2;
+        if how > SHUT_RDWR {
+            return Ok(-errno::EINVAL);
+        }
+        let at = (node, self.resolve(node, fd));
+        match self.sockets.get_mut(&at) {
+            Some(Socket::Stream {
+                peer,
+                finished,
+                read_shut,
+                write_shut,
+                waiting,
+                writers,
+                ..
+            }) => {
+                if peer.is_none() && !*finished {
+                    return Ok(-errno::ENOTCONN);
+                }
+                if how != SHUT_WR {
+                    *read_shut = true;
+                    Self::release_readers(waiting, wakes);
+                    self.edges.entry(at).or_default().arrived += 1;
+                }
+                if how != SHUT_RD && !*write_shut {
+                    *write_shut = true;
+                    for writer in writers.drain(..) {
+                        wakes.push(Wake { task: writer.task, ret: writer.cut_short() });
+                    }
+                }
+            }
+            Some(_) => return Ok(0),
+            None => return Ok(-errno::EBADF),
+        }
+        if how != SHUT_RD {
+            self.pump(at, ctx, wakes)?;
+        }
+        Ok(0)
     }
 
     /// The bound address of a socket, for `getsockname`.
@@ -1428,11 +2342,13 @@ pub(crate) struct PendingRecvArgs {
     pub(crate) len: usize,
     /// Where the source address goes; zero for "not asked".
     pub(crate) src_addr: u64,
+    /// The receive's [`msg`] flags; zero for a plain `read`.
+    pub(crate) flags: u64,
 }
 
 /// Reads a `sockaddr_in` out of guest memory, yielding the node and port it names.
 pub(crate) fn decode_sockaddr(
-    ctx: &mut WorldCtx<'_, '_>,
+    ctx: &mut StopCtx<'_, '_>,
     addr: GuestAddr,
     own: NodeId,
 ) -> Result<Option<(NodeId, u16)>, KernelError> {

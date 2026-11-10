@@ -315,19 +315,12 @@ pub trait DeterminismBackend: Send {
 
     /// Ends a task. Nothing more is reported about it afterwards, its exit included.
     fn kill(&mut self, task: TaskId) -> Result<(), BackendError>;
-
-    /// Holds every guest as it stands, between two picks, so the run can go on from here more
-    /// than once. `Ok(None)` from a backend whose capabilities say `checkpoints: false`.
-    fn checkpoint(&mut self) -> Result<Option<CheckpointId>, BackendError> { Ok(None) }
-
-    /// Puts every guest back as it stood at `id`, keeping the checkpoint. `Ok(false)` if it cannot.
-    fn restore(&mut self, id: CheckpointId) -> Result<bool, BackendError> { Ok(false) }
 }
 ```
 
-`checkpoint` and `restore` are what branching a run from a prefix needs: a reduction or a campaign
-replays a shared prefix once and goes on from it many times. Both backends in this tree answer with
-the default, and `capabilities()` says so before anyone asks.
+There is no checkpoint. A reduction or a campaign that shares a prefix replays it from the first
+instruction every time: neither backend can hold a guest and go on from it twice, and a port no
+backend answers would only promise it.
 
 `set_regs` writes back every field `regs` hands out, arguments included: a boundary that exposes a
 field and then drops it on the way in loses a change without reporting it.
@@ -400,7 +393,7 @@ pub struct BackendCapabilities {
     pub traps_cpuid: bool,
     pub traps_rdrand: bool,               // false for ptrace; the honest hole, §5.8
     pub progress_unit: ProgressUnit,      // Branches | Syscalls
-    pub supports_snapshot: bool,          // world fork/restore; false until the KVM backend
+    pub hands_over_to_debugger: bool,     // `--break-at` can release a stopped guest
     pub max_tasks: u32,
 }
 ```
@@ -682,7 +675,8 @@ attaches one to a public issue by accident:
 | binary paths and blake3 fingerprints | fingerprints only, paths hashed |
 | syscall numbers and argument registers | unchanged |
 | guest memory read or written at intercepted calls (file contents, packet payloads) | **removed**, replaced by length + digest |
-| environment variables and argv of the guest | **removed** |
+| environment variables and argv of the guest, each node's `programs` | **removed** |
+| the prepared state's `dir` and `cwd`, and its file list (`STATE_MANIFEST`) | **removed**; the manifest keeps the state's digest |
 | SDK record `details` payloads | **removed**, names kept |
 | what the guest printed (`GUEST_OUTPUT`) | **removed**; the events keep each write's length and digest |
 | the tape, the event structure, the timeline | unchanged — reduction still replays |
@@ -756,7 +750,7 @@ enomem_probability = "1/500"    # odds a brk, mremap or anonymous mmap is refuse
 fault_points = ["after_ack"]    # SDK fault points a run may arm, by name
 fault_point_probability = "1/2" # odds each is armed on a node, drawn once per run
 restart_after_ticks = 3_000_000 # 0 leaves a killed node dead, a cut standing, a link bad
-arm_after_ticks = 300_000_000   # nothing is drawn before here; 0 arms from the first instruction
+arm_after_ticks = 300_000_000   # no node fault is drawn before here; 0 arms from the first instruction
 disarm_after_ticks = 45_000_000_000 # no drawn fault of any kind fires from here on
 ablate = ["disk_tear"]          # kinds drawn at nought odds, every draw kept; bohr ablate sets it
 draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade", "recover_from_snapshot",
@@ -973,6 +967,13 @@ every other node. A pair with no link is unreachable: a send to it still makes i
 the packet is then dropped with `PacketFate::Dropped` — topology is not a fault, and no
 `FaultFired` is recorded for it.
 
+**Descriptors.** A node's process has one table of descriptor numbers. A socket, a pipe, an
+`epoll` instance and an `eventfd` counter take the lowest free number from it, as a file does, and
+give it back when closed. `dup`, `dup2`, `dup3` and `F_DUPFD` copy any of them; a copy names the
+same socket and shares its `O_NONBLOCK`, which `fcntl` reads and sets, while `FD_CLOEXEC` belongs to
+each number. The socket lives while any copy does. A copy of a file does not share the file's
+position with its original.
+
 **Addressing.** Node `n` owns the virtual address `10.66.0.(n+1)`. Binding registers
 `(node, port)`; ephemeral ports are handed out from 32768 upward in binding order. A receive queue
 holds 64 datagrams, and a packet arriving at a full queue is dropped with `PacketFate::Dropped`.
@@ -985,22 +986,46 @@ three would hand a guest a conversation the real thing cannot produce. A stream 
 therefore costs no entropy, and adding one to a scenario cannot shift the tape alignment of
 anything else in it.
 
-What the transport cannot hide is that the far end is unreachable, and that is the whole of what
-this model does to a stream:
+What the transport cannot hide is that the far end is unreachable or slow, and that is the whole of
+what this model does to a stream:
 
-- **A write into a cut link waits.** It is neither refused nor lost: the bytes are held on the
-  sending side, the call returns their length, and they land when the cut lifts. The caller learns
-  nothing from the write, which is correct — what it learns is that no answer comes back.
+- **Every byte arrives, in order, and a reader that falls behind holds the writer back.** Each end
+  has a send buffer and a receive buffer of 1 MiB. A write fills the writer's send buffer, which
+  drains into the reader's receive buffer while that has room and the link carries. A blocking
+  writer that finds both full waits until the reader takes bytes; a non-blocking one, or one that
+  passed `MSG_DONTWAIT`, is answered what fitted, or `EAGAIN` for nothing. A single write takes at
+  most 1 MiB and answers its count.
+- **A write into a cut link waits like a write to a slow reader.** The bytes stay in the send
+  buffer and land when the cut lifts; a writer past the send buffer waits for the heal. The caller
+  learns nothing from the write — what it learns is that no answer comes back.
 - **A `connect` across a cut link answers `EINPROGRESS` and stays unfinished**, and is completed at
   the heal. Refusing outright would report in an instant a verdict the real transport takes minutes
-  to reach, and would hide the very stall a partition exists to cause.
-- **A stream ends when the process behind it goes.** Closing, shutting down, and a node being killed
-  all leave the other end reading nought — end of stream — and a task already parked in that read is
-  released by it. This is the only way a guest learns its counterpart is gone, and so the only way a
-  client whose server was killed mid-request reaches the code that handles one.
+  to reach, and would hide the very stall a partition exists to cause. A write while connecting
+  waits for the connection, or answers `EAGAIN` if it may not wait.
+- **A stream ends when the process behind it goes.** Closing, and a node being killed, leave the
+  other end reading nought — end of stream — after the bytes already sent, and a task parked in that
+  read is released by it. A socket closed with bytes in its send buffer delivers them first. This is
+  the only way a guest learns its counterpart is gone, and so the only way a client whose server
+  was killed mid-request reaches the code that handles one.
+- **Each direction shuts on its own.** `shutdown(SHUT_WR)` fails this side's further writes, and the
+  other end reads the end after what was sent, while it can still write back: a client may send a
+  request, shut its half, and read the reply. `SHUT_RD` ends this side's reads at once and tells the
+  other end nothing. `SHUT_RDWR` does both.
+- **A receive's flags mean what Linux makes them mean.** `MSG_PEEK` copies without taking;
+  `MSG_DONTWAIT` answers `EAGAIN` instead of waiting; `MSG_WAITALL` waits until the whole buffer is
+  filled or the stream ends; `MSG_TRUNC` answers a datagram's whole length. `MSG_OOB` on a stream is
+  `EINVAL`, and `MSG_ERRQUEUE` answers `EAGAIN`, since no error is ever queued. Other flags are
+  ignored, as Linux ignores the ones it does not know.
+- **Options are kept and read back.** `setsockopt` keeps every option as it was set; `getsockopt`
+  reads what was set, what the socket is (`SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`,
+  `SO_ACCEPTCONN`), the connect error `SO_ERROR` once, or Linux's default, and an option nobody set
+  and the model does not know is `ENOPROTOOPT`. `SO_RCVTIMEO` and `SO_SNDTIMEO` bound a read, an
+  accept or a write by the node's own clock: the call answers `EAGAIN`, or what it moved before the
+  time ran out. Keep-alive, `TCP_NODELAY` and lingering are kept and read back, and change nothing.
 - **Readiness** asks the same question of both kinds: a stream is readable when it holds bytes *or*
-  has ended, a listening socket when a connection is waiting to be accepted. Everything is always
-  writable, because this model has no send buffer to fill.
+  has ended, a listening socket when a connection is waiting to be accepted. A stream is writable
+  while its send buffer has room, and at once when a write would fail; one still connecting is not.
+  A datagram socket is always writable.
 
 `send` is `sendto` with no address, which is what a connected stream uses; it is a stream write and
 the null pointer is never read. `SOCK_NONBLOCK` on `socket` and `accept4` is honoured as `FIONBIO`
@@ -1009,8 +1034,8 @@ is.
 **What a stream does not model**, stated so a finding is never read as more than it is. Bytes arrive
 as they were written, so a read returns everything buffered and never a prefix of it — segmentation
 is real and is not injected here, and a guest whose framing assumes a whole message will not be
-caught by this model. A write never blocks and never writes short, because there is no send buffer
-to fill. A `listen` backlog is read and not honoured: what a full one does is drop the handshake and
+caught by this model. The buffers are a fixed 1 MiB each; `SO_SNDBUF` and `SO_RCVBUF` do not
+resize them. A `listen` backlog is read and not honoured: what a full one does is drop the handshake and
 leave the caller retransmitting, and there is no retransmission here to stall. And nothing times
 out on its own — a connection into a cut link waits for the heal or for the end of the run.
 
@@ -1335,7 +1360,8 @@ cwd = "/var/lib/node"                  # what getcwd answers
 useful size inside a file maintainers are meant to attach to an issue is not a format. What the
 bundle carries is `state_digest` in its manifest and a `STATE_MANIFEST` section listing paths,
 lengths and content digests, so a bundle says what it needs without carrying it; a replay whose
-configuration names a different state is refused with `BOHR-4004`, the same way a changed binary is.
+configuration names a different state, or names one where the bundle recorded none, is refused with
+`BOHR-4004`, the same way a changed binary is.
 
 The digest is over `(path, length, content digest)` in sorted order. Host inode numbers,
 modification times and permissions are not in it, because the world does not model any of them and a
@@ -1461,8 +1487,9 @@ forgotten rather than held against the node. An answer missing a key field is no
 **The probe is found, not written.** It is a static executable — a world holds no dynamic loader —
 named by `BOHR_PROBE`, or beside `bohr`, or where `make probe` builds it,
 `target/x86_64-unknown-linux-gnu/release/bohr-probe`; a dynamic one is passed over, and a scenario
-with probes and no probe is refused (`BOHR-1002`). Inside the run it is always `/bohr/probe`, so a
-bundle replays wherever the file is kept. Requests to one node go as one JSON-RPC batch a round; the
+with probes and no probe is refused (`BOHR-1002`). It is executed from a copy in the user's own
+directory under the temporary directory, `bohr-<uid>`, mode 0700 and refused when it is not;
+inside the run it is always `/bohr/probe`, so a bundle replays wherever the file is kept. Requests to one node go as one JSON-RPC batch a round; the
 reply to a round is read in the next, without waiting, so a node that is slow, down or frozen costs
 only its own answers. A probe holds at most 65,536 keys and says so once (`BOHR-2045`) rather than
 growing.
@@ -1706,11 +1733,17 @@ is, so a network whose runs take half a minute still stops near its budget.
 a new bundle of a known one is not. The campaign stops once N runs have passed since the last new
 group, checked after each generation. Each group's first run and the seconds since the campaign
 started are written to `first-seen.json` in the findings directory, and `bohr findings` prints them.
-When budgets are combined, the first one spent ends the campaign. Counted in runs, the quiet budget
-reproduces with the master seed as `--runs` does.
+A group first reached in a generation the campaign stopped inside is noted, when the campaign is
+resumable, at the run count that generation reaches whole, so the resumed campaign notes it where
+one never stopped would. When budgets are combined, the first one spent ends the campaign. Counted
+in runs, the quiet budget reproduces with the master seed as `--runs` does.
 
-**`--minimize` is not here yet.** Minimising a finding needs `bohr reduce`, which arrives with the
-reduction milestone; the flag is absent rather than accepted and ignored.
+**A finding is saved only when its re-run reproduces it.** The re-run that writes a finding's bundle
+must reach the finding's digest. One that does not is this tool's failure: it is kept as
+`unreproduced-<digest>.bohr`, reported with `BOHR-2011`, and not counted. `bohr findings` leaves
+those out, and every clean bundle with them.
+
+**There is no `--minimize`.** A finding is minimised with `bohr reduce` (§7.4).
 
 A stored corpus holds **tapes only**. What each covered is learned by running it, which costs one
 generation when a campaign starts and keeps an entry to its few kilobytes rather than the
@@ -1735,6 +1768,7 @@ bohr replay [OPTIONS] <bundle.bohr>
   --verify-only           check digest and exit; do not print a timeline
   --gdb                   stop before the first instruction and print a gdb attach line
   --break-at <event-id>   stop the world at an event and hand over to the debugger
+  --record <file>         run the bundle under this build and write what it reaches; compare nothing
 ```
 
 Exit code 0 means every named bundle replayed to the digest it recorded. A run that diverged, or a
@@ -1744,13 +1778,25 @@ defect in one of them rather than a finding about a guest. A bundle that is refu
 bundles may be named at once; each is reported and the worst outcome is the exit code, because a
 glob is checked to learn whether they all still replay.
 
+A replay runs only programs the bundle vouches for. Every program the recorded configuration starts
+needs a `BINARIES` record with a digest that the file still matches; a program the run never hashed
+is refused with `BOHR-4004`, and so is a `builtin:` record in a bundle a backend other than `null`
+wrote, since to such a backend the name is a path. A configuration naming a prepared state needs the
+`state_digest` the run recorded. `bohr reduce` and `bohr ablate` make the same checks before their
+first run.
+
 `--binaries <dir>` looks up every recorded program in `<dir>` by its base name, checks it against
 the digest the bundle recorded, and executes that file for every node that ran it. The guest keeps
-the recorded `argv`. The executed path is padded with slashes to the recorded path's length, because
-the kernel copies it onto the new stack. A moved file therefore replays to the same digest. A path
-longer than the recorded one cannot be shortened, and that replay diverges: name `<dir>` relative
-to the current directory instead. A prepared state is still read from the path the configuration names, relative to the current
-directory.
+the recorded `argv`. Every executed path is padded with slashes to one length, 512 bytes, because
+the kernel copies it onto the new stack, and the guest reads the recorded name in `AT_EXECFN`; a
+moved file therefore replays to the same digest. A prepared state is still read from the path the
+configuration names, relative to the current directory.
+
+`--record <file>` carries a bundle to a new world model. It makes every check a replay makes before
+running, runs the bundle's tape and scenario under this build, and writes the run to `<file>`, with
+the verdict and digest it reached. It compares nothing, since the old model may answer differently:
+whether the new bundle holds the same finding is for its reader, and `scripts/bank.sh` is where a
+bank's are read. Exit 1 when the run found something, 0 when it ran clean.
 
 **A hand-over is inspection, not resumption, and the difference is not negotiable.** The guest is
 released from the supervisor and left stopped, so a debugger can attach and read it: backtraces,
@@ -1822,8 +1868,8 @@ assertion; for a hang it is the reason the run stopped making progress, where `b
 the words of the verdict, so two hangs one keeps together the other may file apart.
 
 What reduction does not do: share the work of two candidates with a common beginning. That needs
-a backend that can hold a guest and go on from it twice (`DeterminismBackend::checkpoint`), and the
-ptrace backend cannot; every candidate runs from the first instruction. A fault moved earlier
+a backend that can hold a guest and go on from it twice, and neither backend can; every candidate
+runs from the first instruction. A fault moved earlier
 leaves the faults after it on bytes that now belong to other decisions — the signature check
 refuses the candidates that broke, so a finding that needs three kills in order shrinks less than
 one that needs one. And an earlier chance is any node's: the journal does not say whose call drew
@@ -2136,6 +2182,13 @@ still running restarts it, as in the world. Run from where the run was started, 
 and prints how many reproduced and the failing node's last three lines of output for each that did.
 **Not a replay but its complement**: a replay shows the failure under bohr's model, this whether it
 survives without the model.
+
+**The script runs, as root, the commands the run recorded.** Each node's program must be, byte for
+byte, the one the bundle recorded, read from where `bohr confirm` runs; another build, or a program
+the run did not record, is refused (`BOHR-5003`), and so are an environment name that is no
+variable's and a working directory that leaves its root. The arguments are the bundle's own, so a
+bundle from someone else is code from someone else: the script lists every node's command at its
+top, and it is read before it is run.
 
 A crash on the model loses every write not yet synced, and a killed process on a real host loses
 none, so where the run killed a node each node's root is on a device-mapper `flakey` device of its

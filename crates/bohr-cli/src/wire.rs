@@ -5,18 +5,17 @@
 //! Not a stored format: the same binary reads it seconds later, so a mismatch is a defect. It
 //! refuses damaged input, so a truncated result is never folded in as a run that covered nothing.
 
-use bohr_backend::CoverageMap;
 use bohr_explorer::{Origin, RunResult, WorkItem};
 use bohr_tape::{DRAW_RECORD_BYTES, DrawRecord, Journal};
-use bohr_types::{Digest, Seed};
+use bohr_types::{CoverageMap, Digest, Seed};
 
 use crate::CliError;
 
 /// What a file of work or results begins with, so a stale one is refused.
-const MAGIC: &[u8; 8] = b"BOHRWIRE";
+const MAGIC: &[u8; 8] = b"BOHRWIR2";
 
 fn broken(what: &str) -> CliError {
-    CliError::Internal(format!("BOHR-3006: a worker handover was unreadable: {what}"))
+    CliError::internal(format!("BOHR-3006: a worker handover was unreadable: {what}"))
 }
 
 /// A reader that refuses to run off the end.
@@ -116,9 +115,10 @@ pub(crate) fn encode_result(result: &RunResult) -> Vec<u8> {
     out.extend_from_slice(&result.guest_edges.to_le_bytes());
     out.extend_from_slice(&result.adversity.to_le_bytes());
     out.extend_from_slice(&(result.observed.len() as u32).to_le_bytes());
-    for (name, held) in &result.observed {
+    for (name, evaluations, held) in &result.observed {
         put_bytes(&mut out, name.as_bytes());
-        out.push(u8::from(*held));
+        out.extend_from_slice(&evaluations.to_le_bytes());
+        out.extend_from_slice(&held.to_le_bytes());
     }
     out.extend_from_slice(&(result.journal.records().len() as u32).to_le_bytes());
     for record in result.journal.records() {
@@ -161,7 +161,7 @@ pub(crate) fn decode_results(bytes: &[u8]) -> Result<Vec<RunResult>, CliError> {
         let mut observed = Vec::with_capacity(stated.min(1024));
         for _ in 0..stated {
             let name = cursor.text()?;
-            observed.push((name, cursor.take(1)?[0] != 0));
+            observed.push((name, cursor.u64()?, cursor.u64()?));
         }
 
         let count = cursor.u32()? as usize;
@@ -209,8 +209,8 @@ mod tests {
             journal,
             adversity: index,
             observed: vec![
-                ("a leader was elected".to_owned(), true),
-                ("a leader changed under a partition".to_owned(), false),
+                ("a leader was elected".to_owned(), 3, 2),
+                ("a leader changed under a partition".to_owned(), 1, 0),
             ],
         }
     }
@@ -248,8 +248,8 @@ mod tests {
         assert_eq!(
             back[0].observed,
             vec![
-                ("a leader was elected".to_owned(), true),
-                ("a leader changed under a partition".to_owned(), false),
+                ("a leader was elected".to_owned(), 3, 2),
+                ("a leader changed under a partition".to_owned(), 1, 0),
             ],
             "the properties a worker observed did not come back"
         );

@@ -5,9 +5,8 @@
 //!
 //! A build reads only its own format version and refuses others with both numbers.
 
-use bohr_backend::CoverageMap;
 use bohr_tape::{DRAW_RECORD_BYTES, DrawRecord, Journal};
-use bohr_types::{Digest, Seed};
+use bohr_types::{CoverageMap, Digest, Seed};
 
 use crate::{
     Campaign, Finding, Operator, Origin, Tally,
@@ -272,7 +271,7 @@ mod tests {
             guest_edges: 10,
             journal,
             adversity: 1,
-            observed: vec![("always holds".to_owned(), true)],
+            observed: vec![("always holds".to_owned(), 1, 1)],
         }
     }
 

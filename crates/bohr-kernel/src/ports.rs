@@ -2,7 +2,7 @@
 
 use bohr_backend::{DeterminismBackend, Regs, Resume, Stop};
 use bohr_tape::{DrawSite, TapeCursor};
-use bohr_trace::{Event, EventKind, FaultKind, Outcome, PacketFate};
+use bohr_trace::{Event, EventKind, Outcome};
 use bohr_types::{Digest, EventId, GuestAddr, NodeId, OracleId, TaskId, Tick, WorldModelId};
 
 use crate::{
@@ -19,7 +19,7 @@ pub trait WorldModel {
     fn identity(&self) -> WorldModelId;
 
     /// The only place a domain interprets guest behaviour.
-    fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError>;
+    fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError>;
 
     /// A task was created, and by which task.
     ///
@@ -34,16 +34,6 @@ pub trait WorldModel {
         Vec::new()
     }
 
-    /// Faults this model can inject.
-    fn fault_catalog(&self) -> &FaultCatalog;
-
-    /// An independent copy in the same state, for a run that branches from a checkpoint.
-    ///
-    /// `None` where the model cannot be copied; a run then cannot branch while it is in use.
-    fn fork(&self) -> Option<Box<dyn WorldModel>> {
-        None
-    }
-
     /// Earliest armed timer, if any.
     fn next_deadline(&self) -> Option<Tick> {
         None
@@ -51,10 +41,9 @@ pub trait WorldModel {
 
     /// Fires everything armed at or before the world clock's current reading.
     ///
-    /// Called while [`Self::next_deadline`] is due, and after the clock jumps to it. The context
-    /// is detached, so events go through [`WorldCtx::emit_for`] and memory through `_for`
-    /// accessors.
-    fn on_deadline(&mut self, _ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
+    /// Called while [`Self::next_deadline`] is due, and after the clock jumps to it. No stop is
+    /// being handled, so events and memory are named by their task ([`DeadlineCtx::emit_for`]).
+    fn on_deadline(&mut self, _ctx: &mut DeadlineCtx<'_, '_>) -> Result<DueEffects, KernelError> {
         Ok(DueEffects::default())
     }
 }
@@ -160,9 +149,10 @@ pub enum NodeOp {
     /// Re-spawn a dead node's initial task from the spec it was started with. The node keeps the
     /// clock it drew at spawn, so a restart cannot shift the tape position of later draws.
     Restart(NodeId),
-    /// The node's process called `exit_group`, ending every task.
+    /// A process of the node called `exit_group`, ending every task of that process.
     ///
-    /// A normal exit. Workers parked on a futex, as in the Go runtime, end with it.
+    /// A normal exit. Workers parked on a futex, as in the Go runtime, end with it; a child process
+    /// the node forked does not.
     Ended {
         /// The node whose process is ending.
         node: NodeId,
@@ -180,40 +170,16 @@ pub struct DueEffects {
     pub node_ops: Vec<NodeOp>,
 }
 
-/// Faults a world model is able to inject.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct FaultCatalog {
-    kinds: Vec<FaultKind>,
-}
-
-impl FaultCatalog {
-    /// A catalogue offering the given faults.
-    #[must_use]
-    pub fn new(kinds: Vec<FaultKind>) -> Self {
-        Self { kinds }
-    }
-
-    /// The faults on offer.
-    #[must_use]
-    pub fn kinds(&self) -> &[FaultKind] {
-        &self.kinds
-    }
-}
-
-/// Decides whether a run, or a set of runs, counts as a finding.
+/// Decides whether a run counts as a finding.
+///
+/// One run; a set of runs compared against each other is judged outside the kernel, which drives
+/// one run at a time.
 pub trait Oracle {
     /// Stable identity, recorded in the bundle and checked before a replay.
     fn identity(&self) -> OracleId;
 
     /// Judges one run.
     fn judge(&mut self, run: &RunOutcome) -> Verdict;
-
-    /// Judges a set of runs against each other.
-    ///
-    /// Implementations of one specification must agree; a disagreement is a bug in one of them.
-    fn judge_group(&mut self, _runs: &[RunOutcome]) -> Verdict {
-        Verdict::Skipped
-    }
 }
 
 /// Something a world model noticed and wrote down, as an oracle reads it.
@@ -342,84 +308,72 @@ impl<W: std::io::Write> EventSink for bohr_trace::TraceWriter<W> {
     }
 }
 
-/// What a world model is given while handling a stop or firing deadlines.
+/// What a world model is given while firing deadlines: the clock, the tape, every task's memory and
+/// the trace, each named by the node and task it concerns.
 ///
-/// Methods expose the clock, tape and memory, so every draw is journalled.
+/// Methods expose the clock, tape and memory, so every draw is journalled. No stop is being
+/// handled, so nothing here can refer to a current task; [`StopCtx`] adds one. Asking for one does
+/// not compile:
 ///
-/// While handling a stop, the short accessors ([`Self::task`], [`Self::now`], [`Self::emit`], plain
-/// memory) refer to the stopped task. In [`WorldModel::on_deadline`] the context is detached: those
-/// panic, and the model uses the `_for` methods.
-pub struct WorldCtx<'a, 't> {
+/// ```compile_fail
+/// fn asks(ctx: &bohr_kernel::DeadlineCtx<'_, '_>) {
+///     let _ = ctx.task();
+/// }
+/// ```
+///
+/// ```
+/// fn asks(ctx: &bohr_kernel::StopCtx<'_, '_>) {
+///     let _ = ctx.task();
+/// }
+/// ```
+pub struct DeadlineCtx<'a, 't> {
     clock: &'a mut Clock,
     cursor: &'a mut TapeCursor<'t>,
     backend: &'a mut dyn DeterminismBackend,
     sink: &'a mut dyn EventSink,
     next_event: &'a mut EventId,
-    origin: Option<(NodeId, TaskId)>,
     recorded: &'a mut Recorded,
 }
 
-impl<'a, 't> WorldCtx<'a, 't> {
-    #[allow(clippy::too_many_arguments)]
+/// What a world model is given while handling a stop: a [`DeadlineCtx`], and the stopped task,
+/// which the short accessors ([`Self::task`], [`Self::now`], [`Self::emit`], plain memory) refer
+/// to.
+pub struct StopCtx<'a, 't> {
+    at: DeadlineCtx<'a, 't>,
+    node: NodeId,
+    task: TaskId,
+}
+
+impl<'a, 't> std::ops::Deref for StopCtx<'a, 't> {
+    type Target = DeadlineCtx<'a, 't>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.at
+    }
+}
+
+impl std::ops::DerefMut for StopCtx<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.at
+    }
+}
+
+impl<'a, 't> DeadlineCtx<'a, 't> {
     pub(crate) fn new(
         clock: &'a mut Clock,
         cursor: &'a mut TapeCursor<'t>,
         backend: &'a mut dyn DeterminismBackend,
         sink: &'a mut dyn EventSink,
         next_event: &'a mut EventId,
-        node: NodeId,
-        task: TaskId,
         recorded: &'a mut Recorded,
     ) -> Self {
-        Self { clock, cursor, backend, sink, next_event, origin: Some((node, task)), recorded }
-    }
-
-    /// A context with no current task, for firing deadlines.
-    pub(crate) fn detached(
-        clock: &'a mut Clock,
-        cursor: &'a mut TapeCursor<'t>,
-        backend: &'a mut dyn DeterminismBackend,
-        sink: &'a mut dyn EventSink,
-        next_event: &'a mut EventId,
-        recorded: &'a mut Recorded,
-    ) -> Self {
-        Self { clock, cursor, backend, sink, next_event, origin: None, recorded }
-    }
-
-    /// The stop's origin, which a detached context does not have.
-    ///
-    /// Panics, since asking while firing deadlines is a bug in the model.
-    #[track_caller]
-    fn origin(&self) -> (NodeId, TaskId) {
-        self.origin.expect("no current task while firing deadlines; attribute explicitly")
-    }
-
-    /// What the node this stop happened on reads for the time.
-    ///
-    /// Includes the node's own offset and drift.
-    ///
-    /// # Panics
-    /// On a detached context; use [`Self::now_on`] there.
-    #[must_use]
-    pub fn now(&self) -> Tick {
-        self.clock.now_on(self.origin().0)
+        Self { clock, cursor, backend, sink, next_event, recorded }
     }
 
     /// What a named node reads for the time.
     #[must_use]
     pub fn now_on(&self, node: NodeId) -> Tick {
         self.clock.now_on(node)
-    }
-
-    /// What the node this stop happened on reads for wall time (`CLOCK_REALTIME`).
-    ///
-    /// [`Self::now`] on the wall epoch plus any step; a step back makes it read earlier.
-    ///
-    /// # Panics
-    /// On a detached context; use [`Self::wall_on`] there.
-    #[must_use]
-    pub fn wall_now(&self) -> Tick {
-        self.clock.wall_on(self.origin().0)
     }
 
     /// What a named node reads for wall time.
@@ -438,24 +392,6 @@ impl<'a, 't> WorldCtx<'a, 't> {
     #[must_use]
     pub fn world_now(&self) -> Tick {
         self.clock.now()
-    }
-
-    /// The node the stop happened on.
-    ///
-    /// # Panics
-    /// On a detached context.
-    #[must_use]
-    pub fn node(&self) -> NodeId {
-        self.origin().0
-    }
-
-    /// The task the stop happened on.
-    ///
-    /// # Panics
-    /// On a detached context.
-    #[must_use]
-    pub fn task(&self) -> TaskId {
-        self.origin().1
     }
 
     /// Draws a value in `0..n`.
@@ -489,26 +425,6 @@ impl<'a, 't> WorldCtx<'a, 't> {
         Ok(self.cursor.draw_exponential(mean, site)?)
     }
 
-    /// Writes into guest memory.
-    ///
-    /// # Panics
-    /// On a detached context; use [`Self::write_mem_for`] there.
-    pub fn write_mem(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), KernelError> {
-        let (_, task) = self.origin();
-        self.backend.write_mem(task, addr, data)?;
-        Ok(())
-    }
-
-    /// Reads guest memory.
-    ///
-    /// # Panics
-    /// On a detached context; use [`Self::read_mem_for`] there.
-    pub fn read_mem(&mut self, addr: GuestAddr, out: &mut [u8]) -> Result<(), KernelError> {
-        let (_, task) = self.origin();
-        self.backend.read_mem(task, addr, out)?;
-        Ok(())
-    }
-
     /// Writes into a named task's memory, such as a receiver's buffer on delivery.
     pub fn write_mem_for(
         &mut self,
@@ -538,34 +454,10 @@ impl<'a, 't> WorldCtx<'a, 't> {
         self.clock.set_node_clock(node, clock);
     }
 
-    /// Reads the stopped task's registers.
-    ///
-    /// # Panics
-    /// On a detached context.
-    pub fn regs(&mut self) -> Result<Regs, KernelError> {
-        let (_, task) = self.origin();
-        Ok(self.backend.regs(task)?)
-    }
-
-    /// Replaces the stopped task's registers.
-    ///
-    /// For emulating a trapped instruction: write its results and move past it.
-    ///
-    /// # Panics
-    /// On a detached context.
-    pub fn set_regs(&mut self, regs: &Regs) -> Result<(), KernelError> {
-        let (_, task) = self.origin();
-        self.backend.set_regs(task, regs)?;
-        Ok(())
-    }
-
-    /// Records an event attributed to the stop being handled.
-    ///
-    /// # Panics
-    /// On a detached context; use [`Self::emit_for`] there.
-    pub fn emit(&mut self, kind: EventKind) -> Result<(), KernelError> {
-        let (node, task) = self.origin();
-        self.emit_for(node, task, kind)
+    /// Counts one adversity that landed on the guest without a fault firing, such as a datagram a
+    /// lossy link dropped: the guest cannot tell it from a fault, and the world knows what it is.
+    pub fn landed(&mut self) {
+        self.recorded.adversity = self.recorded.adversity.saturating_add(1);
     }
 
     /// Records an event for a named node and task, such as a delivery or a deadline's event.
@@ -585,10 +477,8 @@ impl<'a, 't> WorldCtx<'a, 't> {
             EventKind::Assertion { condition: false, .. } => {
                 self.recorded.violation_event.get_or_insert(*self.next_event);
             }
-            // Faults and lossy-link drops both count, since the guest cannot tell them apart.
-            // Duplicated, reordered or altered packets fire their own fault and count there.
-            EventKind::FaultFired { .. }
-            | EventKind::PacketFate { fate: PacketFate::Dropped, .. } => {
+            // A fault that fired counts here; what else a world counts, it says ([`Self::landed`]).
+            EventKind::FaultFired { .. } => {
                 self.recorded.adversity = self.recorded.adversity.saturating_add(1);
             }
             _ => {}
@@ -600,20 +490,120 @@ impl<'a, 't> WorldCtx<'a, 't> {
         self.cursor.set_event(*self.next_event);
         Ok(())
     }
+}
+
+impl<'a, 't> StopCtx<'a, 't> {
+    /// The context of a stop of `task`, on `node`.
+    pub(crate) const fn new(at: DeadlineCtx<'a, 't>, node: NodeId, task: TaskId) -> Self {
+        Self { at, node, task }
+    }
+
+    /// The stopped task's node and the task.
+    const fn origin(&self) -> (NodeId, TaskId) {
+        (self.node, self.task)
+    }
+
+    /// What the node this stop happened on reads for the time.
+    ///
+    /// Includes the node's own offset and drift.
+    #[must_use]
+    pub fn now(&self) -> Tick {
+        self.clock.now_on(self.origin().0)
+    }
+
+    /// What the node this stop happened on reads for wall time (`CLOCK_REALTIME`).
+    ///
+    /// [`Self::now`] on the wall epoch plus any step; a step back makes it read earlier.
+    #[must_use]
+    pub fn wall_now(&self) -> Tick {
+        self.clock.wall_on(self.origin().0)
+    }
+
+    /// The world time at which this stop's node will have read `ahead` ticks pass.
+    ///
+    /// A guest's timeout is a span of its own clock; armed at this tick, it never fires before
+    /// the guest's clock has moved that far.
+    #[must_use]
+    pub fn deadline_after(&self, ahead: u64) -> Tick {
+        self.clock.deadline_on(self.origin().0, ahead)
+    }
+
+    /// The node the stop happened on.
+    #[must_use]
+    pub fn node(&self) -> NodeId {
+        self.origin().0
+    }
+
+    /// The task the stop happened on.
+    #[must_use]
+    pub fn task(&self) -> TaskId {
+        self.origin().1
+    }
+
+    /// Writes into guest memory.
+    pub fn write_mem(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), KernelError> {
+        let (_, task) = self.origin();
+        self.backend.write_mem(task, addr, data)?;
+        Ok(())
+    }
+
+    /// Reads guest memory.
+    pub fn read_mem(&mut self, addr: GuestAddr, out: &mut [u8]) -> Result<(), KernelError> {
+        let (_, task) = self.origin();
+        self.backend.read_mem(task, addr, out)?;
+        Ok(())
+    }
+
+    /// Reads several pieces of guest memory into `out`, one after another, in as few crossings as
+    /// the backend can make.
+    pub fn read_pieces(
+        &mut self,
+        pieces: &[(GuestAddr, usize)],
+        out: &mut [u8],
+    ) -> Result<(), KernelError> {
+        let (_, task) = self.origin();
+        self.backend.read_mem_vectored(task, pieces, out)?;
+        Ok(())
+    }
+
+    /// Reads the stopped task's registers.
+    pub fn regs(&mut self) -> Result<Regs, KernelError> {
+        let (_, task) = self.origin();
+        Ok(self.backend.regs(task)?)
+    }
+
+    /// Replaces the stopped task's registers.
+    ///
+    /// For emulating a trapped instruction: write its results and move past it.
+    pub fn set_regs(&mut self, regs: &Regs) -> Result<(), KernelError> {
+        let (_, task) = self.origin();
+        self.backend.set_regs(task, regs)?;
+        Ok(())
+    }
+
+    /// Records an event attributed to the stop being handled.
+    pub fn emit(&mut self, kind: EventKind) -> Result<(), KernelError> {
+        let (node, task) = self.origin();
+        self.emit_for(node, task, kind)
+    }
 
     /// Refuses a stop this model has no answer for, under the code that names the class.
-    ///
-    /// # Panics
-    /// On a detached context: refusals are stop-scoped by definition.
     pub fn refuse(&self, code: &'static str, what: impl std::fmt::Display) -> KernelError {
         KernelError::World { code, message: format!("{what} on {}", self.origin().1) }
     }
 }
 
-impl std::fmt::Debug for WorldCtx<'_, '_> {
+impl std::fmt::Debug for DeadlineCtx<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorldCtx")
-            .field("origin", &self.origin)
+        f.debug_struct("DeadlineCtx").field("now", &self.clock.now()).finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for StopCtx<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopCtx")
+            .field("node", &self.node)
+            .field("task", &self.task)
             .field("now", &self.clock.now())
             .finish_non_exhaustive()
     }

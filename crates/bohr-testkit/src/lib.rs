@@ -391,6 +391,9 @@ pub struct Scenario {
     pub liveness: Option<bohr_world::LivenessConfig>,
     /// Whether an answer given before a sync and lost to a crash is a finding.
     pub durability: Option<bohr_world::DurabilityConfig>,
+    /// The path each node's program is started from, which `/proc/self/exe` answers; none where
+    /// empty.
+    pub programs: Vec<String>,
 }
 
 /// [`run_cluster`], with the whole scenario wired: network, disk and node faults.
@@ -438,7 +441,8 @@ pub fn refusable_scenario(
         .with_network(scenario.network)
         .with_disk(scenario.disk)
         .with_node_faults(scenario.node_faults)
-        .with_fault_policy(scenario.fault_policy);
+        .with_fault_policy(scenario.fault_policy)
+        .with_programs(scenario.programs);
     if let Some(liveness) = scenario.liveness {
         world = world.with_liveness(liveness);
     }
@@ -512,7 +516,8 @@ pub fn judge_scenario(
         .with_network(scenario.network)
         .with_disk(scenario.disk)
         .with_node_faults(scenario.node_faults)
-        .with_fault_policy(scenario.fault_policy);
+        .with_fault_policy(scenario.fault_policy)
+        .with_programs(scenario.programs);
     let watching = bohr_world::Watching {
         liveness: scenario.liveness.is_some(),
         durability: scenario.durability.is_some(),

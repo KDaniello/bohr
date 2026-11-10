@@ -101,7 +101,7 @@ fn a_saved_bundle_is_self_describing_and_refuses_foreign_components() {
     assert!(manifest.trace_digest.starts_with("blake3:"));
 
     // Every section a replay would need is present and readable.
-    let events = read_events(bundle.section(SectionId::Events).expect("events"))
+    let events = read_events(bundle.event_log().expect("readable").expect("events"))
         .expect("the stored log must parse");
     assert!(!events.is_empty());
     assert!(bundle.section(SectionId::Tape).is_some());
@@ -110,7 +110,7 @@ fn a_saved_bundle_is_self_describing_and_refuses_foreign_components() {
     assert!(
         manifest
             .check_provenance(
-                &WorldModelId::new("minimal", 2),
+                &WorldModelId::new("minimal", 3),
                 &OracleId::new("properties+crash", 1)
             )
             .is_ok()
@@ -152,7 +152,7 @@ fn a_seed_and_a_tape_together_are_refused() {
 fn a_null_path_is_answered_rather_than_ending_the_run() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/guests/build/null_path");
-    if !path.is_file() {
+    if !path.is_file() || !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
     let (code, _, stderr) = run(&["run", "--seed", "1", "--", &path.to_string_lossy()]);
@@ -168,7 +168,7 @@ fn a_null_path_is_answered_rather_than_ending_the_run() {
 fn names_and_descriptors_answer_the_way_the_kernel_does() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/guests/build/links_and_descriptors");
-    if !path.is_file() {
+    if !path.is_file() || !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
     let (code, _, stderr) = run(&["run", "--seed", "1", "--", &path.to_string_lossy()]);
@@ -183,7 +183,7 @@ fn names_and_descriptors_answer_the_way_the_kernel_does() {
 fn a_process_that_ends_with_threads_running_is_not_an_internal_error() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/guests/build/exits_with_threads_running");
-    if !path.is_file() {
+    if !path.is_file() || !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
     let (code, _, stderr) = run(&["run", "--seed", "1", "--", &path.to_string_lossy()]);
@@ -198,7 +198,7 @@ fn a_process_that_ends_with_threads_running_is_not_an_internal_error() {
 fn a_relative_name_is_taken_from_the_directory_that_was_named() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/guests/build/paths_under_a_directory");
-    if !path.is_file() {
+    if !path.is_file() || !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
     let (code, _, stderr) = run(&["run", "--seed", "1", "--", &path.to_string_lossy()]);
@@ -232,4 +232,34 @@ fn a_processor_question_is_answered_where_the_host_cannot_trap_it() {
         plain.contains("cpuid_not_trappable") || plain.contains("cpuid_not_trapped"),
         "and without the rewrite it still is, or this test proves nothing:\n{plain}"
     );
+}
+
+/// A run its event budget ended replays to the same digest: the replay runs under the budget the
+/// run recorded and stops at the same event.
+#[test]
+fn a_run_the_event_budget_ended_replays() {
+    let guest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/guests/build/clock_and_random");
+    if !guest.is_file() || !cfg!(target_os = "linux") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bohr-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let bundle = dir.join("budget.bohr");
+    let bundle = bundle.to_string_lossy();
+    let (_, _, stderr) = run(&[
+        "run",
+        "--seed",
+        "3",
+        "--max-events",
+        "4",
+        "--save",
+        &bundle,
+        "--",
+        &guest.to_string_lossy(),
+    ]);
+    assert!(std::path::Path::new(&*bundle).is_file(), "no bundle was saved: {stderr}");
+    let (code, _, stderr) = run(&["replay", "--verify-only", &bundle]);
+    assert_eq!(code, 0, "a run the budget ended did not replay: {stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

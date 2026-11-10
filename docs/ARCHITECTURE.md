@@ -145,12 +145,14 @@ bohr/
 │   ├── EVIDENCE.md              # what the project claims, and the command that checks it
 │   └── repo/                    # ci.md, labels.md, release.md
 ├── crates/
-│   ├── bohr-types/              # Tick, Seed, NodeId, TaskId, Fd, EventId, digests.
+│   ├── bohr-types/              # Tick, Seed, NodeId, TaskId, Fd, EventId, digests, the coverage map.
 │   │                            # serde + zero I/O. The only crate everyone else knows.
 │   ├── bohr-tape/               # THE ENTROPY TAPE: format, cursor, typed draws, draw journal,
 │   │                            # deterministic extension. No knowledge of what a draw means.
 │   ├── bohr-backend/            # THE BACKEND BOUNDARY: trait DeterminismBackend, Stop, Resume,
 │   │                            # BackendCapabilities. Types only, no implementation.
+│   ├── bohr-x86/                # x86-64 machine code: instruction lengths, symbols, and the
+│   │                            # instructions that leak a machine. A leaf, no dependencies.
 │   ├── bohr-backend-ptrace/     # v1 backend: seccomp-BPF + ptrace + namespaces + prctl.
 │   │                            # Linux x86-64 only. The ONLY crate allowed `unsafe`.
 │   ├── bohr-backend-null/       # in-process backend driving synthetic guests. Lets layers 2-4
@@ -170,6 +172,8 @@ bohr/
 │   │                            # property evaluation
 │   ├── bohr-reducer/            # delta debugging over the tape and over the event list
 │   ├── bohr-report/             # text, JSON and single-file static HTML output
+│   ├── bohr-findings/           # what a finding is: its group, its ablation, its triage, how a
+│   │                            # host stages it, and a run's facts. Rules only, no files read.
 │   ├── bohr-cli/                # the `bohr` binary: wiring, argument parsing, exit codes
 │   └── bohr-testkit/            # fixtures, golden harness, determinism harness, fake guests
 ├── sdk/
@@ -188,30 +192,34 @@ bohr/
 
 ### Crate dependency graph
 
-Acyclic and deliberately narrow. An arrow means "knows about".
+Acyclic and deliberately narrow. A row names what a crate depends on among ours, as its manifest's
+`[dependencies]` says; `scripts/lint-rules.sh` (rule 14e) compares every manifest with this table,
+and a dependency in one and not the other fails `make pr`.
 
-```
-                              bohr-types
-        ┌──────────────┬───────────┼────────────────────┐
-        ▼              ▼           ▼                    ▼
-   bohr-tape      bohr-trace   bohr-backend       bohr-sdk-proto
-        │              │        ▲          ▲            │
-        └──────┬───────┘        │          │            │
-               ▼                │          │            │
-          bohr-kernel      bohr-backend-  bohr-backend- │
-   defines the ports:         ptrace          null      │
-   WorldModel · Oracle                                  │
-   SchedulePolicy                                       │
-      ▲     ▲      ▲     ▲          ▲                   │
-      │     │      │     └──────────┼──────┐            │
- bohr-world │  bohr-reducer         │  bohr-report ◄────┘
- (a model)  │                       │
-      bohr-explorer            bohr-testkit
-                            (fixtures and the
-                             determinism harness)
+<!-- crate-graph -->
+| Crate | Depends on |
+|---|---|
+| `bohr-types` | — |
+| `bohr-x86` | — |
+| `bohr-sdk-proto` | — |
+| `bohr-tape` | `bohr-types` |
+| `bohr-trace` | `bohr-sdk-proto` `bohr-types` |
+| `bohr-backend` | `bohr-types` |
+| `bohr-backend-null` | `bohr-backend` `bohr-types` |
+| `bohr-backend-ptrace` | `bohr-backend` `bohr-types` `bohr-x86` |
+| `bohr-kernel` | `bohr-backend` `bohr-tape` `bohr-trace` `bohr-types` |
+| `bohr-world` | `bohr-backend` `bohr-kernel` `bohr-sdk-proto` `bohr-tape` `bohr-trace` `bohr-types` `bohr-x86` |
+| `bohr-explorer` | `bohr-tape` `bohr-types` |
+| `bohr-reducer` | `bohr-kernel` `bohr-tape` `bohr-trace` `bohr-types` |
+| `bohr-report` | `bohr-sdk-proto` `bohr-tape` `bohr-trace` `bohr-types` |
+| `bohr-findings` | `bohr-kernel` `bohr-reducer` `bohr-report` `bohr-sdk-proto` `bohr-trace` `bohr-types` `bohr-world` |
+| `bohr-testkit` | `bohr-backend` `bohr-backend-null` `bohr-explorer` `bohr-kernel` `bohr-reducer` `bohr-tape` `bohr-trace` `bohr-types` `bohr-world` |
+| `bohr-probe` | `bohr-sdk-proto` |
+| `bohr-cli` | `bohr-backend` `bohr-backend-null` `bohr-backend-ptrace` `bohr-explorer` `bohr-findings` `bohr-kernel` `bohr-reducer` `bohr-report` `bohr-sdk-proto` `bohr-tape` `bohr-testkit` `bohr-trace` `bohr-types` `bohr-world` `bohr-x86` |
+<!-- /crate-graph -->
 
-                        everything above ────► bohr-cli
-```
+`bohr-probe` also depends on the Rust SDK (`sdk/rust`), which is outside `crates/` and depends on
+`bohr-sdk-proto` alone (`scripts/check-sdk-deps.sh`).
 
 The direction around `bohr-kernel` is the one to note: **the kernel is depended upon by the world,
 not the other way round.** It defines the ports and drives them; the distributed-systems model, the
@@ -356,9 +364,9 @@ The catalog is closed; adding a variant is a bundle-format minor version.
 | SDK | arm a guest's own `fault_point`, by name, per node |
 | Node | kill (`SIGKILL` equivalent), freeze/thaw (GC pause, CPU starvation), restart clean, restart from an older disk snapshot, rewind a set of nodes to a common ancestor |
 
-Every kind in this table is one the trace format names and a world fires, and the three lists — the
-format's `FaultKind`, the world's catalogue, what it narrates — are held to one by the linter
-(rule 14m): a kind in one and not the others fails `make pr`.
+Every kind in this table is one the trace format names and a world fires, and the two lists — the
+format's `FaultKind` and what a world narrates — are held to one by the linter (rule 14m): a kind in
+one and not the other fails `make pr`.
 
 One-directional partition is called out explicitly because it is the case teams most often fail to
 test and the one that breaks consensus implementations most reliably.
@@ -371,10 +379,9 @@ time (`CLOCK_REALTIME`, `gettimeofday`, `time`), which a step moves, and monoton
 goes back. A defect that trusts wall time to measure elapsed time is reachable only through the step,
 which is why both readings exist.
 
-**A catalogue is a promise, and it is held to the code.** Each model declares the faults it can
-inject, and `scripts/lint-rules.sh` compares that declaration against every fault the model actually
-narrates. The two are separate lists that nothing at run time reads, so they drift; a campaign plans
-its coverage from the declaration, which is what makes the drift cost something.
+**The list of faults is a promise, and it is held to the code.** The trace format names every
+fault a run can carry, and `scripts/lint-rules.sh` compares that list against every fault a world
+narrates. Nothing at run time holds the two together, so without the rule they drift.
 
 **Fault targeting.** Faults are not injected uniformly at random. The explorer prefers moments that
 are *semantically dangerous* — immediately after a write and before its acknowledgement, during a
@@ -647,7 +654,7 @@ concurrency has no standing if its own is unverified.
 ### 5.16. The world is a port, like the backend
 
 `bohr-kernel` owns time, scheduling and the tape. It does not own the model of the environment.
-Network, disk, node lifecycle and the fault catalog live behind a `WorldModel` trait, exactly as
+Network, disk, node lifecycle and the faults live behind a `WorldModel` trait, exactly as
 interception lives behind `DeterminismBackend` (§5.2). The kernel drives a world; it does not know
 which one.
 
@@ -662,17 +669,15 @@ pub trait WorldModel {
     fn identity(&self) -> WorldModelId;
 
     /// The only place a domain interprets guest behaviour.
-    fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_>) -> Result<Effects, WorldError>;
+    fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_>) -> Result<Effects, WorldError>;
 
     /// Faults this model can inject, and the moments it considers dangerous.
-    fn fault_catalog(&self) -> &FaultCatalog;
-
     /// Timers the model has armed, in ticks. The kernel merges these into its own queue.
     fn next_deadline(&self) -> Option<Tick>;
 
     /// Fires everything due at or before the world clock's reading. Wakes and node
     /// operations come back as data; applying them is the kernel's job.
-    fn on_deadline(&mut self, ctx: &mut WorldCtx<'_>) -> Result<DueEffects, WorldError>;
+    fn on_deadline(&mut self, ctx: &mut DeadlineCtx<'_>) -> Result<DueEffects, WorldError>;
 }
 ```
 
@@ -692,8 +697,10 @@ that, the first cross-domain bundle would silently produce a plausible, wrong ru
 failure mode with a new cause.
 
 The seam costs one indirection on the hot path, in the same place and of the same size as §5.2's,
-and a `WorldCtx` that exposes the clock, the tape cursor and the trace sink without handing over
-ownership of any of them.
+and a context that exposes the clock, the tape cursor and the trace sink without handing over
+ownership of any of them. It comes in two types: a `DeadlineCtx` for firing deadlines, where every
+event and every read names its task, and a `StopCtx` for a stop, which is a `DeadlineCtx` that also
+knows the stopped task. Asking a deadline for the current task does not compile.
 
 ### 5.17. How a run is judged is a port as well
 
@@ -707,23 +714,26 @@ clients — supply an oracle for free. A disagreement is a defect in one of them
 which behaviour was correct need not be known to report that they differed.
 
 ```rust
-/// Decides whether a run, or a set of runs, counts as a finding.
+/// Decides whether a run counts as a finding. In the kernel, which drives one run at a time.
 pub trait Oracle {
     fn identity(&self) -> OracleId;
 
     /// Judge one run from its trace and SDK records.
     fn judge(&mut self, run: &RunOutcome) -> Verdict;
+}
 
-    /// Judge a set of runs against each other. This is where differential testing lives:
-    /// N implementations, one tape, compare. Returns Verdict::Agree when they match.
-    fn judge_group(&mut self, runs: &[RunOutcome]) -> Verdict { Verdict::Skipped }
+/// Decides whether a set of runs counts as a finding. In the world crate, outside the kernel:
+/// N implementations, one tape, compare. Returns Verdict::Agree when they match.
+pub trait GroupOracle {
+    fn identity(&self) -> OracleId;
+    fn judge_group(&mut self, runs: &[RunOutcome]) -> Verdict;
 }
 ```
 
 That verdict cannot be expressed as an assertion inside one guest, so it has a seam of its own. With
 a group oracle a "run" is a *set* of executions driven by one tape, and the corpus, the reducer and
-the bundle all carry that (§5.20). Any oracle that composes others composes the whole interface: a
-panel that answered `judge` and left `judge_group` to the default would quietly stop comparing.
+the bundle all carry that (§5.20). The two are separate traits, and neither has a default: an oracle
+that judged single runs and inherited a group method that skipped would quietly stop comparing.
 
 #### 5.17.1. What is not a port
 
@@ -735,7 +745,7 @@ bundles matter; a trait that touches only code can wait until a second implement
 |---|---|
 | `CoverageSource` | the three tiers are an internal enum (§5.10) with no format impact |
 | `Mutator` | byte operators are one implementation; a journal-aware structural mutator would be a second |
-| `FaultTargeting` | a function of the fault catalog, which §5.16 already makes pluggable |
+| `FaultTargeting` | a function of the faults a world fires, which §5.16 already makes pluggable |
 
 #### 5.17.2. Oracles that ask the guest's own API
 

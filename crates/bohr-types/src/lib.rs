@@ -12,6 +12,83 @@ use std::{borrow::Cow, fmt};
 
 use serde::{Deserialize, Serialize};
 
+mod coverage;
+
+pub use coverage::{CoverageMap, DEFAULT_COVERAGE_MAP_BYTES};
+
+/// A diagnostic code, `BOHR-NNNN`: the class of what happened, stable forever (`docs/API.md`
+/// §8).
+///
+/// Written as the four digits after `BOHR-`, as text on the wire; a message opens with it and a
+/// colon. [`Code::leading`] and [`Code::all_in`] are the only readers of codes out of text.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Code(pub u16);
+
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BOHR-{:04}", self.0)
+    }
+}
+
+impl Code {
+    /// The code at `at` in `text`, where `BOHR-` and four digits stand there and no fifth follows.
+    fn at(text: &str, at: usize) -> Option<Self> {
+        let word = text.get(at..at + 9)?;
+        let digits = word.strip_prefix("BOHR-")?;
+        let next = text[at + 9..].chars().next();
+        if !digits.bytes().all(|b| b.is_ascii_digit()) || next.is_some_and(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok().map(Self)
+    }
+
+    /// The code a text opens with, and the text after it and its `": "`; the rest is the whole
+    /// remainder where no colon follows.
+    #[must_use]
+    pub fn leading(text: &str) -> Option<(Self, &str)> {
+        let code = Self::at(text, 0)?;
+        let rest = &text[9..];
+        Some((code, rest.strip_prefix(": ").unwrap_or(rest)))
+    }
+
+    /// Every code in a text, once each, in the order they first appear.
+    #[must_use]
+    pub fn all_in(text: &str) -> Vec<Self> {
+        let mut out = Vec::new();
+        for (at, _) in text.match_indices("BOHR-") {
+            if let Some(code) = Self::at(text, at)
+                && !out.contains(&code)
+            {
+                out.push(code);
+            }
+        }
+        out
+    }
+}
+
+impl Serialize for Code {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Code {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = <Cow<'de, str>>::deserialize(d)?;
+        match Self::leading(&text) {
+            Some((code, "")) => Ok(code),
+            _ => Err(serde::de::Error::custom(format!("{text:?} is not a BOHR-NNNN code"))),
+        }
+    }
+}
+
+/// The draw ABI: how tape bytes become decisions (`docs/API.md` §2).
+///
+/// Here, beneath both the tape that defines it and the bundle that records it, so the two cannot
+/// name different versions. A change is a new tape ABI, and every stored tape and bundle is refused
+/// by it.
+pub const TAPE_ABI: u16 = 2;
+
 /// Declares a transparent newtype over an integer with the traits every identifier needs.
 ///
 /// No `Default`: zero is usually a real node or task. Types whose zero is an origin implement it
@@ -374,6 +451,24 @@ impl fmt::Display for OracleId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A code is read where `BOHR-` and four digits stand, and nowhere else.
+    #[test]
+    fn a_code_is_read_only_where_one_is_written() {
+        assert_eq!(Code::leading("BOHR-1002: cannot read x"), Some((Code(1002), "cannot read x")));
+        assert_eq!(Code::leading("BOHR-1002"), Some((Code(1002), "")));
+        assert_eq!(Code::leading("BOHR-10021: no"), None, "five digits are no code");
+        assert_eq!(Code::leading("see BOHR-1002"), None, "a code not at the head");
+        assert_eq!(
+            Code::all_in("BOHR-2040: a; BOHR-204; BOHR-2041 and BOHR-2040"),
+            [Code(2040), Code(2041)]
+        );
+        assert_eq!(Code(42).to_string(), "BOHR-0042");
+        let json = serde_json::to_string(&Code(2012)).expect("serialises");
+        assert_eq!(json, "\"BOHR-2012\"");
+        assert_eq!(serde_json::from_str::<Code>(&json).expect("reads back"), Code(2012));
+        assert!(serde_json::from_str::<Code>("\"BOHR-2012: x\"").is_err());
+    }
 
     #[test]
     fn digest_renders_with_its_algorithm_named() {

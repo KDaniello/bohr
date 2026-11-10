@@ -19,8 +19,8 @@ mod schedule;
 
 pub use clock::{Clock, MAX_DRIFT_PPM, NodeClock, WALL_EPOCH};
 pub use ports::{
-    Diagnostic, DueEffects, Effects, EventSink, FaultCatalog, NodeOp, Observer, Oracle, Progress,
-    RunOutcome, TaskState, Verdict, Wake, WorldCtx, WorldModel,
+    DeadlineCtx, Diagnostic, DueEffects, Effects, EventSink, NodeOp, Observer, Oracle, Progress,
+    RunOutcome, StopCtx, TaskState, Verdict, Wake, WorldModel,
 };
 pub use run::{
     ARMED_VARIABLE, ARMING, Arming, PROGRESS_EVERY, RunConfig, RunInputs, RunMetrics, RunReport,

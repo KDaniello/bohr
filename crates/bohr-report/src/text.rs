@@ -6,10 +6,31 @@ use bohr_trace::{Event, EventKind, ExitStatus, Manifest};
 
 use crate::describe;
 
+/// Text from a run, made safe for a terminal.
+///
+/// Every control character but a newline and a tab is written as `\u{..}`: a bundle's strings,
+/// a guest's output among them, cannot move the cursor, rewrite a line, or reach the clipboard.
+#[must_use]
+pub fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    let unsafe_char = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !text.chars().any(unsafe_char) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if unsafe_char(c) {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// One event on one line: where it happened, then what it was, then what it says.
 ///
 /// A fixed shape people grep: the aligned envelope, the kind, then its fields. See
-/// `docs/API.md` §4.3.
+/// `docs/API.md` §4.3. Made [`printable`].
 #[must_use]
 pub fn event_line(event: &Event) -> String {
     let mut out = format!(
@@ -94,7 +115,7 @@ pub fn event_line(event: &Event) -> String {
         }
     }
     out.push('\n');
-    out
+    printable(&out).into_owned()
 }
 
 /// The kinds `bohr trace --kind` selects by, one word per kind of event.
@@ -281,6 +302,24 @@ mod squash_tests {
     use bohr_types::{EventId, NodeId, TaskId, Tick};
 
     use super::*;
+
+    /// A diagnostic a bundle carries reaches the terminal with its escape sequences written out:
+    /// the clipboard sequence and a cursor move arrive as text.
+    #[test]
+    fn a_bundles_text_cannot_drive_the_terminal() {
+        let message = "\u{1b}]52;c;cm0gLXJmIH4=\u{7}\u{1b}[2Aok".to_owned();
+        let event = Event {
+            id: EventId(1),
+            tick: Tick(1),
+            node: NodeId(0),
+            task: TaskId(0),
+            kind: EventKind::Diagnostic { code: "BOHR-2012".to_owned(), message },
+        };
+        let line = event_line(&event);
+        assert!(!line.chars().any(|c| c.is_control() && c != '\n'), "a control reached: {line:?}");
+        assert!(line.contains("\\u{1b}]52"), "the sequence is not shown as text: {line}");
+        assert_eq!(printable("plain\ttext\n"), "plain\ttext\n");
+    }
 
     fn call(id: u64, nr: u32) -> Event {
         Event {

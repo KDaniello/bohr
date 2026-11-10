@@ -10,9 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-bohr-backend.workspace = true
 bohr-tape.workspace = true
-bohr-trace.workspace = true
 bohr-types.workspace = true
 
 [features]

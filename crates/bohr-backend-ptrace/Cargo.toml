@@ -11,10 +11,7 @@ authors.workspace = true
 [dependencies]
 bohr-backend.workspace = true
 bohr-types.workspace = true
-
-[dev-dependencies]
-bohr-backend.workspace = true
-thiserror.workspace = true
+bohr-x86.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 libc.workspace = true

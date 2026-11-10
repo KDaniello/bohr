@@ -8,8 +8,8 @@ use bohr_backend::{
     ProgressUnit, Regs, Resume, Stop, StopKind,
 };
 use bohr_kernel::{
-    DueEffects, Effects, FaultCatalog, KernelError, NodeOp, Observer, Oracle, Progress,
-    RandomPolicy, RunConfig, RunInputs, RunOutcome, RunReport, StopReason, Verdict, Wake, WorldCtx,
+    DeadlineCtx, DueEffects, Effects, KernelError, NodeOp, Observer, Oracle, Progress,
+    RandomPolicy, RunConfig, RunInputs, RunOutcome, RunReport, StopCtx, StopReason, Verdict, Wake,
     WorldModel, run,
 };
 use bohr_tape::Tape;
@@ -70,7 +70,6 @@ impl DeterminismBackend for Scripted {
             progress_unit: ProgressUnit::Syscalls,
             hands_over_to_debugger: false,
             max_tasks: 1024,
-            checkpoints: false,
         }
     }
 
@@ -97,7 +96,7 @@ impl DeterminismBackend for Scripted {
                 let child = self.fresh(self.child.clone());
                 Stop {
                     task: child,
-                    kind: StopKind::TaskCreated { parent: task, shares_memory: true },
+                    kind: StopKind::TaskCreated { parent: task, shares_memory: true, thread: true },
                 }
             }
         };
@@ -165,7 +164,6 @@ const COST: Tick = Tick(1_000);
 struct Answers {
     blocked: Vec<TaskId>,
     deadline: Option<Tick>,
-    catalog: FaultCatalog,
 }
 
 impl WorldModel for Answers {
@@ -173,7 +171,7 @@ impl WorldModel for Answers {
         WorldModelId::new("scripted", 1)
     }
 
-    fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError> {
+    fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         let StopKind::SyscallEntry { nr, .. } = stop.kind else {
             return Ok(Effects::go(Resume::Continue, Tick::ZERO));
         };
@@ -211,15 +209,11 @@ impl WorldModel for Answers {
         })
     }
 
-    fn fault_catalog(&self) -> &FaultCatalog {
-        &self.catalog
-    }
-
     fn next_deadline(&self) -> Option<Tick> {
         self.deadline
     }
 
-    fn on_deadline(&mut self, _ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
+    fn on_deadline(&mut self, _ctx: &mut DeadlineCtx<'_, '_>) -> Result<DueEffects, KernelError> {
         self.deadline = None;
         Ok(DueEffects {
             wake: self.blocked.drain(..).map(|task| Wake { task, ret: 0 }).collect(),

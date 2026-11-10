@@ -81,14 +81,10 @@ pub(crate) fn emit(command: &str, body: Value) {
     println!("{}", object(command, body));
 }
 
-/// The object a failed command writes, with the `BOHR-` code its message opens with.
-pub(crate) fn error(message: &str, exit: u8) -> Value {
-    let code = message
-        .split(|c: char| c == ':' || c.is_whitespace())
-        .next()
-        .filter(|word| word.starts_with("BOHR-"))
-        .map(str::to_owned);
-    object("error", serde_json::json!({ "code": code, "message": message, "exit": exit }))
+/// The object a failed command writes, with its code.
+pub(crate) fn error(error: &crate::CliError, exit: u8) -> Value {
+    let code = error.code.map(|code| code.to_string());
+    object("error", serde_json::json!({ "code": code, "message": error.to_string(), "exit": exit }))
 }
 
 #[cfg(test)]
@@ -104,10 +100,11 @@ mod tests {
 
     #[test]
     fn an_error_carries_the_code_its_message_opens_with() {
-        let value = error("BOHR-1002: cannot read x: gone", 2);
+        let value = error(&crate::CliError::usage("BOHR-1002: cannot read x: gone"), 2);
         assert_eq!(value["code"], "BOHR-1002");
+        assert_eq!(value["message"], "BOHR-1002: cannot read x: gone");
         assert_eq!(value["exit"], 2);
-        assert_eq!(error("no code here", 3)["code"], Value::Null);
+        assert_eq!(error(&crate::CliError::internal("no code here"), 3)["code"], Value::Null);
     }
 
     #[test]

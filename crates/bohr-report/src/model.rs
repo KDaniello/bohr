@@ -85,32 +85,22 @@ impl RunModel {
         // A report describes one execution; a bundle of several is refused.
         let single = bundle.single().map_err(ReportError::Unreadable)?;
 
-        let (events, damage) = match single.events() {
+        let (events, damage) = match single.events().map_err(ReportError::Unreadable)? {
             Some(bytes) => read_events_lossy(bytes),
             None => (Vec::new(), None),
         };
         let journal =
             bundle.section(SectionId::DrawJournal).map_or_else(Journal::new, read_journal);
         let records = single.sdk_records().map(read_records).unwrap_or_default();
-        let host =
-            bundle.section(SectionId::HostProfile).and_then(|b| serde_json::from_slice(b).ok());
-        let binaries = bundle
-            .section(SectionId::Binaries)
-            .and_then(|b| serde_json::from_slice(b).ok())
-            .unwrap_or_default();
-        let config = bundle
-            .section(SectionId::Config)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_default();
+        // An unreadable section is read as none: the text is for a reader, the run is elsewhere.
+        let host = bundle.host_profile().ok().flatten();
+        let binaries = bundle.binaries().unwrap_or_default();
+        let config = bundle.config_text().unwrap_or_default().to_owned();
         let notes = bundle
             .section(SectionId::Notes)
             .map(|b| String::from_utf8_lossy(b).lines().map(str::to_owned).collect())
             .unwrap_or_default();
-        // An unreadable section is read as none: the text is for a reader, the run is elsewhere.
-        let output = bundle
-            .section(SectionId::GuestOutput)
-            .and_then(|b| serde_json::from_slice(b).ok())
-            .unwrap_or_default();
+        let output = bundle.output_tails().unwrap_or_default();
 
         let violation = find_violation(&events, &records);
         Ok(Self {

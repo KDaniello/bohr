@@ -53,12 +53,24 @@ const SCRATCH: u64 = MEMORY_BASE + 0x800;
 
 /// Runs a script against a fresh world and reports what each call answered, in order.
 fn answers(paths: &[&str], ops: Vec<GuestOp>) -> Result<Vec<(u32, i64)>, KernelError> {
+    answers_with(paths, &[], ops)
+}
+
+/// [`answers`], with `bytes` written at their addresses beside the paths.
+fn answers_with(
+    paths: &[&str],
+    bytes: &[(u64, Vec<u8>)],
+    ops: Vec<GuestOp>,
+) -> Result<Vec<(u32, i64)>, KernelError> {
     let tape = Tape::from_seed(Seed(1));
     let mut backend = NullBackend::new(NullProgram::single(ops));
     for (index, path) in paths.iter().enumerate() {
         let mut bytes = path.as_bytes().to_vec();
         bytes.push(0);
         backend.preload(GuestAddr(slot(index as u64)), &bytes).expect("the slot is in range");
+    }
+    for (at, held) in bytes {
+        backend.preload(GuestAddr(*at), held).expect("in range");
     }
     let mut world = MinimalWorld::new();
     let mut policy = RandomPolicy;
@@ -176,4 +188,144 @@ fn the_filesystem_reports_its_own_numbers() {
     assert_eq!(answered[1], (FSTATFS, 0), "and the filesystem under it answers");
     // `EBADF`, since the caller gave a descriptor.
     assert_eq!(answered[2], (FSTATFS, EBADF), "a descriptor nobody holds is a bad descriptor");
+}
+
+const RENAME: u32 = 82;
+const RMDIR: u32 = 84;
+const UNLINK: u32 = 87;
+const EINVAL: i64 = -22;
+const ENOTEMPTY: i64 = -39;
+
+fn rename(from: u64, to: u64) -> GuestOp {
+    GuestOp::Syscall { nr: RENAME, args: [slot(from), slot(to), 0, 0, 0, 0] }
+}
+
+fn rmdir(index: u64) -> GuestOp {
+    GuestOp::Syscall { nr: RMDIR, args: [slot(index), 0, 0, 0, 0, 0] }
+}
+
+fn unlink(index: u64) -> GuestOp {
+    GuestOp::Syscall { nr: UNLINK, args: [slot(index), 0, 0, 0, 0, 0] }
+}
+
+/// A directory with something in it is not removed, and is once it is empty.
+#[test]
+fn a_directory_goes_only_once_it_is_empty() {
+    let answered = answers(
+        &["/tmp/d", "/tmp/d/f"],
+        vec![mkdir(0), open(1, CREATE), rmdir(0), stat(1), unlink(1), rmdir(0), stat(0)],
+    )
+    .expect("nothing here is refused");
+    let answers: Vec<i64> = answered.iter().map(|(_, ret)| *ret).collect();
+    assert_eq!(answers[2..], [ENOTEMPTY, 0, 0, 0, ENOENT], "{answered:?}");
+}
+
+/// A directory moves with everything under it.
+#[test]
+fn a_directory_moves_with_everything_under_it() {
+    let answered = answers(
+        &["/tmp/a", "/tmp/a/f", "/tmp/b", "/tmp/b/f"],
+        vec![mkdir(0), open(1, CREATE), rename(0, 2), stat(3), stat(1), stat(0)],
+    )
+    .expect("nothing here is refused");
+    let answers: Vec<i64> = answered.iter().map(|(_, ret)| *ret).collect();
+    assert_eq!(answers[2..], [0, 0, ENOENT, ENOENT], "{answered:?}");
+}
+
+/// A directory never moves into itself, replaces only an empty directory, and a file and a
+/// directory never replace each other.
+#[test]
+fn a_directory_moves_only_where_linux_lets_it() {
+    const ENOTDIR: i64 = -20;
+    let answered = answers(
+        &["/tmp/a", "/tmp/a/sub", "/tmp/b", "/tmp/b/f", "/tmp/file"],
+        vec![
+            mkdir(0),
+            mkdir(2),
+            open(3, CREATE),
+            open(4, CREATE),
+            rename(0, 1),
+            rename(0, 2),
+            rename(0, 4),
+            rename(4, 2),
+            unlink(3),
+            rename(0, 2),
+            stat(2),
+            stat(0),
+        ],
+    )
+    .expect("nothing here is refused");
+    let answers: Vec<i64> = answered.iter().map(|(_, ret)| *ret).collect();
+    assert_eq!(answers[4..], [EINVAL, ENOTEMPTY, ENOTDIR, EISDIR, 0, 0, 0, ENOENT], "{answered:?}");
+}
+
+/// An appending write lands at the end and leaves the position after it; `pwrite` on an
+/// appending descriptor lands at the end too, as Linux makes it.
+#[test]
+fn an_appending_write_leaves_the_position_at_the_end() {
+    const WRITE: u32 = 1;
+    const CLOSE: u32 = 3;
+    const LSEEK: u32 = 8;
+    const PWRITE64: u32 = 18;
+    const O_APPEND: u64 = 0o2000;
+    const SEEK_CUR: u64 = 1;
+    const SEEK_END: u64 = 2;
+    // The path's own bytes are what is written: ten, then five, then five.
+    let answered = answers(
+        &["/tmp/log.0000"],
+        vec![
+            open(0, CREATE),
+            GuestOp::Syscall { nr: WRITE, args: [3, slot(0), 10, 0, 0, 0] },
+            GuestOp::Syscall { nr: CLOSE, args: [3, 0, 0, 0, 0, 0] },
+            open(0, CREATE | O_APPEND),
+            GuestOp::Syscall { nr: WRITE, args: [3, slot(0), 5, 0, 0, 0] },
+            GuestOp::Syscall { nr: LSEEK, args: [3, 0, SEEK_CUR, 0, 0, 0] },
+            GuestOp::Syscall { nr: PWRITE64, args: [3, slot(0), 5, 0, 0, 0] },
+            GuestOp::Syscall { nr: LSEEK, args: [3, 0, SEEK_CUR, 0, 0, 0] },
+            GuestOp::Syscall { nr: LSEEK, args: [3, 0, SEEK_END, 0, 0, 0] },
+        ],
+    )
+    .expect("nothing here is refused");
+    let answers: Vec<i64> = answered.iter().map(|(_, ret)| *ret).collect();
+    assert_eq!(answers, [3, 10, 0, 3, 5, 15, 5, 15, 20], "{answered:?}");
+}
+
+/// A link is a name: it is renamed over another, as an atomic switch does, and unlinked.
+#[test]
+fn a_link_is_renamed_and_unlinked_as_a_name() {
+    const SYMLINK: u32 = 88;
+    const READLINK: u32 = 89;
+    let link = |target: u64, at: u64| GuestOp::Syscall {
+        nr: SYMLINK,
+        args: [slot(target), slot(at), 0, 0, 0, 0],
+    };
+    let read = |at: u64| GuestOp::Syscall { nr: READLINK, args: [slot(at), SCRATCH, 64, 0, 0, 0] };
+    let answered = answers(
+        &["/tmp/release-1", "/tmp/release-22", "/tmp/current", "/tmp/current.next"],
+        vec![link(0, 2), link(1, 3), rename(3, 2), read(2), read(3), unlink(2), read(2)],
+    )
+    .expect("nothing here is refused");
+    let answers: Vec<i64> = answered.iter().map(|(_, ret)| *ret).collect();
+    let next = "/tmp/release-22".len() as i64;
+    assert_eq!(answers, [0, 0, 0, next, ENOENT, 0, ENOENT], "{answered:?}");
+}
+
+/// An empty segment in a gathering write is passed over, as Linux passes it: the bytes after it
+/// are written too.
+#[test]
+fn a_gathering_write_passes_over_an_empty_segment() {
+    const WRITEV: u32 = 20;
+    let iov = SCRATCH + 0x100;
+    let mut vector = Vec::new();
+    for (base, len) in [(slot(1), 5u64), (slot(2), 0), (slot(3), 5)] {
+        vector.extend_from_slice(&base.to_le_bytes());
+        vector.extend_from_slice(&len.to_le_bytes());
+    }
+    let answered = answers_with(
+        &["/tmp/joined", "hello", "", "world"],
+        &[(iov, vector)],
+        vec![open(0, CREATE), GuestOp::Syscall { nr: WRITEV, args: [3, iov, 3, 0, 0, 0] }],
+    )
+    .expect("a run");
+    assert_eq!(answered[1], (WRITEV, 10), "{answered:?}");
 }

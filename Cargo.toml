@@ -5,12 +5,14 @@ members = [
   "crates/bohr-tape",
   "crates/bohr-trace",
   "crates/bohr-backend",
+  "crates/bohr-x86",
   "crates/bohr-backend-null",
   "crates/bohr-backend-ptrace",
   "crates/bohr-kernel",
   "crates/bohr-world",
   "crates/bohr-explorer",
   "crates/bohr-reducer",
+  "crates/bohr-findings",
   "crates/bohr-report",
   "crates/bohr-cli",
   "crates/bohr-sdk-proto",
@@ -29,12 +31,14 @@ bohr-types = { path = "crates/bohr-types", version = "0.9.1" }
 bohr-tape = { path = "crates/bohr-tape", version = "0.9.1" }
 bohr-trace = { path = "crates/bohr-trace", version = "0.9.1" }
 bohr-backend = { path = "crates/bohr-backend", version = "0.9.1" }
+bohr-x86 = { path = "crates/bohr-x86", version = "0.9.1" }
 bohr-backend-null = { path = "crates/bohr-backend-null", version = "0.9.1" }
 bohr-backend-ptrace = { path = "crates/bohr-backend-ptrace", version = "0.9.1" }
 bohr-kernel = { path = "crates/bohr-kernel", version = "0.9.1" }
 bohr-world = { path = "crates/bohr-world", version = "0.9.1" }
 bohr-explorer = { path = "crates/bohr-explorer", version = "0.9.1" }
 bohr-reducer = { path = "crates/bohr-reducer", version = "0.9.1" }
+bohr-findings = { path = "crates/bohr-findings", version = "0.9.1" }
 bohr-report = { path = "crates/bohr-report", version = "0.9.1" }
 bohr-sdk-proto = { path = "crates/bohr-sdk-proto", version = "0.9.1" }
 bohr-testkit = { path = "crates/bohr-testkit", version = "0.9.1" }
@@ -58,7 +62,7 @@ cucumber = { version = "0.23", default-features = false, features = ["macros"] }
 futures = "0.3"
 
 [workspace.package]
-version = "0.9.1"
+version = "0.9.1+1"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"

@@ -23,9 +23,10 @@ pub const ANSWERER: NodeId = NodeId(1);
 const FIONBIO: u64 = 0x5421;
 /// `O_CREAT`, as an ordinary guest passes it.
 const O_CREAT: u64 = 0o100;
-/// The first socket and the first `openat` descriptor, both deterministic.
-const SOCK: u64 = 4096;
-const RECORDS_FD: u64 = 3;
+/// The socket and the record channel, numbered as a process numbers them: the lowest free number,
+/// the socket first.
+const SOCK: u64 = 3;
+const RECORDS_FD: u64 = 4;
 
 const ADDR_SELF: u64 = MEMORY_BASE;
 const ADDR_PEER: u64 = MEMORY_BASE + 16;

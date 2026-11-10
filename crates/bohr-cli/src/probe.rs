@@ -11,36 +11,19 @@ use crate::CliError;
 /// The variable naming the probe executable, ahead of anywhere it is looked for.
 pub(crate) const PROBE_VARIABLE: &str = "BOHR_PROBE";
 
-/// The file the probe is executed from: a copy at `/tmp/bohr-probe-` and its digest's first 16
-/// hex digits, made where it is not there yet.
-///
-/// The path has the same length on every host, since the kernel copies it onto the guest's stack.
+/// The file the probe is executed from: a copy in the user's private directory, named by its
+/// content.
 pub(crate) fn program() -> Result<String, CliError> {
     // Once per process; the probe does not change during a campaign.
     static PLACED: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    PLACED.get_or_init(|| place().map_err(|e| e.to_string())).clone().map_err(CliError::Usage)
+    PLACED.get_or_init(|| place().map_err(|e| e.to_string())).clone().map_err(CliError::usage)
 }
 
 fn place() -> Result<String, CliError> {
     let found = found()?;
     let bytes = std::fs::read(&found)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {found}: {e}")))?;
-    let digest = bohr_types::Digest::of(&bytes).to_string();
-    let hex = digest.trim_start_matches("blake3:");
-    let fixed = format!("/tmp/bohr-probe-{}", &hex[..16.min(hex.len())]);
-    if std::fs::read(&fixed).is_ok_and(|held| held == bytes) {
-        return Ok(fixed);
-    }
-    // Renamed into place, so a concurrent run never executes a half-written copy.
-    let part = format!("{fixed}.{}", std::process::id());
-    let cannot = |e: std::io::Error| {
-        CliError::Usage(format!("BOHR-1002: cannot place the probe at {fixed}: {e}"))
-    };
-    std::fs::write(&part, &bytes).map_err(cannot)?;
-    let executable: std::fs::Permissions = std::os::unix::fs::PermissionsExt::from_mode(0o755);
-    std::fs::set_permissions(&part, executable).map_err(cannot)?;
-    std::fs::rename(&part, &fixed).map_err(cannot)?;
-    Ok(fixed)
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {found}: {e}")))?;
+    crate::private::place("probe", &bytes)
 }
 
 /// The probe this host has, by the order the module names.
@@ -48,7 +31,7 @@ fn found() -> Result<String, CliError> {
     if let Ok(named) = std::env::var(PROBE_VARIABLE) {
         return match static_executable(Path::new(&named)) {
             Ok(()) => Ok(named),
-            Err(why) => Err(CliError::Usage(format!("BOHR-1002: {PROBE_VARIABLE}={named}: {why}"))),
+            Err(why) => Err(CliError::usage(format!("BOHR-1002: {PROBE_VARIABLE}={named}: {why}"))),
         };
     }
     let here = std::env::current_exe()
@@ -66,7 +49,7 @@ fn found() -> Result<String, CliError> {
             Err(why) => passed.push(format!("{}: {why}", candidate.display())),
         }
     }
-    Err(CliError::Usage(format!(
+    Err(CliError::usage(format!(
         "BOHR-1002: this scenario has probes, and no static bohr-probe was found ({}); build one \
          with `make probe`, or name one in {PROBE_VARIABLE}",
         passed.join("; ")

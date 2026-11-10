@@ -6,38 +6,13 @@
 //! The identity is the outcome's class plus a signature from what the run recorded: the promise and
 //! its line for a property, the node and status for a crash, the reason for a hang.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bohr_kernel::StopReason;
 use bohr_trace::{
-    DURABILITY_CODE, Event, EventKind, ExitStatus, LIVENESS_CODE, Outcome, PROBE_CODES,
+    DURABILITY_CODE, Event, EventKind, ExitStatus, LIVENESS_CODE, Outcome, OutcomeKind, PROBE_CODES,
 };
 use bohr_types::NodeId;
-
-/// The kind of thing that went wrong, with its message discarded.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Class {
-    /// A promise the guest made about itself did not hold.
-    PropertyViolated,
-    /// A task died.
-    GuestCrashed,
-    /// The run did not get anywhere.
-    GuestHung,
-    /// A cluster that could talk to itself again went on committing nothing.
-    LivenessViolated,
-    /// A node answered while what it had written was not durable, and came back without it.
-    DurabilityViolated,
-    /// A probe's answers broke the property it watched.
-    ProbeViolated,
-    /// The guest asked for something the tool does not model.
-    UnsupportedSyscall,
-    /// Two implementations of one specification disagreed.
-    ImplementationsDisagreed,
-    /// The tool reached a state it does not define behaviour for.
-    InternalError,
-    /// Somebody stopped the run to look at it.
-    StoppedOnRequest,
-}
 
 /// One promise a guest made about itself and did not keep.
 ///
@@ -114,45 +89,41 @@ fn refused_call(outcome: &Outcome) -> String {
 /// What made a run a finding.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Violation {
-    class: Class,
+    class: OutcomeKind,
     signature: Signature,
+    /// Where the run fell, where its output tells: two panics of one class at two places are two
+    /// findings.
+    place: Option<String>,
 }
 
 impl Violation {
     /// What a completed run amounted to, or nothing where it was clean.
     #[must_use]
     pub fn of(outcome: &Outcome, stop_reason: StopReason, events: &[Event]) -> Option<Self> {
-        let class = match outcome {
-            Outcome::Clean => return None,
-            Outcome::PropertyViolated(_) => Class::PropertyViolated,
-            Outcome::GuestCrashed(_) => Class::GuestCrashed,
-            Outcome::GuestHung(_) => Class::GuestHung,
-            Outcome::LivenessViolated(_) => Class::LivenessViolated,
-            Outcome::DurabilityViolated(_) => Class::DurabilityViolated,
-            Outcome::ProbeViolated(_) => Class::ProbeViolated,
-            Outcome::UnsupportedSyscall(_) => Class::UnsupportedSyscall,
-            Outcome::ImplementationsDisagreed(_) => Class::ImplementationsDisagreed,
-            Outcome::InternalError(_) => Class::InternalError,
-            Outcome::StoppedOnRequest(_) => Class::StoppedOnRequest,
-        };
+        let class = outcome.kind();
+        if class == OutcomeKind::Clean {
+            return None;
+        }
         let signature = match class {
-            Class::PropertyViolated => Signature::Assertions(failed_assertions(events)),
-            Class::GuestCrashed => Signature::Exits(bad_exits(events)),
-            Class::GuestHung => Signature::NoProgress(stop_reason),
-            Class::LivenessViolated => Signature::Silent(silent_nodes(events)),
-            Class::DurabilityViolated => Signature::Lost(lost_writes(events)),
-            Class::ProbeViolated => Signature::Probed(probed_codes(events)),
+            OutcomeKind::PropertyViolated => Signature::Assertions(failed_assertions(events)),
+            OutcomeKind::GuestCrashed => Signature::Exits(bad_exits(events)),
+            OutcomeKind::GuestHung => Signature::NoProgress(stop_reason),
+            OutcomeKind::LivenessViolated => Signature::Silent(silent_nodes(events)),
+            OutcomeKind::DurabilityViolated => Signature::Lost(lost_writes(events)),
+            OutcomeKind::ProbeViolated => Signature::Probed(probed_codes(events)),
             // Read from the outcome, since no single event stream records a disagreement.
-            Class::ImplementationsDisagreed => Signature::Disagreement(disagreed_labels(outcome)),
+            OutcomeKind::ImplementationsDisagreed => {
+                Signature::Disagreement(disagreed_labels(outcome))
+            }
             // The unmodelled call, by name.
-            Class::UnsupportedSyscall => Signature::Refused(refused_call(outcome)),
+            OutcomeKind::UnsupportedSyscall => Signature::Refused(refused_call(outcome)),
             _ => Signature::ClassAlone,
         };
         // An empty signature cannot tell findings apart, so it is refused like a clean baseline.
         if signature.is_empty() {
             return None;
         }
-        Some(Self { class, signature })
+        Some(Self { class, signature, place: None })
     }
 
     /// The violation as one line: its class and what tells it from others of its class.
@@ -165,7 +136,7 @@ impl Violation {
 
     /// What kind of thing went wrong.
     #[must_use]
-    pub const fn class(&self) -> Class {
+    pub const fn class(&self) -> OutcomeKind {
         self.class
     }
 
@@ -178,13 +149,23 @@ impl Violation {
         }
     }
 
-    /// Whether `candidate` still reproduces this: the same class and the same signature.
+    /// The same violation, known to have fallen at `place`.
+    #[must_use]
+    pub fn at(mut self, place: Option<String>) -> Self {
+        self.place = place;
+        self
+    }
+
+    /// Whether `candidate` still reproduces this: the same class, the same signature and the same
+    /// place.
     ///
-    /// The signatures must be equal. A run that also trips a second assertion belongs to another
+    /// A run that also trips a second assertion, or falls at another place, belongs to another
     /// group in `bohr findings`.
     #[must_use]
     pub fn reproduced_by(&self, candidate: &Self) -> bool {
-        self.class == candidate.class && self.signature == candidate.signature
+        self.class == candidate.class
+            && self.signature == candidate.signature
+            && self.place == candidate.place
     }
 }
 
@@ -196,30 +177,29 @@ fn failed_assertions(events: &[Event]) -> BTreeSet<FailedAssertion> {
     events
         .iter()
         .filter_map(|event| match &event.kind {
-            EventKind::Assertion { name, condition: false, .. } => Some(FailedAssertion {
-                name: name.clone(),
-                at: located.iter().find(|(who, _)| who == name).map(|(_, at)| at.clone()),
-            }),
+            EventKind::Assertion { name, condition: false, .. } => {
+                Some(FailedAssertion { name: name.clone(), at: located.get(name).cloned() })
+            }
             _ => None,
         })
         .collect()
 }
 
-/// Source locations, by the promise they belong to, read out of the diagnostics.
+/// Source locations, by the promise they belong to, read out of the diagnostics: the first a
+/// promise has, which is where it first failed.
 ///
 /// Parsed from `always("name") failed at file:line`, so bundles without an SDK record work.
-fn located_by_name(events: &[Event]) -> Vec<(String, String)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            EventKind::Diagnostic { message, .. } => {
-                let (promise, at) = message.rsplit_once(" failed at ")?;
-                let name = promise.split_once('"')?.1.rsplit_once('"')?.0;
-                Some((name.to_owned(), at.to_owned()))
-            }
-            _ => None,
-        })
-        .collect()
+fn located_by_name(events: &[Event]) -> BTreeMap<String, String> {
+    let mut located = BTreeMap::new();
+    for event in events {
+        let EventKind::Diagnostic { message, .. } = &event.kind else { continue };
+        let Some((promise, at)) = message.rsplit_once(" failed at ") else { continue };
+        let Some(name) = promise.split_once('"').and_then(|(_, rest)| rest.rsplit_once('"')) else {
+            continue;
+        };
+        located.entry(name.0.to_owned()).or_insert_with(|| at.to_owned());
+    }
+    located
 }
 
 /// The nodes the world said committed nothing while a liveness window was open.
@@ -323,6 +303,38 @@ mod tests {
         ]
     }
 
+    /// A finding's group key is this text, and campaigns have written it down: it is pinned, so a
+    /// change to how a kind or a signature prints cannot regroup the findings already kept.
+    #[test]
+    fn the_text_a_group_is_kept_under_is_pinned() {
+        let outcome = Outcome::PropertyViolated("BOHR-2012: ordered".to_owned());
+        let events = broke("ordered", "src/log.rs:10");
+        let violation =
+            Violation::of(&outcome, StopReason::GuestFinished, &events).expect("a violation");
+        assert_eq!(violation.class(), OutcomeKind::PropertyViolated);
+        assert_eq!(
+            violation.describe(),
+            r#"PropertyViolated Assertions({FailedAssertion { name: "ordered", at: Some("src/log.rs:10") }})"#
+        );
+    }
+
+    /// A promise that fails at several places is located where it failed first, and each promise
+    /// by its own diagnostic, however many there are.
+    #[test]
+    fn a_promise_is_located_where_it_first_failed() {
+        let mut events = broke("ordered", "src/log.rs:10");
+        events.extend(broke("ordered", "src/log.rs:99"));
+        for i in 0..2_000 {
+            events.extend(broke(&format!("p{i}"), &format!("src/p.rs:{i}")));
+        }
+        let failed = failed_assertions(&events);
+        assert_eq!(failed.len(), 2_001, "each promise once");
+        let ordered = failed.iter().find(|f| f.name == "ordered").expect("named");
+        assert_eq!(ordered.at.as_deref(), Some("src/log.rs:10"));
+        let last = failed.iter().find(|f| f.name == "p1999").expect("named");
+        assert_eq!(last.at.as_deref(), Some("src/p.rs:1999"));
+    }
+
     /// A liveness finding naming the nodes the world reported silent.
     fn quiet(nodes: &[NodeId]) -> Violation {
         let events: Vec<Event> = nodes
@@ -354,6 +366,19 @@ mod tests {
             events,
         )
         .expect("a finding")
+    }
+
+    /// The same violation fallen at another place is another finding, as `bohr findings` groups
+    /// it.
+    #[test]
+    fn a_violation_at_another_place_is_another_finding() {
+        let at = |place: &str| {
+            violated(&broke("log is monotonic", "src/log.rs:214")).at(Some(place.to_owned()))
+        };
+        assert!(at("raft.go:120").reproduced_by(&at("raft.go:120")));
+        assert!(!at("raft.go:120").reproduced_by(&at("wal.go:88")), "two places read as one");
+        let unplaced = violated(&broke("log is monotonic", "src/log.rs:214"));
+        assert!(!at("raft.go:120").reproduced_by(&unplaced), "a place lost read as kept");
     }
 
     /// The identity is the promise and its location.

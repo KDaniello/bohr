@@ -21,9 +21,6 @@ thiserror.workspace = true
 # whether anything it was supposed to remove is still there.
 toml.workspace = true
 
-[dev-dependencies]
-proptest.workspace = true
-
 [features]
 # Deliberate defects, each breaking determinism at one named site. Off in every build that is
 # not the mutation harness, which asserts the determinism suite goes red for each in turn.

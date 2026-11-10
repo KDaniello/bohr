@@ -5,114 +5,11 @@
 //! they were. A kind whose removal makes the failure go, or turn into another, is necessary; the
 //! finding's grade is the weakest grade among its necessary kinds.
 
+use bohr_findings::ablation::{Ablation, Trial, Without, landed, scheduled_that_fired};
 use bohr_tape::{TAPE_ABI, Tape};
 use bohr_trace::{Bundle, EventKind, FaultGrade, FaultKind, PacketFate, SectionId};
 
 use crate::{CliError, execute, replay};
-
-/// What removing one kind of fault did to the finding.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Without {
-    /// The same failure: the kind was not needed.
-    Same,
-    /// No failure at all: the kind was needed.
-    Clean,
-    /// Another failure: the kind was needed for this one.
-    Other(String),
-}
-
-/// One kind of fault, and what the run did without it.
-#[derive(Clone, Debug)]
-pub(crate) struct Trial {
-    pub(crate) kind: FaultKind,
-    pub(crate) without: Without,
-}
-
-/// What an ablation found.
-#[derive(Clone, Debug)]
-pub(crate) struct Ablation {
-    /// The finding's signature, which every trial is compared against.
-    pub(crate) signature: String,
-    pub(crate) trials: Vec<Trial>,
-    /// Where no single kind was needed and removing every drawn kind at once makes the failure go:
-    /// the kinds of which any one suffices.
-    pub(crate) alternatives: Vec<FaultKind>,
-    /// Kinds that landed and that a scenario wrote down, which an ablation does not remove.
-    pub(crate) scheduled: Vec<FaultKind>,
-}
-
-impl Ablation {
-    /// The kinds the finding needed, every one of them.
-    pub(crate) fn necessary(&self) -> Vec<FaultKind> {
-        self.trials.iter().filter(|t| t.without != Without::Same).map(|t| t.kind).collect()
-    }
-
-    /// The finding's grade among its drawn faults: the weakest of the kinds it needed all of, or,
-    /// where any one of several sufficed, the most real of those.
-    pub(crate) fn grade(&self) -> Option<FaultGrade> {
-        let needed = self.necessary();
-        if needed.is_empty() {
-            self.alternatives.iter().map(|k| k.grade()).min()
-        } else {
-            needed.into_iter().map(FaultKind::grade).max()
-        }
-    }
-}
-
-/// The kinds of fault that landed in a run, in the order they first landed.
-///
-/// A thaw is the end of a freeze and no fault of its own. A datagram dropped, duplicated,
-/// reordered or corrupted by a draw lands as the packet's fate rather than as a fired fault, and
-/// counts as its kind.
-fn landed(events: &[bohr_trace::Event]) -> Vec<FaultKind> {
-    let mut kinds = Vec::new();
-    for event in events {
-        let kind = match event.kind {
-            EventKind::FaultFired { fault, .. } if fault != FaultKind::NodeThaw => Some(fault),
-            EventKind::PacketFate { fate, .. } => match fate {
-                PacketFate::Dropped => Some(FaultKind::NetDrop),
-                PacketFate::Duplicated => Some(FaultKind::NetDuplicate),
-                PacketFate::Reordered => Some(FaultKind::NetReorder),
-                PacketFate::Corrupted => Some(FaultKind::NetCorrupt),
-                PacketFate::Delivered => None,
-            },
-            _ => None,
-        };
-        if let Some(kind) = kind
-            && !kinds.contains(&kind)
-        {
-            kinds.push(kind);
-        }
-    }
-    kinds
-}
-
-/// The kinds a scenario writes down, which land whatever the draws say.
-fn scheduled(config: &toml::Table) -> Vec<FaultKind> {
-    let mut kinds = Vec::new();
-    if config.get("partition").and_then(toml::Value::as_array).is_some_and(|p| !p.is_empty()) {
-        kinds.push(FaultKind::NetPartition);
-    }
-    for fault in config.get("fault").and_then(toml::Value::as_array).into_iter().flatten() {
-        let name = fault.get("kind").and_then(toml::Value::as_str).unwrap_or_default();
-        let kind = match name {
-            "node_kill" => Some(FaultKind::NodeKill),
-            "node_freeze" | "node_thaw" => Some(FaultKind::NodeFreeze),
-            // A plain restart is a recovery, not a fault; only a restore from a snapshot fires one.
-            "node_restart_from_snapshot" => Some(FaultKind::NodeRestart),
-            "clock_step" => Some(FaultKind::ClockStep),
-            "clock_drift" => Some(FaultKind::ClockDrift),
-            "chain_reorg" => Some(FaultKind::ChainReorg),
-            _ => None,
-        };
-        if let Some(kind) = kind
-            && !kinds.contains(&kind)
-        {
-            kinds.push(kind);
-        }
-    }
-    kinds
-}
 
 /// The configuration with `kinds` added to `faults.ablate`.
 fn without(config: &toml::Table, kinds: &[FaultKind]) -> Result<String, CliError> {
@@ -121,14 +18,14 @@ fn without(config: &toml::Table, kinds: &[FaultKind]) -> Result<String, CliError
         .entry("faults")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
-        .ok_or_else(|| CliError::Usage("BOHR-4002: the recorded faults are not a table".into()))?;
+        .ok_or_else(|| CliError::usage("BOHR-4002: the recorded faults are not a table"))?;
     let ablate = faults
         .entry("ablate")
         .or_insert_with(|| toml::Value::Array(Vec::new()))
         .as_array_mut()
-        .ok_or_else(|| CliError::Usage("BOHR-4002: faults.ablate is not a list".into()))?;
+        .ok_or_else(|| CliError::usage("BOHR-4002: faults.ablate is not a list"))?;
     ablate.extend(kinds.iter().map(|kind| toml::Value::String(kind.name().to_owned())));
-    toml::to_string(&config).map_err(|e| CliError::Internal(e.to_string()))
+    toml::to_string(&config).map_err(|e| CliError::internal(e.to_string()))
 }
 
 /// The bundle's run again with `kinds` at nought odds, and what it came to against `signature`.
@@ -142,10 +39,10 @@ fn trial(
     signature: &str,
 ) -> Result<Without, CliError> {
     let text = without(config, kinds)?;
-    let loaded = bohr_world::config::load(&text)?;
+    let loaded = crate::state_dir::load(&text)?;
     let target = replay::target_from(bundle, manifest, Some(&loaded), binaries)?;
     let mut run_config = crate::run_config_for(Some(&loaded), None);
-    run_config.max_events = run_config.max_events.max(manifest.counters.events + 1);
+    run_config.max_events = replay::budget_for(manifest, run_config.max_events);
     let completed = execute::run_with(execute::Execution {
         target: &target,
         tape,
@@ -164,52 +61,90 @@ fn trial(
     let events = completed
         .spooled
         .as_ref()
-        .and_then(|spooled| spooled.events_where(crate::findings::telling).ok())
+        .and_then(|spooled| spooled.events_where(bohr_findings::group::telling).ok())
         .map(|(events, _)| events)
         .unwrap_or_default();
-    let found = crate::findings::signature_of(&completed.report.outcome, &events);
+    let found = bohr_findings::group::finding_key(
+        &completed.report.outcome,
+        &events,
+        &completed.output_tails,
+    );
     Ok(if found == signature { Without::Same } else { Without::Other(found) })
 }
 
 /// Whether an event is one ablation reads: those a signature is read from, and every packet a
 /// draw dropped, duplicated, reordered or corrupted.
 fn ablation_reads(event: &bohr_trace::Event) -> bool {
-    crate::findings::telling(event)
+    bohr_findings::group::telling(event)
         || matches!(event.kind, EventKind::PacketFate { fate, .. } if fate != PacketFate::Delivered)
 }
 
 /// Ablates the finding in `bytes`, looking for moved binaries under `binaries`.
 pub(crate) fn ablation(bytes: &[u8], binaries: Option<&str>) -> Result<Ablation, CliError> {
-    let bundle = Bundle::parse(bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+    let bundle = Bundle::parse(bytes).map_err(|e| CliError::usage(e.to_string()))?;
     ablation_of(&bundle, binaries)
 }
 
 /// Ablates a parsed finding, looking for moved binaries under `binaries`.
 pub(crate) fn ablation_of(bundle: &Bundle, binaries: Option<&str>) -> Result<Ablation, CliError> {
-    let manifest = bundle.manifest().map_err(|e| CliError::Usage(e.to_string()))?;
-    manifest.check_tape_abi(TAPE_ABI).map_err(|e| CliError::Usage(e.to_string()))?;
-    manifest.require_single_execution().map_err(|e| CliError::Usage(e.to_string()))?;
-    replay::verify_binaries(bundle, binaries)?;
+    let manifest = bundle.manifest().map_err(|e| CliError::usage(e.to_string()))?;
+    // A clean run has nothing a fault could be needed for.
+    if matches!(manifest.outcome, bohr_trace::Outcome::Clean) {
+        return Err(CliError::usage(
+            "BOHR-5003: this bundle records nothing going wrong, so there is nothing to ablate"
+                .to_owned(),
+        ));
+    }
+    manifest.check_tape_abi(TAPE_ABI).map_err(|e| CliError::usage(e.to_string()))?;
+    manifest.require_single_execution().map_err(|e| CliError::usage(e.to_string()))?;
+    replay::verify_binaries(bundle, &manifest, binaries)?;
 
     let tape_bytes = bundle
         .section(SectionId::Tape)
-        .ok_or_else(|| CliError::Usage("BOHR-4002: bundle is missing required section 2".into()))?;
-    let tape = Tape::from_container(tape_bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+        .ok_or_else(|| CliError::usage("BOHR-4002: bundle is missing required section 2"))?;
+    let tape = Tape::from_container(tape_bytes).map_err(|e| CliError::usage(e.to_string()))?;
     let events: Vec<bohr_trace::Event> = bundle
-        .section(SectionId::Events)
+        .event_log()
+        .map_err(|e| CliError::usage(e.to_string()))?
         .map(|raw| bohr_trace::read_events_where(raw, ablation_reads).0)
         .unwrap_or_default();
-    let signature = crate::findings::signature_of(&manifest.outcome, &events);
+    let tails = bundle.output_tails().map_err(|e| CliError::usage(e.to_string()))?;
+    let signature = bohr_findings::group::finding_key(&manifest.outcome, &events, &tails);
 
-    let config_text =
-        String::from_utf8_lossy(bundle.section(SectionId::Config).unwrap_or_default());
+    let config_text = bundle
+        .config_text()
+        .map_err(|e| CliError::usage(format!("BOHR-4002: config section: {e}")))?;
     let config: toml::Table = config_text
         .parse()
-        .map_err(|e| CliError::Usage(format!("BOHR-4002: the recorded configuration: {e}")))?;
-    let scheduled = scheduled(&config);
+        .map_err(|e| CliError::usage(format!("BOHR-4002: the recorded configuration: {e}")))?;
+    // The same checks a replay makes: a run under another model, oracle or state would differ in
+    // every trial, and every fault would read as needed.
+    let loaded = if config_text.trim().is_empty() {
+        None
+    } else {
+        Some(crate::state_dir::load(config_text)?)
+    };
+    replay::verify_state(&manifest, loaded.as_ref())?;
+    let (world, oracle) = crate::identities(loaded.as_ref());
+    manifest.check_provenance(&world, &oracle).map_err(|e| CliError::usage(e.to_string()))?;
+    // A control with nothing suppressed must fail as the bundle did; one that does not is a run
+    // this build does not reproduce, and no trial against it could tell what it needed.
+    let control = trial(bundle, &manifest, &tape, &config, &[], binaries, &signature)?;
+    if control != Without::Same {
+        return Err(CliError::internal(format!(
+            "BOHR-2011: the finding did not run to itself under this build, so what it needed \
+             cannot be told: run again with nothing suppressed it came to {}",
+            match control {
+                Without::Clean => "a clean run".to_owned(),
+                Without::Other(other) => other,
+                Without::Same => String::new(),
+            }
+        )));
+    }
+    let fired = landed(&events);
+    let scheduled = scheduled_that_fired(loaded.as_ref(), &fired);
 
-    let drawn: Vec<FaultKind> =
-        landed(&events).into_iter().filter(|k| !scheduled.contains(k)).collect();
+    let drawn: Vec<FaultKind> = fired.into_iter().filter(|k| !scheduled.contains(k)).collect();
     let mut trials = Vec::new();
     for kind in &drawn {
         let without = trial(bundle, &manifest, &tape, &config, &[*kind], binaries, &signature)?;
@@ -229,7 +164,7 @@ pub(crate) fn ablation_of(bundle: &Bundle, binaries: Option<&str>) -> Result<Abl
 /// `bohr ablate <bundle>`: prints which faults the finding needed and its grade.
 pub(crate) fn ablate(path: &str, binaries: Option<&str>) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
     let ablation = ablation(&bytes, binaries)?;
     let necessary = ablation.necessary();
     if crate::json::on() {

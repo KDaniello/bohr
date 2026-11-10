@@ -23,6 +23,17 @@ pub(crate) enum Due {
         /// Which of the task's waits armed it.
         seq: u64,
     },
+    /// A socket's `SO_RCVTIMEO` or `SO_SNDTIMEO` ran out on a waiting call.
+    SocketTimeout {
+        /// The node the socket is on.
+        node: NodeId,
+        /// The socket's identity.
+        socket: i64,
+        /// The task that waited.
+        task: TaskId,
+        /// When it parked, so a timer its wait outlived fires into nothing.
+        since: Tick,
+    },
     /// A bounded `epoll_wait` ran out with nothing to report.
     PollTimeout {
         /// The node whose readiness set holds the wait.

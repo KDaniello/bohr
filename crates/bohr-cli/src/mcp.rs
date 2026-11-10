@@ -47,7 +47,7 @@ pub(crate) fn serve() -> Result<u8, CliError> {
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let mut answering = Vec::new();
     for line in std::io::stdin().lock().lines() {
-        let line = line.map_err(|e| CliError::Internal(format!("reading a request: {e}")))?;
+        let line = line.map_err(|e| CliError::internal(format!("reading a request: {e}")))?;
         if line.trim().is_empty() {
             continue;
         }

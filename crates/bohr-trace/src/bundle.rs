@@ -28,10 +28,16 @@ const COMPRESS_THRESHOLD: usize = 512;
 /// Compression level, fixed so every build writes the same bytes.
 pub(crate) const COMPRESS_LEVEL: i32 = 3;
 
-/// The largest a section may unpack to.
+/// The most every section but the event log may unpack to, together.
 ///
-/// Sections are hashed in memory. Far above any real section; it bounds hostile files.
+/// Sections are hashed in memory. Far above any real bundle; it bounds hostile files, which could
+/// otherwise claim a gigabyte in each of thousands of sections.
 const MAX_SECTION_BYTES: u64 = 1 << 30;
+
+/// The most sections a bundle may carry: every section this format names, and room for a later
+/// format's. A reader adds a note to a bundle it read, so the count never reaches what the
+/// header can hold.
+const MAX_SECTIONS: usize = 1 << 10;
 
 /// The largest the event log may unpack to.
 ///
@@ -218,6 +224,100 @@ pub enum Outcome {
     StoppedOnRequest(String),
 }
 
+/// Which way a run ended, without what it said: the variant of an [`Outcome`].
+///
+/// What a group of findings, a verdict and a reduction tell runs apart by, so none of them reads
+/// it back out of the outcome's debug text.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum OutcomeKind {
+    /// See [`Outcome::Clean`].
+    Clean,
+    /// See [`Outcome::PropertyViolated`].
+    PropertyViolated,
+    /// See [`Outcome::GuestCrashed`].
+    GuestCrashed,
+    /// See [`Outcome::GuestHung`].
+    GuestHung,
+    /// See [`Outcome::LivenessViolated`].
+    LivenessViolated,
+    /// See [`Outcome::DurabilityViolated`].
+    DurabilityViolated,
+    /// See [`Outcome::ProbeViolated`].
+    ProbeViolated,
+    /// See [`Outcome::UnsupportedSyscall`].
+    UnsupportedSyscall,
+    /// See [`Outcome::ImplementationsDisagreed`].
+    ImplementationsDisagreed,
+    /// See [`Outcome::InternalError`].
+    InternalError,
+    /// See [`Outcome::StoppedOnRequest`].
+    StoppedOnRequest,
+}
+
+impl OutcomeKind {
+    /// The kind's name, as reports and facts print it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Clean => "Clean",
+            Self::PropertyViolated => "PropertyViolated",
+            Self::GuestCrashed => "GuestCrashed",
+            Self::GuestHung => "GuestHung",
+            Self::LivenessViolated => "LivenessViolated",
+            Self::DurabilityViolated => "DurabilityViolated",
+            Self::ProbeViolated => "ProbeViolated",
+            Self::UnsupportedSyscall => "UnsupportedSyscall",
+            Self::ImplementationsDisagreed => "ImplementationsDisagreed",
+            Self::InternalError => "InternalError",
+            Self::StoppedOnRequest => "StoppedOnRequest",
+        }
+    }
+}
+
+impl Outcome {
+    /// Which way the run ended.
+    #[must_use]
+    pub const fn kind(&self) -> OutcomeKind {
+        match self {
+            Self::Clean => OutcomeKind::Clean,
+            Self::PropertyViolated(_) => OutcomeKind::PropertyViolated,
+            Self::GuestCrashed(_) => OutcomeKind::GuestCrashed,
+            Self::GuestHung(_) => OutcomeKind::GuestHung,
+            Self::LivenessViolated(_) => OutcomeKind::LivenessViolated,
+            Self::DurabilityViolated(_) => OutcomeKind::DurabilityViolated,
+            Self::ProbeViolated(_) => OutcomeKind::ProbeViolated,
+            Self::UnsupportedSyscall(_) => OutcomeKind::UnsupportedSyscall,
+            Self::ImplementationsDisagreed(_) => OutcomeKind::ImplementationsDisagreed,
+            Self::InternalError(_) => OutcomeKind::InternalError,
+            Self::StoppedOnRequest(_) => OutcomeKind::StoppedOnRequest,
+        }
+    }
+
+    /// What the run said about it; empty for a clean run.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Clean => "",
+            Self::PropertyViolated(detail)
+            | Self::GuestCrashed(detail)
+            | Self::GuestHung(detail)
+            | Self::LivenessViolated(detail)
+            | Self::DurabilityViolated(detail)
+            | Self::ProbeViolated(detail)
+            | Self::UnsupportedSyscall(detail)
+            | Self::ImplementationsDisagreed(detail)
+            | Self::InternalError(detail)
+            | Self::StoppedOnRequest(detail) => detail,
+        }
+    }
+
+    /// The code the detail opens with, where it opens with one.
+    #[must_use]
+    pub fn code(&self) -> Option<bohr_types::Code> {
+        bohr_types::Code::leading(self.detail()).map(|(code, _)| code)
+    }
+}
+
 /// Which components produced a run.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Provenance {
@@ -310,6 +410,10 @@ pub struct Manifest {
     /// Checked before a replay, like the binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_digest: Option<String>,
+    /// The event budget the run had, which a replay runs under, so a run the budget ended ends at
+    /// the same event again. Absent from a bundle written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_events: Option<u64>,
 }
 
 impl Manifest {
@@ -378,6 +482,36 @@ pub struct HostProfile {
     pub traps_rdrand: bool,
 }
 
+/// What an object was to the run, written in lowercase.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BinaryRole {
+    /// A program the scenario runs: what is under test.
+    Executable,
+    /// The probe that asks the nodes, which belongs to the bench.
+    Probe,
+    /// A guest built into bohr, which has no file.
+    Builtin,
+}
+
+impl BinaryRole {
+    /// The word the bundle writes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Executable => "executable",
+            Self::Probe => "probe",
+            Self::Builtin => "builtin",
+        }
+    }
+
+    /// Whether the object is a program under test, which the probe is not.
+    #[must_use]
+    pub const fn under_test(self) -> bool {
+        matches!(self, Self::Executable | Self::Builtin)
+    }
+}
+
 /// One object the guest ran, and the fingerprint a replay checks it against (`docs/API.md` §4.5).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct BinaryRecord {
@@ -385,8 +519,8 @@ pub struct BinaryRecord {
     pub path: String,
     /// `blake3` of its bytes.
     pub blake3: String,
-    /// What it was to the run: the program, its loader, or a library it mapped.
-    pub role: String,
+    /// What it was to the run.
+    pub role: BinaryRole,
     /// The arguments after the program's own name, where it was given any.
     ///
     /// Arguments sit on the initial stack, so a replay passes the same ones. Absent means none.
@@ -443,6 +577,17 @@ pub struct BundleWriter {
     sections: BTreeMap<u32, Vec<u8>>,
     /// Sections already compressed into a file, copied into the bundle as they are.
     spooled: BTreeMap<u32, SpoolEntry>,
+    /// Sections carried over from a bundle that was read, written as they were stored.
+    packed: BTreeMap<u32, Packed>,
+}
+
+/// A section as a bundle stores it: its encoding, its stored bytes, and what they unpack to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Packed {
+    flags: u32,
+    bytes: Vec<u8>,
+    original: u64,
+    hash: Digest,
 }
 
 /// Where a spooled section is and what its table entry says.
@@ -499,9 +644,7 @@ impl BundleWriter {
 
     /// Adds or replaces a section.
     pub fn section(&mut self, id: SectionId, bytes: Vec<u8>) -> &mut Self {
-        self.spooled.remove(&(id as u32));
-        self.sections.insert(id as u32, bytes);
-        self
+        self.raw_section(id as u32, bytes)
     }
 
     /// Adds or replaces a section from a finished spool, copied from its file when written.
@@ -509,6 +652,7 @@ impl BundleWriter {
     /// The spool must outlive the writing: its file goes when it is dropped.
     pub fn spooled_section(&mut self, id: SectionId, spooled: &crate::Spooled) -> &mut Self {
         self.sections.remove(&(id as u32));
+        self.packed.remove(&(id as u32));
         self.spooled.insert(
             id as u32,
             SpoolEntry {
@@ -524,11 +668,15 @@ impl BundleWriter {
     /// Takes a section out, where it is present.
     pub fn remove(&mut self, id: SectionId) -> &mut Self {
         self.sections.remove(&(id as u32));
+        self.spooled.remove(&(id as u32));
+        self.packed.remove(&(id as u32));
         self
     }
 
     /// Adds or replaces a section by raw number, preserving sections this build does not know.
     pub fn raw_section(&mut self, id: u32, bytes: Vec<u8>) -> &mut Self {
+        self.spooled.remove(&id);
+        self.packed.remove(&id);
         self.sections.insert(id, bytes);
         self
     }
@@ -558,7 +706,13 @@ impl BundleWriter {
     ///
     /// Panics on more sections than the header's count can hold.
     pub fn write_to(&self, out: &mut impl std::io::Write, run_id: [u8; 16]) -> std::io::Result<()> {
-        let mut ids: Vec<u32> = self.sections.keys().chain(self.spooled.keys()).copied().collect();
+        let mut ids: Vec<u32> = self
+            .sections
+            .keys()
+            .chain(self.spooled.keys())
+            .chain(self.packed.keys())
+            .copied()
+            .collect();
         ids.sort_unstable();
         let count = ids.len();
         assert!(
@@ -578,6 +732,15 @@ impl BundleWriter {
         let payloads: Vec<(u32, Payload<'_>)> = ids
             .iter()
             .map(|id| {
+                if let Some(packed) = self.packed.get(id) {
+                    let payload = Payload::Memory {
+                        flags: packed.flags,
+                        bytes: Cow::Borrowed(packed.bytes.as_slice()),
+                        original: packed.original,
+                        hash: packed.hash,
+                    };
+                    return (*id, payload);
+                }
                 let payload = match (self.sections.get(id), self.spooled.get(id)) {
                     (Some(bytes), _) => {
                         // Compressed only above the threshold and only if it shrinks; borrowed
@@ -594,7 +757,7 @@ impl BundleWriter {
                         }
                     }
                     (None, Some(entry)) => Payload::File(entry),
-                    (None, None) => unreachable!("every id came from one of the two maps"),
+                    (None, None) => unreachable!("every id came from one of the three maps"),
                 };
                 (*id, payload)
             })
@@ -639,10 +802,86 @@ pub struct Bundle {
     /// Layout version recorded in the header.
     pub format: u16,
     sections: BTreeMap<u32, Vec<u8>>,
+    /// The event log, as stored, until it is read.
+    events: Option<EventLog>,
+}
+
+/// The event log as the bundle stores it, unpacked and checked against its hash on first read.
+///
+/// The one section that may run to gigabytes, and one most readers never read: a replay reads it
+/// only to name where a run diverged, and a note carries it over as it was stored.
+#[derive(Clone, Debug)]
+struct EventLog {
+    stored: Packed,
+    unpacked: std::sync::OnceLock<Unpacked>,
+}
+
+/// What reading the event log came to.
+#[derive(Clone, Debug)]
+enum Unpacked {
+    /// Unpacked, and its hash is the recorded one.
+    Read(Vec<u8>),
+    /// Stored as is, and its hash is the recorded one.
+    AsStored,
+    /// It does not unpack, for this reason.
+    Unreadable(String),
+    /// It unpacks to bytes of this other hash.
+    Mismatch(Digest),
+}
+
+impl PartialEq for EventLog {
+    /// Two logs are the same when they were stored the same; whether either was read is not part
+    /// of what it is.
+    fn eq(&self, other: &Self) -> bool {
+        self.stored == other.stored
+    }
+}
+
+impl Eq for EventLog {}
+
+impl EventLog {
+    /// The log's bytes, unpacked and checked the first time they are asked for.
+    fn read(&self) -> Result<&[u8], TraceError> {
+        let id = SectionId::Events as u32;
+        let stored = &self.stored;
+        let unpacked = self.unpacked.get_or_init(|| {
+            let (payload, as_stored) = if stored.flags & SECTION_FLAG_ZSTD == 0 {
+                (Cow::Borrowed(stored.bytes.as_slice()), true)
+            } else {
+                match decompress(&stored.bytes, stored.original, MAX_EVENTS_BYTES) {
+                    Ok(payload) => (Cow::Owned(payload), false),
+                    Err(reason) => return Unpacked::Unreadable(reason),
+                }
+            };
+            let computed = Digest::of(&payload);
+            if computed != stored.hash {
+                Unpacked::Mismatch(computed)
+            } else if as_stored {
+                Unpacked::AsStored
+            } else {
+                Unpacked::Read(payload.into_owned())
+            }
+        });
+        match unpacked {
+            Unpacked::Read(payload) => Ok(payload),
+            Unpacked::AsStored => Ok(&stored.bytes),
+            Unpacked::Unreadable(reason) => {
+                Err(TraceError::SectionUnreadable { id, reason: reason.clone() })
+            }
+            Unpacked::Mismatch(computed) => Err(TraceError::SectionHashMismatch {
+                id,
+                expected: stored.hash,
+                computed: *computed,
+            }),
+        }
+    }
 }
 
 impl Bundle {
-    /// Parses a container, verifying every section against its recorded hash.
+    /// Parses a container, verifying every section but the event log against its recorded hash.
+    ///
+    /// The event log's place in the file is checked here and its bytes when first read
+    /// ([`Bundle::event_log`]), so a reader that never reads it never unpacks it.
     pub fn parse(bytes: &[u8]) -> Result<Self, TraceError> {
         if bytes.len() < BUNDLE_HEADER_BYTES {
             return Err(TraceError::BundleTruncated { offset: 0 });
@@ -662,6 +901,12 @@ impl Bundle {
             return Err(TraceError::BundleTruncated { offset: 12 });
         }
         let count = u16::from_le_bytes([bytes[10], bytes[11]]) as usize;
+        if count > MAX_SECTIONS {
+            return Err(TraceError::SectionUnreadable {
+                id: 0,
+                reason: format!("{count} sections, past the {MAX_SECTIONS} a bundle may carry"),
+            });
+        }
         let mut run_id = [0u8; 16];
         run_id.copy_from_slice(&bytes[16..32]);
 
@@ -670,7 +915,29 @@ impl Bundle {
             return Err(TraceError::BundleTruncated { offset: bytes.len() as u64 });
         }
 
+        // What the sections other than the event log claim together, refused before any of them is
+        // unpacked.
+        let mut claimed: u64 = 0;
+        for i in 0..count {
+            let e = &bytes[BUNDLE_HEADER_BYTES + i * SECTION_ENTRY_BYTES..][..SECTION_ENTRY_BYTES];
+            let id = u32::from_le_bytes(e[0..4].try_into().unwrap_or_default());
+            let original = u64::from_le_bytes(e[24..32].try_into().unwrap_or_default());
+            if id != SectionId::Events as u32 {
+                claimed = claimed.saturating_add(original);
+            }
+        }
+        if claimed > MAX_SECTION_BYTES {
+            return Err(TraceError::SectionUnreadable {
+                id: 0,
+                reason: format!(
+                    "the sections claim {claimed} bytes, past the {MAX_SECTION_BYTES} a reader \
+                     holds for them together"
+                ),
+            });
+        }
+
         let mut sections = BTreeMap::new();
+        let mut events = None;
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(count);
         for i in 0..count {
             let e = &bytes[BUNDLE_HEADER_BYTES + i * SECTION_ENTRY_BYTES..][..SECTION_ENTRY_BYTES];
@@ -695,18 +962,31 @@ impl Bundle {
                 .ok_or(TraceError::BundleTruncated { offset })?;
 
             let raw = &bytes[start..end];
+            if flags & SECTION_FLAG_ZSTD == 0 && stored != original {
+                return Err(TraceError::BundleTruncated { offset });
+            }
+            if id == SectionId::Events as u32 {
+                if original > MAX_EVENTS_BYTES {
+                    return Err(TraceError::SectionUnreadable {
+                        id,
+                        reason: format!(
+                            "the event log claims {original} bytes, past the {MAX_EVENTS_BYTES} \
+                             a reader holds"
+                        ),
+                    });
+                }
+                let stored = Packed { flags, bytes: raw.to_vec(), original, hash: expected };
+                let log = EventLog { stored, unpacked: std::sync::OnceLock::new() };
+                if events.replace(log).is_some() {
+                    return Err(TraceError::DuplicateSection { id });
+                }
+                spans.push((start, end));
+                continue;
+            }
             let payload = if flags & SECTION_FLAG_ZSTD != 0 {
-                let bound = if id == SectionId::Events as u32 {
-                    MAX_EVENTS_BYTES
-                } else {
-                    MAX_SECTION_BYTES
-                };
-                decompress(raw, original, bound)
+                decompress(raw, original, MAX_SECTION_BYTES)
                     .map_err(|reason| TraceError::SectionUnreadable { id, reason })?
             } else {
-                if stored != original {
-                    return Err(TraceError::BundleTruncated { offset });
-                }
                 raw.to_vec()
             };
             let computed = Digest::of(&payload);
@@ -733,7 +1013,7 @@ impl Bundle {
             return Err(TraceError::BundleTruncated { offset: reach as u64 });
         }
 
-        Ok(Self { run_id, format, sections })
+        Ok(Self { run_id, format, sections, events })
     }
 
     /// The one execution this bundle holds, refusing a bundle that holds several.
@@ -761,6 +1041,9 @@ impl Bundle {
     }
 
     /// A section, if present.
+    ///
+    /// The event log is here only once it reads to its recorded hash; [`Bundle::event_log`] says
+    /// why one does not, and is how a reader of the log reads it.
     #[must_use]
     pub fn section(&self, id: SectionId) -> Option<&[u8]> {
         self.raw_section(id as u32)
@@ -769,12 +1052,81 @@ impl Bundle {
     /// A section by raw number, including one this build does not understand.
     #[must_use]
     pub fn raw_section(&self, id: u32) -> Option<&[u8]> {
+        if id == SectionId::Events as u32 {
+            return self.event_log().ok().flatten();
+        }
         self.sections.get(&id).map(Vec::as_slice)
+    }
+
+    /// The event log, unpacked and checked against its recorded hash on the first call.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a log that does not unpack, or that unpacks to other bytes than the table recorded.
+    pub fn event_log(&self) -> Result<Option<&[u8]>, TraceError> {
+        self.events.as_ref().map(EventLog::read).transpose()
     }
 
     /// Every section number present, ascending.
     pub fn section_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.sections.keys().copied()
+        let events = self.events.as_ref().map(|_| SectionId::Events as u32);
+        let mut ids: Vec<u32> = self.sections.keys().copied().chain(events).collect();
+        ids.sort_unstable();
+        ids.into_iter()
+    }
+
+    /// The objects the run started, as `BINARIES` records them; none where the section is absent.
+    ///
+    /// # Errors
+    ///
+    /// The section is not the list a writer writes.
+    pub fn binaries(&self) -> Result<Vec<BinaryRecord>, TraceError> {
+        self.json(SectionId::Binaries)
+    }
+
+    /// The scenario the run was made under, as the text it was written in; empty where there was
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// The section is not UTF-8.
+    pub fn config_text(&self) -> Result<&str, TraceError> {
+        self.section(SectionId::Config).map_or(Ok(""), |raw| {
+            std::str::from_utf8(raw)
+                .map_err(|e| TraceError::Decode(format!("the configuration is not text: {e}")))
+        })
+    }
+
+    /// What each node printed last; none where the run kept none.
+    ///
+    /// # Errors
+    ///
+    /// The section is not the list a writer writes.
+    pub fn output_tails(&self) -> Result<Vec<crate::OutputTail>, TraceError> {
+        self.json(SectionId::GuestOutput)
+    }
+
+    /// The host as the guest was shown it, where the bundle records one.
+    ///
+    /// # Errors
+    ///
+    /// The section is not the profile a writer writes.
+    pub fn host_profile(&self) -> Result<Option<HostProfile>, TraceError> {
+        self.json(SectionId::HostProfile)
+    }
+
+    /// A JSON section, decoded; the type's default where the section is absent.
+    fn json<T: serde::de::DeserializeOwned + Default>(
+        &self,
+        id: SectionId,
+    ) -> Result<T, TraceError> {
+        self.section(id).map_or_else(
+            || Ok(T::default()),
+            |raw| {
+                serde_json::from_slice(raw)
+                    .map_err(|e| TraceError::Decode(format!("section {}: {e}", id as u32)))
+            },
+        )
     }
 
     /// Parses the manifest.
@@ -787,12 +1139,16 @@ impl Bundle {
 
     /// Rebuilds a writer holding every section, including unrecognised ones.
     ///
-    /// Unknown sections are kept, so an older tool never loses data.
+    /// Unknown sections are kept, so an older tool never loses data. The event log is carried as it
+    /// was stored, neither unpacked nor packed again, and with the hash it was stored under.
     #[must_use]
     pub fn to_writer(&self) -> BundleWriter {
         let mut w = BundleWriter::new();
         for (id, bytes) in &self.sections {
             w.raw_section(*id, bytes.clone());
+        }
+        if let Some(log) = &self.events {
+            w.packed.insert(SectionId::Events as u32, log.stored.clone());
         }
         w
     }
@@ -806,11 +1162,14 @@ pub struct SingleExecution<'a> {
     bundle: &'a Bundle,
 }
 
-impl SingleExecution<'_> {
-    /// The framed event log.
-    #[must_use]
-    pub fn events(&self) -> Option<&[u8]> {
-        self.bundle.section(SectionId::Events)
+impl<'a> SingleExecution<'a> {
+    /// The framed event log, where the bundle holds one.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a log that does not read to its recorded hash ([`Bundle::event_log`]).
+    pub fn events(&self) -> Result<Option<&'a [u8]>, TraceError> {
+        self.bundle.event_log()
     }
 
     /// What the guest wrote about itself.
@@ -877,7 +1236,11 @@ impl Group<'_> {
     }
 
     fn streams(&self, id: SectionId) -> Result<Vec<Vec<u8>>, TraceError> {
-        let Some(raw) = self.bundle.section(id) else {
+        let raw = match id {
+            SectionId::Events => self.bundle.event_log()?,
+            _ => self.bundle.section(id),
+        };
+        let Some(raw) = raw else {
             return Ok(Vec::new());
         };
         // A single execution is unframed.
@@ -897,6 +1260,8 @@ pub struct ManifestInputs {
     pub reduced_from: Option<String>,
     /// The prepared filesystem the run began from, where it began from one.
     pub state_digest: Option<String>,
+    /// The run's event budget, which a replay runs under.
+    pub max_events: Option<u64>,
     /// Seed the run was derived from.
     pub seed: Seed,
     /// Digest of the canonical event stream.
@@ -927,7 +1292,7 @@ pub fn manifest_for(inputs: ManifestInputs) -> Manifest {
     let level = if inputs.degraded_reasons.is_empty() { "full" } else { "degraded" };
     Manifest {
         bundle_format: BUNDLE_FORMAT,
-        tape_abi: bohr_tape_abi(),
+        tape_abi: bohr_types::TAPE_ABI,
         sdk_schema: SDK_SCHEMA,
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: hex16(&inputs.run_id),
@@ -946,6 +1311,7 @@ pub fn manifest_for(inputs: ManifestInputs) -> Manifest {
         executions: 1,
         reduced_from: inputs.reduced_from,
         state_digest: inputs.state_digest,
+        max_events: inputs.max_events,
     }
 }
 
@@ -993,13 +1359,6 @@ fn format_rfc3339(seconds: u64) -> String {
     )
 }
 
-/// The draw ABI this build records.
-///
-/// Duplicated from `bohr-tape`; `scripts/lint-rules.sh` checks they match.
-const fn bohr_tape_abi() -> u16 {
-    2
-}
-
 fn hex16(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for b in bytes {
@@ -1013,6 +1372,44 @@ fn hex16(bytes: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
+    /// A header that counts more sections than a bundle may carry is refused before any is read.
+    #[test]
+    fn a_bundle_of_too_many_sections_is_refused() {
+        let mut bytes = BUNDLE_MAGIC.to_vec();
+        bytes.extend_from_slice(&BUNDLE_FORMAT.to_le_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.resize(BUNDLE_HEADER_BYTES + usize::from(u16::MAX) * SECTION_ENTRY_BYTES, 0);
+        let refused = Bundle::parse(&bytes);
+        assert!(
+            matches!(&refused, Err(TraceError::SectionUnreadable { reason, .. }) if reason.contains("sections")),
+            "{refused:?}"
+        );
+    }
+
+    /// Sections other than the event log are bounded together, and refused before any is unpacked:
+    /// two that each claim 600 MiB are refused though either alone is under the bound.
+    #[test]
+    fn the_sections_are_bounded_together() {
+        let mut bytes = BUNDLE_MAGIC.to_vec();
+        bytes.extend_from_slice(&BUNDLE_FORMAT.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        for id in [100u32, 101] {
+            let mut entry = vec![0u8; SECTION_ENTRY_BYTES];
+            entry[0..4].copy_from_slice(&id.to_le_bytes());
+            entry[24..32].copy_from_slice(&(600u64 << 20).to_le_bytes());
+            bytes.extend_from_slice(&entry);
+        }
+        let refused = Bundle::parse(&bytes);
+        assert!(
+            matches!(&refused, Err(TraceError::SectionUnreadable { reason, .. }) if reason.contains("together")),
+            "{refused:?}"
+        );
+    }
+
     fn provenance() -> Provenance {
         Provenance {
             world_model: WorldModelId::new("distributed", 1),
@@ -1025,6 +1422,7 @@ mod tests {
         let digest = Digest::of(b"trace");
         let run_id = derive_run_id(Seed(7), digest);
         let manifest = manifest_for(ManifestInputs {
+            max_events: None,
             reduced_from: None,
             state_digest: None,
             seed: Seed(7),
@@ -1110,6 +1508,46 @@ mod tests {
         assert_ne!(derive_run_id(Seed(7), Digest::of(b"other")), derive_run_id(Seed(7), d));
     }
 
+    /// A role is written as the lowercase word bundles have always carried, and read back.
+    #[test]
+    fn a_role_keeps_its_word_on_the_wire() {
+        for (role, word) in [
+            (BinaryRole::Executable, "executable"),
+            (BinaryRole::Probe, "probe"),
+            (BinaryRole::Builtin, "builtin"),
+        ] {
+            let text = serde_json::to_string(&role).expect("serialises");
+            assert_eq!(text, format!("\"{word}\""));
+            assert_eq!(role.as_str(), word);
+            assert_eq!(serde_json::from_str::<BinaryRole>(&text).expect("reads back"), role);
+        }
+        assert!(serde_json::from_str::<BinaryRole>("\"library\"").is_err(), "no role is guessed");
+        assert!(!BinaryRole::Probe.under_test());
+    }
+
+    /// A section the bundle lacks reads as none; one that does not decode is refused, never read as
+    /// none.
+    #[test]
+    fn a_section_reads_as_written_as_absent_or_not_at_all() {
+        let empty = Bundle::parse(&BundleWriter::new().finish([0; 16])).expect("a bundle");
+        assert_eq!(empty.binaries().expect("absent"), Vec::new());
+        assert_eq!(empty.config_text().expect("absent"), "");
+        assert_eq!(empty.output_tails().expect("absent"), Vec::new());
+        assert_eq!(empty.host_profile().expect("absent"), None);
+
+        let mut writer = BundleWriter::new();
+        writer.section(SectionId::Binaries, b"[{\"path\": 3}]".to_vec());
+        writer.section(SectionId::Config, vec![0xff, 0xfe]);
+        writer.section(SectionId::GuestOutput, b"not json".to_vec());
+        writer.section(SectionId::HostProfile, b"[]".to_vec());
+        let broken = Bundle::parse(&writer.finish([0; 16])).expect("a bundle");
+        assert!(broken.binaries().is_err());
+        assert!(broken.config_text().is_err());
+        assert!(broken.output_tails().is_err());
+        assert!(broken.host_profile().is_err());
+    }
+
+    /// Damage anywhere is named: in the event log when the log is read, elsewhere at parse.
     #[test]
     fn damage_to_any_section_is_named_not_ignored() {
         let bytes = sample_bundle();
@@ -1117,14 +1555,45 @@ mod tests {
         for i in table_end..bytes.len() {
             let mut damaged = bytes.clone();
             damaged[i] ^= 0x01;
+            let read = Bundle::parse(&damaged).and_then(|b| b.event_log().map(|_| ()));
             // The hash or the encoding catches it; both name the section.
-            match Bundle::parse(&damaged) {
+            match read {
                 Err(
                     TraceError::SectionHashMismatch { .. } | TraceError::SectionUnreadable { .. },
                 ) => {}
                 other => panic!("damage at {i} produced {other:?}"),
             }
         }
+    }
+
+    /// A damaged event log leaves the rest of the bundle readable, and is refused when it is read,
+    /// never read as absent or as other events.
+    #[test]
+    fn a_damaged_event_log_is_named_when_it_is_read() {
+        let mut writer = BundleWriter::new();
+        writer.section(SectionId::Manifest, b"{}".to_vec());
+        writer.section(SectionId::Events, vec![7; 64 << 10]);
+        let mut bytes = writer.finish([0; 16]);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+
+        let bundle = Bundle::parse(&bytes).expect("the rest is readable");
+        assert_eq!(bundle.section(SectionId::Manifest), Some(&b"{}"[..]));
+        assert!(bundle.event_log().is_err(), "a damaged log was read");
+        assert!(bundle.event_log().is_err(), "and refused again on the second read");
+        assert_eq!(bundle.section(SectionId::Events), None);
+        assert_eq!(bundle.section_ids().collect::<Vec<_>>(), vec![1, SectionId::Events as u32]);
+    }
+
+    /// A log carried into another bundle is written as it was stored, and reads the same there.
+    #[test]
+    fn a_carried_event_log_reads_the_same() {
+        let mut writer = BundleWriter::new();
+        writer.section(SectionId::Events, (0..=255u8).cycle().take(64 << 10).collect());
+        let bundle = Bundle::parse(&writer.finish([0; 16])).expect("a bundle");
+        let carried = Bundle::parse(&bundle.to_writer().finish([0; 16])).expect("carried");
+        assert_eq!(carried, bundle);
+        assert_eq!(carried.event_log().expect("readable"), bundle.event_log().expect("readable"));
     }
 
     #[test]
@@ -1262,6 +1731,7 @@ mod tests {
     #[test]
     fn a_foreign_tape_abi_is_refused_not_reinterpreted() {
         let mut manifest = manifest_for(ManifestInputs {
+            max_events: None,
             reduced_from: None,
             state_digest: None,
             seed: Seed(1),
@@ -1282,7 +1752,7 @@ mod tests {
         assert!(manifest.check_tape_abi(manifest.tape_abi).is_ok());
         manifest.tape_abi += 1;
         assert!(matches!(
-            manifest.check_tape_abi(bohr_tape_abi()),
+            manifest.check_tape_abi(bohr_types::TAPE_ABI),
             Err(TraceError::TapeAbiMismatch { .. })
         ));
     }

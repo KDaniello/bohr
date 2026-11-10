@@ -72,6 +72,10 @@ pub(crate) mod sys {
     pub(crate) const SCHED_YIELD: u32 = 24;
     /// `prctl`.
     pub(crate) const PRCTL: u32 = 157;
+    /// `rseq`, refused as a kernel without it refuses it.
+    pub(crate) const RSEQ: u32 = 334;
+    /// `getcpu`.
+    pub(crate) const GETCPU: u32 = 309;
     /// `poll`.
     pub(crate) const POLL: u32 = 7;
     /// `fadvise64`.
@@ -184,6 +188,8 @@ pub(crate) mod sys {
     pub(crate) const MUNMAP: u32 = 11;
     /// `msync`.
     pub(crate) const MSYNC: u32 = 26;
+    /// `madvise`, which reaches here only with `MADV_FREE`.
+    pub(crate) const MADVISE: u32 = 28;
 }
 
 /// Errors returned to the guest, spelled out so this crate needs no libc.
@@ -255,4 +261,8 @@ pub(crate) mod errno {
     pub(crate) const EDEADLK: i64 = 35;
     /// A directory still holds entries.
     pub(crate) const ENOTEMPTY: i64 = 39;
+    /// A message larger than the socket can ever carry in one piece.
+    pub(crate) const EMSGSIZE: i64 = 90;
+    /// A socket option nobody set and the model does not know.
+    pub(crate) const ENOPROTOOPT: i64 = 92;
 }

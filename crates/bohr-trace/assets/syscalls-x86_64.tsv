@@ -22,134 +22,139 @@
 # The classification follows each call's declared prototype rather than what a particular guest
 # passes, so it is a fact about Linux and not about a target. A number absent from this table is
 # hashed by all six registers, which is stricter than necessary and never wrong.
+#
+# The fourth column is what the filter does with the call: `trace` stops the guest and hands the
+# call to the world, `admit` lets it through to the host. A call the world answers is one the filter
+# traces, which a test of the world holds it to.
 
-0	read	sps
-1	write	sps
-2	open	pss
-3	close	s
-5	fstat	sp
-7	poll	pss
-8	lseek	sss
-9	mmap	psssss
-10	mprotect	pss
-11	munmap	ps
-12	brk	p
-13	rt_sigaction	spps
-14	rt_sigprocmask	spps
-15	rt_sigreturn	-
-16	ioctl	ssp
-17	pread64	spss
-18	pwrite64	spss
-20	writev	sps
-21	access	ps
-24	sched_yield	-
-25	mremap	psssp
-26	msync	pss
-28	madvise	pss
-32	dup	s
-33	dup2	ss
-35	nanosleep	pp
-39	getpid	-
-41	socket	sss
-42	connect	sps
-43	accept	spp
-44	sendto	spssps
-45	recvfrom	spsspp
-46	sendmsg	sps
-47	recvmsg	sps
-48	shutdown	ss
-49	bind	sps
-50	listen	ss
-51	getsockname	spp
-52	getpeername	spp
-53	socketpair	sssp
-54	setsockopt	sssps
-55	getsockopt	ssspp
-56	clone	sppps
-57	fork	-
-58	vfork	-
-59	execve	ppp
-60	exit	s
-62	kill	ss
-63	uname	p
-72	fcntl	sss
-73	flock	ss
-74	fsync	s
-75	fdatasync	s
-77	ftruncate	ss
-79	getcwd	ps
-82	rename	pp
-83	mkdir	ps
-84	rmdir	p
-87	unlink	p
-88	symlink	pp
-89	readlink	pps
-90	chmod	ps
-91	fchmod	ss
-96	gettimeofday	pp
-97	getrlimit	sp
-98	getrusage	sp
-99	sysinfo	p
-102	getuid	-
-104	getgid	-
-107	geteuid	-
-108	getegid	-
-110	getppid	-
-111	getpgrp	-
-131	sigaltstack	pp
-137	statfs	pp
-138	fstatfs	sp
-140	getpriority	ss
-141	setpriority	sss
-142	sched_setparam	sp
-143	sched_getparam	sp
-144	sched_setscheduler	ssp
-145	sched_getscheduler	s
-157	prctl	sssss
-158	arch_prctl	ss
-160	setrlimit	sp
-186	gettid	-
-187	readahead	sss
-201	time	p
-202	futex	psspps
-204	sched_getaffinity	ssp
-217	getdents64	sps
-218	set_tid_address	p
-221	fadvise64	ssss
-228	clock_gettime	sp
-230	clock_nanosleep	sspp
-231	exit_group	s
-232	epoll_wait	spss
-233	epoll_ctl	sssp
-234	tgkill	sss
-254	inotify_add_watch	sps
-255	inotify_rm_watch	ss
-257	openat	spss
-258	mkdirat	sps
-262	newfstatat	spps
-263	unlinkat	sps
-264	renameat	spsp
-266	symlinkat	psp
-267	readlinkat	spps
-268	fchmodat	sps
-273	set_robust_list	ps
-277	sync_file_range	ssss
-281	epoll_pwait	spssps
-285	fallocate	ssss
-288	accept4	spps
-290	eventfd2	ss
-291	epoll_create1	s
-292	dup3	sss
-293	pipe2	ps
-294	inotify_init1	s
-296	pwritev	spsss
-302	prlimit64	sspp
-316	renameat2	spsps
-318	getrandom	pss
-332	statx	spssp
-334	rseq	psss
-425	io_uring_setup	sps
-426	io_uring_enter	sssssp
-427	io_uring_register	sssp
-435	clone3	ps
-439	faccessat2	spss
+0	read	sps	trace
+1	write	sps	trace
+2	open	pss	trace
+3	close	s	trace
+5	fstat	sp	trace
+7	poll	pss	trace
+8	lseek	sss	trace
+9	mmap	psssss	trace
+10	mprotect	pss	admit
+11	munmap	ps	trace
+12	brk	p	admit
+13	rt_sigaction	spps	admit
+14	rt_sigprocmask	spps	admit
+15	rt_sigreturn	-	admit
+16	ioctl	ssp	trace
+17	pread64	spss	trace
+18	pwrite64	spss	trace
+20	writev	sps	trace
+21	access	ps	trace
+24	sched_yield	-	trace
+25	mremap	psssp	admit
+26	msync	pss	trace
+28	madvise	pss	trace
+32	dup	s	trace
+33	dup2	ss	trace
+35	nanosleep	pp	trace
+39	getpid	-	trace
+41	socket	sss	trace
+42	connect	sps	trace
+43	accept	spp	trace
+44	sendto	spssps	trace
+45	recvfrom	spsspp	trace
+46	sendmsg	sps	trace
+47	recvmsg	sps	trace
+48	shutdown	ss	trace
+49	bind	sps	trace
+50	listen	ss	trace
+51	getsockname	spp	trace
+52	getpeername	spp	trace
+53	socketpair	sssp	trace
+54	setsockopt	sssps	trace
+55	getsockopt	ssspp	trace
+56	clone	sppps	trace
+57	fork	-	trace
+58	vfork	-	trace
+59	execve	ppp	admit
+60	exit	s	trace
+62	kill	ss	trace
+63	uname	p	trace
+72	fcntl	sss	trace
+73	flock	ss	trace
+74	fsync	s	trace
+75	fdatasync	s	trace
+77	ftruncate	ss	trace
+79	getcwd	ps	trace
+82	rename	pp	trace
+83	mkdir	ps	trace
+84	rmdir	p	trace
+87	unlink	p	trace
+88	symlink	pp	trace
+89	readlink	pps	trace
+90	chmod	ps	trace
+91	fchmod	ss	trace
+96	gettimeofday	pp	trace
+97	getrlimit	sp	trace
+98	getrusage	sp	trace
+99	sysinfo	p	trace
+102	getuid	-	trace
+104	getgid	-	trace
+107	geteuid	-	trace
+108	getegid	-	trace
+110	getppid	-	trace
+111	getpgrp	-	trace
+131	sigaltstack	pp	admit
+137	statfs	pp	trace
+138	fstatfs	sp	trace
+140	getpriority	ss	trace
+141	setpriority	sss	trace
+142	sched_setparam	sp	trace
+143	sched_getparam	sp	trace
+144	sched_setscheduler	ssp	trace
+145	sched_getscheduler	s	trace
+157	prctl	sssss	trace
+158	arch_prctl	ss	admit
+160	setrlimit	sp	trace
+186	gettid	-	trace
+187	readahead	sss	trace
+201	time	p	trace
+202	futex	psspps	trace
+204	sched_getaffinity	ssp	trace
+217	getdents64	sps	trace
+218	set_tid_address	p	admit
+221	fadvise64	ssss	trace
+228	clock_gettime	sp	trace
+230	clock_nanosleep	sspp	trace
+231	exit_group	s	trace
+232	epoll_wait	spss	trace
+233	epoll_ctl	sssp	trace
+234	tgkill	sss	trace
+254	inotify_add_watch	sps	trace
+255	inotify_rm_watch	ss	trace
+257	openat	spss	trace
+258	mkdirat	sps	trace
+262	newfstatat	spps	trace
+263	unlinkat	sps	trace
+264	renameat	spsp	trace
+266	symlinkat	psp	trace
+267	readlinkat	spps	trace
+268	fchmodat	sps	trace
+273	set_robust_list	ps	admit
+277	sync_file_range	ssss	trace
+281	epoll_pwait	spssps	trace
+285	fallocate	ssss	trace
+288	accept4	spps	trace
+290	eventfd2	ss	trace
+291	epoll_create1	s	trace
+292	dup3	sss	trace
+293	pipe2	ps	trace
+294	inotify_init1	s	trace
+296	pwritev	spsss	trace
+302	prlimit64	sspp	trace
+309	getcpu	pp	trace
+316	renameat2	spsps	trace
+318	getrandom	pss	trace
+332	statx	spssp	trace
+334	rseq	psss	trace
+425	io_uring_setup	sps	trace
+426	io_uring_enter	sssssp	trace
+427	io_uring_register	sssp	trace
+435	clone3	ps	trace
+439	faccessat2	spss	trace

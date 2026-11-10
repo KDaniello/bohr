@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bohr_backend::{Resume, Stop, StopKind};
 use bohr_kernel::{
-    DueEffects, Effects, FaultCatalog, KernelError, MAX_DRIFT_PPM, NodeOp, TaskState, Wake,
-    WorldCtx, WorldModel,
+    DeadlineCtx, DueEffects, Effects, KernelError, MAX_DRIFT_PPM, NodeOp, StopCtx, TaskState, Wake,
+    WorldModel,
 };
 use bohr_tape::DrawSite;
 use bohr_trace::{DiskOpKind, Endpoint, EventKind, FaultKind, FaultTarget, NodeState};
@@ -228,6 +228,23 @@ impl Suppressed {
     }
 }
 
+impl NodeFaultKind {
+    /// The fault a scheduled one fires as, by the name ablation gives it: a thaw is the freeze's,
+    /// a plain restart is a recovery and fires none, and the link faults are drawn only.
+    #[must_use]
+    pub const fn fired(&self) -> Option<FaultKind> {
+        match self {
+            Self::Kill => Some(FaultKind::NodeKill),
+            Self::Freeze | Self::Thaw => Some(FaultKind::NodeFreeze),
+            Self::RestartFromSnapshot { .. } => Some(FaultKind::NodeRestart),
+            Self::ChainReorg { .. } => Some(FaultKind::ChainReorg),
+            Self::ClockStep { .. } => Some(FaultKind::ClockStep),
+            Self::ClockDrift { .. } => Some(FaultKind::ClockDrift),
+            Self::Restart | Self::Isolate | Self::Degrade => None,
+        }
+    }
+}
+
 /// The fault kind a drawn node fault lands as, which ablation names it by.
 const fn landed_as(kind: &NodeFaultKind) -> FaultKind {
     match kind {
@@ -429,9 +446,9 @@ const DOMAIN_EXPOSED: u32 = 3;
 
 /// This model's version, recorded in every bundle and checked before a replay.
 ///
-/// Incremented when behaviour changes stored runs. Version 2: per-file durability and per-sector
-/// crashes.
-const MODEL_VERSION: u16 = 3;
+/// Incremented when behaviour changes stored runs, so an older bundle is refused by its version
+/// rather than replayed into a divergence.
+const MODEL_VERSION: u16 = 4;
 
 /// The namespace this model's domain events are read in.
 ///
@@ -462,8 +479,46 @@ const O_NONBLOCK: i64 = 0o4000;
 /// `FIONBIO`: the ioctl an event loop uses to make a socket non-blocking.
 const FIONBIO: u64 = 0x5421;
 
+/// Every node's table of descriptor numbers, lent to the tables kept outside the node's world.
+///
+/// One process has one table of numbers: a socket, a poller or a counter takes the lowest free
+/// number from the same table a file does. Borrowed beside the network and the pollers, which
+/// are other fields of the cluster.
+pub(crate) struct Numbers<'a>(&'a mut BTreeMap<NodeId, MinimalWorld>);
+
+impl Numbers<'_> {
+    /// Takes the lowest free number at or above `at_least` on `node`.
+    ///
+    /// Every node that makes a call has a world by then; one that has none answers `at_least`
+    /// and takes nothing.
+    pub(crate) fn claim(&mut self, node: NodeId, at_least: i64) -> i64 {
+        self.0.get_mut(&node).map_or(at_least, |world| world.claim_number(at_least))
+    }
+
+    /// Takes exactly `fd` on `node`; the caller has closed whatever held it.
+    pub(crate) fn claim_exact(&mut self, node: NodeId, fd: i64) {
+        if let Some(world) = self.0.get_mut(&node) {
+            world.claim_exact(fd);
+        }
+    }
+
+    /// Gives back a number on `node`.
+    pub(crate) fn release(&mut self, node: NodeId, fd: i64) {
+        if let Some(world) = self.0.get_mut(&node) {
+            world.release_number(fd);
+        }
+    }
+}
+
+/// The first number a descriptor's process may hold, past the three standard ones.
+pub(crate) const FIRST_DESCRIPTOR: i64 = 3;
+
 /// Largest datagram the model moves in one send.
 const MAX_DATAGRAM: usize = 64 * 1024;
+
+/// Most a single stream write takes, the size of a stream's send buffer; a larger one is taken in
+/// part and answers its count, as a write interrupted by a signal does.
+const MAX_STREAM_WRITE: usize = 1 << 20;
 
 /// The descriptor a socket call names, which is always its first argument.
 fn fd_of(args: [u64; 6]) -> i64 {
@@ -488,7 +543,7 @@ pub const fn sdk_violation_code() -> &'static str {
 ///
 /// Read with the node's reader, since a path near the end of its mapping cannot be read as a fixed
 /// block.
-fn opened_path(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<Option<String>, KernelError> {
+fn opened_path(ctx: &mut StopCtx<'_, '_>, addr: GuestAddr) -> Result<Option<String>, KernelError> {
     // Only the name, to recognise the opened descriptor.
     Ok(match crate::minimal::read_c_string(ctx, addr)? {
         crate::minimal::PathArg::Named(name) => Some(name),
@@ -498,10 +553,10 @@ fn opened_path(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<Option<Str
 
 /// True with probability `num/den`, always consuming two bytes.
 ///
-/// Unlike [`WorldCtx::draw_bool`], certainties also cost two bytes. The journal records whether it
+/// Unlike [`StopCtx::draw_bool`], certainties also cost two bytes. The journal records whether it
 /// fired, for the reducer.
 pub(crate) fn draw_odds(
-    ctx: &mut WorldCtx<'_, '_>,
+    ctx: &mut StopCtx<'_, '_>,
     (num, den): (u32, u32),
     site: bohr_tape::DrawSite,
 ) -> Result<bool, KernelError> {
@@ -523,6 +578,9 @@ pub struct DistributedWorld {
     /// Records the guests wrote about themselves, and the descriptors they wrote them on.
     sdk: sdk::SdkRecords,
     sdk_fds: BTreeSet<(NodeId, i64)>,
+    /// Socket, poller and counter descriptors marked `FD_CLOEXEC`; the mark belongs to the number,
+    /// not to what it names.
+    cloexec: BTreeSet<(NodeId, i64)>,
     /// The path an SDK is told to write to, when this run offers one.
     sdk_path: Option<String>,
     /// Which nodes have written to their disk since they last asked a socket for something.
@@ -541,7 +599,6 @@ pub struct DistributedWorld {
     ///
     /// Kept only for a run whose log is kept.
     tails: Option<bohr_trace::OutputTails>,
-    catalog: FaultCatalog,
     /// What every node's world is made of.
     template: NodeTemplate,
     /// Watches for a cluster that healed and went on committing nothing, where one was asked for.
@@ -596,8 +653,17 @@ fn node_shell(template: &NodeTemplate) -> MinimalWorld {
 /// A node's world holding a disk it is handed.
 ///
 /// The prepared filesystem is skipped, since the restored image replaces it entirely.
-fn restored_node(template: &NodeTemplate, image: crate::minimal::DiskImage) -> MinimalWorld {
+/// A node's world after a crash or a rewind: its program, as at its first start, on the disk
+/// image that came back.
+fn restored_node(
+    node: NodeId,
+    template: &NodeTemplate,
+    image: crate::minimal::DiskImage,
+) -> MinimalWorld {
     let mut world = node_shell(template);
+    if let Some(program) = template.programs.get(node.get() as usize) {
+        world = world.with_program(program.clone());
+    }
     world.restore_disk(image);
     world
 }
@@ -669,6 +735,7 @@ impl DistributedWorld {
             node_faults: Vec::new(),
             sdk: sdk::SdkRecords::default(),
             sdk_fds: BTreeSet::new(),
+            cloexec: BTreeSet::new(),
             sdk_path: None,
             wrote_since_asking: BTreeSet::new(),
             fault_policy: FaultPolicy::default(),
@@ -682,29 +749,6 @@ impl DistributedWorld {
             epolls: Epolls::default(),
             observer: None,
             probe_node: None,
-            // Exactly the faults this model emits; `scripts/lint-rules.sh` checks it against every
-            // `FaultFired`.
-            catalog: FaultCatalog::new(vec![
-                FaultKind::NetDelay,
-                FaultKind::NetDrop,
-                FaultKind::NetDuplicate,
-                FaultKind::NetReorder,
-                FaultKind::NetPartition,
-                FaultKind::DiskTear,
-                FaultKind::DiskReorder,
-                FaultKind::DiskStall,
-                FaultKind::DiskFull,
-                FaultKind::DiskError,
-                FaultKind::NodeKill,
-                FaultKind::NodeFreeze,
-                FaultKind::NodeThaw,
-                FaultKind::NodeRestart,
-                FaultKind::ChainReorg,
-                FaultKind::ClockStep,
-                FaultKind::ClockDrift,
-                FaultKind::MemoryExhausted,
-                FaultKind::NetCorrupt,
-            ]),
         }
     }
 
@@ -758,6 +802,22 @@ impl DistributedWorld {
     #[must_use]
     pub fn sdk_records(&self) -> Vec<u8> {
         self.sdk.to_bytes()
+    }
+
+    /// Each campaign-scoped promise the guests made, as `(name, evaluations, held)`, by name.
+    ///
+    /// Folded as the records arrive, so a campaign reads them without the records.
+    #[must_use]
+    pub fn sdk_tallies(&self) -> Vec<(String, u64, u64)> {
+        self.sdk.tallies()
+    }
+
+    /// The same cluster, reading its guests' records without keeping them, for a run whose log
+    /// nobody reads: [`Self::sdk_records`] is then empty and [`Self::sdk_tallies`] is all there is.
+    #[must_use]
+    pub fn without_sdk_records(mut self) -> Self {
+        self.sdk.unkept = true;
+        self
     }
 
     /// The assertion that failed, where one did.
@@ -820,10 +880,24 @@ impl DistributedWorld {
         self.tails.as_ref().map(bohr_trace::OutputTails::records).unwrap_or_default()
     }
 
-    /// Tells the liveness watch what this world just did to a node.
+    /// Changes what a node is, on the timeline and for every watch, in one call.
     ///
-    /// Called beside every `NodeState`, which `scripts/lint-rules.sh` checks, so the watch never
-    /// blames a node the world stopped. See [`watch::Liveness::node_became`].
+    /// The event is attributed to `by`, the node and task whose stop or deadline did it; the
+    /// liveness watch, the observer and the output tails hear of `node`. One call, so the watch
+    /// never blames a node this world stopped.
+    fn set_node_state(
+        &mut self,
+        ctx: &mut DeadlineCtx<'_, '_>,
+        node: NodeId,
+        by: (NodeId, TaskId),
+        state: NodeState,
+    ) -> Result<(), KernelError> {
+        self.node_became(node, state, ctx.world_now());
+        ctx.emit_for(by.0, by.1, EventKind::NodeState { state })
+    }
+
+    /// Tells the watches what this world just did to a node; see [`Self::set_node_state`] and
+    /// [`watch::Liveness::node_became`].
     fn node_became(&mut self, node: NodeId, state: NodeState, now: Tick) {
         // A restart begins a new incarnation, whose output is kept apart from the last one's.
         if state == NodeState::Restarting
@@ -907,7 +981,7 @@ impl DistributedWorld {
     fn note_what_came_back(
         &mut self,
         node: NodeId,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
     ) -> Result<(), KernelError> {
         if self.durability.is_none() {
             return Ok(());
@@ -942,7 +1016,7 @@ impl DistributedWorld {
     fn note_an_answer(
         &mut self,
         node: NodeId,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<(), KernelError> {
         if self.durability.is_none() || !self.disks.get(&node).is_some_and(NodeDisk::is_dirty) {
             return Ok(());
@@ -976,6 +1050,131 @@ impl DistributedWorld {
         (world, disk)
     }
 
+    /// Forgets everything a node's process held outside its own world, because the process is
+    /// gone: its tasks, sockets, pollers and counters, descriptor flags and record channels.
+    ///
+    /// Every stream it carried ends and its peers read the end; the next process starts with a
+    /// table holding only what its own world opens.
+    fn forget_process(&mut self, node: NodeId, wakes: &mut Vec<Wake>) {
+        self.node_of_task.retain(|_, n| *n != node);
+        self.net.drop_node(node, wakes);
+        self.epolls.drop_node(node);
+        self.cloexec.retain(|(n, _)| *n != node);
+        self.sdk_fds.retain(|(n, _)| *n != node);
+    }
+
+    /// Whether `fd` names a socket, a poller or a counter, kept outside the node's own world.
+    fn holds_foreign(&self, node: NodeId, fd: i64) -> bool {
+        self.net.is_socket(node, fd) || self.epolls.holds(node, fd)
+    }
+
+    /// Answers `fcntl` on a socket, a poller or a counter.
+    ///
+    /// `O_NONBLOCK` belongs to the socket and is shared by its copies; `FD_CLOEXEC` belongs to the
+    /// number. A poller or a counter reports itself non-blocking, as it answers.
+    fn foreign_fcntl(&mut self, node: NodeId, fd: i64, args: [u64; 6]) -> i64 {
+        const FD_CLOEXEC: u64 = 1;
+        match args[1] {
+            F_GETFD => i64::from(self.cloexec.contains(&(node, fd))),
+            F_SETFD => {
+                if args[2] & FD_CLOEXEC != 0 {
+                    self.cloexec.insert((node, fd));
+                } else {
+                    self.cloexec.remove(&(node, fd));
+                }
+                0
+            }
+            // A poller never waits on a read, so it reports itself non-blocking.
+            F_GETFL => {
+                let nonblocking = self.net.is_nonblocking(node, fd);
+                match nonblocking.or_else(|| self.epolls.counter_nonblocking(node, fd)) {
+                    Some(false) => O_RDWR,
+                    Some(true) | None => O_RDWR | O_NONBLOCK,
+                }
+            }
+            F_SETFL => {
+                let on = args[2] as i64 & O_NONBLOCK != 0;
+                self.net.set_nonblocking(node, fd, on);
+                self.epolls.set_counter_nonblocking(node, fd, on);
+                0
+            }
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let at_least = args[2] as i64;
+                let mut numbers = Numbers(&mut self.nodes);
+                let copy = self
+                    .epolls
+                    .dup(node, fd, at_least, &mut numbers)
+                    .or_else(|| self.net.dup(node, fd, at_least, &mut numbers))
+                    .unwrap_or(-errno::EBADF);
+                if args[1] == F_DUPFD_CLOEXEC && copy >= 0 {
+                    self.cloexec.insert((node, copy));
+                }
+                copy
+            }
+            _ => -errno::EINVAL,
+        }
+    }
+
+    /// Answers `dup`, `dup2` or `dup3` where a socket, a poller or a counter is copied, or is
+    /// copied onto; nothing where neither number is one, which the node's world answers.
+    ///
+    /// A copy onto a number first closes what the number held, which may end a stream and release
+    /// tasks; they are added to `wakes`. A file copied onto a socket's number closes the socket
+    /// here and leaves the copy to the node's world.
+    fn foreign_dup(
+        &mut self,
+        node: NodeId,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+        wakes: &mut Vec<Wake>,
+    ) -> Result<Option<i64>, KernelError> {
+        const O_CLOEXEC: u64 = 0o2_000_000;
+        let (from, onto) = (args[0] as i64, args[1] as i64);
+        let from_foreign = self.holds_foreign(node, from);
+        let onto_foreign = nr != sys::DUP && self.holds_foreign(node, onto);
+        if !from_foreign && !onto_foreign {
+            return Ok(None);
+        }
+        let mut numbers = Numbers(&mut self.nodes);
+        if nr == sys::DUP {
+            let copy = self
+                .epolls
+                .dup(node, from, FIRST_DESCRIPTOR, &mut numbers)
+                .or_else(|| self.net.dup(node, from, FIRST_DESCRIPTOR, &mut numbers))
+                .unwrap_or(-errno::EBADF);
+            return Ok(Some(copy));
+        }
+        if onto < 0 {
+            return Ok(Some(-errno::EBADF));
+        }
+        // `dup2` onto itself does nothing; `dup3` calls it an error.
+        if from == onto {
+            return Ok(Some(if nr == sys::DUP3 { -errno::EINVAL } else { onto }));
+        }
+        if !from_foreign && !numbers.0.get(&node).is_some_and(|world| world.holds_fd(from)) {
+            return Ok(Some(-errno::EBADF));
+        }
+        if onto_foreign {
+            self.cloexec.remove(&(node, onto));
+            if !self.epolls.close(node, onto, &mut numbers) {
+                self.net.close(node, onto, &mut numbers, ctx, wakes)?;
+            }
+        } else if let Some(world) = numbers.0.get_mut(&node) {
+            world.close_number(onto);
+        }
+        if !from_foreign {
+            // A file onto a number now free: the node's world makes the copy.
+            return Ok(None);
+        }
+        let copied = self.epolls.dup_onto(node, from, onto, &mut numbers)
+            || self.net.dup_onto(node, from, onto, &mut numbers);
+        if nr == sys::DUP3 && args[2] & O_CLOEXEC != 0 {
+            self.cloexec.insert((node, onto));
+        }
+        Ok(Some(if copied { onto } else { -errno::EBADF }))
+    }
+
     fn node_world(&mut self, node: NodeId) -> &mut MinimalWorld {
         // Registered at birth, so a node that never syncs is noticed. The probe is excluded.
         if let Some(watch) = self.liveness.as_mut()
@@ -991,7 +1190,7 @@ impl DistributedWorld {
     fn crash(
         &mut self,
         node: NodeId,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
         // Recorded before the crash, attributed explicitly since deadlines have no current task.
@@ -1013,10 +1212,8 @@ impl DistributedWorld {
             && !off.contains(FaultKind::DiskReorder);
         let (world, disk) = self.node_parts(node);
         let image = disk.crash_image(node, world, reorder, ctx)?;
-        self.nodes.insert(node, restored_node(&self.template, image));
-        self.node_of_task.retain(|_, n| *n != node);
-        self.net.drop_node(node, wakes);
-        self.epolls.drop_node(node);
+        self.nodes.insert(node, restored_node(node, &self.template, image));
+        self.forget_process(node, wakes);
         Ok(())
     }
 
@@ -1031,7 +1228,7 @@ impl DistributedWorld {
         args: [u64; 6],
         mapped: Option<u64>,
         stop: &Stop,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let fd = args[0] as i64;
         match nr {
@@ -1113,24 +1310,18 @@ impl DistributedWorld {
                 Self::finish_disk_op(nr, args, fd, DiskOpKind::Fsync, 0, 0, 0, ctx)
             }
             sys::WRITE | sys::WRITEV | sys::PWRITE64 | sys::PWRITEV => {
-                let enospc_odds = self
-                    .fault_policy
-                    .windowed(ctx.world_now(), self.disk_config.enospc_probability);
-                let enospc_odds =
-                    self.fault_policy.suppressed.odds(FaultKind::DiskFull, enospc_odds);
-                let enospc = draw_odds(ctx, enospc_odds, DrawSite::DiskError)?;
-                let offset = if matches!(nr, sys::PWRITE64 | sys::PWRITEV) {
-                    args[3]
-                } else {
-                    self.node_world(node).file_position(fd)
-                };
+                let named = matches!(nr, sys::PWRITE64 | sys::PWRITEV).then_some(args[3]);
+                let offset = self.node_world(node).write_offset(fd, named);
                 // A vectored call passes a segment count, so the length is computed.
                 let requested = if matches!(nr, sys::WRITEV | sys::PWRITEV) {
                     MinimalWorld::iov_bytes(ctx, GuestAddr(args[1]), args[2])?
                 } else {
                     args[2] as u32
                 };
-                if enospc {
+                // Only a write that needs new space can find the disk full.
+                let needs_space =
+                    self.node_world(node).needs_space(fd, offset, u64::from(requested));
+                if needs_space && self.disk_full(ctx)? {
                     ctx.emit(EventKind::FaultFired {
                         fault: FaultKind::DiskFull,
                         target: FaultTarget::Descriptor(Fd(fd as i32)),
@@ -1210,8 +1401,17 @@ impl DistributedWorld {
                 })?;
                 Ok(effects)
             }
-            // Added space is unsynced, like a write.
+            // Added space is unsynced, like a write; asking for space can find the disk full.
             sys::FALLOCATE => {
+                if self.node_world(node).needs_space(fd, args[2], args[3]) && self.disk_full(ctx)? {
+                    ctx.emit(EventKind::FaultFired {
+                        fault: FaultKind::DiskFull,
+                        target: FaultTarget::Descriptor(Fd(fd as i32)),
+                    })?;
+                    let end = args[2].saturating_add(args[3]);
+                    let (op, ret) = (DiskOpKind::Truncate, -errno::ENOSPC);
+                    return Self::finish_disk_op(nr, args, fd, op, end, 0, ret, ctx);
+                }
                 let before = self.node_world(node).length_of(fd).unwrap_or(0);
                 let effects = self.node_world(node).handle(stop, ctx)?;
                 let ret = answered(&effects);
@@ -1235,6 +1435,13 @@ impl DistributedWorld {
         }
     }
 
+    /// Draws whether the disk is full for a call that needs new space.
+    fn disk_full(&mut self, ctx: &mut StopCtx<'_, '_>) -> Result<bool, KernelError> {
+        let odds = self.fault_policy.windowed(ctx.world_now(), self.disk_config.enospc_probability);
+        let odds = self.fault_policy.suppressed.odds(FaultKind::DiskFull, odds);
+        draw_odds(ctx, odds, DrawSite::DiskError)
+    }
+
     /// Records the two rows a fully-answered disk call leaves and hands the answer back.
     #[allow(clippy::too_many_arguments)]
     fn finish_disk_op(
@@ -1245,7 +1452,7 @@ impl DistributedWorld {
         offset: u64,
         len: u32,
         ret: i64,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         ctx.emit(EventKind::DiskOp { fd: Fd(fd as i32), op, offset, len, ret })?;
         ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
@@ -1261,7 +1468,7 @@ impl DistributedWorld {
         node: NodeId,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Option<Effects>, KernelError> {
         /// `brk`, `mmap`, `mremap`.
         const BRK: u32 = 12;
@@ -1304,7 +1511,7 @@ impl DistributedWorld {
     fn maybe_kill(
         &mut self,
         node: NodeId,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Option<Effects>, KernelError> {
         if !self.fault_policy.is_armed() || Some(node) == self.probe_node {
             return Ok(None);
@@ -1413,8 +1620,8 @@ impl DistributedWorld {
             fault: FaultKind::NodeKill,
             target: FaultTarget::Node(node),
         })?;
-        self.node_became(node, NodeState::Dead, ctx.world_now());
-        ctx.emit(EventKind::NodeState { state: NodeState::Dead })?;
+        let by = (ctx.node(), ctx.task());
+        self.set_node_state(ctx, node, by, NodeState::Dead)?;
         // Peers waiting on the killed node's connections read end-of-stream.
         let mut wakes = Vec::new();
         self.crash(node, ctx, &mut wakes)?;
@@ -1471,7 +1678,7 @@ impl DistributedWorld {
         node: NodeId,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let bytes = if nr == sys::WRITEV {
             MinimalWorld::gather(ctx, GuestAddr(args[1]), args[2])?
@@ -1529,20 +1736,21 @@ impl DistributedWorld {
         node: NodeId,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
-        let answer = |ret: i64, ctx: &mut WorldCtx<'_, '_>| -> Result<Effects, KernelError> {
+        let answer = |ret: i64, ctx: &mut StopCtx<'_, '_>| -> Result<Effects, KernelError> {
             ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
             Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST))
         };
 
         match nr {
             poll_sys::EPOLL_CREATE1 => {
-                let fd = self.epolls.create(node);
+                let fd = self.epolls.create(node, &mut Numbers(&mut self.nodes));
                 answer(fd, ctx)
             }
             poll_sys::EVENTFD2 => {
-                let fd = self.epolls.open_counter(node, args[0]);
+                let fd =
+                    self.epolls.open_counter(node, args[0], args[1], &mut Numbers(&mut self.nodes));
                 answer(fd, ctx)
             }
             poll_sys::EPOLL_CTL => {
@@ -1563,21 +1771,20 @@ impl DistributedWorld {
             }
             poll_sys::EPOLL_WAIT | poll_sys::EPOLL_PWAIT => {
                 let epfd = args[0] as i64;
-                let (out, max, timeout) = (GuestAddr(args[1]), args[2] as usize, args[3] as i64);
+                // The timeout is an `int`, so -1 is read as -1 whatever the upper half holds.
+                let (out, max, timeout) =
+                    (GuestAddr(args[1]), args[2] as usize, i64::from(args[3] as i32));
                 let ready = self.ready_on(node, epfd);
                 if !ready.is_empty() || timeout == 0 {
                     let wrote = Self::write_ready(ctx, out, max, &ready)?;
-                    let fds: Vec<i64> = ready[..wrote].iter().map(|r| r.fd).collect();
-                    self.epolls.reported(node, epfd, &fds);
+                    self.epolls.reported(node, epfd, &ready[..wrote]);
                     return answer(wrote as i64, ctx);
                 }
                 // Nothing ready: park, with a timer only if a timeout was given.
                 self.epolls.park(node, epfd, ctx.task(), out, max, false);
                 if timeout > 0 {
-                    let at =
-                        Tick(ctx.world_now().get().saturating_add(
-                            (timeout as u64).saturating_mul(Tick::MILLISECOND.get()),
-                        ));
+                    let at = ctx
+                        .deadline_after((timeout as u64).saturating_mul(Tick::MILLISECOND.get()));
                     self.timers.arm(at, node, Due::PollTimeout { node, epfd, task: ctx.task() });
                 }
                 ctx.emit(EventKind::Syscall {
@@ -1601,28 +1808,49 @@ impl DistributedWorld {
         node: NodeId,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let fd = args[0] as i64;
-        let ret = if nr == sys::READ {
-            match self.epolls.drain_counter(node, fd) {
-                Some(0) | None => -errno::EAGAIN,
-                Some(held) => {
-                    ctx.write_mem(GuestAddr(args[1]), &held.to_le_bytes())?;
+        let mut wakes = Vec::new();
+        // A counter moves eight bytes; a buffer smaller than that is `EINVAL`.
+        let ret = if args[2] < 8 {
+            -errno::EINVAL
+        } else if nr == sys::READ {
+            match self.epolls.read_counter(node, fd, ctx.task(), GuestAddr(args[1])) {
+                Some(epoll::CounterRead::Took(value)) => {
+                    ctx.write_mem(GuestAddr(args[1]), &value.to_le_bytes())?;
                     8
                 }
+                Some(epoll::CounterRead::WouldBlock) => -errno::EAGAIN,
+                Some(epoll::CounterRead::Waits) => {
+                    return self.park_releasing(nr, args, wakes, ctx);
+                }
+                None => -errno::EBADF,
             }
         } else {
             let mut buf = [0u8; 8];
             ctx.read_mem(GuestAddr(args[1]), &mut buf)?;
-            if self.epolls.add_to_counter(node, fd, u64::from_le_bytes(buf)) {
-                8
-            } else {
-                -errno::EBADF
+            let by = u64::from_le_bytes(buf);
+            match self.epolls.counter_room(node, fd) {
+                None => -errno::EBADF,
+                // The one value no counter may be given.
+                Some(_) if by == u64::MAX => -errno::EINVAL,
+                // Linux would hold a blocking writer until a read made room; it is told now.
+                Some(room) if by > room => {
+                    self.epolls.counter_full(node, fd);
+                    -errno::EAGAIN
+                }
+                Some(_) => {
+                    let handed = self.epolls.add_to_counter(node, fd, by, |task, out, taken| {
+                        ctx.write_mem_for(task, out, &taken.to_le_bytes())?;
+                        wakes.push(Wake { task, ret: 8 });
+                        Ok(())
+                    })?;
+                    if handed { 8 } else { -errno::EBADF }
+                }
             }
         };
         // A counter write wakes parked pollers now.
-        let mut wakes = Vec::new();
         if nr != sys::READ && ret > 0 {
             self.wake_ready_pollers(ctx, &mut wakes)?;
         }
@@ -1635,11 +1863,9 @@ impl DistributedWorld {
     /// The answer is written before the wake, which carries the count.
     fn wake_ready_pollers(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), KernelError> {
-        // Readiness may have changed: a new epoch.
-        self.epolls.bump();
         let instances: Vec<(NodeId, i64)> = self.epolls.parked_instances();
         for (node, epfd) in instances {
             let ready = self.ready_on(node, epfd);
@@ -1649,7 +1875,7 @@ impl DistributedWorld {
             if let Some((task, out, max, poll)) = self.epolls.take_parked(node, epfd) {
                 if poll {
                     let answered = Self::write_revents(ctx, task, out, max, &ready)?;
-                    self.epolls.close(node, epfd);
+                    self.epolls.close(node, epfd, &mut Numbers(&mut self.nodes));
                     wakes.push(Wake { task, ret: answered });
                     continue;
                 }
@@ -1661,8 +1887,7 @@ impl DistributedWorld {
                 if !bytes.is_empty() {
                     ctx.write_mem_for(task, out, &bytes)?;
                 }
-                let fds: Vec<i64> = ready[..taken].iter().map(|r| r.fd).collect();
-                self.epolls.reported(node, epfd, &fds);
+                self.epolls.reported(node, epfd, &ready[..taken]);
                 wakes.push(Wake { task, ret: taken as i64 });
             }
         }
@@ -1677,7 +1902,7 @@ impl DistributedWorld {
         &mut self,
         node: NodeId,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let (fds, nfds, timeout) = (GuestAddr(args[0]), args[1] as usize, args[2] as i32);
         // Too many entries is `EINVAL`, as in a kernel.
@@ -1722,8 +1947,10 @@ impl DistributedWorld {
             if readable && events & (POLLIN | POLLRDNORM) != 0 {
                 revents[index] |= events & (POLLIN | POLLRDNORM);
             }
-            // Nothing here has a send buffer to fill, as `ready_on` says for epoll.
-            revents[index] |= events & (POLLOUT | POLLWRNORM);
+            // A file or a counter always takes a write; a socket while it has room.
+            if self.net.writable(node, *fd).unwrap_or(true) {
+                revents[index] |= events & (POLLOUT | POLLWRNORM);
+            }
         }
         let ready = revents.iter().filter(|r| **r != 0).count();
 
@@ -1750,21 +1977,22 @@ impl DistributedWorld {
         // A private instance whose tokens are array indices.
         let epfd = self.epolls.create_hidden(node);
         for (index, (fd, events)) in asked.iter().enumerate() {
-            if *fd >= 0 && events & (POLLIN | POLLRDNORM) != 0 {
-                self.epolls.control(
-                    node,
-                    epfd,
-                    epoll::CTL_ADD,
-                    *fd,
-                    (epoll::EPOLLIN, index as u64),
-                );
+            let mut watched = 0;
+            if events & (POLLIN | POLLRDNORM) != 0 {
+                watched |= epoll::EPOLLIN;
+            }
+            if events & (POLLOUT | POLLWRNORM) != 0 {
+                watched |= epoll::EPOLLOUT;
+            }
+            if *fd >= 0 && watched != 0 {
+                self.epolls.control(node, epfd, epoll::CTL_ADD, *fd, (watched, index as u64));
             }
         }
         self.epolls.park(node, epfd, ctx.task(), fds, nfds, true);
         if timeout > 0 {
-            let at = Tick(ctx.world_now().get().saturating_add(
+            let at = ctx.deadline_after(
                 u64::from(timeout.unsigned_abs()).saturating_mul(Tick::MILLISECOND.get()),
-            ));
+            );
             self.timers.arm(at, node, Due::PollTimeout { node, epfd, task: ctx.task() });
         }
         ctx.emit(EventKind::Syscall {
@@ -1779,7 +2007,7 @@ impl DistributedWorld {
 
     /// Writes a woken `poll`'s answer: each entry's `revents`, from what its instance reported.
     fn write_revents(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
         task: TaskId,
         fds: GuestAddr,
         nfds: usize,
@@ -1795,18 +2023,27 @@ impl DistributedWorld {
         }
         // Every entry for a ready descriptor is answered, as a kernel does.
         let entries = bytes.as_chunks_mut::<8>().0;
-        let became: std::collections::BTreeSet<i32> = ready
-            .iter()
-            .filter_map(|one| entries.get(one.token as usize))
-            .map(|entry| i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]))
-            .collect();
+        let mut became: std::collections::BTreeMap<i32, u32> = std::collections::BTreeMap::new();
+        for one in ready {
+            if let Some(entry) = entries.get(one.token as usize) {
+                let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                *became.entry(fd).or_default() |= one.events;
+            }
+        }
         let mut answered = 0;
         for entry in entries.iter_mut() {
             let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-            // The instance watched only for input.
-            let asked = u16::from_le_bytes([entry[4], entry[5]]) & (POLLIN | POLLRDNORM);
-            if became.contains(&fd) && asked != 0 {
-                entry[6..8].copy_from_slice(&asked.to_le_bytes());
+            let events = became.get(&fd).copied().unwrap_or(0);
+            let asked = u16::from_le_bytes([entry[4], entry[5]]);
+            let mut revents = 0;
+            if events & epoll::EPOLLIN != 0 {
+                revents |= asked & (POLLIN | POLLRDNORM);
+            }
+            if events & epoll::EPOLLOUT != 0 {
+                revents |= asked & (POLLOUT | POLLWRNORM);
+            }
+            if revents != 0 {
+                entry[6..8].copy_from_slice(&revents.to_le_bytes());
                 answered += 1;
             }
         }
@@ -1815,11 +2052,16 @@ impl DistributedWorld {
     }
 
     /// What an instance would report right now.
+    ///
+    /// An edge-triggered watch reports again only past an edge: more arrived while it is readable,
+    /// or room came back after a write found none. A file has no edges, so such a watch reports it
+    /// once.
     fn ready_on(&self, node: NodeId, epfd: i64) -> Vec<epoll::Ready> {
         self.epolls
             .watched(node, epfd)
             .into_iter()
-            .filter_map(|(fd, wanted, token)| {
+            .filter_map(|watch| {
+                let (fd, wanted) = (watch.fd, watch.events);
                 let readable = self
                     .net
                     .readable(node, fd)
@@ -1830,18 +2072,32 @@ impl DistributedWorld {
                 if readable && wanted & epoll::EPOLLIN != 0 {
                     events |= epoll::EPOLLIN;
                 }
-                // There are no send buffers, so writing is always ready.
-                if wanted & epoll::EPOLLOUT != 0 {
+                // A file or a counter always takes a write; a socket while it has room.
+                if wanted & epoll::EPOLLOUT != 0 && self.net.writable(node, fd).unwrap_or(true) {
                     events |= epoll::EPOLLOUT;
                 }
-                (events != 0).then_some(epoll::Ready { fd, events, token })
+                let edges = self
+                    .net
+                    .edges(node, fd)
+                    .or_else(|| self.epolls.counter_edges(node, fd))
+                    .unwrap_or_default();
+                if wanted & epoll::EPOLLET != 0
+                    && let Some(seen) = watch.seen
+                {
+                    let read_edge = events & epoll::EPOLLIN != 0 && edges.arrived != seen.arrived;
+                    let write_edge = events & epoll::EPOLLOUT != 0 && edges.filled != seen.filled;
+                    if !read_edge && !write_edge {
+                        return None;
+                    }
+                }
+                (events != 0).then_some(epoll::Ready { fd, events, token: watch.token, edges })
             })
             .collect()
     }
 
     /// Writes a ready list into the guest's buffer and says how many entries it took.
     fn write_ready(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         out: GuestAddr,
         max: usize,
         ready: &[epoll::Ready],
@@ -1865,16 +2121,16 @@ impl DistributedWorld {
         node: NodeId,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let mut wakes = Vec::new();
         let ret: i64 = match nr {
             socket_sys::SOCKET => {
                 let nonblocking = args[1] & socket_sys::SOCK_NONBLOCK != 0;
                 if args[1] & socket_sys::SOCK_KIND == socket_sys::SOCK_STREAM {
-                    self.net.open_stream(node, nonblocking)
+                    self.net.open_stream(node, nonblocking, &mut Numbers(&mut self.nodes))
                 } else {
-                    self.net.open_udp(node, ctx.task(), nonblocking)
+                    self.net.open_udp(node, ctx.task(), nonblocking, &mut Numbers(&mut self.nodes))
                 }
             }
             socket_sys::BIND => match decode_sockaddr(ctx, GuestAddr(args[1]), node)? {
@@ -1889,16 +2145,29 @@ impl DistributedWorld {
                     nonblocking: nr == socket_sys::ACCEPT4
                         && args[3] & socket_sys::SOCK_NONBLOCK != 0,
                 };
-                match self.net.accept(node, args[0] as i64, want, ctx)? {
+                match self.net.accept(
+                    node,
+                    args[0] as i64,
+                    want,
+                    &mut Numbers(&mut self.nodes),
+                    ctx,
+                )? {
                     Some(ret) => ret,
-                    None => return self.park_in(nr, args, ctx),
+                    None => return self.park_socket(node, nr, args, false, wakes, ctx),
                 }
             }
             socket_sys::CONNECT => match decode_sockaddr(ctx, GuestAddr(args[1]), node)? {
                 // A stream's connect creates the connection.
                 Some((dest, port)) if self.net.is_stream(node, args[0] as i64) => {
                     let to = Endpoint { node: dest, port };
-                    self.net.connect(node, args[0] as i64, to, ctx, &mut wakes)?
+                    self.net.connect(
+                        node,
+                        args[0] as i64,
+                        to,
+                        &mut Numbers(&mut self.nodes),
+                        ctx,
+                        &mut wakes,
+                    )?
                 }
                 // A datagram connect is remembered for later `send`s, as stub resolvers use.
                 Some((dest, port)) => {
@@ -1906,28 +2175,49 @@ impl DistributedWorld {
                 }
                 None => -errno::EINVAL,
             },
-            socket_sys::SHUTDOWN => self.net.shutdown(node, args[0] as i64, &mut wakes),
+            socket_sys::SHUTDOWN => {
+                self.net.shutdown(node, args[0] as i64, args[1], ctx, &mut wakes)?
+            }
             // Only `SO_REUSEPORT` is remembered; other options are accepted.
+            // Every option is kept as set; `SO_REUSEPORT` also shares the port.
             socket_sys::SETSOCKOPT => {
                 /// `SOL_SOCKET`, the level the option belongs to.
                 const SOL_SOCKET: u64 = 1;
                 /// `SO_REUSEPORT`.
                 const SO_REUSEPORT: u64 = 15;
-                if args[1] == SOL_SOCKET && args[2] == SO_REUSEPORT && args[4] >= 4 {
-                    let mut value = [0u8; 4];
+                /// Past any option's size; a longer value is kept to this.
+                const MAX_OPTION_BYTES: usize = 64;
+                let len = (args[4] as usize).min(MAX_OPTION_BYTES);
+                let mut value = vec![0u8; len];
+                if len > 0 {
                     ctx.read_mem(GuestAddr(args[3]), &mut value)?;
-                    let wanted = i32::from_le_bytes(value) != 0;
+                }
+                if args[1] == SOL_SOCKET && args[2] == SO_REUSEPORT && len >= 4 {
+                    let wanted = value[..4] != [0; 4];
                     self.net.share_port(node, args[0] as i64, wanted);
                 }
-                0
+                self.net.set_option(node, args[0] as i64, args[1], args[2], value)
             }
-            // Options read back zero.
+            // What was set, what the socket is, or Linux's default, at the length asked for.
             socket_sys::GETSOCKOPT => {
-                if args[4] != 0 {
-                    ctx.write_mem(GuestAddr(args[3]), &0i32.to_le_bytes())?;
-                    ctx.write_mem(GuestAddr(args[4]), &4i32.to_le_bytes())?;
+                if args[4] == 0 {
+                    -errno::EFAULT
+                } else {
+                    let mut room = [0u8; 4];
+                    ctx.read_mem(GuestAddr(args[4]), &mut room)?;
+                    let room = u32::from_le_bytes(room) as usize;
+                    match self.net.get_option(node, args[0] as i64, args[1], args[2]) {
+                        Ok(value) => {
+                            let taken = room.min(value.len());
+                            if taken > 0 {
+                                ctx.write_mem(GuestAddr(args[3]), &value[..taken])?;
+                            }
+                            ctx.write_mem(GuestAddr(args[4]), &(taken as u32).to_le_bytes())?;
+                            0
+                        }
+                        Err(refused) => refused,
+                    }
                 }
-                0
             }
             socket_sys::GETSOCKNAME => match self.net.name_of(node, args[0] as i64) {
                 Some(addr) => {
@@ -1944,7 +2234,11 @@ impl DistributedWorld {
                 None => -errno::ENOTCONN,
             },
             socket_sys::SOCKETPAIR => {
-                let (a, b) = self.net.open_pair(node);
+                let nonblocking = args[1] & socket_sys::SOCK_NONBLOCK != 0;
+                // `SOCK_DGRAM` and `SOCK_SEQPACKET` keep message boundaries.
+                let messages = args[1] & socket_sys::SOCK_KIND != socket_sys::SOCK_STREAM;
+                let (a, b) =
+                    self.net.open_pair(node, nonblocking, messages, &mut Numbers(&mut self.nodes));
                 let mut pair = [0u8; 8];
                 pair[..4].copy_from_slice(&(a as i32).to_le_bytes());
                 pair[4..].copy_from_slice(&(b as i32).to_le_bytes());
@@ -1953,9 +2247,6 @@ impl DistributedWorld {
             }
             socket_sys::SENDTO => {
                 self.note_an_answer(node, ctx)?;
-                let len = (args[2] as usize).min(MAX_DATAGRAM);
-                let mut payload = vec![0u8; len];
-                ctx.read_mem(GuestAddr(args[1]), &mut payload)?;
                 // `send` has no address; a connected socket supplies it.
                 let destination = if args[4] == 0 {
                     // A connected datagram socket uses its remembered address.
@@ -1970,9 +2261,23 @@ impl DistributedWorld {
                 };
                 match destination {
                     None => {
-                        self.net.stream_write(node, args[0] as i64, &payload, ctx, &mut wakes)?
+                        let len = (args[2] as usize).min(MAX_STREAM_WRITE);
+                        let mut payload = vec![0u8; len];
+                        ctx.read_mem(GuestAddr(args[1]), &mut payload)?;
+                        let may_wait = args[3] & net::msg::DONTWAIT == 0;
+                        let fd = args[0] as i64;
+                        match self
+                            .net
+                            .stream_write(node, fd, &payload, may_wait, ctx, &mut wakes)?
+                        {
+                            Some(ret) => ret,
+                            None => return self.park_socket(node, nr, args, true, wakes, ctx),
+                        }
                     }
                     Some((dest_node, dest_port)) => {
+                        let len = (args[2] as usize).min(MAX_DATAGRAM);
+                        let mut payload = vec![0u8; len];
+                        ctx.read_mem(GuestAddr(args[1]), &mut payload)?;
                         let mut armed = Vec::new();
                         let ret = self.net.send(
                             node,
@@ -1997,13 +2302,20 @@ impl DistributedWorld {
                     buf: GuestAddr(args[1]),
                     len: args[2] as usize,
                     src_addr: args[4],
+                    flags: args[3],
                 };
-                match self.net.recv(node, args[0] as i64, recv, ctx)? {
+                match self.net.recv(node, args[0] as i64, recv, ctx, &mut wakes)? {
                     Some(ret) => ret,
-                    None => return self.park_in(nr, args, ctx),
+                    None => return self.park_socket(node, nr, args, false, wakes, ctx),
                 }
             }
-            sys::CLOSE => self.net.close(node, args[0] as i64, &mut wakes),
+            sys::CLOSE => self.net.close(
+                node,
+                args[0] as i64,
+                &mut Numbers(&mut self.nodes),
+                ctx,
+                &mut wakes,
+            )?,
             sys::IOCTL if args[1] == FIONBIO => {
                 let mut on = [0u8; 4];
                 ctx.read_mem(GuestAddr(args[2]), &mut on)?;
@@ -2011,25 +2323,39 @@ impl DistributedWorld {
                 if self.net.set_nonblocking(node, fd_of(args), on) { 0 } else { -errno::EBADF }
             }
             sys::READ => {
-                let recv =
-                    PendingRecvArgs { buf: GuestAddr(args[1]), len: args[2] as usize, src_addr: 0 };
-                match self.net.recv(node, args[0] as i64, recv, ctx)? {
+                let recv = PendingRecvArgs {
+                    buf: GuestAddr(args[1]),
+                    len: args[2] as usize,
+                    src_addr: 0,
+                    flags: 0,
+                };
+                match self.net.recv(node, args[0] as i64, recv, ctx, &mut wakes)? {
                     Some(ret) => ret,
-                    None => return self.park_in(nr, args, ctx),
+                    None => return self.park_socket(node, nr, args, false, wakes, ctx),
                 }
             }
             sys::WRITE | sys::WRITEV => {
-                // A stream may take less than offered and returns the count.
+                // A write past `MAX_STREAM_WRITE` is taken in part and answers its count.
                 let payload = if nr == sys::WRITEV {
                     let mut gathered = MinimalWorld::gather(ctx, GuestAddr(args[1]), args[2])?;
-                    gathered.truncate(MAX_DATAGRAM);
+                    gathered.truncate(MAX_STREAM_WRITE);
                     gathered
                 } else {
-                    let mut buf = vec![0u8; (args[2] as usize).min(MAX_DATAGRAM)];
+                    let mut buf = vec![0u8; (args[2] as usize).min(MAX_STREAM_WRITE)];
                     ctx.read_mem(GuestAddr(args[1]), &mut buf)?;
                     buf
                 };
-                self.net.stream_write(node, args[0] as i64, &payload, ctx, &mut wakes)?
+                match self.net.stream_write(
+                    node,
+                    args[0] as i64,
+                    &payload,
+                    true,
+                    ctx,
+                    &mut wakes,
+                )? {
+                    Some(ret) => ret,
+                    None => return self.park_socket(node, nr, args, true, wakes, ctx),
+                }
             }
             _ => return Err(ctx.refuse("BOHR-2001", format!("unsupported socket call {nr}"))),
         };
@@ -2045,33 +2371,60 @@ impl DistributedWorld {
         args: [u64; 6],
         ret: i64,
         mut wakes: Vec<Wake>,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         self.wake_ready_pollers(ctx, &mut wakes)?;
         ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
         Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST).releasing(wakes))
     }
 
-    /// Records a call that parked its task, which answers nothing until something releases it.
-    fn park_in(
+    /// Parks a task in a socket call, with a timer where the socket bounds the wait in that
+    /// direction: `SO_SNDTIMEO` for a write, `SO_RCVTIMEO` for a read or an accept.
+    fn park_socket(
+        &mut self,
+        node: NodeId,
+        nr: u32,
+        args: [u64; 6],
+        sending: bool,
+        wakes: Vec<Wake>,
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Effects, KernelError> {
+        let fd = args[0] as i64;
+        if let Some(span) = self.net.timeout(node, fd, sending) {
+            let socket = self.net.resolve(node, fd);
+            let (task, since) = (ctx.task(), ctx.world_now());
+            let at = ctx.deadline_after(span);
+            self.timers.arm(at, node, Due::SocketTimeout { node, socket, task, since });
+        }
+        self.park_releasing(nr, args, wakes, ctx)
+    }
+
+    /// Parks the task, releasing the tasks its call released on the way and telling pollers.
+    ///
+    /// A stream call may move bytes for others before it waits: a write that filled what it could,
+    /// a receive that took part of what it asked for.
+    fn park_releasing(
         &mut self,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        mut wakes: Vec<Wake>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
+        self.wake_ready_pollers(ctx, &mut wakes)?;
         ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: true, data_digest: None })?;
-        Ok(Effects::wait(SYSCALL_COST))
+        Ok(Effects::wait(SYSCALL_COST).releasing(wakes))
     }
 
     /// A sleep parks the task and arms a timer; nothing else moves.
     ///
-    /// Armed in world ticks; drift shows only in what guests read.
+    /// The span is the node's own, so a node whose clock runs slow sleeps longer by the world
+    /// clock and never wakes early by its own.
     fn sleep(
         &mut self,
         node: NodeId,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let request = if nr == sys::NANOSLEEP { args[0] } else { args[2] };
         let absolute = nr == sys::CLOCK_NANOSLEEP && args[1] & TIMER_ABSTIME != 0;
@@ -2085,11 +2438,55 @@ impl DistributedWorld {
         };
         ctx.emit(EventKind::ClockRead { presented: MinimalWorld::presented_now(ctx) })?;
 
-        let at = Tick(ctx.world_now().get().saturating_add(ahead));
+        let at = ctx.deadline_after(ahead);
         self.timers.arm(at, node, Due::SleepExpiry { task: ctx.task() });
         Ok(Effects::wait(SYSCALL_COST))
     }
 }
+
+/// One rule of the route: it takes a call and answers it, or passes it to the next.
+type Rule = fn(
+    &mut DistributedWorld,
+    NodeId,
+    &Stop,
+    u32,
+    [u64; 6],
+    &mut StopCtx<'_, '_>,
+) -> Result<Option<Effects>, KernelError>;
+
+/// The route a call takes through the cluster's parts, in order; a call no rule takes is the node's
+/// world's, with a futex's timeout read on the way. Order matters where a number is shared: a read
+/// is a counter's, a socket's, a record channel's, output or a file's by its descriptor.
+const ROUTE: [(&str, Rule); 14] = [
+    ("sleep", DistributedWorld::by_sleep),
+    ("poller", DistributedWorld::by_poller),
+    ("poll on sockets", DistributedWorld::by_poll_on_sockets),
+    ("counter", DistributedWorld::by_counter),
+    ("foreign fcntl", DistributedWorld::by_foreign_fcntl),
+    ("foreign dup", DistributedWorld::by_foreign_dup),
+    ("close", DistributedWorld::by_close),
+    ("pipe", DistributedWorld::by_pipe),
+    ("socket", DistributedWorld::by_socket),
+    ("record channel", DistributedWorld::by_record_channel),
+    ("output", DistributedWorld::by_output),
+    ("disk", DistributedWorld::by_disk),
+    ("msync", DistributedWorld::by_msync),
+    ("node", DistributedWorld::by_nothing),
+];
+
+/// The data calls and syncs the disk model answers on a file.
+const DISK_CALLS: [u32; 10] = [
+    sys::WRITE,
+    sys::WRITEV,
+    sys::PWRITE64,
+    sys::PWRITEV,
+    sys::READ,
+    sys::PREAD64,
+    sys::FSYNC,
+    sys::FDATASYNC,
+    sys::FTRUNCATE,
+    sys::FALLOCATE,
+];
 
 impl WorldModel for DistributedWorld {
     fn identity(&self) -> WorldModelId {
@@ -2100,7 +2497,7 @@ impl WorldModel for DistributedWorld {
         }
     }
 
-    fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError> {
+    fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         let effects = self.answer(stop, ctx)?;
         self.audit_answer(stop, &effects, ctx)?;
         // A finished node is silent by design; read off the effects.
@@ -2132,15 +2529,11 @@ impl WorldModel for DistributedWorld {
         self.node_world(node).task_exited(task)
     }
 
-    fn fault_catalog(&self) -> &FaultCatalog {
-        &self.catalog
-    }
-
     fn next_deadline(&self) -> Option<Tick> {
         self.timers.next()
     }
 
-    fn on_deadline(&mut self, ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
+    fn on_deadline(&mut self, ctx: &mut DeadlineCtx<'_, '_>) -> Result<DueEffects, KernelError> {
         let mut effects = DueEffects::default();
         for entry in self.timers.pop_due(ctx.world_now()) {
             match entry {
@@ -2153,6 +2546,9 @@ impl WorldModel for DistributedWorld {
                         effects.wake.push(Wake { task, ret: -errno::ETIMEDOUT });
                     }
                 }
+                Due::SocketTimeout { node, socket, task, since } => {
+                    self.net.time_out(node, socket, task, since, &mut effects.wake);
+                }
                 Due::PollTimeout { node, epfd, task } => {
                     // A timed-out wait returns an empty list, for this timer's task only and only
                     // if still parked.
@@ -2162,7 +2558,7 @@ impl WorldModel for DistributedWorld {
                         // A timed-out `poll` reports nothing ready.
                         if poll {
                             Self::write_revents(ctx, task, out, max, &[])?;
-                            self.epolls.close(node, epfd);
+                            self.epolls.close(node, epfd, &mut Numbers(&mut self.nodes));
                         }
                         effects.wake.push(Wake { task, ret: 0 });
                     }
@@ -2173,7 +2569,13 @@ impl WorldModel for DistributedWorld {
                     self.wake_ready_pollers(ctx, &mut effects.wake)?;
                 }
                 Due::PartitionChange { index, raise } => {
-                    self.net.set_partition(index, raise, ctx, &mut effects.wake)?;
+                    self.net.set_partition(
+                        index,
+                        raise,
+                        &mut Numbers(&mut self.nodes),
+                        ctx,
+                        &mut effects.wake,
+                    )?;
                     // A heal resumes streams, so pollers are told.
                     self.wake_ready_pollers(ctx, &mut effects.wake)?;
                     // The window opens when the last cut lifts.
@@ -2278,11 +2680,11 @@ impl WorldModel for DistributedWorld {
                                     target: FaultTarget::Node(fault.node),
                                 },
                             )?;
-                            self.node_became(fault.node, NodeState::Frozen, ctx.world_now());
-                            ctx.emit_for(
+                            self.set_node_state(
+                                ctx,
                                 fault.node,
-                                TaskId::ZERO,
-                                EventKind::NodeState { state: NodeState::Frozen },
+                                (fault.node, TaskId::ZERO),
+                                NodeState::Frozen,
                             )?;
                             effects.node_ops.push(NodeOp::Freeze(fault.node));
                         }
@@ -2319,11 +2721,11 @@ impl WorldModel for DistributedWorld {
                                     target: FaultTarget::Node(fault.node),
                                 },
                             )?;
-                            self.node_became(fault.node, NodeState::Running, ctx.world_now());
-                            ctx.emit_for(
+                            self.set_node_state(
+                                ctx,
                                 fault.node,
-                                TaskId::ZERO,
-                                EventKind::NodeState { state: NodeState::Running },
+                                (fault.node, TaskId::ZERO),
+                                NodeState::Running,
                             )?;
                             effects.node_ops.push(NodeOp::Thaw(fault.node));
                         }
@@ -2336,22 +2738,22 @@ impl WorldModel for DistributedWorld {
                                     target: FaultTarget::Node(fault.node),
                                 },
                             )?;
-                            self.node_became(fault.node, NodeState::Dead, ctx.world_now());
-                            ctx.emit_for(
+                            self.set_node_state(
+                                ctx,
                                 fault.node,
-                                TaskId::ZERO,
-                                EventKind::NodeState { state: NodeState::Dead },
+                                (fault.node, TaskId::ZERO),
+                                NodeState::Dead,
                             )?;
                             self.crash(fault.node, ctx, &mut effects.wake)?;
                             effects.node_ops.push(NodeOp::Kill(fault.node));
                         }
                         NodeFaultKind::Restart => {
                             self.note_what_came_back(fault.node, ctx)?;
-                            self.node_became(fault.node, NodeState::Restarting, ctx.world_now());
-                            ctx.emit_for(
+                            self.set_node_state(
+                                ctx,
                                 fault.node,
-                                TaskId::ZERO,
-                                EventKind::NodeState { state: NodeState::Restarting },
+                                (fault.node, TaskId::ZERO),
+                                NodeState::Restarting,
                             )?;
                             effects.node_ops.push(NodeOp::Restart(fault.node));
                         }
@@ -2392,15 +2794,15 @@ impl WorldModel for DistributedWorld {
                                 applied = applied.max(disk.rewind(back));
                                 let image = disk.durable_image();
 
-                                self.nodes.insert(*node, restored_node(&self.template, image));
-                                self.node_of_task.retain(|_, n| n != node);
-                                self.net.drop_node(*node, &mut effects.wake);
+                                self.nodes
+                                    .insert(*node, restored_node(*node, &self.template, image));
+                                self.forget_process(*node, &mut effects.wake);
 
-                                self.node_became(*node, NodeState::Dead, ctx.world_now());
-                                ctx.emit_for(
+                                self.set_node_state(
+                                    ctx,
                                     *node,
-                                    TaskId::ZERO,
-                                    EventKind::NodeState { state: NodeState::Dead },
+                                    (*node, TaskId::ZERO),
+                                    NodeState::Dead,
                                 )?;
                                 effects.node_ops.push(NodeOp::Kill(*node));
                             }
@@ -2416,11 +2818,11 @@ impl WorldModel for DistributedWorld {
                             )?;
 
                             for node in targets {
-                                self.node_became(node, NodeState::Restarting, ctx.world_now());
-                                ctx.emit_for(
+                                self.set_node_state(
+                                    ctx,
                                     node,
-                                    TaskId::ZERO,
-                                    EventKind::NodeState { state: NodeState::Restarting },
+                                    (node, TaskId::ZERO),
+                                    NodeState::Restarting,
                                 )?;
                                 effects.node_ops.push(NodeOp::Restart(node));
                             }
@@ -2433,7 +2835,11 @@ impl WorldModel for DistributedWorld {
                             let (_, disk) = self.node_parts(fault.node);
                             disk.rewind(back);
                             let image = disk.durable_image();
-                            self.nodes.insert(fault.node, restored_node(&self.template, image));
+                            self.nodes.insert(
+                                fault.node,
+                                restored_node(fault.node, &self.template, image),
+                            );
+                            self.forget_process(fault.node, &mut effects.wake);
                             ctx.emit_for(
                                 fault.node,
                                 TaskId::ZERO,
@@ -2442,11 +2848,11 @@ impl WorldModel for DistributedWorld {
                                     target: FaultTarget::Node(fault.node),
                                 },
                             )?;
-                            self.node_became(fault.node, NodeState::Restarting, ctx.world_now());
-                            ctx.emit_for(
+                            self.set_node_state(
+                                ctx,
                                 fault.node,
-                                TaskId::ZERO,
-                                EventKind::NodeState { state: NodeState::Restarting },
+                                (fault.node, TaskId::ZERO),
+                                NodeState::Restarting,
                             )?;
                             effects.node_ops.push(NodeOp::Restart(fault.node));
                         }
@@ -2460,9 +2866,12 @@ impl WorldModel for DistributedWorld {
 
 impl DistributedWorld {
     /// Everything this world does with a stop, which the audit above reads the result of.
-    fn answer(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError> {
+    fn answer(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         let node = ctx.node();
         self.node_of_task.insert(stop.task, node);
+        // The node's world exists before anything is answered, since every descriptor number,
+        // a socket's too, is taken from its table.
+        self.node_parts(node);
         // Any stop shows the node is alive; recorded before answering.
         if let Some(watch) = self.liveness.as_mut()
             && Some(node) != self.probe_node
@@ -2493,7 +2902,7 @@ impl DistributedWorld {
         node: NodeId,
         stop: &Stop,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         let ret = match self.node_world(node).take_submissions(ctx, args)? {
             Err(errno) => -errno,
@@ -2538,215 +2947,13 @@ impl DistributedWorld {
         &mut self,
         node: NodeId,
         stop: &Stop,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         if let StopKind::SyscallEntry { nr, args } = stop.kind {
-            if nr == sys::NANOSLEEP || nr == sys::CLOCK_NANOSLEEP {
-                return self.sleep(node, nr, args, ctx);
-            }
-
-            let poll_family = matches!(
-                nr,
-                poll_sys::EPOLL_CREATE1
-                    | poll_sys::EPOLL_CTL
-                    | poll_sys::EPOLL_WAIT
-                    | poll_sys::EPOLL_PWAIT
-                    | poll_sys::EVENTFD2
-            );
-            if poll_family {
-                return self.poll_call(node, nr, args, ctx);
-            }
-            // `poll` on a node with sockets, pollers or counters is answered here.
-            if nr == sys::POLL
-                && (self.net.node_has_sockets(node) || self.epolls.node_holds_any(node))
-            {
-                return self.poll_sockets(node, args, ctx);
-            }
-            // A counter reads eight bytes and adds on write.
-            if matches!(nr, sys::READ | sys::WRITE) && self.epolls.is_counter(node, args[0] as i64)
-            {
-                return self.counter_call(node, nr, args, ctx);
-            }
-            // `fcntl` on this model's descriptors is answered here, as runtimes set them
-            // non-blocking.
-            if nr == sys::FCNTL
-                && (self.net.is_socket(node, args[0] as i64)
-                    || self.epolls.is_counter(node, args[0] as i64)
-                    || args[0] as i64 >= epoll::EPOLL_FD_BASE)
-            {
-                let ret = match args[1] {
-                    // Nothing here survives exec or blocks.
-                    F_GETFD | F_SETFD | F_SETFL => 0,
-                    F_GETFL => O_RDWR | O_NONBLOCK,
-                    // Copied by whichever disjoint table holds the original.
-                    F_DUPFD | F_DUPFD_CLOEXEC => self
-                        .epolls
-                        .dup(node, args[0] as i64)
-                        .or_else(|| self.net.dup(node, args[0] as i64))
-                        .unwrap_or(-errno::EBADF),
-                    _ => -errno::EINVAL,
-                };
-                ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
-                return Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST));
-            }
-            if nr == sys::CLOSE && self.epolls.close(node, args[0] as i64) {
-                ctx.emit(EventKind::Syscall {
-                    nr,
-                    args,
-                    ret: 0,
-                    emulated: true,
-                    data_digest: None,
-                })?;
-                return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST));
-            }
-
-            // A pipe is a stream pair. Direction is not enforced: a write to the read end is
-            // delivered where the kernel would answer `EBADF`.
-            if nr == sys::PIPE2 {
-                let (read_end, write_end) = self.net.open_pair(node);
-                if args[1] as i64 & O_NONBLOCK != 0 {
-                    self.net.set_nonblocking(node, read_end, true);
-                    self.net.set_nonblocking(node, write_end, true);
+            for (_, rule) in ROUTE {
+                if let Some(effects) = rule(self, node, stop, nr, args, ctx)? {
+                    return Ok(effects);
                 }
-                let mut pair = [0u8; 8];
-                pair[..4].copy_from_slice(&(read_end as i32).to_le_bytes());
-                pair[4..].copy_from_slice(&(write_end as i32).to_le_bytes());
-                ctx.write_mem(GuestAddr(args[0]), &pair)?;
-                ctx.emit(EventKind::Syscall {
-                    nr,
-                    args,
-                    ret: 0,
-                    emulated: true,
-                    data_digest: None,
-                })?;
-                return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST));
-            }
-
-            let ioctl_on_socket = nr == sys::IOCTL && self.net.is_socket(node, args[0] as i64);
-            let socket_family = matches!(
-                nr,
-                socket_sys::SOCKET
-                    | socket_sys::CONNECT
-                    | socket_sys::SENDTO
-                    | socket_sys::RECVFROM
-                    | socket_sys::SHUTDOWN
-                    | socket_sys::BIND
-                    | socket_sys::GETSOCKNAME
-                    | socket_sys::GETPEERNAME
-                    | socket_sys::SOCKETPAIR
-                    | socket_sys::SETSOCKOPT
-                    | socket_sys::GETSOCKOPT
-                    | socket_sys::SENDMSG
-                    | socket_sys::RECVMSG
-                    | socket_sys::LISTEN
-                    | socket_sys::ACCEPT
-                    | socket_sys::ACCEPT4
-            );
-            // read/write/writev/close follow the descriptor: sockets here, files to the node.
-            #[cfg(feature = "chaos-unknown-descriptor")]
-            let vectored = crate::chaos::vectored_reaches_sockets();
-            #[cfg(not(feature = "chaos-unknown-descriptor"))]
-            let vectored = true;
-
-            let on_socket_fd = (matches!(nr, sys::READ | sys::WRITE | sys::CLOSE)
-                || (vectored && nr == sys::WRITEV))
-                && self.net.is_socket(node, args[0] as i64);
-            if socket_family || on_socket_fd || ioctl_on_socket {
-                return self.socket_call(node, nr, args, ctx);
-            }
-
-            // Record channel writes are records, checked first.
-            if matches!(nr, sys::WRITE | sys::WRITEV)
-                && self.sdk_fds.contains(&(node, args[0] as i64))
-            {
-                return self.sdk_write(node, nr, args, ctx);
-            }
-
-            // Standard output and error go to the cluster sink. Too many segments are refused
-            // before any is read.
-            if nr == sys::WRITEV && crate::minimal::too_many_iovecs(args[2]) {
-                let ret = -crate::nums::errno::EINVAL;
-                return Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST));
-            }
-            if matches!(nr, sys::WRITE | sys::WRITEV) && (args[0] == 1 || args[0] == 2) {
-                let bytes = if nr == sys::WRITEV {
-                    MinimalWorld::gather(ctx, GuestAddr(args[1]), args[2])?
-                } else {
-                    let mut buf = vec![0u8; (args[2] as usize).min(MAX_DATAGRAM)];
-                    ctx.read_mem(GuestAddr(args[1]), &mut buf)?;
-                    buf
-                };
-                if let Some(sink) = self.output.as_mut() {
-                    use std::io::Write as _;
-                    let _ = sink.write_all(&bytes);
-                    let _ = sink.flush();
-                }
-                // Kept on the writing node, where projections read.
-                self.node_world(node).keep_written_out(&bytes);
-                if let Some(tails) = self.tails.as_mut() {
-                    tails.wrote(node.get(), &bytes);
-                }
-                let ret = bytes.len() as i64;
-                ctx.emit(EventKind::Syscall {
-                    nr,
-                    args,
-                    ret,
-                    emulated: true,
-                    data_digest: Some(bohr_trace::short_digest(&bytes)),
-                })?;
-                return Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST));
-            }
-
-            let disk_shaped = matches!(
-                nr,
-                sys::WRITE
-                    | sys::WRITEV
-                    | sys::PWRITE64
-                    | sys::PWRITEV
-                    | sys::READ
-                    | sys::PREAD64
-                    | sys::FSYNC
-                    | sys::FDATASYNC
-                    | sys::FTRUNCATE
-                    | sys::FALLOCATE
-            );
-            if disk_shaped && self.node_world(node).is_file(args[0] as i64) {
-                return self.disk_call(node, nr, args, None, stop, ctx);
-            }
-
-            // `msync` takes the same path as `fsync`: same draws, failures and stalls.
-            if nr == sys::MSYNC {
-                return match self.node_world(node).mapped_sync(args[0], args[1]) {
-                    Err(()) => Err(ctx.refuse(
-                        "BOHR-2001",
-                        "one sync over mappings of several files is not modelled; \
-                         see docs/PLATFORMS.md §4.3",
-                    )),
-                    Ok(None) => {
-                        ctx.emit(EventKind::Syscall {
-                            nr,
-                            args,
-                            ret: 0,
-                            emulated: true,
-                            data_digest: None,
-                        })?;
-                        Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST))
-                    }
-                    Ok(Some((fd, inode))) => {
-                        for (offset, len) in self.node_world(node).collect_mapped(ctx, inode)? {
-                            let (_, disk) = self.node_parts(node);
-                            disk.mark_written(inode, offset, len);
-                        }
-                        self.disk_call(
-                            node,
-                            sys::FSYNC,
-                            [fd as u64, 0, 0, 0, 0, 0],
-                            Some(inode),
-                            stop,
-                            ctx,
-                        )
-                    }
-                };
             }
 
             // The timeout is read before delegation and armed only if the task parked.
@@ -2810,6 +3017,331 @@ impl DistributedWorld {
         Ok(effects)
     }
 
+    /// A sleep, on the node's own clock.
+    fn by_sleep(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if nr != sys::NANOSLEEP && nr != sys::CLOCK_NANOSLEEP {
+            return Ok(None);
+        }
+        self.sleep(node, nr, args, ctx).map(Some)
+    }
+
+    /// The readiness calls: pollers and counters ([`epoll::HANDLES`]).
+    fn by_poller(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if !epoll::HANDLES.contains(&nr) {
+            return Ok(None);
+        }
+        self.poll_call(node, nr, args, ctx).map(Some)
+    }
+
+    /// `poll` on a node with sockets, pollers or counters.
+    fn by_poll_on_sockets(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if nr != sys::POLL || !(self.net.node_has_sockets(node) || self.epolls.node_holds_any(node))
+        {
+            return Ok(None);
+        }
+        self.poll_sockets(node, args, ctx).map(Some)
+    }
+
+    /// A counter reads eight bytes and adds on write.
+    fn by_counter(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if !matches!(nr, sys::READ | sys::WRITE) || !self.epolls.is_counter(node, args[0] as i64) {
+            return Ok(None);
+        }
+        self.counter_call(node, nr, args, ctx).map(Some)
+    }
+
+    /// `fcntl` on a socket, a poller or a counter, as runtimes set them non-blocking.
+    fn by_foreign_fcntl(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        // `fcntl` on a socket, a poller or a counter is answered here, as runtimes set them
+        // non-blocking.
+        let fd = args[0] as i64;
+        if nr != sys::FCNTL || !self.holds_foreign(node, fd) {
+            return Ok(None);
+        }
+        {
+            let ret = self.foreign_fcntl(node, fd, args);
+            ctx.emit(EventKind::Syscall { nr, args, ret, emulated: true, data_digest: None })?;
+            Ok(Some(Effects::go(Resume::Emulate { ret }, SYSCALL_COST)))
+        }
+    }
+
+    /// A copy of, or onto, a socket, a poller or a counter; a copy of a file passes on.
+    fn by_foreign_dup(
+        &mut self,
+        node: NodeId,
+        stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        // A copy of, or onto, a socket, a poller or a counter.
+        if matches!(nr, sys::DUP | sys::DUP2 | sys::DUP3) {
+            let mut wakes = Vec::new();
+            if let Some(ret) = self.foreign_dup(node, nr, args, ctx, &mut wakes)? {
+                return self.answer_socket_call(nr, args, ret, wakes, ctx).map(Some);
+            }
+            if !wakes.is_empty() {
+                // A file copied onto a socket's number: the socket closed here, the copy is
+                // the node's, and whoever the close released goes with its answer.
+                let mut effects = self.node_world(node).handle(stop, ctx)?;
+                effects.wake.extend(wakes);
+                return Ok(Some(effects));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A close forgets the number's `FD_CLOEXEC`, and closes a poller or a counter here.
+    fn by_close(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if nr != sys::CLOSE {
+            return Ok(None);
+        }
+        let fd = args[0] as i64;
+        self.cloexec.remove(&(node, fd));
+        if !self.epolls.close(node, fd, &mut Numbers(&mut self.nodes)) {
+            return Ok(None);
+        }
+        ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: true, data_digest: None })?;
+        Ok(Some(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST)))
+    }
+
+    /// A pipe is a stream pair. Direction is not enforced: a write to the read end is
+    /// delivered where the kernel would answer `EBADF`.
+    fn by_pipe(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        // A pipe is a stream pair. Direction is not enforced: a write to the read end is
+        // delivered where the kernel would answer `EBADF`.
+        if nr != sys::PIPE2 {
+            return Ok(None);
+        }
+        {
+            let nonblocking = args[1] as i64 & O_NONBLOCK != 0;
+            let (read_end, write_end) =
+                self.net.open_pair(node, nonblocking, false, &mut Numbers(&mut self.nodes));
+            let mut pair = [0u8; 8];
+            pair[..4].copy_from_slice(&(read_end as i32).to_le_bytes());
+            pair[4..].copy_from_slice(&(write_end as i32).to_le_bytes());
+            ctx.write_mem(GuestAddr(args[0]), &pair)?;
+            ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: true, data_digest: None })?;
+            Ok(Some(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST)))
+        }
+    }
+
+    /// The socket calls ([`net::HANDLES`]), and read, write, writev, close and ioctl on a
+    /// socket's number.
+    fn by_socket(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        let ioctl_on_socket = nr == sys::IOCTL && self.net.is_socket(node, args[0] as i64);
+        let socket_family = net::HANDLES.contains(&nr);
+        // read/write/writev/close follow the descriptor: sockets here, files to the node.
+        #[cfg(feature = "chaos-unknown-descriptor")]
+        let vectored = crate::chaos::vectored_reaches_sockets();
+        #[cfg(not(feature = "chaos-unknown-descriptor"))]
+        let vectored = true;
+
+        let on_socket_fd = (matches!(nr, sys::READ | sys::WRITE | sys::CLOSE)
+            || (vectored && nr == sys::WRITEV))
+            && self.net.is_socket(node, args[0] as i64);
+        if !(socket_family || on_socket_fd || ioctl_on_socket) {
+            return Ok(None);
+        }
+        self.socket_call(node, nr, args, ctx).map(Some)
+    }
+
+    /// Record channel writes are records, checked before output.
+    fn by_record_channel(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if !matches!(nr, sys::WRITE | sys::WRITEV)
+            || !self.sdk_fds.contains(&(node, args[0] as i64))
+        {
+            return Ok(None);
+        }
+        self.sdk_write(node, nr, args, ctx).map(Some)
+    }
+
+    /// Standard output and error go to the cluster sink. Too many segments are refused before
+    /// any is read.
+    fn by_output(
+        &mut self,
+        node: NodeId,
+        _stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if nr == sys::WRITEV && crate::minimal::too_many_iovecs(args[2]) {
+            let ret = -crate::nums::errno::EINVAL;
+            return Ok(Some(Effects::go(Resume::Emulate { ret }, SYSCALL_COST)));
+        }
+        if !matches!(nr, sys::WRITE | sys::WRITEV) || !(args[0] == 1 || args[0] == 2) {
+            return Ok(None);
+        }
+        {
+            let bytes = if nr == sys::WRITEV {
+                MinimalWorld::gather(ctx, GuestAddr(args[1]), args[2])?
+            } else {
+                let mut buf = vec![0u8; (args[2] as usize).min(MAX_DATAGRAM)];
+                ctx.read_mem(GuestAddr(args[1]), &mut buf)?;
+                buf
+            };
+            if let Some(sink) = self.output.as_mut() {
+                use std::io::Write as _;
+                let _ = sink.write_all(&bytes);
+                let _ = sink.flush();
+            }
+            // Kept on the writing node, where projections read.
+            self.node_world(node).keep_written_out(&bytes);
+            if let Some(tails) = self.tails.as_mut() {
+                tails.wrote(node.get(), &bytes);
+            }
+            let ret = bytes.len() as i64;
+            ctx.emit(EventKind::Syscall {
+                nr,
+                args,
+                ret,
+                emulated: true,
+                data_digest: Some(bohr_trace::short_digest(&bytes)),
+            })?;
+            Ok(Some(Effects::go(Resume::Emulate { ret }, SYSCALL_COST)))
+        }
+    }
+
+    /// Data calls and syncs on a file, which the disk model answers ([`DISK_CALLS`]).
+    fn by_disk(
+        &mut self,
+        node: NodeId,
+        stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        if !DISK_CALLS.contains(&nr) || !self.node_world(node).is_file(args[0] as i64) {
+            return Ok(None);
+        }
+        self.disk_call(node, nr, args, None, stop, ctx).map(Some)
+    }
+
+    /// `msync` takes the same path as `fsync`: same draws, failures and stalls.
+    fn by_msync(
+        &mut self,
+        node: NodeId,
+        stop: &Stop,
+        nr: u32,
+        args: [u64; 6],
+        ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        // `msync` takes the same path as `fsync`: same draws, failures and stalls.
+        if nr != sys::MSYNC {
+            return Ok(None);
+        }
+        {
+            match self.node_world(node).mapped_sync(args[0], args[1]) {
+                Err(()) => Err(ctx.refuse(
+                    "BOHR-2001",
+                    "one sync over mappings of several files is not modelled; \
+                     see docs/PLATFORMS.md §4.3",
+                )),
+                Ok(None) => {
+                    ctx.emit(EventKind::Syscall {
+                        nr,
+                        args,
+                        ret: 0,
+                        emulated: true,
+                        data_digest: None,
+                    })?;
+                    Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST))
+                }
+                Ok(Some((fd, inode))) => {
+                    for (offset, len) in self.node_world(node).collect_mapped(ctx, inode)? {
+                        let (_, disk) = self.node_parts(node);
+                        disk.mark_written(inode, offset, len);
+                    }
+                    self.disk_call(
+                        node,
+                        sys::FSYNC,
+                        [fd as u64, 0, 0, 0, 0, 0],
+                        Some(inode),
+                        stop,
+                        ctx,
+                    )
+                }
+            }
+            .map(Some)
+        }
+    }
+
+    /// The end of the table: what is left is the node's world's.
+    fn by_nothing(
+        &mut self,
+        _node: NodeId,
+        _stop: &Stop,
+        _nr: u32,
+        _args: [u64; 6],
+        _ctx: &mut StopCtx<'_, '_>,
+    ) -> Result<Option<Effects>, KernelError> {
+        Ok(None)
+    }
+
     /// Whether this world has just told a guest it never issued a descriptor it did issue.
     ///
     /// `EBADF` for a held descriptor tells the guest something untrue, so the run stops.
@@ -2819,7 +3351,7 @@ impl DistributedWorld {
         &mut self,
         stop: &Stop,
         effects: &Effects,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<(), KernelError> {
         let StopKind::SyscallEntry { nr, args } = stop.kind else {
             return Ok(());
@@ -2912,5 +3444,28 @@ impl std::fmt::Debug for DistributedWorld {
             .field("nodes", &self.nodes.len())
             .field("timers", &self.timers)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every call the cluster's own parts answer is one the syscall filter stops the guest at, and
+    /// no call belongs to two families: an admitted call never reaches the world.
+    #[test]
+    fn every_call_the_cluster_answers_is_traced() {
+        let mut seen = BTreeSet::new();
+        for nr in net::HANDLES.iter().chain(epoll::HANDLES) {
+            assert!(seen.insert(*nr), "{nr} belongs to two families");
+        }
+        let untraced: Vec<(u32, Option<&str>)> = seen
+            .iter()
+            .chain(DISK_CALLS.iter())
+            .copied()
+            .filter(|nr| bohr_trace::syscall_traced(*nr) != Some(true))
+            .map(|nr| (nr, bohr_trace::syscall_name(nr)))
+            .collect();
+        assert!(untraced.is_empty(), "answered and not traced: {untraced:?}");
     }
 }

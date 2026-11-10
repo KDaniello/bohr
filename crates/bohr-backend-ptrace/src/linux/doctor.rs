@@ -4,7 +4,7 @@
 //! `seccomp` and `prctl`. The module only measures; the caller decides what an answer means. See
 //! `docs/PLATFORMS.md` §2.
 
-use bohr_backend::code::entropy;
+use bohr_x86::entropy;
 
 /// Whether a host capability is present.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

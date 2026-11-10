@@ -42,8 +42,9 @@ const TIMESPEC_AT: u64 = MEMORY_BASE + 0x100;
 const PAYLOAD_AT: u64 = MEMORY_BASE + 0x200;
 const SOCKADDR_AT: u64 = MEMORY_BASE + 0x300;
 
+/// The file is opened first and takes 3; the socket takes the next free number.
 const DATA_FD: u64 = 3;
-const SOCKET_FD: u64 = 4096;
+const SOCKET_FD: u64 = 4;
 const INBOX_AT: u64 = MEMORY_BASE + 0x1200;
 
 /// Writes, syncs and works the socket, over and over — enough for every model to act on.

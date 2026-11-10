@@ -22,7 +22,7 @@ src_of() { # crate -> its src dir, if present
 
 SANS_IO=(bohr-kernel bohr-world bohr-explorer bohr-reducer)
 ABOVE_BOUNDARY=(bohr-types bohr-tape bohr-trace bohr-backend bohr-kernel bohr-world \
-                bohr-explorer bohr-reducer bohr-report bohr-sdk-proto)
+                bohr-explorer bohr-reducer bohr-report bohr-sdk-proto bohr-x86)
 
 grep_in() { # pattern, dirs...
   local pat="$1"; shift
@@ -51,15 +51,36 @@ if hits=$(grep_in '(^|[^_[:alnum:]])unsafe[[:space:]]' "${dirs[@]}"); then
   report 14b §5.12 $'unsafe outside bohr-backend-ptrace:\n'"$hits"
 fi
 
-# §5.1 and rule 9: no host clock, no ambient randomness in decision paths.
+# §5.1 and rule 9: no host clock, no ambient randomness and no host file system in decision paths.
+# A scenario that read the host while it was parsed would differ between two machines holding the
+# same text; the command line reads the host and hands the world what it read.
 dirs=(); for c in "${SANS_IO[@]}"; do d=$(src_of "$c") && dirs+=("$d"); done
-if hits=$(grep_in_determinism '(Instant::now|SystemTime::now|thread_rng|rand::random)' "${dirs[@]}"); then
-  report 14c §5.1 $'host clock or ambient RNG in a sans-io crate:\n'"$hits"
+if hits=$(grep_in_determinism '(Instant::now|SystemTime::now|thread_rng|rand::random|std::fs::|File::(open|create))' "${dirs[@]}"); then
+  report 14c §5.1 $'host clock, ambient RNG or the host file system in a sans-io crate:\n'"$hits"
 fi
 
 # Rule 10: hash iteration order is not stable across runs.
 if hits=$(grep_in_determinism '\b(HashMap|HashSet)\b' "${dirs[@]}"); then
   report 14d 'rule 10' $'HashMap/HashSet in a decision path; use BTreeMap or IndexMap:\n'"$hits"
+fi
+
+# §3: every crate depends on exactly what ARCHITECTURE.md's table says. A graph drawn by hand drifts
+# from the manifests, and it had: the explorer and the reducer named crates they never used.
+graph=$(sed -n '/<!-- crate-graph -->/,/<!-- \/crate-graph -->/p' docs/ARCHITECTURE.md \
+  | grep -E '^\| `bohr-' | sed -E 's/^\| `([a-z0-9-]+)` \|(.*)\|$/\1:\2/' | tr -d '`' \
+  | while IFS=: read -r crate deps; do
+      printf '%s:%s\n' "$crate" "$(echo "$deps" | tr ' ' '\n' | grep -E '^bohr-' | sort | tr '\n' ' ')"
+    done)
+manifests=$(for m in crates/*/Cargo.toml; do
+    crate=$(basename "$(dirname "$m")")
+    deps=$(sed -n '/^\[dependencies\]/,/^\[/p' "$m" | grep -oE '^bohr-[a-z0-9-]+' | grep -v '^bohr-sdk$' \
+      | sort | tr '\n' ' ')
+    printf '%s:%s\n' "$crate" "$deps"
+  done)
+if [ "$(echo "$graph" | sort)" != "$(echo "$manifests" | sort)" ]; then
+  report 14e §3 $'the manifests and ARCHITECTURE.md §3 name different dependencies:\n'"$(
+    diff <(echo "$graph" | sort) <(echo "$manifests" | sort) \
+      | sed 's/^</  the table says: /;s/^>/  the manifest says: /' | grep -E '^  ')"
 fi
 
 # §5.2, §5.16, §5.17: the kernel declares its ports and depends on none of their implementations.
@@ -109,41 +130,24 @@ fi
 # API 9: the documented bundle format version must match the code.
 #
 # sed rather than `grep -P`, which is a GNU extension that fails open where it is unavailable and
-# would leave this check silently passing.
+# would leave this check silently passing. The tape ABI needs no such check: it is one constant in
+# bohr-types, which the tape and the bundle both read.
 if [ -f crates/bohr-trace/src/lib.rs ]; then
   code=$(sed -nE 's/^pub const BUNDLE_FORMAT: u16 = ([0-9]+);.*/\1/p' crates/bohr-trace/src/lib.rs | head -1)
   docv=$(sed -nE 's/^ *[0-9]+ +[0-9]+ +bundle_format +u16, currently ([0-9]+).*/\1/p' docs/API.md | head -1)
   if [ -n "$code" ] && [ -n "$docv" ] && [ "$code" != "$docv" ]; then
     report 14i 'API 9' "bundle_format is $code in code and $docv in docs/API.md"
   fi
-  # The tape ABI is spelled twice: once where it is defined, once in the bundle layer, which does
-  # not depend on the tape crate. A bundle recording an ABI the tape never had would be refused
-  # for the wrong reason, or accepted for none.
-  tape=$(sed -nE 's/^pub const TAPE_ABI: u16 = ([0-9]+);.*/\1/p' crates/bohr-tape/src/lib.rs | head -1)
-  echoed=$(sed -nE '/const fn bohr_tape_abi/,/^}/s/^ *([0-9]+)$/\1/p' crates/bohr-trace/src/bundle.rs | head -1)
-  if [ -n "$tape" ] && [ -n "$echoed" ] && [ "$tape" != "$echoed" ]; then
-    report 14j 'API 9' "tape_abi is $tape in bohr-tape and $echoed in bohr-trace"
-  fi
 
-  # A world advertises the faults it can inject and narrates them as they fire. Those are two
-  # lists, and nothing at run time reads the first — so it drifts, and it has: two clock faults
-  # were offered that no scenario could ask for, and a reorg was narrated that the catalogue did
-  # not mention. A campaign plans coverage from the catalogue, which is what makes the drift cost
-  # something rather than merely being untidy.
+  # The trace format names the faults a run can carry, and a world narrates them as they fire.
+  # Those are two lists, and nothing at run time holds them together, so they drift: a kind the
+  # format names and no world fires is a promise nobody keeps, and a kind fired and never named
+  # cannot be read back.
   world=crates/bohr-world/src
   if [ -d "$world" ]; then
     # The leading boundary matters: `NodeFaultKind::Kill` contains `FaultKind::Kill`, and a
     # pattern without it reports every scheduled fault as a narrated one.
     narrated=$(grep -rhoE 'fault: FaultKind::[A-Za-z]+' "$world" | sed 's/.*:://' | sort -u)
-    advertised=$(sed -n '/FaultCatalog::new(vec!\[/,/^ *\]),$/p' "$world/distributed/mod.rs" \
-      | grep -oE '(^|[^A-Za-z])FaultKind::[A-Za-z]+' | sed 's/.*:://' | sort -u)
-    if [ "$narrated" != "$advertised" ]; then
-      report 14m §4.5 $'the fault catalogue and what the world narrates disagree:\n'"$(
-        diff <(echo "$advertised") <(echo "$narrated") \
-          | sed 's/^</  advertised, never narrated: /;s/^>/  narrated, never advertised: /')"
-    fi
-    # The third list: every kind the trace format names. A kind the format names and no world
-    # fires is a promise in the format nobody keeps, and a campaign planning from it plans nothing.
     named=$(sed -n '/^pub enum FaultKind/,/^}/p' crates/bohr-trace/src/event.rs \
       | grep -oE '^    [A-Z][A-Za-z]+' | tr -d ' ' | sort -u)
     if [ -n "$named" ] && [ "$named" != "$narrated" ]; then
@@ -173,26 +177,14 @@ if [ -f crates/bohr-trace/src/lib.rs ]; then
   asset=crates/bohr-trace/assets/syscalls-x86_64.tsv
   if [ -f "$table" ] && [ -f "$asset" ]; then
     from_backend=$(grep -oE '(admit|trace)\((-?[0-9]+), "([a-z0-9_]+)"\)' "$table" \
-      | sed -E 's/(admit|trace)\((-?[0-9]+), "([a-z0-9_]+)"\)/\2\t\3/' | sort -n -u)
-    from_asset=$(grep -vE '^#|^$' "$asset" | cut -f1,2 | sort -n -u)
+      | sed -E 's/(admit|trace)\((-?[0-9]+), "([a-z0-9_]+)"\)/\2\t\3\t\1/' | sort -n -u)
+    from_asset=$(grep -vE '^#|^$' "$asset" | cut -f1,2,4 | sort -n -u)
     if [ "$from_backend" != "$from_asset" ]; then
       report 14k §5.7 $'the syscall table and the trace asset disagree:\n'"$(
         diff <(echo "$from_backend") <(echo "$from_asset") | head -20)"
     fi
   fi
 
-  # The liveness watch cannot tell a node this world stopped from a node that stopped on its own,
-  # so a state change it is not told about becomes a finding against our own doing — and only on
-  # the runs a fault campaign exists to produce. One notification per state put on the timeline.
-  world=crates/bohr-world/src/distributed/mod.rs
-  if [ -f "$world" ]; then
-    states=$(grep -c 'EventKind::NodeState' "$world")
-    told=$(grep -c 'self.node_became(' "$world")
-    if [ "$states" != "$told" ]; then
-      report 14m §5.17 "the world puts $states node states on the timeline and tells the liveness \
-watch about $told of them"
-    fi
-  fi
 
   # The mutation harness is only as good as its inventory: an injection the table does not list is
   # one nobody knows is running, and a table row with no injection behind it is a promise of

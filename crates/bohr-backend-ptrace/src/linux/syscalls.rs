@@ -43,6 +43,20 @@ fn mapping_rules() -> Result<Vec<SeccompRule>, String> {
     ])
 }
 
+/// `madvise`, admitted for every advice but one.
+const MADVISE: i64 = 28;
+
+/// `MADV_FREE`: a freed page keeps or loses its bytes by the host's memory pressure, so it stops
+/// the guest and is carried out as `MADV_DONTNEED`.
+const MADV_FREE: u64 = 8;
+
+/// The rule admitting `madvise` with any advice but `MADV_FREE`.
+fn advice_rules() -> Result<Vec<SeccompRule>, String> {
+    let not_free = SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, MADV_FREE)
+        .map_err(|e| e.to_string())?;
+    Ok(vec![SeccompRule::new(vec![not_free]).map_err(|e| e.to_string())?])
+}
+
 /// What the filter does about a syscall.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Disposition {
@@ -83,7 +97,8 @@ pub(crate) const TABLE: &[Entry] = &[
     // Traced by default; `mapping_rules` admits two narrow cases.
     trace(9, "mmap"),
     admit(25, "mremap"),
-    admit(28, "madvise"),
+    // Traced by default; `advice_rules` admits every advice but `MADV_FREE`.
+    trace(28, "madvise"),
     admit(10, "mprotect"),
     // Traced: the world tracks file mappings and must see one removed.
     trace(11, "munmap"),
@@ -97,7 +112,9 @@ pub(crate) const TABLE: &[Entry] = &[
     admit(158, "arch_prctl"),
     admit(218, "set_tid_address"),
     admit(273, "set_robust_list"),
-    admit(334, "rseq"),
+    // Traced and refused: the host kernel would write the current core into the guest.
+    trace(334, "rseq"),
+    trace(309, "getcpu"),
     trace(0, "read"),
     trace(1, "write"),
     trace(20, "writev"),
@@ -269,6 +286,7 @@ pub(crate) fn filter_program(allocations: bool) -> Result<BpfProgram, String> {
         mapping.remove(0);
     }
     rules.insert(MMAP, mapping);
+    rules.insert(MADVISE, advice_rules()?);
 
     let filter = SeccompFilter::new(
         rules,
@@ -332,10 +350,8 @@ mod tests {
                 "arch_prctl",
                 "brk",
                 "execve",
-                "madvise",
                 "mprotect",
                 "mremap",
-                "rseq",
                 "rt_sigaction",
                 "rt_sigprocmask",
                 "rt_sigreturn",

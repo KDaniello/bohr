@@ -261,10 +261,17 @@ directories of the hierarchy standard — `/bin`, `/dev`, `/etc`, `/home`, `/lib
 there because every filesystem a program is ever started on has them, and a world that made a guest
 create `/tmp` before writing to it would refuse an open that succeeds everywhere.
 
-**A directory is a name, not a container.** It can be made, asked about, opened and synced, and a
-file cannot be created where its directory does not exist. What it is not is a step in a walk:
-resolution is by the whole path, so there are no links, no `..`, and no working directory to be
-relative to. `getdents64` answers empty, whatever is there.
+**A directory is a name, not a container.** It can be made, asked about, opened, listed and
+synced, and a file cannot be created where its directory does not exist. What it is not is a step in
+a walk: a name is the whole path, so `..` inside one is part of the name, not a way up. A relative
+name is taken against the working directory, which `[state] cwd` sets and no call moves: `chdir`
+is not modelled and stops the run, as every call the world does not answer does. The `*at` calls
+take a relative name against the directory their descriptor names. A symbolic link is followed at
+the last component only, at most eight times, its text taken against the link's directory;
+`unlink`, `rename` and `readlink` act on the link itself, and a link in the middle of a path is not
+followed. `getdents64` lists a directory's entries, itself and its parent first. A directory with
+anything under it is not removed (`ENOTEMPTY`), and one that is renamed takes everything under it
+along, onto nothing or onto an empty directory, and never into itself.
 
 `/dev/urandom` and `/dev/random` resolve and read as the endless draw. **Nothing under `/proc` or
 `/sys` exists** — an open answers `ENOENT`, which is behaviour a portable program already handles,

@@ -450,11 +450,47 @@ impl Event {
     /// Host-derived values are excluded so that the same run on two machines produces the same
     /// digest. The exclusion list is a tested contract; see `docs/API.md` §4.4.
     pub fn absorb(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.id.get().to_le_bytes());
-        hasher.update(&self.tick.get().to_le_bytes());
-        hasher.update(&self.node.get().to_le_bytes());
-        hasher.update(&self.task.get().to_le_bytes());
-        self.kind.absorb(hasher);
+        let mut h = Gather { hasher, buf: [0; GATHERED], len: 0 };
+        h.update(&self.id.get().to_le_bytes());
+        h.update(&self.tick.get().to_le_bytes());
+        h.update(&self.node.get().to_le_bytes());
+        h.update(&self.task.get().to_le_bytes());
+        self.kind.absorb(&mut h);
+        h.flush();
+    }
+}
+
+/// Room for every fixed-size event; a longer one, carrying a long name or payload, takes more than
+/// one update.
+const GATHERED: usize = 128;
+
+/// An event's canonical bytes, gathered on the stack and handed to the hasher in one update.
+///
+/// The hasher is fed the same bytes in the same order either way, so the digest is unchanged; what
+/// changes is that a typical event costs one update instead of about sixteen small ones.
+struct Gather<'h> {
+    hasher: &'h mut blake3::Hasher,
+    buf: [u8; GATHERED],
+    len: usize,
+}
+
+impl Gather<'_> {
+    fn update(&mut self, bytes: &[u8]) -> &mut Self {
+        if self.len + bytes.len() > GATHERED {
+            self.flush();
+            if bytes.len() > GATHERED {
+                self.hasher.update(bytes);
+                return self;
+            }
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        self
+    }
+
+    fn flush(&mut self) {
+        self.hasher.update(&self.buf[..self.len]);
+        self.len = 0;
     }
 }
 
@@ -465,7 +501,7 @@ impl Event {
 ///
 /// An address is hashed as null or not; what it points at is carried by `data_digest`. An unknown
 /// number hashes all six registers.
-fn absorb_args(nr: u32, args: &[u64; 6], h: &mut blake3::Hasher) {
+fn absorb_args(nr: u32, args: &[u64; 6], h: &mut Gather<'_>) {
     let Some(shape) = crate::syscall_args(nr) else {
         for a in args {
             h.update(&a.to_le_bytes());
@@ -482,7 +518,7 @@ fn absorb_args(nr: u32, args: &[u64; 6], h: &mut blake3::Hasher) {
 
 /// Outer discriminants are explicit, so inserting a variant changes no stored digest.
 impl EventKind {
-    fn absorb(&self, h: &mut blake3::Hasher) {
+    fn absorb(&self, h: &mut Gather<'_>) {
         match self {
             Self::Syscall { nr, args, ret, emulated, data_digest } => {
                 h.update(&[1]);
@@ -594,14 +630,14 @@ impl EventKind {
 }
 
 impl Endpoint {
-    fn absorb(self, h: &mut blake3::Hasher) {
+    fn absorb(self, h: &mut Gather<'_>) {
         h.update(&self.node.get().to_le_bytes());
         h.update(&self.port.to_le_bytes());
     }
 }
 
 impl FaultTarget {
-    fn absorb(&self, h: &mut blake3::Hasher) {
+    fn absorb(&self, h: &mut Gather<'_>) {
         match self {
             Self::Node(n) => {
                 h.update(&[0]);
@@ -635,7 +671,7 @@ pub fn short_digest(bytes: &[u8]) -> [u8; 8] {
 }
 
 /// Length-prefixed so that `("ab", "c")` and `("a", "bc")` cannot hash alike.
-fn absorb_str(h: &mut blake3::Hasher, s: &str) {
+fn absorb_str(h: &mut Gather<'_>, s: &str) {
     h.update(&(s.len() as u64).to_le_bytes());
     h.update(s.as_bytes());
 }

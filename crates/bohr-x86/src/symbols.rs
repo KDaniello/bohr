@@ -1,7 +1,7 @@
 //! Where the functions are, and which bytes inside one begin an instruction.
 //!
 //! `0F A2` is `cpuid` only where an instruction begins; elsewhere it may be part of a
-//! displacement. Walking the code and measuring each step ([`crate::code::insn`]) tells them apart.
+//! displacement. Walking the code and measuring each step ([`crate::insn`]) tells them apart.
 //!
 //! The walk starts at a function symbol and stops at its declared size. `.text` also holds data,
 //! padding and jump tables; a sweep from the start of the section would walk into them and lose

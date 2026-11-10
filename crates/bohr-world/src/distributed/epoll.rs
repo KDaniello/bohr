@@ -9,13 +9,14 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bohr_types::{GuestAddr, NodeId, TaskId};
 
-/// First descriptor handed out for an epoll instance.
-///
-/// A range clear of files (from 3) and sockets (from 4096), so descriptors are unambiguous.
-pub(crate) const EPOLL_FD_BASE: i64 = 8192;
+use super::{FIRST_DESCRIPTOR, Numbers};
 
-/// First descriptor handed out for an event counter.
-pub(crate) const EVENTFD_BASE: i64 = 12288;
+/// First identity an instance or a counter is kept under, past every number a guest's descriptor
+/// can hold.
+///
+/// A guest names one by a number from its process's one table; it is kept under an identity of
+/// its own, so a `dup` or a close of one number never moves it.
+const ID_BASE: i64 = 1 << 32;
 
 /// `EPOLL_CTL_ADD`, `_DEL`, `_MOD`.
 pub(crate) const CTL_ADD: u64 = 1;
@@ -36,6 +37,19 @@ pub(crate) const EPOLLONESHOT: u32 = 1 << 30;
 /// Size of `struct epoll_event` on x86-64, which is packed: a `u32` and a `u64` with no padding.
 pub(crate) const EVENT_BYTES: usize = 12;
 
+/// How often a descriptor has had something arrive, and how often a write found it full.
+///
+/// Each only grows. An edge-triggered watch reports when one has moved since its last report:
+/// readable once more arrived, writable once room came back after a write found none, which is the
+/// edge from full to not full.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Edges {
+    /// Bytes, a message, a datagram, a connection, the end of a stream or an error.
+    pub(crate) arrived: u64,
+    /// A write that did not go whole.
+    pub(crate) filled: u64,
+}
+
 /// What one watched descriptor asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Watch {
@@ -43,8 +57,8 @@ struct Watch {
     events: u32,
     /// The guest's token, returned untouched.
     token: u64,
-    /// The readiness epoch this descriptor was last reported in, for an edge-triggered watch.
-    seen: Option<u64>,
+    /// The descriptor's edges when it was last reported, for an edge-triggered watch.
+    seen: Option<Edges>,
     /// Whether a one-shot watch has fired, and so reports nothing until it is modified.
     fired: bool,
 }
@@ -74,25 +88,60 @@ struct Instance {
     parked: VecDeque<Parked>,
 }
 
+/// An event counter, as `eventfd2` makes one.
+#[derive(Debug, Default)]
+struct Counter {
+    value: u64,
+    /// `EFD_SEMAPHORE`: a read takes one, not the whole value.
+    semaphore: bool,
+    /// `EFD_NONBLOCK`: a read of nought answers `EAGAIN` instead of waiting.
+    nonblocking: bool,
+    /// Tasks parked in a read of nought, oldest first, and where each wants the value.
+    readers: VecDeque<(TaskId, GuestAddr)>,
+    edges: Edges,
+}
+
+impl Counter {
+    /// Takes what a read takes: one under `EFD_SEMAPHORE`, else the whole value.
+    fn take(&mut self) -> u64 {
+        let taken = if self.semaphore { 1 } else { self.value };
+        self.value -= taken;
+        taken
+    }
+}
+
+/// A read of a counter: the value it took, or that it waits.
+pub(crate) enum CounterRead {
+    Took(u64),
+    WouldBlock,
+    Waits,
+}
+
+/// The readiness calls this part answers.
+pub(crate) const HANDLES: &[u32] = &[
+    super::poll_sys::EPOLL_CREATE1,
+    super::poll_sys::EPOLL_CTL,
+    super::poll_sys::EPOLL_WAIT,
+    super::poll_sys::EPOLL_PWAIT,
+    super::poll_sys::EVENTFD2,
+];
+
 /// What a node was asked to report readiness on.
 #[derive(Debug, Default)]
 pub(crate) struct Epolls {
     instances: BTreeMap<(NodeId, i64), Instance>,
-    /// Event counters, by the descriptor each was opened as.
+    /// Event counters, by identity.
     ///
     /// Runtimes use them to wake their poller.
-    counters: BTreeMap<(NodeId, i64), u64>,
-    /// Duplicate descriptors, each naming the instance it was copied from.
+    counters: BTreeMap<(NodeId, i64), Counter>,
+    /// Every descriptor a guest holds on an instance or a counter, and the identity it names.
     ///
-    /// Aliases, since a `dup` names the same instance.
-    aliases: BTreeMap<(NodeId, i64), i64>,
-    next_epoll: BTreeMap<NodeId, i64>,
-    next_counter: BTreeMap<NodeId, i64>,
+    /// A `dup` adds a second number for one; it goes with its last number.
+    descriptors: BTreeMap<(NodeId, i64), i64>,
+    /// The next identity; never reused.
+    next_id: i64,
     /// The next number for an instance a `poll` makes for itself.
     next_hidden: BTreeMap<NodeId, i64>,
-    /// Counts moments readiness may change: deliveries, counter writes, heals. Edge-triggered
-    /// watches report once per epoch.
-    epoch: u64,
 }
 
 /// Past every guest descriptor, so closing a `poll`'s instance never closes a guest's.
@@ -107,6 +156,17 @@ pub(crate) struct Ready {
     pub(crate) events: u32,
     /// The guest's token for the descriptor it happened on.
     pub(crate) token: u64,
+    /// The descriptor's edges when this was read, kept as what the watch last saw.
+    pub(crate) edges: Edges,
+}
+
+/// One watch an instance holds, as the world reads readiness for it.
+pub(crate) struct Watching {
+    pub(crate) fd: i64,
+    pub(crate) events: u32,
+    pub(crate) token: u64,
+    /// The edges it was last reported at; `None` before its first report.
+    pub(crate) seen: Option<Edges>,
 }
 
 impl Ready {
@@ -120,27 +180,61 @@ impl Ready {
 }
 
 impl Epolls {
-    /// The descriptor an instance is really kept under, following one alias.
+    /// The identity a descriptor names.
+    ///
+    /// An identity passes through, so internal callers may hand one in; a number no instance or
+    /// counter descriptor holds answers -1, which names nothing.
     fn resolve(&self, node: NodeId, fd: i64) -> i64 {
-        self.aliases.get(&(node, fd)).copied().unwrap_or(fd)
+        if fd >= ID_BASE {
+            return fd;
+        }
+        self.descriptors.get(&(node, fd)).copied().unwrap_or(-1)
     }
 
-    /// Copies a descriptor, answering with the new one, or nothing where it is not ours.
-    ///
-    /// Pollers and counters are both aliased.
-    pub(crate) fn dup(&mut self, node: NodeId, fd: i64) -> Option<i64> {
-        let original = self.resolve(node, fd);
-        let next = if self.instances.contains_key(&(node, original)) {
-            self.next_epoll.entry(node).or_insert(EPOLL_FD_BASE)
-        } else if self.counters.contains_key(&(node, original)) {
-            self.next_counter.entry(node).or_insert(EVENTFD_BASE)
-        } else {
+    /// Copies a descriptor to the lowest free number at or above `at_least`, answering with it,
+    /// or nothing where it is not ours.
+    pub(crate) fn dup(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        at_least: i64,
+        numbers: &mut Numbers<'_>,
+    ) -> Option<i64> {
+        let id = self.resolve(node, fd);
+        if !self.instances.contains_key(&(node, id)) && !self.counters.contains_key(&(node, id)) {
             return None;
-        };
-        let copy = *next;
-        *next += 1;
-        self.aliases.insert((node, copy), original);
+        }
+        let copy = numbers.claim(node, at_least);
+        self.descriptors.insert((node, copy), id);
         Some(copy)
+    }
+
+    /// Copies a descriptor onto exactly `onto`, as `dup2` does; the caller has closed whatever
+    /// `onto` held. False where `fd` is not ours.
+    pub(crate) fn dup_onto(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        onto: i64,
+        numbers: &mut Numbers<'_>,
+    ) -> bool {
+        if !self.holds(node, fd) {
+            return false;
+        }
+        let id = self.resolve(node, fd);
+        numbers.claim_exact(node, onto);
+        self.descriptors.insert((node, onto), id);
+        true
+    }
+
+    /// A fresh identity, given the lowest free number in its process's table.
+    fn named(&mut self, node: NodeId, numbers: &mut Numbers<'_>) -> (i64, i64) {
+        self.next_id = self.next_id.max(ID_BASE);
+        let id = self.next_id;
+        self.next_id += 1;
+        let fd = numbers.claim(node, FIRST_DESCRIPTOR);
+        self.descriptors.insert((node, fd), id);
+        (id, fd)
     }
 
     /// Opens an instance for one `poll` to wait on, numbered where no guest descriptor is.
@@ -153,21 +247,46 @@ impl Epolls {
     }
 
     /// Opens an instance and answers with the descriptor naming it.
-    pub(crate) fn create(&mut self, node: NodeId) -> i64 {
-        let next = self.next_epoll.entry(node).or_insert(EPOLL_FD_BASE);
-        let fd = *next;
-        *next += 1;
-        self.instances.insert((node, fd), Instance::default());
+    pub(crate) fn create(&mut self, node: NodeId, numbers: &mut Numbers<'_>) -> i64 {
+        let (id, fd) = self.named(node, numbers);
+        self.instances.insert((node, id), Instance::default());
         fd
     }
 
-    /// Opens an event counter with a starting value.
-    pub(crate) fn open_counter(&mut self, node: NodeId, initial: u64) -> i64 {
-        let next = self.next_counter.entry(node).or_insert(EVENTFD_BASE);
-        let fd = *next;
-        *next += 1;
-        self.counters.insert((node, fd), initial);
+    /// Opens an event counter with a starting value, a semaphore under `EFD_SEMAPHORE` and
+    /// non-blocking under `EFD_NONBLOCK`.
+    pub(crate) fn open_counter(
+        &mut self,
+        node: NodeId,
+        initial: u64,
+        flags: u64,
+        numbers: &mut Numbers<'_>,
+    ) -> i64 {
+        const EFD_SEMAPHORE: u64 = 1;
+        const EFD_NONBLOCK: u64 = 0o4000;
+        let (id, fd) = self.named(node, numbers);
+        let counter = Counter {
+            value: initial,
+            semaphore: flags & EFD_SEMAPHORE != 0,
+            nonblocking: flags & EFD_NONBLOCK != 0,
+            readers: VecDeque::new(),
+            edges: Edges::default(),
+        };
+        self.counters.insert((node, id), counter);
         fd
+    }
+
+    /// Whether a counter answers `EAGAIN` instead of waiting, or nothing where it is not one.
+    pub(crate) fn counter_nonblocking(&self, node: NodeId, fd: i64) -> Option<bool> {
+        self.counters.get(&(node, self.resolve(node, fd))).map(|c| c.nonblocking)
+    }
+
+    /// Sets or clears a counter's non-blocking flag, as `F_SETFL` does.
+    pub(crate) fn set_counter_nonblocking(&mut self, node: NodeId, fd: i64, on: bool) {
+        let at = (node, self.resolve(node, fd));
+        if let Some(counter) = self.counters.get_mut(&at) {
+            counter.nonblocking = on;
+        }
     }
 
     /// Whether a descriptor is an event counter, following an alias to reach one.
@@ -214,29 +333,26 @@ impl Epolls {
         true
     }
 
-    /// Everything an instance may report now, as `(descriptor, wanted events, token)`.
-    ///
-    /// Leaves out edge-triggered watches already reported this epoch and fired one-shot watches.
-    pub(crate) fn watched(&self, node: NodeId, epfd: i64) -> Vec<(i64, u32, u64)> {
+    /// Every watch an instance may report from, leaving out one-shot watches that fired.
+    pub(crate) fn watched(&self, node: NodeId, epfd: i64) -> Vec<Watching> {
         self.instances.get(&(node, self.resolve(node, epfd))).map_or_else(Vec::new, |instance| {
             instance
                 .watched
                 .iter()
                 .filter(|(_, w)| !w.fired)
-                .filter(|(_, w)| w.events & EPOLLET == 0 || w.seen != Some(self.epoch))
-                .map(|(fd, w)| (*fd, w.events, w.token))
+                .map(|(fd, w)| Watching { fd: *fd, events: w.events, token: w.token, seen: w.seen })
                 .collect()
         })
     }
 
-    /// Records that these descriptors were reported to the guest from an instance.
-    pub(crate) fn reported(&mut self, node: NodeId, epfd: i64, fds: &[i64]) {
-        let epoch = self.epoch;
+    /// Records that these were reported to the guest from an instance, at the edges they were
+    /// read at.
+    pub(crate) fn reported(&mut self, node: NodeId, epfd: i64, ready: &[Ready]) {
         let epfd = self.resolve(node, epfd);
         if let Some(instance) = self.instances.get_mut(&(node, epfd)) {
-            for fd in fds {
-                if let Some(watch) = instance.watched.get_mut(fd) {
-                    watch.seen = Some(epoch);
+            for one in ready {
+                if let Some(watch) = instance.watched.get_mut(&one.fd) {
+                    watch.seen = Some(one.edges);
                     if watch.events & EPOLLONESHOT != 0 {
                         watch.fired = true;
                     }
@@ -245,9 +361,16 @@ impl Epolls {
         }
     }
 
-    /// Opens a new readiness epoch: something may have become ready.
-    pub(crate) fn bump(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
+    /// A counter's edges, or nothing where the descriptor is not a counter.
+    pub(crate) fn counter_edges(&self, node: NodeId, fd: i64) -> Option<Edges> {
+        self.counters.get(&(node, self.resolve(node, fd))).map(|c| c.edges)
+    }
+
+    /// Notes that a write found a counter with no room for what it added.
+    pub(crate) fn counter_full(&mut self, node: NodeId, fd: i64) {
+        if let Some(counter) = self.counters.get_mut(&(node, self.resolve(node, fd))) {
+            counter.edges.filled += 1;
+        }
     }
 
     /// Parks a task until something the instance watches becomes ready.
@@ -299,61 +422,104 @@ impl Epolls {
 
     /// What an event counter holds.
     pub(crate) fn counter(&self, node: NodeId, fd: i64) -> Option<u64> {
-        self.counters.get(&(node, self.resolve(node, fd))).copied()
+        self.counters.get(&(node, self.resolve(node, fd))).map(|c| c.value)
     }
 
-    /// Adds to an event counter, saturating as the kernel's own does short of its maximum.
-    pub(crate) fn add_to_counter(&mut self, node: NodeId, fd: i64, by: u64) -> bool {
-        let at = self.resolve(node, fd);
-        match self.counters.get_mut(&(node, at)) {
-            Some(counter) => {
-                *counter = counter.saturating_add(by);
-                true
-            }
-            None => false,
+    /// Adds to an event counter and hands the readers parked on it what each takes, writing the
+    /// value where each asked for it. False where `fd` is not a counter.
+    ///
+    /// The value is held below `u64::MAX`; an addition that would pass it is refused by the
+    /// caller first, see [`Self::counter_room`].
+    pub(crate) fn add_to_counter(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        by: u64,
+        mut hand: impl FnMut(TaskId, GuestAddr, u64) -> Result<(), bohr_kernel::KernelError>,
+    ) -> Result<bool, bohr_kernel::KernelError> {
+        let at = (node, self.resolve(node, fd));
+        let Some(counter) = self.counters.get_mut(&at) else {
+            return Ok(false);
+        };
+        counter.value = counter.value.saturating_add(by);
+        if by > 0 {
+            counter.edges.arrived += 1;
         }
-    }
-
-    /// Empties an event counter and answers what it held.
-    pub(crate) fn drain_counter(&mut self, node: NodeId, fd: i64) -> Option<u64> {
-        let at = self.resolve(node, fd);
-        let counter = self.counters.get_mut(&(node, at))?;
-        Some(std::mem::take(counter))
-    }
-
-    /// Forgets a descriptor: an instance, a counter, or a watch on any instance of the node.
-    pub(crate) fn close(&mut self, node: NodeId, fd: i64) -> bool {
-        // Closing an alias removes only the alias.
-        if self.aliases.remove(&(node, fd)).is_some() {
-            return true;
+        while counter.value > 0 {
+            let Some((task, out)) = counter.readers.pop_front() else { break };
+            let taken = counter.take();
+            hand(task, out, taken)?;
         }
+        Ok(true)
+    }
+
+    /// How much more a counter takes before it would reach `u64::MAX`, which Linux never lets
+    /// it hold.
+    pub(crate) fn counter_room(&self, node: NodeId, fd: i64) -> Option<u64> {
+        let counter = self.counters.get(&(node, self.resolve(node, fd)))?;
+        Some(u64::MAX - 1 - counter.value)
+    }
+
+    /// Reads a counter for `task`, which wants the value at `out`.
+    pub(crate) fn read_counter(
+        &mut self,
+        node: NodeId,
+        fd: i64,
+        task: TaskId,
+        out: GuestAddr,
+    ) -> Option<CounterRead> {
+        let counter = self.counters.get_mut(&(node, self.resolve(node, fd)))?;
+        if counter.value > 0 {
+            return Some(CounterRead::Took(counter.take()));
+        }
+        if counter.nonblocking {
+            return Some(CounterRead::WouldBlock);
+        }
+        counter.readers.push_back((task, out));
+        Some(CounterRead::Waits)
+    }
+
+    /// Closes a descriptor, answering whether it was one of ours, and forgets every watch on its
+    /// number, ours or not.
+    ///
+    /// The instance or counter goes once no other descriptor names it. A closed number is
+    /// watched no more, so a later descriptor that takes the number starts unwatched.
+    pub(crate) fn close(&mut self, node: NodeId, fd: i64, numbers: &mut Numbers<'_>) -> bool {
         if fd >= HIDDEN_BASE {
             return self.instances.remove(&(node, fd)).is_some();
         }
-        let was_ours = self.instances.remove(&(node, fd)).is_some()
-            || self.counters.remove(&(node, fd)).is_some();
-        // A closed descriptor is no longer watched, ours or not.
         for ((owner, _), instance) in &mut self.instances {
             if *owner == node {
                 instance.watched.remove(&fd);
             }
         }
-        was_ours
+        let Some(id) = self.descriptors.remove(&(node, fd)) else {
+            return false;
+        };
+        numbers.release(node, fd);
+        let still_named =
+            self.descriptors.iter().any(|((at, _), named)| *at == node && *named == id);
+        if !still_named {
+            self.instances.remove(&(node, id));
+            self.counters.remove(&(node, id));
+        }
+        true
     }
 
     /// Forgets everything a node had, because the node is gone.
     pub(crate) fn drop_node(&mut self, node: NodeId) {
         self.instances.retain(|(owner, _), _| *owner != node);
         self.counters.retain(|(owner, _), _| *owner != node);
-        self.aliases.retain(|(owner, _), _| *owner != node);
-        self.next_epoll.remove(&node);
-        self.next_counter.remove(&node);
+        self.descriptors.retain(|(owner, _), _| *owner != node);
     }
 
     /// Forgets every wait a task was parked in, because the task has ended.
     pub(crate) fn forget_task(&mut self, task: TaskId) {
         for instance in self.instances.values_mut() {
             instance.parked.retain(|p| p.task != task);
+        }
+        for counter in self.counters.values_mut() {
+            counter.readers.retain(|(reader, _)| *reader != task);
         }
         // A `poll`'s instance goes with its task.
         self.instances.retain(|(_, id), instance| *id < HIDDEN_BASE || !instance.parked.is_empty());

@@ -49,7 +49,7 @@ pub(crate) const NO_PROCESS: &str = "BOHR-3006: this bundle ran a guest built in
 /// Checked before the host, since this answer is the same on every host.
 pub(crate) fn refuse_if_there_is_no_process(target: &Target) -> Result<(), CliError> {
     match target {
-        Target::Demo(..) => Err(CliError::Internal(NO_PROCESS.to_owned())),
+        Target::Demo(..) => Err(CliError::internal(NO_PROCESS.to_owned())),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         Target::Program(..) => Ok(()),
     }
@@ -66,7 +66,7 @@ pub(crate) fn refuse_if_a_debugger_cannot_attach() -> Result<(), CliError> {
     {
         let scope = bohr_backend_ptrace::doctor::sysctl("kernel.yama.ptrace_scope");
         if let Some(scope) = scope.filter(|value| value != "0") {
-            return Err(CliError::Usage(format!(
+            return Err(CliError::usage(format!(
                 "BOHR-3001: a debugger cannot attach to the guest on this host\n  \
                  kernel.yama.ptrace_scope is {scope}, which permits tracing only a descendant of\n  \
                  the tracing process, and a debugger started by hand will not be one.\n  \

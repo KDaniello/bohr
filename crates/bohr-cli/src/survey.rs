@@ -24,11 +24,11 @@ pub(crate) fn run(
 ) -> Result<u8, CliError> {
     let config_toml = match config_path {
         Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?,
+            .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?,
         None => String::new(),
     };
     let mut loaded = match config_path {
-        Some(_) => Some(bohr_world::config::load(&config_toml)?),
+        Some(_) => Some(crate::state_dir::load(&config_toml)?),
         None => None,
     };
     // A dynamic target's libraries are trapped like its binary, as in a run.
@@ -112,7 +112,7 @@ fn target_for(
     _program: Vec<String>,
     _loaded: Option<&LoadedConfig>,
 ) -> Result<execute::Target, CliError> {
-    Err(CliError::Usage(
+    Err(CliError::usage(
         "BOHR-3005: this build has no interceptor, so there is no program to survey".to_owned(),
     ))
 }

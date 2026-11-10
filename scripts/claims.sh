@@ -44,7 +44,7 @@ elif targets:
 else:
     claim(1, "Clients run unmodified", UNMEASURED, "no campaign recorded", "v0_9.hunts")
 
-# 2. The fault catalogue is real: the lint rule that holds the three lists to one.
+# 2. The fault catalogue is real: the lint rule that holds the two lists to one.
 rule = pathlib.Path("scripts/lint-rules.sh").read_text(encoding="utf-8")
 claim(2, "The fault catalogue is real", HELD if "14m" in rule else FAILED,
       "rule 14m in make pr" if "14m" in rule else "rule 14m is gone", "v0_6.gates.fault_lists_agree")

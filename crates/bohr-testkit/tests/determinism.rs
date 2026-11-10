@@ -256,6 +256,7 @@ mod cluster {
     fn world_models_refuse_each_others_bundles() {
         let oracle = bohr_types::OracleId::new("accept-everything", 1);
         let manifest = bohr_trace::manifest_for(bohr_trace::ManifestInputs {
+            max_events: None,
             reduced_from: None,
             state_digest: None,
             seed: Seed(1),
@@ -296,8 +297,8 @@ mod network {
     const SENDTO: u32 = 44;
     const RECVFROM: u32 = 45;
     const BIND: u32 = 49;
-    /// The first socket a node opens, deterministic.
-    const FD: u64 = 4096;
+    /// The first socket a node opens: the lowest free number, past the standard three.
+    const FD: u64 = 3;
 
     const ADDR_SELF: u64 = MEMORY_BASE;
     const ADDR_PEER: u64 = MEMORY_BASE + 16;
@@ -451,6 +452,41 @@ mod network {
         }
     }
 
+    /// Every datagram the network loses counts as adversity that landed, as a fault does, and
+    /// nothing else that crosses it counts.
+    #[test]
+    fn a_lost_datagram_counts_as_adversity() {
+        let preloads = [
+            (0u32, ADDR_SELF, sockaddr_for(0, 9000)),
+            (0, ADDR_PEER, sockaddr_for(1, 7000)),
+            (0, PAYLOAD, b"spam".to_vec()),
+        ];
+        let send = GuestOp::Syscall { nr: SENDTO, args: [FD, PAYLOAD, 4, 0, ADDR_PEER, 16] };
+        let spammer = NullProgram::single(vec![
+            GuestOp::Syscall { nr: SOCKET, args: [2, 2, 0, 0, 0, 0] },
+            GuestOp::Syscall { nr: BIND, args: [FD, ADDR_SELF, 16, 0, 0, 0] },
+            send.clone(),
+            send.clone(),
+            send,
+            GuestOp::Exit(0),
+        ]);
+        let lossy =
+            NetworkConfig { nodes: 2, drop_probability: (1, 1), ..NetworkConfig::default() };
+        let quiet = NullProgram::single(vec![GuestOp::Exit(0)]);
+        let (report, events) = run_networked(vec![spammer, quiet], &preloads, lossy, Seed(3));
+        let dropped = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::PacketFate { fate: bohr_trace::PacketFate::Dropped, .. }
+                )
+            })
+            .count();
+        assert_eq!(dropped, 3, "every datagram was to be lost");
+        assert_eq!(report.adversity, 3);
+    }
+
     /// Two cuts raised at one tick fire in `(tick, node, seq)` order; this is the run the
     /// deadline-tie injection must break.
     #[test]
@@ -584,7 +620,7 @@ mod network {
         const SOL_SOCKET: u64 = 1;
         const SO_REUSEPORT: u64 = 15;
         const DATAGRAM: u64 = 2;
-        const FD2: u64 = 4097;
+        const FD2: u64 = 4;
         const ON: u64 = MEMORY_BASE + 256;
 
         let binds = |sharing: bool| {
@@ -630,7 +666,7 @@ mod network {
         const STREAM: u64 = 1;
         const DATAGRAM: u64 = 2;
         /// The second socket a node opens, the first being `FD`.
-        const FD2: u64 = 4097;
+        const FD2: u64 = 4;
 
         let both = NullProgram::single(vec![
             GuestOp::Syscall { nr: SOCKET, args: [2, DATAGRAM, 0, 0, 0, 0] },
@@ -941,7 +977,8 @@ mod cluster_scenarios {
     const RECVFROM: u32 = 45;
     const BIND: u32 = 49;
     const NANOSLEEP: u32 = 35;
-    const FD: u64 = 4096;
+    /// The first socket a node opens: the lowest free number, past the standard three.
+    const FD: u64 = 3;
 
     const ADDR_SELF: u64 = MEMORY_BASE;
     const ADDR_PEER: u64 = MEMORY_BASE + 16;

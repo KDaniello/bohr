@@ -10,6 +10,7 @@ use std::{
     process::Command,
 };
 
+use bohr_trace::{Bundle, Outcome, SectionId};
 use serde_json::Value;
 
 const BUNDLES: [&str; 3] =
@@ -19,13 +20,17 @@ const BUNDLES: [&str; 3] =
 struct Here(PathBuf);
 
 impl Here {
-    fn new(case: &str) -> Self {
+    /// The stored bundles under `findings/`, with `more` written beside them.
+    fn new(case: &str, more: &[(&str, Vec<u8>)]) -> Self {
         let dir = std::env::temp_dir().join(format!("bohr-json-{case}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("findings")).expect("a directory");
         let stored = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/bundles");
         for name in BUNDLES {
             std::fs::copy(stored.join(name), dir.join("findings").join(name)).expect("a copy");
+        }
+        for (name, bytes) in more {
+            std::fs::write(dir.join("findings").join(name), bytes).expect("a bundle");
         }
         Self(dir)
     }
@@ -37,9 +42,23 @@ impl Drop for Here {
     }
 }
 
+/// A finding for `bohr findings` to group: the stored bundles all ran clean, and no built-in guest
+/// fails, so the two-task run is recorded as ended by a crash.
+fn crashed() -> Vec<u8> {
+    let stored =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/bundles/two-tasks-seed0.bohr");
+    let bytes = std::fs::read(stored).expect("the stored bundle");
+    let bundle = Bundle::parse(&bytes).expect("a bundle");
+    let mut manifest = bundle.manifest().expect("a manifest");
+    manifest.outcome = Outcome::GuestCrashed("killed by signal 11".to_owned());
+    let mut writer = bundle.to_writer();
+    writer.section(SectionId::Manifest, serde_json::to_vec(&manifest).expect("a manifest"));
+    writer.finish(bundle.run_id)
+}
+
 /// The one object `args` writes, with the exit code; stdout holds nothing else.
-fn object(case: &str, args: &[&str]) -> (Value, i32) {
-    let here = Here::new(case);
+fn object(case: &str, args: &[&str], more: &[(&str, Vec<u8>)]) -> (Value, i32) {
+    let here = Here::new(case, more);
     let out = Command::new(env!("CARGO_BIN_EXE_bohr"))
         .arg("--json")
         .args(args)
@@ -71,7 +90,12 @@ fn steady(mut value: Value) -> Value {
 }
 
 fn golden(case: &str, args: &[&str], exit: i32) {
-    let (value, code) = object(case, args);
+    golden_with(case, args, exit, &[]);
+}
+
+/// [`golden`], with bundles written beside the stored ones.
+fn golden_with(case: &str, args: &[&str], exit: i32, more: &[(&str, Vec<u8>)]) {
+    let (value, code) = object(case, args, more);
     assert_eq!(code, exit, "{case}: exit {code}: {value}");
     let value = steady(value);
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/json/{case}.json"));
@@ -118,7 +142,7 @@ fn trace() {
 
 #[test]
 fn findings() {
-    golden("findings", &["findings", "findings"], 0);
+    golden_with("findings", &["findings", "findings"], 0, &[("crashed.bohr", crashed())]);
 }
 
 #[test]

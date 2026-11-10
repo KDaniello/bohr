@@ -29,6 +29,7 @@ mod state;
 
 pub use config::{
     Cluster, ConfigError, Differential, Implementation, IoUring, LinuxConfig, LoadedConfig,
+    StateSource,
 };
 pub use distributed::{
     DiskConfig, DistributedWorld, DrawnFaults, DurabilityConfig, FaultPolicy, GreyWindow,
@@ -37,7 +38,7 @@ pub use distributed::{
 };
 pub use minimal::{MinimalWorld, OutputSink};
 pub use oracle::{
-    AgreementOracle, DurabilityOracle, LivenessOracle, Panel, ProbeOracle, Probed,
+    AgreementOracle, DurabilityOracle, GroupOracle, LivenessOracle, Panel, ProbeOracle, Probed,
     PropertiesAndCrashOracle, Watching, panel,
 };
 pub use probe::{ProbeSpec, Property};

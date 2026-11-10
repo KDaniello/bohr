@@ -100,10 +100,6 @@ pub(crate) struct Pack {
     pub(crate) nonproduction: Vec<String>,
 }
 
-fn refused(text: String) -> CliError {
-    CliError::Usage(format!("BOHR-1002: {text}"))
-}
-
 /// Where a pack named bare is read from: `targets/` here, or else the packs a release installed.
 ///
 /// `targets/` here first, then `$BOHR_HOME/packs` or `~/.bohr/packs`, where `bohrup` installs them.
@@ -141,16 +137,19 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
         given.to_owned()
     };
     let text = std::fs::read_to_string(&file).map_err(|e| {
-        refused(format!("no target pack at {}: {e}; packs live in targets/<name>/", file.display()))
+        CliError::refused(format!(
+            "no target pack at {}: {e}; packs live in targets/<name>/",
+            file.display()
+        ))
     })?;
     let raw: RawPack = toml::from_str(&text)
-        .map_err(|e| refused(format!("{} does not parse: {e}", file.display())))?;
+        .map_err(|e| CliError::refused(format!("{} does not parse: {e}", file.display())))?;
     // The repository is two directories above `target.toml`, on its absolute path.
     let file = std::path::absolute(&file).unwrap_or(file);
     let dir = file.parent().unwrap_or(Path::new("."));
     let root = dir.parent().and_then(Path::parent).unwrap_or(Path::new(".")).to_owned();
     if !ORACLES.contains(&raw.judge.oracle.as_str()) {
-        return Err(refused(format!(
+        return Err(CliError::refused(format!(
             "{}: judge.oracle {:?} is none of {}",
             file.display(),
             raw.judge.oracle,
@@ -158,10 +157,10 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
         )));
     }
     if raw.bench.as_ref().is_some_and(|b| b.argv.is_empty()) {
-        return Err(refused(format!("{}: bench.argv is empty", file.display())));
+        return Err(CliError::refused(format!("{}: bench.argv is empty", file.display())));
     }
     if raw.build.command.is_empty() {
-        return Err(refused(format!("{}: build.command is empty", file.display())));
+        return Err(CliError::refused(format!("{}: build.command is empty", file.display())));
     }
     Ok(Pack {
         name: dir.file_name().map_or_else(|| name.to_owned(), |n| n.to_string_lossy().into_owned()),
@@ -180,8 +179,8 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
 
 /// The blake3 digest of a file, in hex.
 pub(crate) fn digest_of(path: &Path) -> Result<String, CliError> {
-    let bytes =
-        std::fs::read(path).map_err(|e| refused(format!("cannot read {}: {e}", path.display())))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| CliError::refused(format!("cannot read {}: {e}", path.display())))?;
     Ok(blake3_hex(&bytes))
 }
 
@@ -196,11 +195,11 @@ pub(crate) fn binary_for(pack: &Pack, given: Option<&Path>) -> Result<PathBuf, C
     let path = given.map_or_else(|| pack.binary.clone(), Path::to_owned);
     if !path.is_file() {
         if given.is_some() {
-            return Err(refused(format!("no binary at {}", path.display())));
+            return Err(CliError::refused(format!("no binary at {}", path.display())));
         }
         build(pack)?;
         if !path.is_file() {
-            return Err(refused(format!(
+            return Err(CliError::refused(format!(
                 "{}'s build ran and left no binary at {}",
                 pack.name,
                 path.display()
@@ -209,7 +208,7 @@ pub(crate) fn binary_for(pack: &Pack, given: Option<&Path>) -> Result<PathBuf, C
     }
     let found = digest_of(&path)?;
     if found != pack.digest {
-        return Err(refused(format!(
+        return Err(CliError::refused(format!(
             "{} has blake3 {found}, and pack {} names {}; it is not the program the pack names",
             path.display(),
             pack.name,
@@ -228,10 +227,11 @@ fn build(pack: &Pack) -> Result<(), CliError> {
     if crate::json::on() {
         command.stdout(std::io::stderr());
     }
-    let status =
-        command.status().map_err(|e| refused(format!("cannot run {}: {e}", pack.build[0])))?;
+    let status = command
+        .status()
+        .map_err(|e| CliError::refused(format!("cannot run {}: {e}", pack.build[0])))?;
     if !status.success() {
-        return Err(refused(format!("{}'s build failed: {status}", pack.name)));
+        return Err(CliError::refused(format!("{}'s build failed: {status}", pack.name)));
     }
     Ok(())
 }

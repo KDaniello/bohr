@@ -8,12 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bohr_sdk_proto::json::Json;
-use bohr_types::Tick;
-
-/// The name of the SDK event the probe reports a round of answers under.
-pub const PROBE_EVENT: &str = "bohr_probe";
-
+pub use bohr_sdk_proto::probe::{Answer, PROBE_EVENT};
 pub use bohr_trace::{ADVANCES_CODE, AGREES_CODE, MONOTONIC_CODE, NEVER_REVERTS_CODE, UNIQUE_CODE};
+use bohr_types::Tick;
 /// A probe holds as many keys as it may and compares no new ones.
 pub const KEYS_FULL_CODE: &str = "BOHR-2045";
 
@@ -183,38 +180,14 @@ pub fn plan_of(requests: &[Request]) -> String {
     out
 }
 
-/// What one request came back with.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Answer {
-    /// The result, reduced to the requested fields.
-    Result(Json),
-    /// Why there is no result: refused, timed out, unreadable, or an error the node returned.
-    Unanswered(String),
-}
-
 /// Reads one round the probe reported, as `(request, answer)` pairs.
 ///
 /// A malformed round is ignored; answers for unknown requests are dropped.
 #[must_use]
 pub fn answers_in(details: &Json, requests: usize) -> Vec<(usize, Answer)> {
-    let Some(Json::Array(round)) = details.get("round") else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(round.len());
-    for item in round {
-        let Some(index) = item.get("request").and_then(Json::as_int) else { continue };
-        let Ok(index) = usize::try_from(index) else { continue };
-        if index >= requests {
-            continue;
-        }
-        let answer = match (item.get("result"), item.get("unanswered")) {
-            (Some(result), _) => Answer::Result(result.clone()),
-            (None, Some(why)) => Answer::Unanswered(why.as_str().unwrap_or("unanswered").into()),
-            (None, None) => continue,
-        };
-        out.push((index, answer));
-    }
-    out
+    bohr_sdk_proto::probe::Round::from_details(details)
+        .map(|round| round.0.into_iter().filter(|(index, _)| *index < requests).collect())
+        .unwrap_or_default()
 }
 
 /// A fact one probe's answers established, with its code.

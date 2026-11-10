@@ -320,3 +320,82 @@ fn adjacent_strings_cannot_be_re_split_to_collide() {
     });
     assert_ne!(ab_c, a_bc, "a namespace and a payload can be re-split to collide");
 }
+
+/// Every kind of event, with values in every field, for a digest pinned across releases.
+fn every_kind() -> Vec<Event> {
+    use bohr_trace::{Endpoint, FaultTarget};
+    use bohr_types::Fd;
+    let kinds = vec![
+        EventKind::Syscall {
+            nr: 1,
+            args: [3, 0x7fff_0000, 9, 0, 0, 0],
+            ret: 9,
+            emulated: true,
+            data_digest: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+        },
+        EventKind::Syscall {
+            nr: 999,
+            args: [1, 2, 3, 4, 5, 6],
+            ret: -38,
+            emulated: false,
+            data_digest: None,
+        },
+        EventKind::Schedule { from: TaskId(1), to: TaskId(2), reason: SwitchReason::Yield },
+        EventKind::TaskSpawned { parent: TaskId(1) },
+        EventKind::TaskExited { status: ExitStatus::Exited(2) },
+        EventKind::TaskExited { status: ExitStatus::Signalled(11) },
+        EventKind::PacketSent {
+            from: Endpoint { node: NodeId(0), port: 9000 },
+            to: Endpoint { node: NodeId(1), port: 40000 },
+            len: 512,
+            digest: [9; 8],
+        },
+        EventKind::PacketFate { fate: PacketFate::Reordered, delay_ticks: 77 },
+        EventKind::DiskOp { fd: Fd(5), op: DiskOpKind::Write, offset: 4096, len: 100, ret: 100 },
+        EventKind::FaultFired {
+            fault: FaultKind::NetPartition,
+            target: FaultTarget::Link { from: NodeId(0), to: NodeId(2) },
+        },
+        EventKind::FaultFired { fault: FaultKind::NodeKill, target: FaultTarget::Node(NodeId(1)) },
+        EventKind::FaultFired {
+            fault: FaultKind::DiskError,
+            target: FaultTarget::Descriptor(Fd(7)),
+        },
+        EventKind::FaultFired { fault: FaultKind::ClockStep, target: FaultTarget::World },
+        EventKind::NodeState { state: NodeState::Frozen },
+        EventKind::Waited { on: SyncWordId(4) },
+        EventKind::Woke { task: TaskId(3), on: SyncWordId(4) },
+        EventKind::ClockRead { presented: Tick(123_456) },
+        EventKind::Assertion {
+            name: "ordered".to_owned(),
+            kind: AssertionKind::Always,
+            hit: true,
+            condition: false,
+        },
+        EventKind::SdkRecord { index: 3 },
+        EventKind::Diagnostic { code: "BOHR-2012".to_owned(), message: "words".to_owned() },
+        EventKind::Domain { ns: WorldModelId::new("example", 2), kind: 7, payload: vec![1, 2, 3] },
+        EventKind::Domain { ns: WorldModelId::new("example", 2), kind: 8, payload: vec![0; 300] },
+    ];
+    kinds
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| Event {
+            id: EventId(i as u64),
+            tick: Tick(1000 + i as u64),
+            node: NodeId(i as u32 % 3),
+            task: TaskId(i as u32 % 4),
+            kind,
+        })
+        .collect()
+}
+
+/// The canonical bytes of every kind of event digest to what they did when this was written: the
+/// projection is a format, and a change to how it is fed to the hasher must not move a byte.
+#[test]
+fn the_digest_of_every_kind_is_pinned() {
+    assert_eq!(
+        digest_of(&every_kind()).to_string(),
+        "blake3:584fa396e5e025be7349d9bd8eb8a1810ea1e043d8a31f019ed47d5aeab44d97"
+    );
+}

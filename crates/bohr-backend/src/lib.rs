@@ -8,12 +8,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod code;
-
-mod coverage;
-
+pub use bohr_types::{CoverageMap, DEFAULT_COVERAGE_MAP_BYTES};
 use bohr_types::{GuestAddr, NodeId, TaskId};
-pub use coverage::{CoverageMap, DEFAULT_COVERAGE_MAP_BYTES};
 
 /// A source of guest execution that can be stopped, inspected and resumed deterministically.
 pub trait DeterminismBackend {
@@ -41,6 +37,24 @@ pub trait DeterminismBackend {
         addr: GuestAddr,
         out: &mut [u8],
     ) -> Result<(), BackendError>;
+
+    /// Copies several pieces of guest memory into `out`, one after another; `out` is as long as
+    /// the pieces together.
+    ///
+    /// One crossing where the backend can make one; by default, one read per piece.
+    fn read_mem_vectored(
+        &mut self,
+        task: TaskId,
+        pieces: &[(GuestAddr, usize)],
+        out: &mut [u8],
+    ) -> Result<(), BackendError> {
+        let mut at = 0;
+        for (addr, len) in pieces {
+            self.read_mem(task, *addr, &mut out[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
 
     /// Copies into guest memory.
     fn write_mem(&mut self, task: TaskId, addr: GuestAddr, data: &[u8])
@@ -95,21 +109,6 @@ pub trait DeterminismBackend {
     fn hand_over(&mut self) -> Result<Vec<DebuggerTarget>, BackendError> {
         Ok(Vec::new())
     }
-
-    /// Holds every guest as it stands, so the run can later go on from here more than once.
-    ///
-    /// Taken with every task stopped, between two picks. `Ok(None)` from a backend that cannot;
-    /// [`BackendCapabilities::checkpoints`] says so in advance.
-    fn checkpoint(&mut self) -> Result<Option<CheckpointId>, BackendError> {
-        Ok(None)
-    }
-
-    /// Puts every guest back as it stood at `id`, keeping the checkpoint for another restore.
-    ///
-    /// `Ok(false)` from a backend that cannot, or for an id it does not hold.
-    fn restore(&mut self, _id: CheckpointId) -> Result<bool, BackendError> {
-        Ok(false)
-    }
 }
 
 /// Where an external debugger is told to look, and what it will not be able to do there.
@@ -150,6 +149,12 @@ impl DebuggerTarget {
         &self.limits
     }
 }
+
+/// The stack limit every guest runs under and is told of, as Linux's default.
+///
+/// The host's own limit would govern the guest while the world answered another, and an unlimited
+/// stack also switches the kernel to the legacy mapping layout.
+pub const GUEST_STACK_BYTES: u64 = 8 << 20;
 
 /// What to execute, and in what environment.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -209,6 +214,8 @@ pub enum StopKind {
         parent: TaskId,
         /// Whether it shares an address space with its parent.
         shares_memory: bool,
+        /// Whether it is a thread of its parent's process, ending when that process ends.
+        thread: bool,
     },
     /// A task ended.
     TaskExited {
@@ -322,14 +329,7 @@ pub struct BackendCapabilities {
     pub hands_over_to_debugger: bool,
     /// Largest number of concurrent tasks.
     pub max_tasks: u32,
-    /// Whether every guest can be held at a point and resumed from it again
-    /// ([`DeterminismBackend::checkpoint`]).
-    pub checkpoints: bool,
 }
-
-/// A held point of a whole run's guests, named by the backend that holds it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct CheckpointId(pub u64);
 
 /// The x86-64 register file, as far as interception needs it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
