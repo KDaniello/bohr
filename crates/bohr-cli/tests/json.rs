@@ -1,0 +1,141 @@
+//! `--json` held to golden files: a schema's output changes only together with its version.
+//!
+//! Each case runs the binary in a directory of its own, holding copies of the stored bundles, so
+//! every path in the output is relative and the same on every host. A difference under the same
+//! schema name is a change nobody versioned and fails; a difference under a new name is a version
+//! bumped, and fails until the golden file is written again with `BOHR_BLESS=1`.
+//!
+//! What this does not cover: commands that need a backend. Their objects are built from the same
+//! code on every host and are checked by the tests that run them on Linux.
+
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use serde_json::Value;
+
+const BUNDLES: [&str; 3] =
+    ["clock-and-random-seed0.bohr", "large-random-seed0.bohr", "two-tasks-seed0.bohr"];
+
+/// A directory of copies of the stored bundles, removed when dropped.
+struct Here(PathBuf);
+
+impl Here {
+    fn new(case: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("bohr-json-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("findings")).expect("a directory");
+        let stored = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/bundles");
+        for name in BUNDLES {
+            std::fs::copy(stored.join(name), dir.join("findings").join(name)).expect("a copy");
+        }
+        Self(dir)
+    }
+}
+
+impl Drop for Here {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The one object `args` writes, with the exit code; standard output must hold nothing else.
+fn object(case: &str, args: &[&str]) -> (Value, i32) {
+    let here = Here::new(case);
+    let out = Command::new(env!("CARGO_BIN_EXE_bohr"))
+        .arg("--json")
+        .args(args)
+        .current_dir(&here.0)
+        .output()
+        .expect("the binary under test must be runnable");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "{case}: standard output is not one object:\n{text}");
+    let value = serde_json::from_str(lines[0]).unwrap_or_else(|e| panic!("{case}: {e}:\n{text}"));
+    (value, out.status.code().unwrap_or(-1))
+}
+
+/// What differs from build to build or host to host without being part of the shape: the
+/// version, and the separator a path is written with.
+fn steady(mut value: Value) -> Value {
+    fn separators(value: &mut Value) {
+        match value {
+            Value::String(text) => *text = text.replace('\\', "/"),
+            Value::Array(items) => items.iter_mut().for_each(separators),
+            Value::Object(fields) => fields.values_mut().for_each(separators),
+            _ => {}
+        }
+    }
+    separators(&mut value);
+    if let Some(version) = value.get_mut("tool_version") {
+        *version = Value::String("<this build>".to_owned());
+    }
+    value
+}
+
+fn golden(case: &str, args: &[&str], exit: i32) {
+    let (value, code) = object(case, args);
+    assert_eq!(code, exit, "{case}: exit {code}: {value}");
+    let value = steady(value);
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/json/{case}.json"));
+    let written = serde_json::to_string_pretty(&value).expect("printable") + "\n";
+    if std::env::var_os("BOHR_BLESS").is_some() {
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("a directory");
+        std::fs::write(&file, &written).expect("a golden file");
+        return;
+    }
+    let kept = std::fs::read_to_string(&file).unwrap_or_else(|_| {
+        panic!("{case}: no golden file at {}; write it with BOHR_BLESS=1", file.display())
+    });
+    if kept.replace("\r\n", "\n") == written {
+        return;
+    }
+    let before: Value = serde_json::from_str(&kept).expect("a golden file is JSON");
+    if before["schema"] == value["schema"] {
+        panic!(
+            "{case}: the output of {} changed without a new schema version. Bump it in \
+             crates/bohr-cli/src/json.rs, or put the output back.\nwas:\n{kept}\nnow:\n{written}",
+            value["schema"]
+        );
+    }
+    panic!(
+        "{case}: {} is now {}; write the golden file again with BOHR_BLESS=1",
+        before["schema"], value["schema"]
+    );
+}
+
+#[test]
+fn version() {
+    golden("version", &["version"], 0);
+}
+
+#[test]
+fn explain() {
+    golden("explain", &["explain", "findings/two-tasks-seed0.bohr"], 0);
+}
+
+#[test]
+fn trace() {
+    golden("trace", &["trace", "findings/two-tasks-seed0.bohr", "--around", "8"], 0);
+}
+
+#[test]
+fn findings() {
+    golden("findings", &["findings", "findings"], 0);
+}
+
+#[test]
+fn note() {
+    golden("note", &["note", "findings/two-tasks-seed0.bohr", "seen on a laptop"], 0);
+}
+
+#[test]
+fn report() {
+    golden("report", &["report", "findings/two-tasks-seed0.bohr", "-o", "page.html"], 0);
+}
+
+#[test]
+fn error() {
+    golden("error", &["run", "--seed", "1", "--tape", "t.tape", "--", "x"], 2);
+}

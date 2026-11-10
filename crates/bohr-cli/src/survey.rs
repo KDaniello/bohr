@@ -57,7 +57,21 @@ pub(crate) fn run(
         max_events,
         execute::Record::DigestOnly,
     )?;
-    report(&completed, seed);
+    if crate::json::on() {
+        let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+        crate::json::emit(
+            "survey",
+            account(
+                seed,
+                completed.counters.events,
+                completed.report.outcome == Outcome::Clean,
+                &verdict,
+                &completed.surveyed,
+            ),
+        );
+    } else {
+        report(&completed, seed);
+    }
     // Never zero with something to report, and never one: a survey found nothing about the guest,
     // it found something about this build. A guest that did not run to completion is something to
     // report -- see `report` for why it cannot be allowed to read as a clean surface.
@@ -162,6 +176,38 @@ the guest did not run to completion, so this is not its surface:"
     );
 }
 
+/// A survey as the body of a `bohr.survey` object: the walls, and whether the guest ran far
+/// enough for them to be its surface.
+///
+/// `completed` false means the walls are no measurement, as [`report`] says in words.
+fn account(
+    seed: u64,
+    events: u64,
+    completed: bool,
+    verdict: &bohr_report::narrate::Verdict,
+    surveyed: &[(u32, u64)],
+) -> serde_json::Value {
+    serde_json::json!({
+        "seed": seed,
+        "events": events,
+        "completed": completed,
+        "outcome": verdict.code,
+        "headline": verdict.headline,
+        "walls": walls_json(surveyed),
+    })
+}
+
+/// The walls a survey met, one row each: number, name, calls and which kind of wall.
+pub(crate) fn walls_json(surveyed: &[(u32, u64)]) -> Vec<serde_json::Value> {
+    surveyed
+        .iter()
+        .map(|(nr, calls)| {
+            let (name, wall) = describe(*nr);
+            serde_json::json!({ "nr": nr, "name": name, "calls": calls, "wall": wall })
+        })
+        .collect()
+}
+
 /// A syscall's name, and which kind of wall the guest met at it.
 ///
 /// The two are not the same work and must not read as though they were. *nothing models it* is a
@@ -183,4 +229,25 @@ pub(crate) fn describe(nr: u32) -> (&'static str, &'static str) {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub(crate) fn describe(_nr: u32) -> (&'static str, &'static str) {
     ("?", "nothing models it")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A survey's object carries each wall as a row and says whether the guest ran to completion,
+    /// because walls of a guest that did not are no measurement.
+    #[test]
+    fn a_survey_object_names_its_walls_and_whether_the_guest_ran() {
+        let clean = bohr_report::narrate::verdict(&Outcome::Clean);
+        let value = crate::json::object("survey", account(1, 900, true, &clean, &[(425, 2)]));
+        assert_eq!(value["schema"], "bohr.survey/1");
+        assert_eq!(value["seed"], 1);
+        assert_eq!(value["events"], 900);
+        assert_eq!(value["completed"], true);
+        assert_eq!(value["walls"][0]["nr"], 425);
+        assert_eq!(value["walls"][0]["calls"], 2);
+        assert!(value["walls"][0]["wall"].is_string());
+        assert_eq!(account(1, 0, true, &clean, &[])["walls"], serde_json::json!([]));
+    }
 }

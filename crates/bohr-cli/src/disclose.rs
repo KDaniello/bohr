@@ -61,7 +61,7 @@ pub(crate) fn disclosure(path: &str, out: &str) -> Result<u8, CliError> {
     }
     let source = source_of(&model);
     write(out, &bohr_report::disclosure::disclosure(&model, path, source.as_ref()))?;
-    println!("{out}");
+    crate::wrote("disclosure", path, &[out.to_owned()]);
     Ok(crate::exit::CLEAN)
 }
 
@@ -133,7 +133,16 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
 
     let log = bohr_report::sarif::sarif(env!("CARGO_PKG_VERSION"), &findings);
     write(out, &serde_json::to_string_pretty(&log).unwrap_or_default())?;
-    println!("{out} · {} result{}", findings.len(), if findings.len() == 1 { "" } else { "s" });
+    if crate::json::on() {
+        crate::json::emit(
+            "report",
+            serde_json::json!({
+                "kind": "sarif", "bundle": path, "written": [out], "results": findings.len(),
+            }),
+        );
+    } else {
+        println!("{out} · {} result{}", findings.len(), if findings.len() == 1 { "" } else { "s" });
+    }
     Ok(crate::exit::CLEAN)
 }
 

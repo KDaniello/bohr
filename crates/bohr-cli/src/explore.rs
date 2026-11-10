@@ -107,7 +107,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     };
     #[allow(clippy::disallowed_methods)]
     let started = Instant::now();
-    let mut saved = 0u64;
+    let mut saved: Vec<PathBuf> = Vec::new();
 
     // A stored corpus is tapes and nothing else, so what those tapes covered has to be learned by
     // running them. One generation buys back everything a previous campaign found out, and keeps
@@ -140,7 +140,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         campaign.fold(&planned, std::mem::take(&mut pending));
         // Saved after folding, so that a finding reached twice in one generation is written once.
-        saved += save_new_findings(request, &campaign, &known)?;
+        saved.extend(save_new_findings(request, &campaign, &known)?);
         // Written down after every whole generation, so a campaign stopped at any moment resumes
         // from the last one rather than from nothing.
         if let Some(dir) = &request.resume {
@@ -157,14 +157,14 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         let planned = campaign.plan(GENERATION_ITEMS);
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         view.fold(&planned[..pending.len()], pending);
-        saved += save_new_findings(request, &view, &known)?;
+        saved.extend(save_new_findings(request, &view, &known)?);
     }
     let campaign = view;
 
     if let Some(dir) = &request.corpus {
         save_corpus(dir, &campaign)?;
     }
-    report(&campaign, started, saved);
+    report(&campaign, started, saved.len() as u64);
     if let Some(path) = &request.summary {
         std::fs::write(path, summary(request, &campaign)).map_err(|e| {
             CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
@@ -187,6 +187,10 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
             campaign.runs()
         )));
     }
+    if crate::json::on() {
+        let elapsed_ms = u64::try_from(elapsed_since(started).as_millis()).unwrap_or(u64::MAX);
+        crate::json::emit("explore", result(request, &campaign, &saved, elapsed_ms));
+    }
     Ok(if campaign.findings().is_empty() { crate::exit::CLEAN } else { crate::exit::FINDING })
 }
 
@@ -202,16 +206,16 @@ fn elapsed_since(started: Instant) -> Duration {
     started.elapsed()
 }
 
-/// Writes the findings a fold added, and says how many.
+/// Writes the findings a fold added, and says where.
 fn save_new_findings(
     request: &Request,
     campaign: &Campaign,
     known: &std::collections::BTreeSet<bohr_types::Digest>,
-) -> Result<u64, CliError> {
-    let mut saved = 0;
+) -> Result<Vec<PathBuf>, CliError> {
+    let mut saved = Vec::new();
     for (digest, finding) in campaign.findings() {
-        if !known.contains(digest) && save_finding(request, finding)? {
-            saved += 1;
+        if !known.contains(digest) {
+            saved.extend(save_finding(request, finding)?);
         }
     }
     Ok(saved)
@@ -562,15 +566,17 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
     }
 }
 
-/// Writes the bundle a finding is carried in.
-/// Writes a finding's bundle, and says whether it wrote one: a bundle already on disk under its
+/// Writes a finding's bundle, and says where, if it wrote one: a bundle already on disk under its
 /// digest's name is the same run, written before a campaign was stopped and resumed.
-fn save_finding(request: &Request, finding: &bohr_explorer::Finding) -> Result<bool, CliError> {
+fn save_finding(
+    request: &Request,
+    finding: &bohr_explorer::Finding,
+) -> Result<Option<PathBuf>, CliError> {
     let short = format!("{}", finding.digest);
     let short = short.rsplit(':').next().unwrap_or(&short);
     let path = request.findings.join(format!("finding-{}.bohr", &short[..12.min(short.len())]));
     if path.is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     // Re-run with the log kept. The campaign never held one — a trace is a pure function of the
     // tape — so the bundle is made by running the finding again, which by construction produces
@@ -597,7 +603,7 @@ fn save_finding(request: &Request, finding: &bohr_explorer::Finding) -> Result<b
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display())))?;
     let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
     eprintln!("  found  {}    {} · {}", verdict.headline, verdict.code, path.display());
-    Ok(true)
+    Ok(Some(path))
 }
 
 /// What the campaign amounted to.
@@ -670,9 +676,8 @@ fn report(campaign: &Campaign, started: Instant, saved: u64) {
 /// **Written through a serialiser, because the strings in it are the guest's.** A finding's kind
 /// is `format!("{:?}")` of an outcome and a property name comes from a record the guest wrote, so
 /// hand-assembled JSON would let a guest naming a property `x", "satisfied": 999999, "y` rewrite
-/// the account of the campaign that ran it. The gate compares this file byte for byte.
-/// so an invalid file shipped as soon as anything was found.
-fn summary(request: &Request, campaign: &Campaign) -> String {
+/// the account of the campaign that ran it.
+fn account(request: &Request, campaign: &Campaign) -> serde_json::Value {
     let findings: Vec<serde_json::Value> = campaign
         .findings()
         .values()
@@ -707,7 +712,7 @@ fn summary(request: &Request, campaign: &Campaign) -> String {
         })
         .collect();
 
-    let account = serde_json::json!({
+    serde_json::json!({
         "master_seed": request.master.get(),
         "runs": campaign.runs(),
         "generations": campaign.generation(),
@@ -723,13 +728,45 @@ fn summary(request: &Request, campaign: &Campaign) -> String {
         "findings": findings,
         "kept_by_operator": credit,
         "properties": properties,
-    });
+    })
+}
 
-    // Pretty, because a person reads this as often as a machine does, and stable because the gate
-    // compares two of them byte for byte.
-    let mut text = serde_json::to_string_pretty(&account).unwrap_or_else(|_| "{}".to_owned());
+/// The `--summary` file: the account, pretty, because a person reads it as often as a machine
+/// does, and stable, because the gate compares two of them byte for byte.
+fn summary(request: &Request, campaign: &Campaign) -> String {
+    let mut text = serde_json::to_string_pretty(&account(request, campaign))
+        .unwrap_or_else(|_| "{}".to_owned());
     text.push('\n');
     text
+}
+
+/// The `--json` object: the account, and what this invocation wrote and how long it took.
+///
+/// `saved` is the bundles written by this invocation only; a resumed campaign's earlier findings
+/// are in `findings` and already on disk. `elapsed_ms` is the host clock and never reproduces.
+fn result(
+    request: &Request,
+    campaign: &Campaign,
+    saved: &[PathBuf],
+    elapsed_ms: u64,
+) -> serde_json::Value {
+    let shown = |path: &Path| path.display().to_string();
+    let mut value = account(request, campaign);
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.extend([
+            ("found".to_owned(), serde_json::json!(!campaign.findings().is_empty())),
+            ("findings_dir".to_owned(), serde_json::json!(shown(&request.findings))),
+            (
+                "saved".to_owned(),
+                serde_json::json!(saved.iter().map(|p| shown(p)).collect::<Vec<_>>()),
+            ),
+            ("summary".to_owned(), serde_json::json!(request.summary.as_deref().map(shown))),
+            ("corpus_dir".to_owned(), serde_json::json!(request.corpus.as_deref().map(shown))),
+            ("resume_dir".to_owned(), serde_json::json!(request.resume.as_deref().map(shown))),
+            ("elapsed_ms".to_owned(), serde_json::json!(elapsed_ms)),
+        ]);
+    }
+    value
 }
 
 /// Reads the tapes a previous campaign left behind.
@@ -942,5 +979,46 @@ mod resume {
                 .map_err(|e| refused(format!("cannot write {}: {e}", at.display())))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The object is the `--summary` account and what this invocation wrote beside it: a reader of
+    /// one learns nothing the other contradicts.
+    #[test]
+    fn the_object_is_the_summary_and_what_was_written() {
+        let request = Request {
+            master: Seed(7),
+            runs: Some(0),
+            time: None,
+            jobs: 1,
+            findings: PathBuf::from("out/findings"),
+            corpus: None,
+            resume: None,
+            summary: Some(PathBuf::from("out/summary.json")),
+            subject: Subject::Demo(Demo::ManyFlips),
+            scenario_path: None,
+            scenario: None,
+        };
+        let campaign = Campaign::new(request.master);
+        let saved = [PathBuf::from("out/findings/finding-0123456789ab.bohr")];
+        let value = crate::json::object("explore", result(&request, &campaign, &saved, 12));
+        assert_eq!(value["schema"], "bohr.explore/1");
+        assert_eq!(value["master_seed"], 7);
+        assert_eq!(value["runs"], 0);
+        assert_eq!(value["found"], false);
+        assert_eq!(value["findings"], serde_json::json!([]));
+        assert_eq!(value["saved"][0], "out/findings/finding-0123456789ab.bohr");
+        assert_eq!(value["summary"], "out/summary.json");
+        assert_eq!(value["corpus_dir"], serde_json::Value::Null);
+        assert_eq!(value["elapsed_ms"], 12);
+
+        let file: serde_json::Value = serde_json::from_str(&summary(&request, &campaign)).unwrap();
+        for (key, field) in file.as_object().unwrap() {
+            assert_eq!(&value[key], field, "{key} differs from the summary file");
+        }
     }
 }

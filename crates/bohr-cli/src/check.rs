@@ -971,6 +971,9 @@ pub(crate) struct Request {
 }
 
 /// Carries out every check of every subject and prints one block per subject.
+///
+/// Under `--json` nothing is printed, and one `bohr.check` object carries every subject: its plan
+/// with `--plan`, otherwise the account written to its file with each result's detail and notes.
 pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
     for name in &request.only {
         if !crate::subjects::CHECKS.contains(&name.as_str()) {
@@ -980,9 +983,13 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
             )));
         }
     }
+    let text = !crate::json::on();
     let mut worst = crate::exit::CLEAN;
+    let mut accounts: Vec<serde_json::Value> = Vec::new();
     for subject in &request.subjects {
-        println!("{} · {}", subject.name, subject.about);
+        if text {
+            println!("{} · {}", subject.name, subject.about);
+        }
         let notes: std::collections::BTreeMap<&str, &str> = subject
             .groups
             .iter()
@@ -994,6 +1001,10 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
             .flat_map(|g| g.checks.iter().map(move |c| (&g.label, c)))
             .filter(|(_, c)| request.only.is_empty() || request.only.iter().any(|o| o == c.name))
             .collect();
+        if !text && (checks.is_empty() || request.plan) {
+            accounts.push(planned(subject, &checks));
+            continue;
+        }
         if checks.is_empty() {
             println!("\n  no checks declared\n");
             continue;
@@ -1017,11 +1028,13 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
             Some(pack) => match crate::targets::binary_for(pack, None) {
                 Ok(binary) => absolute(&binary),
                 Err(e) => {
-                    println!(
-                        "
-  not checked: {e}
-"
-                    );
+                    if text {
+                        println!("\n  not checked: {e}\n");
+                    } else {
+                        accounts.push(serde_json::json!({
+                            "subject": subject.name, "not_checked": e.to_string(),
+                        }));
+                    }
                     worst = worst.max(crate::exit::USAGE);
                     continue;
                 }
@@ -1032,11 +1045,15 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
         let runner = Runner::new(&subject.cwd, &scratch, request.jobs)?;
         let mut verdicts = Vec::new();
         let mut label_now: Option<&String> = None;
-        println!();
+        if text {
+            println!();
+        }
         for (label, c) in &checks {
             if label.as_ref() != label_now {
                 label_now = label.as_ref();
-                if let Some(label) = label_now {
+                if let Some(label) = label_now
+                    && text
+                {
                     match notes.get(label.as_str()) {
                         Some(note) => println!("  {label} — {note}"),
                         None => println!("  {label}"),
@@ -1068,20 +1085,74 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
             if let Some(label) = label {
                 verdict.name = format!("{label} {}", c.name);
             }
-            print_verdict(c.name, &verdict, label.is_some());
+            if text {
+                print_verdict(c.name, &verdict, label.is_some());
+            }
             verdicts.push(verdict);
         }
         let _ = std::fs::remove_dir_all(&scratch);
         let ran: Vec<&Verdict> = verdicts.iter().filter(|v| v.holds.is_some()).collect();
         let held = ran.iter().filter(|v| v.holds == Some(true)).count();
         let file = request.out.join(format!("{}.json", subject.name));
-        write_results(&file, subject, &verdicts)?;
-        println!("\n  {held} of {} hold · results in {}\n", ran.len(), file.display());
+        let account = write_results(&file, subject, &verdicts)?;
+        if text {
+            println!("\n  {held} of {} hold · results in {}\n", ran.len(), file.display());
+        } else {
+            accounts.push(with_what_was_printed(account, &verdicts, &file, held, ran.len()));
+        }
         if held < ran.len() {
             worst = worst.max(crate::exit::FINDING);
         }
     }
+    if !text {
+        crate::json::emit(
+            "check",
+            serde_json::json!({ "plan": request.plan, "subjects": accounts }),
+        );
+    }
     Ok(worst)
+}
+
+/// A subject's plan as data: each check, the label it sits under and the scenario it runs.
+fn planned(subject: &Subject, checks: &[(&Option<String>, &Check)]) -> serde_json::Value {
+    let checks: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|(label, c)| {
+            serde_json::json!({
+                "name": c.name,
+                "label": label,
+                "scenario": c.generated.is_none().then(|| c.scenario.display().to_string()),
+                "generated": c.generated.is_some(),
+                "description": describe(c, &subject.cwd),
+            })
+        })
+        .collect();
+    serde_json::json!({ "subject": subject.name, "about": subject.about, "checks": checks })
+}
+
+/// The account a subject's file holds, with what the text shows and the file does not: the file's
+/// path, how many checks held of how many ran, and each result's detail and notes.
+fn with_what_was_printed(
+    mut account: serde_json::Value,
+    verdicts: &[Verdict],
+    file: &Path,
+    held: usize,
+    ran: usize,
+) -> serde_json::Value {
+    if let Some(results) = account.get_mut("results").and_then(serde_json::Value::as_array_mut) {
+        for (result, verdict) in results.iter_mut().zip(verdicts) {
+            if let serde_json::Value::Object(fields) = result {
+                fields.insert("detail".to_owned(), serde_json::json!(verdict.detail));
+                fields.insert("notes".to_owned(), serde_json::json!(verdict.notes));
+            }
+        }
+    }
+    if let serde_json::Value::Object(fields) = &mut account {
+        fields.insert("file".to_owned(), serde_json::json!(file.display().to_string()));
+        fields.insert("held".to_owned(), serde_json::json!(held));
+        fields.insert("ran".to_owned(), serde_json::json!(ran));
+    }
+    account
 }
 
 fn describe(check: &Check, cwd: &Path) -> String {
@@ -1161,7 +1232,12 @@ fn print_verdict(name: &str, verdict: &Verdict, indented: bool) {
     }
 }
 
-fn write_results(file: &Path, subject: &Subject, verdicts: &[Verdict]) -> Result<(), CliError> {
+/// Writes a subject's results to `file`, and returns the account written.
+fn write_results(
+    file: &Path,
+    subject: &Subject,
+    verdicts: &[Verdict],
+) -> Result<serde_json::Value, CliError> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| refused(format!("cannot use {}: {e}", dir.display())))?;
@@ -1182,7 +1258,9 @@ fn write_results(file: &Path, subject: &Subject, verdicts: &[Verdict]) -> Result
     });
     let mut text = serde_json::to_string_pretty(&account).unwrap_or_else(|_| "{}".to_owned());
     text.push('\n');
-    std::fs::write(file, text).map_err(|e| refused(format!("cannot write {}: {e}", file.display())))
+    std::fs::write(file, text)
+        .map_err(|e| refused(format!("cannot write {}: {e}", file.display())))?;
+    Ok(account)
 }
 
 /// What `bohr sweep` was asked for.
@@ -1213,6 +1291,88 @@ pub(crate) fn sweep(request: &Sweep) -> Result<u8, CliError> {
     let ran = runner.many(&scenario, &program, &seeds_of(request.seeds));
     let _ = std::fs::remove_dir_all(&scratch);
 
+    if crate::json::on() {
+        crate::json::emit("sweep", swept(request, &program, &ran));
+    } else {
+        print_sweep(request, &ran);
+    }
+    Ok(if ran.iter().any(|r| r.facts.is_none()) {
+        crate::exit::INTERNAL
+    } else {
+        match (&request.expect, request.at_least) {
+            (Some(code), Some(at_least)) => {
+                let hits =
+                    ran.iter().filter(|r| r.facts.as_ref().is_some_and(|f| f.names(code))).count()
+                        as u64;
+                if hits >= at_least { crate::exit::CLEAN } else { crate::exit::FINDING }
+            }
+            _ if ran.iter().any(|r| r.facts.as_ref().is_some_and(Facts::found)) => {
+                crate::exit::FINDING
+            }
+            _ => crate::exit::CLEAN,
+        }
+    })
+}
+
+/// What a sweep found on each seed, as the body of a `bohr.sweep` object.
+///
+/// Every seed's facts, in seed order, beside the counts the text shows; `hits` and `holds` only
+/// where `--expect` and `--at-least` asked for them.
+fn swept(request: &Sweep, program: &str, ran: &[Ran]) -> serde_json::Value {
+    let seeds_where = |keep: &dyn Fn(&Ran) -> bool| -> Vec<u64> {
+        ran.iter().filter(|r| keep(r)).map(|r| r.seed).collect()
+    };
+    let clean = seeds_where(&|r| r.facts.as_ref().is_some_and(|f| !f.found()));
+    let found = seeds_where(&|r| r.facts.as_ref().is_some_and(Facts::found));
+    let incomplete = seeds_where(&|r| r.facts.is_none());
+    let hits = request
+        .expect
+        .as_ref()
+        .map(|code| seeds_where(&|r| r.facts.as_ref().is_some_and(|f| f.names(code))));
+    // Counted, not subtracted: with `--expect Clean` a clean seed is also a hit.
+    let other = request.expect.as_ref().map(|code| {
+        seeds_where(&|r| r.facts.as_ref().is_some_and(|f| f.found() && !f.names(code))).len()
+    });
+    let holds = hits.as_ref().zip(request.at_least).map(|(h, at_least)| h.len() as u64 >= at_least);
+    let mut kinds: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
+    for r in ran {
+        if let Some(f) = r.facts.as_ref().filter(|f| f.found()) {
+            let key = f.codes.first().cloned().unwrap_or_else(|| f.outcome.clone());
+            kinds.entry(key).or_default().push(r.seed);
+        }
+    }
+    let results: Vec<serde_json::Value> = ran
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "seed": r.seed,
+                "facts": r.facts,
+                "said": r.facts.is_none().then_some(&r.said),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "scenario": request.scenario.display().to_string(),
+        "program": program,
+        "no_faults": request.no_faults,
+        "from": request.seeds.0,
+        "to": request.seeds.1,
+        "seeds": ran.len(),
+        "expect": request.expect,
+        "at_least": request.at_least,
+        "hits": hits,
+        "other": other,
+        "holds": holds,
+        "found": found.len(),
+        "clean": clean.len(),
+        "incomplete": incomplete,
+        "kinds": kinds,
+        "results": results,
+    })
+}
+
+/// The sweep as a person reads it.
+fn print_sweep(request: &Sweep, ran: &[Ran]) {
     let clean: Vec<u64> = ran
         .iter()
         .filter(|r| r.facts.as_ref().is_some_and(|f| !f.found()))
@@ -1282,22 +1442,6 @@ pub(crate) fn sweep(request: &Sweep) -> Result<u8, CliError> {
         println!("\n  seed {} did not complete: {}", first.seed, first.said);
     }
     println!();
-    Ok(if !lost.is_empty() {
-        crate::exit::INTERNAL
-    } else {
-        match (&request.expect, request.at_least) {
-            (Some(code), Some(at_least)) => {
-                let hits =
-                    ran.iter().filter(|r| r.facts.as_ref().is_some_and(|f| f.names(code))).count()
-                        as u64;
-                if hits >= at_least { crate::exit::CLEAN } else { crate::exit::FINDING }
-            }
-            _ if ran.iter().any(|r| r.facts.as_ref().is_some_and(Facts::found)) => {
-                crate::exit::FINDING
-            }
-            _ => crate::exit::CLEAN,
-        }
-    })
 }
 
 #[cfg(test)]
@@ -1348,6 +1492,73 @@ mod tests {
         );
         let lost = Ran { seed: 3, facts: None, said: "gone".into(), wall: Duration::ZERO };
         assert_eq!(never_finds("n", &[ran(1, "Clean", None), lost]).holds, Some(false));
+    }
+
+    /// A plan names each check with its label and scenario; a generated scenario is said to be
+    /// generated rather than given a path nobody can open.
+    #[test]
+    fn a_plan_is_each_check_with_its_scenario() {
+        let check = |name, generated: Option<&str>| Check {
+            name,
+            scenario: PathBuf::from("bug/s.toml"),
+            generated: generated.map(str::to_owned),
+            kind: Kind::Repeats { seed: 3, times: 4 },
+        };
+        let subject = Subject {
+            name: "bug".to_owned(),
+            about: "a seeded defect".to_owned(),
+            cwd: PathBuf::from("."),
+            pack: None,
+            groups: Vec::new(),
+        };
+        let label = Some("lost-write".to_owned());
+        let (given, generated) = (check("repeats", None), check("works", Some("[run]\n")));
+        let plan = planned(&subject, &[(&None, &given), (&label, &generated)]);
+        let value =
+            crate::json::object("check", serde_json::json!({ "plan": true, "subjects": [plan] }));
+        assert_eq!(value["schema"], "bohr.check/1");
+        let checks = &value["subjects"][0]["checks"];
+        assert_eq!(value["subjects"][0]["subject"], "bug");
+        assert_eq!(checks[0]["name"], "repeats");
+        assert_eq!(checks[0]["label"], serde_json::Value::Null);
+        assert_eq!(checks[0]["generated"], false);
+        assert!(checks[0]["scenario"].as_str().is_some_and(|s| s.ends_with("s.toml")));
+        assert!(checks[0]["description"].as_str().is_some_and(|d| d.contains("seed 3 × 4")));
+        assert_eq!(checks[1]["label"], "lost-write");
+        assert_eq!(checks[1]["scenario"], serde_json::Value::Null);
+    }
+
+    /// A sweep's object carries every seed's facts and the count `--at-least` is held to.
+    #[test]
+    fn a_sweep_object_counts_against_its_bound() {
+        let request = Sweep {
+            scenario: PathBuf::from("s.toml"),
+            seeds: (1, 4),
+            expect: Some("BOHR-2043".to_owned()),
+            at_least: Some(2),
+            no_faults: false,
+            jobs: 1,
+            program: None,
+        };
+        let swept_runs = [
+            ran(1, "ProbeViolated", Some("BOHR-2043")),
+            ran(2, "Clean", None),
+            ran(3, "GuestCrashed", None),
+            Ran { seed: 4, facts: None, said: "killed".into(), wall: Duration::ZERO },
+        ];
+        let value = crate::json::object("sweep", swept(&request, "./node", &swept_runs));
+        assert_eq!(value["schema"], "bohr.sweep/1");
+        assert_eq!(value["seeds"], 4);
+        assert_eq!(value["hits"], serde_json::json!([1]));
+        assert_eq!(value["other"], 1);
+        assert_eq!(value["holds"], false);
+        assert_eq!(value["found"], 2);
+        assert_eq!(value["clean"], 1);
+        assert_eq!(value["incomplete"], serde_json::json!([4]));
+        assert_eq!(value["kinds"]["BOHR-2043"], serde_json::json!([1]));
+        assert_eq!(value["results"][0]["facts"]["outcome"], "ProbeViolated");
+        assert_eq!(value["results"][3]["facts"], serde_json::Value::Null);
+        assert_eq!(value["results"][3]["said"], "killed");
     }
 
     #[test]

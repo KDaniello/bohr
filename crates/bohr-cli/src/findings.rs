@@ -89,8 +89,11 @@ fn read(path: &Path) -> Result<Read, CliError> {
     })
 }
 
-/// Groups the bundles in `dir` and prints the groups, largest first.
-pub(crate) fn findings(dir: &str, json: bool) -> Result<u8, CliError> {
+/// Bundles grouped by signature, each group led by its smallest bundle.
+type Groups = Vec<(String, Vec<Read>)>;
+
+/// How many bundles `dir` holds, and their groups, largest first.
+fn grouped(dir: &str) -> Result<(usize, Groups), CliError> {
     let listed = std::fs::read_dir(dir)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {dir}: {e}")))?;
     let mut paths: Vec<PathBuf> = listed
@@ -115,28 +118,42 @@ pub(crate) fn findings(dir: &str, json: bool) -> Result<u8, CliError> {
     }
     // Largest group first, then by signature, so the same directory prints the same way.
     ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    Ok((paths.len(), ordered))
+}
 
-    if json {
-        let groups: Vec<serde_json::Value> = ordered
-            .iter()
-            .map(|(signature, members)| {
-                serde_json::json!({
-                    "signature": signature,
-                    "verdict": members[0].verdict.headline,
-                    "code": members[0].verdict.code,
-                    "count": members.len(),
-                    "smallest": members[0].path.display().to_string(),
-                    "bundles": members.iter().map(|m| serde_json::json!({
-                        "path": m.path.display().to_string(),
-                        "events": m.events,
-                    })).collect::<Vec<_>>(),
-                })
+/// The groups as the body of a `bohr.findings` object, for any command that reports a directory.
+pub(crate) fn groups_json(dir: &str) -> Result<serde_json::Value, CliError> {
+    let (count, ordered) = grouped(dir)?;
+    Ok(as_json(count, &ordered))
+}
+
+fn as_json(count: usize, ordered: &[(String, Vec<Read>)]) -> serde_json::Value {
+    let groups: Vec<serde_json::Value> = ordered
+        .iter()
+        .map(|(signature, members)| {
+            serde_json::json!({
+                "signature": signature,
+                "verdict": members[0].verdict.headline,
+                "code": members[0].verdict.code,
+                "count": members.len(),
+                "smallest": members[0].path.display().to_string(),
+                "bundles": members.iter().map(|m| serde_json::json!({
+                    "path": m.path.display().to_string(),
+                    "events": m.events,
+                })).collect::<Vec<_>>(),
             })
-            .collect();
-        let account = serde_json::json!({ "findings": paths.len(), "groups": groups });
-        println!("{}", serde_json::to_string_pretty(&account).unwrap_or_default());
+        })
+        .collect();
+    serde_json::json!({ "findings": count, "groups": groups })
+}
+
+/// Groups the bundles in `dir` and prints the groups, largest first.
+pub(crate) fn findings(dir: &str) -> Result<u8, CliError> {
+    let (count, ordered) = grouped(dir)?;
+    if crate::json::on() {
+        crate::json::emit("findings", as_json(count, &ordered));
     } else {
-        println!("{} findings in {} groups", paths.len(), ordered.len());
+        println!("{count} findings in {} groups", ordered.len());
         for (signature, members) in &ordered {
             let smallest = &members[0];
             println!(

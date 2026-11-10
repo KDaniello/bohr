@@ -1,14 +1,20 @@
 name: release
 
+# Two ways in, one build. A dispatch builds, compares and signs everything a release ships and
+# keeps it as workflow artefacts; a `v*` tag does the same and then publishes it. Nothing reaches
+# a release page or a registry from a dispatch.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
 
 jobs:
   # Every stored bundle must still replay with the release build. This is the
@@ -35,8 +41,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       - uses: ./.github/actions/deterministic-build-env
-      - run: cargo build --release --locked --target x86_64-unknown-linux-musl --bin bohr
-      - run: sha256sum target/x86_64-unknown-linux-musl/release/bohr | tee hash-${{ matrix.runner }}.txt
+      - run: cargo build --profile dist --locked --target "$TARGET" --bin bohr
+      - run: sha256sum "target/$TARGET/dist/bohr" | tee hash-${{ matrix.runner }}.txt
       - uses: actions/upload-artifact@v7
         with: { name: "hash-${{ matrix.runner }}", path: hash-*.txt }
 
@@ -55,44 +61,127 @@ jobs:
   build:
     needs: [compat, compare-hashes]
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        target: [x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu]
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # The same environment the hash gate above verified. Building the published artefact any
       # other way would mean shipping a binary nobody proved reproducible.
       - uses: ./.github/actions/deterministic-build-env
-      - run: cargo build --release --locked --target ${{ matrix.target }} --bin bohr
-      - name: Package
-        # The archive is pinned as hard as the binary: without a fixed time, ownership and order
-        # the tarball differs on every run and its checksum says nothing about its contents.
+      - run: cargo build --profile dist --locked --target "$TARGET" --bin bohr
+      - name: Package the binary and the packs
+        # Pinned as hard as the binary: without a fixed time, ownership and order an archive
+        # differs on every run and its checksum says nothing about its contents. The packs are
+        # what `bohr hunt <name>` needs off a checkout: the pack files, the examples they build,
+        # the script that builds them, the C runtime an instrumented example compiles in, and the
+        # toolchain they are pinned to. A pushed tag names the release; anything else is a build
+        # of the workspace version, marked as one.
         run: |
+          set -e
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=$GITHUB_REF_NAME
+          else
+            version="v$(cargo pkgid -p bohr-cli | sed 's/.*[#@]//')-dev"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          mkdir dist
           tar --sort=name --numeric-owner --owner=0 --group=0 \
             --mtime="@$SOURCE_DATE_EPOCH" --format=gnu \
-            -cf - -C target/${{ matrix.target }}/release bohr \
-            | gzip -n -9 > bohr-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-          sha256sum bohr-*.tar.gz > SHA256SUMS-${{ matrix.target }}
+            -cf - -C "target/$TARGET/dist" bohr \
+            | gzip -n -9 > "dist/bohr-$version-$TARGET.tar.gz"
+          git archive --format=tar HEAD targets examples sdk/c scripts/build-example.sh rust-toolchain.toml \
+            | gzip -n -9 > "dist/bohr-packs-$version.tar.gz"
+          cp "target/$TARGET/dist/bohr" dist/bohr
+          (cd dist && sha256sum "bohr-$version-$TARGET.tar.gz" "bohr-packs-$version.tar.gz" > SHA256SUMS)
+      - name: Sign
+        id: sign
+        # The key signs SHA256SUMS and nothing else; every file is checked against the sums.
+        # `ssh-keygen -Y` because every host bohrup runs on already has it. A repository without
+        # the key builds and checks everything and publishes nothing signed.
+        env:
+          KEY: ${{ secrets.BOHR_RELEASE_KEY }}
+          SIGNER: ${{ vars.BOHR_RELEASE_SIGNER }}
+        run: |
+          set -e
+          if [ -z "$KEY" ] || [ -z "$SIGNER" ]; then
+            # A tag publishes, and an unsigned release is one bohrup refuses to install.
+            if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+              echo "::error::a release needs its key"; exit 1
+            fi
+            echo "::warning::no release key: nothing is signed"
+            cp scripts/bohrup.sh dist/bohrup.sh
+            exit 0
+          fi
+          # The line is written into a single-quoted shell string, so a quote in it would end it.
+          case "$SIGNER" in *"'"*) echo "::error::the signer line holds a quote"; exit 1 ;; esac
+          umask 077
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/key"
+          ssh-keygen -Y sign -f "$RUNNER_TEMP/key" -n bohr-release dist/SHA256SUMS
+          rm "$RUNNER_TEMP/key"
+          printf '%s\n' "$SIGNER" > "$RUNNER_TEMP/allowed"
+          ssh-keygen -Y verify -f "$RUNNER_TEMP/allowed" -I bohr-release -n bohr-release \
+            -s dist/SHA256SUMS.sig < dist/SHA256SUMS
+          # Spliced in as text: a replacement string in awk reads `&` and `\` as its own.
+          awk '{ i = index($0, "@BOHR_RELEASE_SIGNER@")
+                 if (i) $0 = substr($0, 1, i - 1) ENVIRON["SIGNER"] substr($0, i + 21) } 1' \
+            scripts/bohrup.sh > dist/bohrup.sh
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - name: Install from what was just built
+        # The installer is tested against the very files it would fetch, from a directory.
+        if: steps.sign.outputs.signed == 'true'
+        run: BOHRUP_SOURCE=dist BOHR_HOME="$RUNNER_TEMP/home" sh dist/bohrup.sh < /dev/null
       - uses: actions/upload-artifact@v7
         with:
-          name: "dist-${{ matrix.target }}"
-          path: |
-            bohr-*.tar.gz
-            SHA256SUMS-*
+          name: dist
+          path: dist/
 
-  publish:
+  image:
     needs: build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
-        with: { path: dist/, merge-multiple: true }
-      - run: cat dist/SHA256SUMS-* > dist/SHA256SUMS
+        with: { name: dist, path: dist/ }
+      - name: Build the image from the release's own files
+        run: |
+          set -e
+          version=$(sed -n 's|.*bohr-packs-\(.*\)\.tar\.gz$|\1|p' dist/SHA256SUMS)
+          cp Dockerfile scripts/docker-help.txt dist/
+          chmod 755 dist/bohr
+          docker build --build-arg VERSION="$version" -t "ghcr.io/kdaniello/bohr:$version" dist
+          docker run --rm "ghcr.io/kdaniello/bohr:$version" version --verbose
+          docker save "ghcr.io/kdaniello/bohr:$version" | gzip -1 > image.tar.gz
+      - uses: actions/upload-artifact@v7
+        with: { name: image, path: image.tar.gz }
+
+  # Only a pushed tag publishes, and the release page before the image: a registry tag nothing
+  # links to is the one artefact here nobody would know to look for.
+  publish:
+    needs: [build, image]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { name: dist, path: dist/ }
+      - name: The tag is the version the workspace says
+        run: |
+          set -e
+          want="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME, workspace $want"; exit 1; }
       - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/bohr-*.tar.gz
             dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/bohrup.sh
           generate_release_notes: false
           body_path: CHANGELOG.md
+      - uses: actions/download-artifact@v8
+        with: { name: image, path: . }
+      - name: Push the image
+        run: |
+          set -e
+          gunzip -c image.tar.gz | docker load
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "ghcr.io/kdaniello/bohr:$GITHUB_REF_NAME"

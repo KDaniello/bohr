@@ -1,0 +1,27 @@
+{
+  "bundle_format": 2,
+  "schema": "bohr.version/1",
+  "schemas": {
+    "check": "bohr.check/1",
+    "doctor": "bohr.doctor/1",
+    "error": "bohr.error/1",
+    "explain": "bohr.explain/1",
+    "explore": "bohr.explore/1",
+    "findings": "bohr.findings/1",
+    "hunt": "bohr.hunt/1",
+    "init": "bohr.init/1",
+    "note": "bohr.note/1",
+    "reduce": "bohr.reduce/1",
+    "replay": "bohr.replay/1",
+    "report": "bohr.report/1",
+    "run": "bohr.run/1",
+    "selftest": "bohr.selftest/1",
+    "survey": "bohr.survey/1",
+    "sweep": "bohr.sweep/1",
+    "trace": "bohr.trace/1",
+    "version": "bohr.version/1"
+  },
+  "sdk_schema": 1,
+  "tape_abi": 2,
+  "tool_version": "<this build>"
+}

@@ -1,0 +1,180 @@
+{
+  "bundle": "findings/two-tasks-seed0.bohr",
+  "events": [
+    {
+      "id": 0,
+      "kind": "task_spawned",
+      "node": 0,
+      "task": 1,
+      "task_spawned": {
+        "parent": 0
+      },
+      "tick": 0
+    },
+    {
+      "id": 1,
+      "kind": "syscall",
+      "node": 0,
+      "syscall": {
+        "args": [
+          "0x1000",
+          "0x10",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0"
+        ],
+        "data_digest": "39c4fde3d4098880",
+        "emulated": true,
+        "name": "getrandom",
+        "nr": 318,
+        "ret": 16
+      },
+      "task": 0,
+      "tick": 0
+    },
+    {
+      "clock_read": {
+        "presented": 1735689600041519174
+      },
+      "id": 2,
+      "kind": "clock_read",
+      "node": 0,
+      "task": 0,
+      "tick": 1000
+    },
+    {
+      "id": 3,
+      "kind": "syscall",
+      "node": 0,
+      "syscall": {
+        "args": [
+          "0x0",
+          "0x1040",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0"
+        ],
+        "data_digest": "db4fb278be11cd4c",
+        "emulated": true,
+        "name": "clock_gettime",
+        "nr": 228,
+        "ret": 0
+      },
+      "task": 0,
+      "tick": 1000
+    },
+    {
+      "id": 4,
+      "kind": "syscall",
+      "node": 0,
+      "syscall": {
+        "args": [
+          "0x0",
+          "0x1060",
+          "0x8",
+          "0x0",
+          "0x0",
+          "0x0"
+        ],
+        "emulated": true,
+        "name": "read",
+        "nr": 0,
+        "ret": 0
+      },
+      "task": 0,
+      "tick": 2000
+    },
+    {
+      "id": 5,
+      "kind": "task_exited",
+      "node": 0,
+      "task": 0,
+      "task_exited": {
+        "code": 0,
+        "how": "exited"
+      },
+      "tick": 3000
+    },
+    {
+      "id": 6,
+      "kind": "schedule",
+      "node": 0,
+      "schedule": {
+        "from": 0,
+        "reason": "task_exit",
+        "to": 1
+      },
+      "task": 1,
+      "tick": 3000
+    },
+    {
+      "id": 7,
+      "kind": "syscall",
+      "node": 0,
+      "syscall": {
+        "args": [
+          "0x1080",
+          "0x10",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0"
+        ],
+        "data_digest": "1bd85a8944e2ddd9",
+        "emulated": true,
+        "name": "getrandom",
+        "nr": 318,
+        "ret": 16
+      },
+      "task": 1,
+      "tick": 3000
+    },
+    {
+      "clock_read": {
+        "presented": 1735689600041522174
+      },
+      "id": 8,
+      "kind": "clock_read",
+      "node": 0,
+      "task": 1,
+      "tick": 4000
+    },
+    {
+      "id": 9,
+      "kind": "syscall",
+      "node": 0,
+      "syscall": {
+        "args": [
+          "0x0",
+          "0x10c0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0"
+        ],
+        "data_digest": "6b597493cdca05f8",
+        "emulated": true,
+        "name": "clock_gettime",
+        "nr": 228,
+        "ret": 0
+      },
+      "task": 1,
+      "tick": 4000
+    },
+    {
+      "id": 10,
+      "kind": "task_exited",
+      "node": 0,
+      "task": 1,
+      "task_exited": {
+        "code": 0,
+        "how": "exited"
+      },
+      "tick": 5000
+    }
+  ],
+  "schema": "bohr.trace/1",
+  "truncated": null
+}

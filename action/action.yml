@@ -1,0 +1,131 @@
+name: bohr hunt
+description: >
+  Hunts a target pack with bohr and fails the job on a finding, with the bundle, a report and SARIF
+  attached. A finding is a run that reproduces: the bundle replays on any Linux x86-64 host.
+
+branding:
+  icon: target
+  color: gray-dark
+
+inputs:
+  pack:
+    description: A pack name under targets/, or the path of a pack's directory or file.
+    required: true
+  time:
+    description: "Wall-clock budget: 90s, 5m, 1h. Ignored where seeds is given."
+    default: 5m
+  seeds:
+    description: "Run these seeds once each, a..b, instead of searching; the budget that repeats."
+    default: ""
+  binary:
+    description: >
+      A built binary to hunt instead of building the pack's own; it must have the pack's digest.
+      Without it the pack builds its program in the job, which takes as long as that build does.
+    default: ""
+  version:
+    description: The bohr release to install, v1.0.0; the latest where empty.
+    default: ""
+  source:
+    description: Where bohrup fetches the release from; a URL or a directory. The releases page where empty.
+    default: ""
+  out:
+    description: Where findings, the summary, the report and the SARIF are written.
+    default: bohr-hunt
+
+outputs:
+  findings:
+    description: How many runs found something.
+    value: ${{ steps.hunt.outputs.findings }}
+  sarif:
+    description: The SARIF file, for github/codeql-action/upload-sarif; empty where nothing was found.
+    value: ${{ steps.hunt.outputs.sarif }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install bohr
+      shell: bash
+      env:
+        BOHR_VERSION: ${{ inputs.version }}
+        BOHRUP_SOURCE: ${{ inputs.source }}
+      # The installer published with the release, so its key is the release's key.
+      run: |
+        set -euo pipefail
+        [ -n "$BOHR_VERSION" ] || unset BOHR_VERSION
+        echo "$HOME/.bohr/bin" >> "$GITHUB_PATH"
+        case "${BOHRUP_SOURCE:-}" in
+          "")
+            unset BOHRUP_SOURCE
+            base=https://github.com/KDaniello/bohr/releases ;;
+          http://*|https://*)
+            base=$BOHRUP_SOURCE ;;
+          *)
+            # A directory is one release's files, and the installer is one of them.
+            [ -f "$BOHRUP_SOURCE/bohrup.sh" ] || { echo "::error::no bohrup.sh in $BOHRUP_SOURCE"; exit 1; }
+            sh "$BOHRUP_SOURCE/bohrup.sh" < /dev/null
+            exit 0 ;;
+        esac
+        url=$base/latest/download/bohrup.sh
+        [ -z "${BOHR_VERSION:-}" ] || url=$base/download/$BOHR_VERSION/bohrup.sh
+        curl -sSfL --proto '=https' -o "$RUNNER_TEMP/bohrup.sh" "$url"
+        sh "$RUNNER_TEMP/bohrup.sh" < /dev/null
+
+    - name: Hunt
+      id: hunt
+      shell: bash
+      env:
+        PACK: ${{ inputs.pack }}
+        TIME: ${{ inputs.time }}
+        SEEDS: ${{ inputs.seeds }}
+        BINARY: ${{ inputs.binary }}
+        OUT: ${{ inputs.out }}
+      # Exit 1 is a finding and is the job's answer, not a failure of this step: everything a
+      # reader needs is written first, and the job fails in the last step.
+      run: |
+        set -uo pipefail
+        budget=(--time "$TIME")
+        [ -z "$SEEDS" ] || budget=(--seeds "$SEEDS")
+        [ -z "$BINARY" ] || budget+=(--binary "$BINARY")
+        "$HOME/.bohr/bin/bohr" hunt "$PACK" "${budget[@]}" -o "$OUT" --json > "$OUT.json"
+        code=$?
+        echo "exit=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" -gt 1 ]; then
+          cat "$OUT.json"
+          exit "$code"
+        fi
+        found=0
+        if [ -d "$OUT/findings" ] && ls "$OUT"/findings/*.bohr >/dev/null 2>&1; then
+          found=$(ls "$OUT"/findings/*.bohr | wc -l)
+          if "$HOME/.bohr/bin/bohr" report "$OUT/findings" --sarif -o "$OUT/bohr.sarif" --json >/dev/null; then
+            echo "sarif=$OUT/bohr.sarif" >> "$GITHUB_OUTPUT"
+          fi
+          # The smallest bundle of the largest group; none where every bundle was unreadable.
+          smallest=$("$HOME/.bohr/bin/bohr" findings "$OUT/findings" --json | python3 -c \
+            'import json,sys; g=json.load(sys.stdin).get("groups") or [{}]; print(g[0].get("smallest", ""))')
+          if [ -n "$smallest" ]; then
+            "$HOME/.bohr/bin/bohr" report "$smallest" -o "$OUT/report.html" --json >/dev/null \
+              || echo "::warning::no page for $smallest"
+            "$HOME/.bohr/bin/bohr" report "$smallest" --disclosure -o "$OUT/disclosure.md" --json >/dev/null \
+              || echo "::warning::no disclosure draft for $smallest"
+          fi
+          {
+            echo "### bohr found $found run(s) that fail"
+            echo
+            "$HOME/.bohr/bin/bohr" findings "$OUT/findings"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        echo "findings=$found" >> "$GITHUB_OUTPUT"
+
+    - name: Keep what was found
+      if: steps.hunt.outputs.findings != '0'
+      uses: actions/upload-artifact@v7
+      with:
+        name: bohr-findings
+        path: ${{ inputs.out }}/
+
+    - name: Fail on a finding
+      if: steps.hunt.outputs.findings != '0'
+      shell: bash
+      run: |
+        echo "::error::bohr found ${{ steps.hunt.outputs.findings }} run(s) that fail; the bundles are attached as bohr-findings"
+        exit 1

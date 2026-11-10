@@ -161,17 +161,60 @@ pub(crate) fn reduce(
     std::fs::write(out, written)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {out}: {e}")))?;
 
-    println!(
-        "events: {} → {}, tape: {} → {} draws",
-        before.events, after.events, before.draws, after.draws
-    );
     let spent = reduction.spent();
+    if crate::json::on() {
+        let verdict = bohr_report::narrate::verdict(&manifest.outcome);
+        crate::json::emit(
+            "reduce",
+            account(path, out, &manifest.run_id, &verdict, (before, after), spent, budget),
+        );
+    } else {
+        println!(
+            "events: {} → {}, tape: {} → {} draws",
+            before.events, after.events, before.draws, after.draws
+        );
+    }
     eprintln!(
         "  replays spent: {} verifying, {} on faults, {} on the configuration, {} on deliveries, \
          {} on the tape · written to {out}, reduced from run {}",
         spent.verifying, spent.faults, spent.config, spent.events, spent.tape, manifest.run_id
     );
     Ok(crate::exit::CLEAN)
+}
+
+/// A reduction as the body of a `bohr.reduce` object: the sizes before and after, the replays
+/// each pass spent, and the bundle written.
+///
+/// `shrank` is false where neither events nor draws went down: the bundle written is then the
+/// finding as it was, re-recorded, and a reader acting on "reduced" should know it is not smaller.
+fn account(
+    from: &str,
+    out: &str,
+    run_id: &str,
+    verdict: &bohr_report::narrate::Verdict,
+    (before, after): (Size, Size),
+    spent: bohr_reducer::Spent,
+    budget: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "bundle": from,
+        "out": out,
+        "from_run": run_id,
+        "outcome": verdict.code,
+        "headline": verdict.headline,
+        "events": { "before": before.events, "after": after.events },
+        "draws": { "before": before.draws, "after": after.draws },
+        "shrank": after.events < before.events || after.draws < before.draws,
+        "budget": budget,
+        "replays_spent": {
+            "verifying": spent.verifying,
+            "faults": spent.faults,
+            "config": spent.config,
+            "events": spent.events,
+            "tape": spent.tape,
+            "total": spent.total(),
+        },
+    })
 }
 
 /// The configuration, where there is one.
@@ -271,6 +314,33 @@ mod tests {
             reduced.read_at(at, &mut now);
             assert_eq!(was, now, "the tapes differ at offset {at}");
         }
+    }
+
+    /// The object says what went in and what came out, and whether it is any smaller: a reduction
+    /// that removed nothing still writes a bundle, and `shrank` is how a reader tells.
+    #[test]
+    fn a_reduction_object_carries_both_sizes_and_the_replays() {
+        let verdict = bohr_report::narrate::verdict(&bohr_trace::Outcome::GuestCrashed(
+            "node 0 exited 1".to_owned(),
+        ));
+        let spent = bohr_reducer::Spent { verifying: 2, faults: 3, config: 0, events: 5, tape: 7 };
+        let before = Size { events: 900, draws: 40 };
+        let after = Size { events: 120, draws: 40 };
+        let value = crate::json::object(
+            "reduce",
+            account("in.bohr", "out.bohr", "run-1", &verdict, (before, after), spent, 500),
+        );
+        assert_eq!(value["schema"], "bohr.reduce/1");
+        assert_eq!(value["bundle"], "in.bohr");
+        assert_eq!(value["out"], "out.bohr");
+        assert_eq!(value["from_run"], "run-1");
+        assert_eq!(value["events"]["before"], 900);
+        assert_eq!(value["events"]["after"], 120);
+        assert_eq!(value["draws"]["after"], 40);
+        assert_eq!(value["shrank"], true);
+        assert_eq!(value["replays_spent"]["total"], 17);
+        let same = account("a", "b", "r", &verdict, (before, before), spent, 500);
+        assert_eq!(same["shrank"], false);
     }
 
     /// And a run that read more than a reduction will write out is refused rather than reduced,

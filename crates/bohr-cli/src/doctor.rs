@@ -33,6 +33,16 @@ impl Verdict {
             Self::Skip => "skip",
         }
     }
+
+    /// The verdict as a `--json` reader matches it: lower case, so a failure is `fail`.
+    const fn status(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+        }
+    }
 }
 
 /// One thing that was checked.
@@ -72,8 +82,13 @@ pub(crate) fn run(target: Option<&str>, list_syscalls: bool) -> Result<u8, CliEr
         checks.extend(target_checks(path)?);
     }
 
+    let worst = worst_of(&checks);
+    if crate::json::on() {
+        crate::json::emit("doctor", checks_json(&checks, worst));
+        return Ok(if worst == Verdict::Fail { crate::exit::DEGRADED } else { crate::exit::CLEAN });
+    }
+
     let width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
-    let mut worst = Verdict::Pass;
     for check in &checks {
         println!("{:width$}  {}  {}", check.name, check.verdict.mark(), check.detail);
         // Only where something is wrong: a remedy printed under a passing check reads as an
@@ -82,11 +97,6 @@ pub(crate) fn run(target: Option<&str>, list_syscalls: bool) -> Result<u8, CliEr
             && let Some(remedy) = &check.remedy
         {
             println!("{:width$}        {remedy}", "");
-        }
-        if check.verdict == Verdict::Fail {
-            worst = Verdict::Fail;
-        } else if check.verdict == Verdict::Warn && worst == Verdict::Pass {
-            worst = Verdict::Warn;
         }
     }
 
@@ -107,8 +117,44 @@ pub(crate) fn run(target: Option<&str>, list_syscalls: bool) -> Result<u8, CliEr
     }
 }
 
+/// The worst verdict among `checks`; a skipped check counts as passed.
+fn worst_of(checks: &[Check]) -> Verdict {
+    let mut worst = Verdict::Pass;
+    for check in checks {
+        if check.verdict == Verdict::Fail {
+            worst = Verdict::Fail;
+        } else if check.verdict == Verdict::Warn && worst == Verdict::Pass {
+            worst = Verdict::Warn;
+        }
+    }
+    worst
+}
+
+/// Every check as a row, and the worst of them as the host's verdict.
+///
+/// A remedy is carried whatever the status: a program decides for itself what to show, and the
+/// rule that hides it under a pass is about what a person reads.
+fn checks_json(checks: &[Check], worst: Verdict) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "status": c.verdict.status(),
+                "detail": c.detail,
+                "remedy": c.remedy,
+            })
+        })
+        .collect();
+    serde_json::json!({ "verdict": worst.status(), "checks": rows })
+}
+
 /// The support table, so a target can be compared against it by eye.
 fn print_syscalls() -> u8 {
+    if crate::json::on() {
+        crate::json::emit("doctor", syscalls_json());
+        return crate::exit::CLEAN;
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     for (nr, name) in bohr_backend_ptrace::syscall_table() {
         println!("{nr:>4}  {name}");
@@ -116,6 +162,20 @@ fn print_syscalls() -> u8 {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     println!("this build has no syscall backend, so it has no table to print");
     crate::exit::CLEAN
+}
+
+/// The support table as rows; `backend` is false, and the table empty, in a build without one.
+fn syscalls_json() -> serde_json::Value {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let (backend, rows): (bool, Vec<serde_json::Value>) = (
+        true,
+        bohr_backend_ptrace::syscall_table()
+            .map(|(nr, name)| serde_json::json!({ "nr": nr, "name": name }))
+            .collect(),
+    );
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let (backend, rows): (bool, Vec<serde_json::Value>) = (false, Vec::new());
+    serde_json::json!({ "backend": backend, "syscalls": rows })
 }
 
 /// What a build without an interceptor can say about a host: that it is not one.
@@ -365,4 +425,51 @@ fn namespace_remedy() -> String {
     format!(
         "printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile bohr {exe} flags=(unconfined) {{\n  userns,\n}}\n' | sudo tee /etc/apparmor.d/bohr && sudo apparmor_parser -r /etc/apparmor.d/bohr   # AppArmor lets this binary, and no other, make namespaces"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every check is a row with its status in lower case, and the worst row is the verdict.
+    #[test]
+    fn a_diagnosis_is_a_row_per_check_and_the_worst_of_them() {
+        let checks = [
+            Check::new("ptrace", Verdict::Pass, "a child can be traced"),
+            Check::new("branch counters", Verdict::Warn, "unavailable")
+                .with_remedy("sysctl kernel.perf_event_paranoid"),
+            Check::new("namespaces", Verdict::Fail, "refused"),
+        ];
+        let value = crate::json::object("doctor", checks_json(&checks, worst_of(&checks)));
+        assert_eq!(value["schema"], "bohr.doctor/1");
+        assert_eq!(value["verdict"], "fail");
+        assert_eq!(value["checks"][0]["status"], "pass");
+        assert_eq!(value["checks"][0]["remedy"], serde_json::Value::Null);
+        assert_eq!(value["checks"][1]["remedy"], "sysctl kernel.perf_event_paranoid");
+        assert_eq!(value["checks"][2]["status"], "fail");
+        assert_eq!(worst_of(&checks[..2]), Verdict::Warn);
+    }
+
+    /// The host checks this build runs come out as rows whatever the host is.
+    #[test]
+    fn this_hosts_checks_are_rows() {
+        let checks = host_checks();
+        let value = checks_json(&checks, worst_of(&checks));
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(checks.len()));
+        assert!(["pass", "warn", "fail"].contains(&value["verdict"].as_str().unwrap_or("")));
+    }
+
+    /// The support table is rows of number and name, and a build without one says so.
+    #[test]
+    fn the_syscall_table_is_rows() {
+        let value = crate::json::object("doctor", syscalls_json());
+        assert_eq!(value["schema"], "bohr.doctor/1");
+        let rows = value["syscalls"].as_array().expect("an array");
+        if value["backend"] == true {
+            assert!(!rows.is_empty());
+            assert!(rows.iter().all(|r| r["nr"].is_u64() && r["name"].is_string()), "{value}");
+        } else {
+            assert!(rows.is_empty());
+        }
+    }
 }

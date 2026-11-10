@@ -1,0 +1,45 @@
+{
+  "findings": 3,
+  "groups": [
+    {
+      "bundles": [
+        {
+          "events": 7,
+          "path": "findings/clock-and-random-seed0.bohr"
+        }
+      ],
+      "code": "Clean",
+      "count": 1,
+      "signature": "builtin:clock-and-random: Clean: nothing was found",
+      "smallest": "findings/clock-and-random-seed0.bohr",
+      "verdict": "nothing was found"
+    },
+    {
+      "bundles": [
+        {
+          "events": 2,
+          "path": "findings/large-random-seed0.bohr"
+        }
+      ],
+      "code": "Clean",
+      "count": 1,
+      "signature": "builtin:large-random: Clean: nothing was found",
+      "smallest": "findings/large-random-seed0.bohr",
+      "verdict": "nothing was found"
+    },
+    {
+      "bundles": [
+        {
+          "events": 11,
+          "path": "findings/two-tasks-seed0.bohr"
+        }
+      ],
+      "code": "Clean",
+      "count": 1,
+      "signature": "builtin:two-tasks: Clean: nothing was found",
+      "smallest": "findings/two-tasks-seed0.bohr",
+      "verdict": "nothing was found"
+    }
+  ],
+  "schema": "bohr.findings/1"
+}

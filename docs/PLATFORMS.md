@@ -101,8 +101,8 @@ a host setting ourselves.**
 |---|:---:|---|
 | bare metal, ordinary distribution | **supported** | the reference environment |
 | a virtual machine (KVM, VMware, Hyper-V) | **supported** | branch counters are often unavailable; expect degraded progress measurement |
-| Docker, default profile | **needs flags** | the default seccomp profile blocks `ptrace`. Run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` |
-| Docker, our published image | **supported** | ships the profile and documents the flags |
+| Docker, default profile | **needs flags** | the default seccomp profile blocks `ptrace` and `unshare`, and the AppArmor profile the mounts. Run with `--cap-add SYS_PTRACE --security-opt seccomp=unconfined --security-opt apparmor=unconfined` |
+| Docker, our image | **supported with those flags** | the static release binary and its packs on `debian:12.8-slim`; with no command it runs `bohr doctor`, which names a flag still missing. The flags are in the image's label and `/usr/share/doc/bohr/docker.txt` |
 | GitHub Actions `ubuntu-latest` | **supported** | verified by CI; no branch counters, so L4 runs at syscall granularity |
 | Kubernetes pods | **needs config** | `SYS_PTRACE` capability plus a relaxed seccomp profile; many clusters forbid both |
 | WSL2 | **partial** | works for L0–L3; `perf_event_open` and some namespace configurations are unreliable. Not a supported target, and `doctor` says so |
@@ -347,10 +347,15 @@ syscall in `bohr-kernel` turns those jobs red.
 
 | Target | Form | Notes |
 |---|---|---|
-| `x86_64-unknown-linux-musl` | static binary | the one referenced in documentation; works in minimal CI containers |
-| `x86_64-unknown-linux-gnu` | dynamic binary | for hosts where a static build is discouraged |
-| container image | `ghcr.io/kdaniello/bohr` | carries the seccomp profile and documents the required flags |
-| install script | `bohrup` | downloads, verifies `SHA256SUMS`, installs to `~/.bohr/bin` |
+| `x86_64-unknown-linux-musl` | static binary | the one a release ships; works in minimal CI containers |
+| target packs | `bohr-packs-<version>.tar.gz` | what `bohr hunt <name>` needs off a checkout |
+| container image | `ghcr.io/kdaniello/bohr:<version>` | built from a release's own files; documents the flags it needs and checks them with `bohr doctor` |
+| install script | `bohrup` | checks the signature on `SHA256SUMS` and every file against it, installs to `~/.bohr`, links `~/.local/bin/bohr` |
+
+**On Ubuntu 23.10 and later an installed binary cannot isolate a guest until AppArmor allows it.**
+`kernel.apparmor_restrict_unprivileged_userns = 1` refuses user namespaces to every program no
+profile names, and `bohr doctor` fails on `namespaces` and prints the profile to add — one `sudo`
+command, for the path the binary was installed to. A build run from a checkout is no exception.
 
 Reproducible builds ([`ARCHITECTURE.md`](./ARCHITECTURE.md) §12): a tool that promises
 reproducibility and cannot reproduce its own build has an obvious credibility problem, and the

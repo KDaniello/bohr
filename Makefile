@@ -32,8 +32,8 @@ install: ## Install bohr into $(CARGO_HOME)/bin
 	$(CARGO) install --path crates/bohr-cli --force --locked
 
 .PHONY: build-musl
-build-musl: ## Static build, the artefact referenced in the documentation
-	$(CARGO) build --release --target x86_64-unknown-linux-musl --bin bohr
+build-musl: ## Static build, the artefact a release ships (docs/repo/release.md)
+	$(CARGO) build --profile dist --locked --target x86_64-unknown-linux-musl --bin bohr
 
 .PHONY: guests
 guests: ## Build the test guest programs

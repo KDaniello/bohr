@@ -1,0 +1,8 @@
+{
+  "bundle": "findings/two-tasks-seed0.bohr",
+  "kind": "page",
+  "schema": "bohr.report/1",
+  "written": [
+    "page.html"
+  ]
+}
