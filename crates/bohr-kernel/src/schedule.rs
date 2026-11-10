@@ -31,13 +31,6 @@ pub trait SchedulePolicy {
     ///
     /// Ids are never reused, so the policy can forget it and stay bounded.
     fn forget(&mut self, _task: TaskId) {}
-
-    /// An independent copy in the same state, for a run that branches from a checkpoint.
-    ///
-    /// `None` where the policy cannot be copied; a run then cannot branch while it is in use.
-    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
-        None
-    }
 }
 
 /// Uniform choice among runnable tasks.
@@ -56,10 +49,6 @@ impl SchedulePolicy for RandomPolicy {
     ) -> Result<TaskId, KernelError> {
         let index = cursor.draw_index(runnable.len(), DrawSite::SchedPick)?;
         runnable.get(index).copied().ok_or(KernelError::Invariant("scheduler drew out of range"))
-    }
-
-    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
-        Some(Box::new(*self))
     }
 }
 
@@ -154,10 +143,6 @@ impl SchedulePolicy for PctPolicy {
 
     fn forget(&mut self, task: TaskId) {
         self.priorities.remove(&task);
-    }
-
-    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
-        Some(Box::new(self.clone()))
     }
 
     fn pick(
@@ -291,10 +276,6 @@ impl SchedulePolicy for FairPolicy {
 
     fn forget(&mut self, task: TaskId) {
         self.passed_over.remove(&task);
-    }
-
-    fn fork(&self) -> Option<Box<dyn SchedulePolicy>> {
-        Some(Box::new(self.clone()))
     }
 }
 
@@ -463,23 +444,6 @@ mod tests {
         let mut cursor = tape.cursor();
         assert_eq!(FairPolicy::default().pick(&[TaskId(9)], &mut cursor).unwrap(), TaskId(9));
         assert_eq!(cursor.position().get(), 0, "one option is not a decision");
-    }
-
-    #[test]
-    fn a_forked_policy_continues_where_its_original_is() {
-        let tasks: Vec<TaskId> = (0..4).map(TaskId).collect();
-        let tape = Tape::from_seed(Seed(3));
-        let mut cursor = tape.cursor();
-        let mut original = PctPolicy::new(3, 50);
-        for _ in 0..20 {
-            original.pick(&tasks, &mut cursor).unwrap();
-        }
-        let mut fork = original.fork().expect("PCT can be copied");
-        let mut a = tape.cursor();
-        let mut b = tape.cursor();
-        let next_a: Vec<_> = (0..30).map(|_| original.pick(&tasks, &mut a).unwrap()).collect();
-        let next_b: Vec<_> = (0..30).map(|_| fork.pick(&tasks, &mut b).unwrap()).collect();
-        assert_eq!(next_a, next_b);
     }
 
     #[test]

@@ -191,7 +191,7 @@ impl NullBackend {
             ^ (to as u64).wrapping_mul(31);
         #[cfg(feature = "chaos-coverage-ambient")]
         let mixed = mixed ^ crate::chaos::drift();
-        let at = (mixed as usize) % bohr_backend::DEFAULT_COVERAGE_MAP_BYTES;
+        let at = (mixed as usize) % bohr_types::DEFAULT_COVERAGE_MAP_BYTES;
         let counter = &mut self.covered.as_bytes_mut()[at];
         *counter = counter.saturating_add(1);
     }
@@ -269,7 +269,6 @@ impl DeterminismBackend for NullBackend {
             // A scripted guest lives in this process; there is nothing for a debugger to attach to.
             hands_over_to_debugger: false,
             max_tasks: 1024,
-            checkpoints: false,
         }
     }
 
@@ -392,7 +391,11 @@ impl DeterminismBackend for NullBackend {
                     );
                     return Ok(Some(Stop {
                         task: child,
-                        kind: StopKind::TaskCreated { parent: task, shares_memory: true },
+                        kind: StopKind::TaskCreated {
+                            parent: task,
+                            shares_memory: true,
+                            thread: true,
+                        },
                     }));
                 }
                 GuestOp::Jump { pc } => {

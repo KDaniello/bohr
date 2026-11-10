@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 bohr-backend.workspace = true
+bohr-x86.workspace = true
 bohr-backend-null.workspace = true
 bohr-backend-ptrace.workspace = true
 bohr-kernel.workspace = true
@@ -26,6 +27,7 @@ bohr-trace.workspace = true
 bohr-types.workspace = true
 bohr-world.workspace = true
 bohr-explorer.workspace = true
+bohr-findings.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -160,7 +160,7 @@ pub(crate) struct Subject {
 }
 
 fn refused(file: &Path, text: impl std::fmt::Display) -> CliError {
-    CliError::Usage(format!("BOHR-1002: {}: {text}", file.display()))
+    CliError::refused(format!("{}: {text}", file.display()))
 }
 
 /// Finds a subject by name, or by the path of its directory or its file.
@@ -181,7 +181,7 @@ pub(crate) fn resolve(name: &str) -> Result<Subject, CliError> {
         match candidates.iter().find(|c| c.is_file()) {
             Some(found) => found.clone(),
             None => {
-                return Err(CliError::Usage(format!(
+                return Err(CliError::usage(format!(
                     "BOHR-1002: no subject named {name}: looked for {}",
                     candidates
                         .iter()

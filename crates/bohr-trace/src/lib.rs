@@ -25,10 +25,11 @@ mod spool;
 mod syscalls;
 
 pub use bundle::{
-    BUNDLE_HEADER_BYTES, BUNDLE_MAGIC, BinaryRecord, Bundle, BundleWriter, Counters,
+    BUNDLE_HEADER_BYTES, BUNDLE_MAGIC, BinaryRecord, BinaryRole, Bundle, BundleWriter, Counters,
     DeterminismReport, ExecutionRecord, Group, HostProfile, Manifest, ManifestInputs, Outcome,
-    PolicyRecord, ProjectionRecord, Provenance, SECTION_ENTRY_BYTES, SectionId, SingleExecution,
-    derive_run_id, frame_streams, group_digest, manifest_for, now_utc, read_streams,
+    OutcomeKind, PolicyRecord, ProjectionRecord, Provenance, SECTION_ENTRY_BYTES, SectionId,
+    SingleExecution, derive_run_id, frame_streams, group_digest, manifest_for, now_utc,
+    read_streams,
 };
 pub use event::{
     ADVANCES_CODE, AGREES_CODE, AssertionKind, DURABILITY_CODE, DiskOpKind, Endpoint, Event,
@@ -42,7 +43,7 @@ pub use log::{
 pub use output::{OUTPUT_TAIL_BYTES, OutputTail, OutputTails};
 pub use redact::redact;
 pub use spool::{Spool, Spooled};
-pub use syscalls::{Arg, named_syscalls, syscall_args, syscall_name};
+pub use syscalls::{Arg, named_syscalls, syscall_args, syscall_name, syscall_traced};
 
 /// Version of the bundle layout.
 ///

@@ -11,10 +11,6 @@ use std::path::{Path, PathBuf};
 
 use crate::{CliError, execute, survey};
 
-fn refused(text: String) -> CliError {
-    CliError::Usage(format!("BOHR-1002: {text}"))
-}
-
 /// The ELF interpreter a binary names, where it names one: a dynamic binary's loader.
 pub(crate) fn interpreter(bytes: &[u8]) -> Option<String> {
     let word = |at: usize, n: usize| -> Option<u64> {
@@ -46,12 +42,12 @@ fn libraries_into(binary: &str, state: &Path) -> Result<usize, CliError> {
     let listed = std::process::Command::new("ldd")
         .arg(binary)
         .output()
-        .map_err(|e| refused(format!("cannot ask ldd about {binary}: {e}")))?;
+        .map_err(|e| CliError::refused(format!("cannot ask ldd about {binary}: {e}")))?;
     let mut copied = 0;
     for line in String::from_utf8_lossy(&listed.stdout).lines() {
         // A library the loader cannot find is reported now; the scenario could not start.
         if line.contains("not found") {
-            return Err(refused(format!(
+            return Err(CliError::refused(format!(
                 "{binary} needs a library this host does not have: {}",
                 line.trim()
             )));
@@ -68,9 +64,10 @@ fn libraries_into(binary: &str, state: &Path) -> Result<usize, CliError> {
         let into = state.join(path.trim_start_matches('/'));
         if let Some(parent) = into.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| refused(format!("cannot use {}: {e}", parent.display())))?;
+                .map_err(|e| CliError::refused(format!("cannot use {}: {e}", parent.display())))?;
         }
-        std::fs::copy(source, &into).map_err(|e| refused(format!("cannot copy {path}: {e}")))?;
+        std::fs::copy(source, &into)
+            .map_err(|e| CliError::refused(format!("cannot copy {path}: {e}")))?;
         copied += 1;
     }
     Ok(copied)
@@ -91,17 +88,17 @@ fn calls_made(log: &[u8]) -> std::collections::BTreeSet<u32> {
 /// Writes a first scenario for `program` to `out`, and says what it found.
 pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, CliError> {
     let Some(binary) = program.first().cloned() else {
-        return Err(CliError::Usage("BOHR-1002: init needs a program, after `--`".to_owned()));
+        return Err(CliError::usage("BOHR-1002: init needs a program, after `--`".to_owned()));
     };
     let out = PathBuf::from(out);
     if out.exists() {
-        return Err(refused(format!(
+        return Err(CliError::refused(format!(
             "{} exists, and init does not write over a scenario",
             out.display()
         )));
     }
-    let bytes =
-        std::fs::read(&binary).map_err(|e| refused(format!("cannot read {binary}: {e}")))?;
+    let bytes = std::fs::read(&binary)
+        .map_err(|e| CliError::refused(format!("cannot read {binary}: {e}")))?;
     let nodes = nodes.max(1);
 
     let mut head = format!(
@@ -122,14 +119,14 @@ pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, Cl
             out.file_stem().map_or_else(|| "scenario".into(), |s| s.to_string_lossy().into_owned());
         let state = out.with_file_name(format!("{stem}-state"));
         if state.exists() {
-            return Err(refused(format!(
+            return Err(CliError::refused(format!(
                 "{} exists, and init does not write over a prepared state",
                 state.display()
             )));
         }
         let copied = libraries_into(&binary, &state)?;
-        let image = bohr_world::StateImage::from_dir(&state, u64::MAX)
-            .map_err(|e| refused(e.to_string()))?;
+        let image = crate::state_dir::read(&state, u64::MAX)
+            .map_err(|e| CliError::refused(e.to_string()))?;
         state_text = format!(
             "\n# {binary} is dynamically linked against {loader}: {copied} libraries its loader asks\n\
              # for, copied from this host and pinned, so the run loads exactly these.\n\
@@ -147,7 +144,7 @@ pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, Cl
 
     // One survey in the world written so far, with the log kept, to learn what it calls.
     let first = format!("{head}{state_text}");
-    let loaded = bohr_world::config::load(&first)?;
+    let loaded = crate::state_dir::load(&first)?;
     let completed = survey::surface(
         program.clone(),
         1,
@@ -201,9 +198,9 @@ pub(crate) fn init(program: Vec<String>, nodes: u32, out: &str) -> Result<u8, Cl
     }
 
     let text = format!("{first}{faults}{walls}");
-    bohr_world::config::load(&text)?;
+    crate::state_dir::load(&text)?;
     std::fs::write(&out, &text)
-        .map_err(|e| refused(format!("cannot write {}: {e}", out.display())))?;
+        .map_err(|e| CliError::refused(format!("cannot write {}: {e}", out.display())))?;
     eprintln!(
         "wrote {} · {} node(s) · {} walls · disk faults {} · network faults {}",
         out.display(),

@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use bohr_kernel::{KernelError, WorldCtx};
+use bohr_kernel::{DeadlineCtx, KernelError};
 use bohr_tape::DrawSite;
 use bohr_trace::{EventKind, FaultKind, FaultTarget};
 use bohr_types::{NodeId, TaskId};
@@ -196,6 +196,7 @@ impl NodeDisk {
         let mut live = world.disk_image();
         // Names and their directories go together, so no directory returns as an empty file.
         image.names = std::mem::take(&mut live.names);
+        image.links = std::mem::take(&mut live.links);
         image.directories = std::mem::take(&mut live.directories);
         image.next_inode = live.next_inode;
         if let Some(inode) = inode {
@@ -262,7 +263,7 @@ impl NodeDisk {
         node: NodeId,
         live: &MinimalWorld,
         reorder: bool,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut DeadlineCtx<'_, '_>,
     ) -> Result<DiskImage, KernelError> {
         // One draw, always.
         let mut drawn = [0u8; 8];
@@ -474,6 +475,7 @@ mod tests {
         for length in 1..=count {
             let mut grown = MinimalWorld::new();
             grown.restore_disk(crate::minimal::DiskImage {
+                links: BTreeMap::new(),
                 content: [(2, FileBytes::from_vec(vec![b'x'; length]))].into_iter().collect(),
                 names: [("/log".to_owned(), 2)].into_iter().collect(),
                 directories: std::collections::BTreeSet::new(),
@@ -492,6 +494,7 @@ mod tests {
     fn holding(bytes: &[u8]) -> MinimalWorld {
         let mut world = MinimalWorld::new();
         world.restore_disk(crate::minimal::DiskImage {
+            links: BTreeMap::new(),
             content: [(2, FileBytes::from_vec(bytes.to_vec()))].into_iter().collect(),
             names: [("/log".to_owned(), 2)].into_iter().collect(),
             directories: std::collections::BTreeSet::new(),
@@ -585,6 +588,7 @@ mod tests {
     fn a_sync_shares_every_file_it_was_not_about() {
         let mut world = MinimalWorld::new();
         world.restore_disk(crate::minimal::DiskImage {
+            links: BTreeMap::new(),
             content: [
                 (2, FileBytes::from_vec(vec![b'a'; 64])),
                 (3, FileBytes::from_vec(vec![b'b'; 64])),

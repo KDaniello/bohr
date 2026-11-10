@@ -20,11 +20,14 @@ pub struct Limits {
     pub replays: u32,
     /// Which passes run.
     pub keep: Keep,
+    /// The keys of the scenario that name a moment, which the moment pass brings forward; none
+    /// where the caller names none. The scenario's schema is the world's, so the world names them.
+    pub moments: &'static [&'static str],
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { replays: 2000, keep: Keep::Both }
+        Self { replays: 2000, keep: Keep::Both, moments: &[] }
     }
 }
 
@@ -159,7 +162,7 @@ pub struct Reduction {
     /// Minimisation re-proposes refused subsets after a success, and two passes can reach the same
     /// scenario. On a client whose replay takes a minute, those repeats would spend the budget. A
     /// hash collision skips a candidate; it never gives a wrong answer.
-    answered: BTreeSet<u64>,
+    answered: BTreeSet<bohr_types::Digest>,
 }
 
 /// Where the fault pass has got to.
@@ -366,7 +369,7 @@ impl Reduction {
     /// The tick the moment now being worked on is written at, or zero where there is none.
     fn current_moment_ticks(&self) -> u64 {
         ConfigDoc::parse(self.best.config())
-            .moments()
+            .moments(self.limits.moments)
             .get(self.config.moment)
             .map_or(0, |moment| moment.ticks)
     }
@@ -448,7 +451,7 @@ impl Reduction {
 
         // Then moments, brought forward to shorten the run.
         loop {
-            let moments = doc.moments();
+            let moments = doc.moments(self.limits.moments);
             let moment = moments.get(self.config.moment)?;
             if self.config.ladder.is_empty() {
                 self.config.ladder = ladder_for(moment.ticks);
@@ -557,13 +560,16 @@ fn rungs_below(count: usize) -> Vec<usize> {
 }
 
 /// A scenario's identity, for knowing it has been answered.
-fn fingerprint(scenario: &Scenario) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    scenario.seed().get().hash(&mut hasher);
-    scenario.prefix().hash(&mut hasher);
-    scenario.config().hash(&mut hasher);
-    hasher.finish()
+///
+/// A digest of its seed, its prefix and its configuration, each length-prefixed, so it is the same
+/// under every release of the compiler.
+fn fingerprint(scenario: &Scenario) -> bohr_types::Digest {
+    let mut bytes = scenario.seed().get().to_le_bytes().to_vec();
+    for part in [scenario.prefix(), scenario.config().as_bytes()] {
+        bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(part);
+    }
+    bohr_types::Digest::of(&bytes)
 }
 
 /// The ticks to try for a moment, soonest last.
@@ -585,6 +591,29 @@ fn ladder_for(ticks: u64) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scenario's fingerprint is a digest of its parts, the same under every compiler.
+    #[test]
+    fn a_fingerprint_is_the_same_under_every_compiler() {
+        let scenario = Scenario::new(bohr_types::Seed(7), vec![1, 2, 3], "[faults]\n".to_owned());
+        assert_eq!(fingerprint(&scenario), fingerprint(&scenario.clone()));
+        let other =
+            Scenario::new(bohr_types::Seed(7), vec![1, 2, 3], "[faults]\nkill = 1\n".to_owned());
+        assert_ne!(fingerprint(&scenario), fingerprint(&other));
+        // Pinned: a change of algorithm is a change of what a reduction skips.
+        assert_eq!(
+            fingerprint(&scenario).to_hex(),
+            bohr_types::Digest::of(&{
+                let mut bytes = 7u64.to_le_bytes().to_vec();
+                bytes.extend_from_slice(&3u64.to_le_bytes());
+                bytes.extend_from_slice(&[1, 2, 3]);
+                bytes.extend_from_slice(&9u64.to_le_bytes());
+                bytes.extend_from_slice(b"[faults]\n");
+                bytes
+            })
+            .to_hex()
+        );
+    }
 
     #[test]
     fn a_ladder_descends_to_the_first_tick_and_never_climbs() {
@@ -610,7 +639,11 @@ mod tests {
             size: Size { events: 10, draws: 2 },
             journal: Journal::new(),
         };
-        let refused = Reduction::new(scenario, baseline, Limits { replays: 2, keep: Keep::Both });
+        let refused = Reduction::new(
+            scenario,
+            baseline,
+            Limits { replays: 2, keep: Keep::Both, moments: &[] },
+        );
         assert!(matches!(refused, Err(ReducerError::BudgetTooSmall { .. })));
     }
 }

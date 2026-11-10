@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-backend"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "bohr-types",
  "thiserror",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-backend-null"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "bohr-backend",
  "bohr-types",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-kernel"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "bohr-backend",
  "bohr-tape",
@@ -78,11 +78,11 @@ dependencies = [
 
 [[package]]
 name = "bohr-sdk-proto"
-version = "0.9.1"
+version = "0.9.1+1"
 
 [[package]]
 name = "bohr-tape"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "blake3",
  "bohr-types",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-trace"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "blake3",
  "bohr-sdk-proto",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-types"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "blake3",
  "serde",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-world"
-version = "0.9.1"
+version = "0.9.1+1"
 dependencies = [
  "bohr-backend",
  "bohr-kernel",
@@ -124,10 +124,15 @@ dependencies = [
  "bohr-tape",
  "bohr-trace",
  "bohr-types",
+ "bohr-x86",
  "serde",
  "thiserror",
  "toml",
 ]
+
+[[package]]
+name = "bohr-x86"
+version = "0.9.1+1"
 
 [[package]]
 name = "cc"

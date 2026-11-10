@@ -74,14 +74,21 @@ impl Properties {
     ///
     /// A name beyond [`MOST_PROPERTIES`] is counted and refused; see the constant.
     pub fn observe(&mut self, name: &str, held: bool, run: Digest) {
+        self.observe_tally(name, 1, u64::from(held), run);
+    }
+
+    /// Records one run's evaluations of one property at once: `evaluations` of them, `held` true.
+    ///
+    /// The same as that many calls to [`Self::observe`], in any order.
+    pub fn observe_tally(&mut self, name: &str, evaluations: u64, held: u64, run: Digest) {
         if self.by_name.len() >= MOST_PROPERTIES && !self.by_name.contains_key(name) {
-            self.refused += 1;
+            self.refused += evaluations;
             return;
         }
         let tally = self.by_name.entry(name.to_owned()).or_default();
-        tally.evaluations += 1;
-        if held {
-            tally.satisfied += 1;
+        tally.evaluations += evaluations;
+        if held > 0 {
+            tally.satisfied += held;
             tally.first_satisfied = Some(match tally.first_satisfied {
                 Some(known) => known.min(run),
                 None => run,
@@ -213,5 +220,18 @@ mod tests {
         let properties = Properties::new();
         assert!(properties.is_empty());
         assert!(properties.unsatisfied().is_empty());
+    }
+
+    /// A run's tally of one property is the same as its evaluations one by one, the bound on
+    /// names included.
+    #[test]
+    fn a_tally_is_its_evaluations_at_once() {
+        let mut one_by_one = Properties::new();
+        let mut at_once = Properties::new();
+        for held in [true, false, false, true, false] {
+            one_by_one.observe("p", held, run(3));
+        }
+        at_once.observe_tally("p", 5, 2, run(3));
+        assert_eq!(one_by_one, at_once);
     }
 }

@@ -1,8 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+mod clock;
+mod io_uring;
+mod mappings;
+mod process;
+mod signals;
+mod vfs;
+
 use bohr_backend::{Resume, Stop, StopKind};
 use bohr_kernel::{
-    DueEffects, Effects, FaultCatalog, KernelError, NodeOp, TaskState, Wake, WorldCtx, WorldModel,
+    DeadlineCtx, DueEffects, Effects, KernelError, NodeOp, StopCtx, TaskState, Wake, WorldModel,
 };
 use bohr_tape::DrawSite;
 use bohr_trace::{EventKind, short_digest};
@@ -31,8 +38,11 @@ struct OpenFile {
     durable: bool,
     /// Whether every write through this descriptor lands at the end of the file.
     ///
-    /// Set by `O_APPEND` at open.
+    /// Set by `O_APPEND` at open and by `F_SETFL`.
     appending: bool,
+    /// The flags `F_GETFL` reports: the access mode, `O_APPEND`, `O_NONBLOCK` and the rest, as
+    /// the open gave them and `F_SETFL` changed them.
+    status: u64,
 }
 
 /// Size of the `struct sysinfo` a caller reads back.
@@ -60,8 +70,34 @@ mod stat {
 mod fcntl_cmd {
     /// Lowest free descriptor at or above the third argument, onto the same open file.
     pub(crate) const DUPFD: u32 = 0;
-    /// The same, closed on exec, which changes nothing this model does.
+    /// The descriptor's own flags, `FD_CLOEXEC`.
+    pub(crate) const GETFD: u32 = 1;
+    pub(crate) const SETFD: u32 = 2;
+    /// The open file's status flags.
+    pub(crate) const GETFL: u32 = 3;
+    pub(crate) const SETFL: u32 = 4;
+    /// Record locks, process-associated and open-file-associated.
+    pub(crate) const GETLK: u32 = 5;
+    pub(crate) const SETLK: u32 = 6;
+    pub(crate) const SETLKW: u32 = 7;
+    pub(crate) const OFD_GETLK: u32 = 36;
+    pub(crate) const OFD_SETLK: u32 = 37;
+    pub(crate) const OFD_SETLKW: u32 = 38;
+    /// Signal ownership: `F_SETOWN`, `F_GETOWN`, `F_SETSIG`, `F_GETSIG`, `F_SETOWN_EX`,
+    /// `F_GETOWN_EX`. No signal is ever sent for I/O here.
+    pub(crate) const OWNERSHIP: [u32; 6] = [8, 9, 10, 11, 15, 16];
+    /// Leases and directory notices: `F_SETLEASE`, `F_NOTIFY`; and `F_GETLEASE`, which reads none.
+    pub(crate) const SETLEASE: u32 = 1024;
+    pub(crate) const GETLEASE: u32 = 1025;
+    pub(crate) const NOTIFY: u32 = 1026;
+    /// The same as `DUPFD`, with the copy marked `FD_CLOEXEC`.
     pub(crate) const DUPFD_CLOEXEC: u32 = 1030;
+    /// Write-life hints, `F_GET_RW_HINT` and `F_SET_RW_HINT`, which change nothing here.
+    pub(crate) const RW_HINTS: [u32; 2] = [1035, 1036];
+    /// `FD_CLOEXEC`, the one descriptor flag.
+    pub(crate) const FD_CLOEXEC: u64 = 1;
+    /// `F_UNLCK`, the lock type `F_GETLK` writes where nothing stands in the way.
+    pub(crate) const UNLOCKED: i16 = 2;
 }
 
 /// The `futex` operations a threaded guest reaches, with the flags glibc adds masked off.
@@ -147,7 +183,7 @@ pub(crate) struct Taken {
 }
 
 /// The run's end for a submission this ring does not carry, named by what it asked for.
-pub(crate) fn refuse_submission(ctx: &mut WorldCtx<'_, '_>, what: &str) -> KernelError {
+pub(crate) fn refuse_submission(ctx: &mut StopCtx<'_, '_>, what: &str) -> KernelError {
     ctx.refuse(
         "BOHR-2004",
         format_args!("io_uring {what} is not modelled; see docs/PLATFORMS.md §4.1"),
@@ -159,7 +195,7 @@ pub(crate) fn refuse_submission(ctx: &mut WorldCtx<'_, '_>, what: &str) -> Kerne
 /// A submission that would park or reach the host is refused, since every completion is posted
 /// before `io_uring_enter` returns.
 pub(crate) fn submission_answer(
-    ctx: &mut WorldCtx<'_, '_>,
+    ctx: &mut StopCtx<'_, '_>,
     effects: &Effects,
 ) -> Result<i64, KernelError> {
     match effects.state {
@@ -211,6 +247,29 @@ const O_WRITABLE: u64 = 0o3;
 const O_APPEND: u64 = 0o2000;
 /// The open must create the file, and fails where the name is taken.
 const O_EXCL: u64 = 0o200;
+
+/// The flags `F_GETFL` reports and `F_SETFL` may change, as Linux keeps them on an open file.
+mod status {
+    /// The access mode, `O_RDONLY`, `O_WRONLY` or `O_RDWR`.
+    pub(crate) const ACCESS: u64 = 0o3;
+    /// `O_RDWR`, which the standard descriptors and the model's own handles report.
+    pub(crate) const READ_WRITE: u64 = 0o2;
+    /// `O_NONBLOCK`.
+    pub(crate) const NONBLOCK: u64 = 0o4000;
+    /// `O_LARGEFILE`, which a 64-bit kernel sets on every open.
+    pub(crate) const LARGEFILE: u64 = 0o100_000;
+    /// `O_ASYNC`, `O_DIRECT` and `O_NOATIME`, which `F_SETFL` changes and the model only keeps.
+    pub(crate) const KEPT_ONLY: u64 = 0o20_000 | 0o40_000 | 0o1_000_000;
+    /// `O_DSYNC` and `__O_SYNC`, which make up `O_SYNC`.
+    pub(crate) const SYNC: u64 = 0o10_000 | 0o4_000_000;
+    /// What an open records: the access mode and every flag `F_GETFL` reports.
+    pub(crate) const OPENED: u64 = ACCESS | super::O_APPEND | NONBLOCK | KEPT_ONLY | SYNC;
+    /// What `F_SETFL` may change; the access mode and the sync flags it leaves alone.
+    pub(crate) const SETTABLE: u64 = super::O_APPEND | NONBLOCK | KEPT_ONLY;
+}
+
+/// `O_CLOEXEC`: the descriptor is closed on exec, a mark on its number.
+const O_CLOEXEC: u64 = 0o2_000_000;
 
 /// The directory descriptor an `*at` call carries, read at the width the kernel reads it.
 ///
@@ -312,8 +371,16 @@ const RLIMIT_NOFILE: u64 = 7;
 ///
 /// Descriptors get stock Linux's limit; everything else is unlimited.
 const fn limit_for(resource: u64) -> (u64, u64) {
-    if resource == RLIMIT_NOFILE { (1024, 1_048_576) } else { (u64::MAX, u64::MAX) }
+    match resource {
+        RLIMIT_NOFILE => (1024, 1_048_576),
+        // The limit the backend starts every guest under.
+        RLIMIT_STACK => (bohr_backend::GUEST_STACK_BYTES, u64::MAX),
+        _ => (u64::MAX, u64::MAX),
+    }
 }
+
+/// `RLIMIT_STACK`.
+const RLIMIT_STACK: u64 = 3;
 
 /// Size of `struct statfs` on x86-64.
 const STATFS_BYTES: usize = 120;
@@ -407,6 +474,9 @@ struct Waiter {
 pub(crate) struct DiskImage {
     pub(crate) content: BTreeMap<u64, FileBytes>,
     pub(crate) names: BTreeMap<String, u64>,
+    /// Symbolic links and the text each holds; names on the disk like any other, synced with
+    /// the namespace.
+    pub(crate) links: BTreeMap<String, String>,
     /// Which of those names are directories, restored together with them.
     pub(crate) directories: BTreeSet<u64>,
     pub(crate) next_inode: u64,
@@ -417,9 +487,70 @@ pub(crate) struct DiskImage {
 /// Supplied by the caller, so this crate does no host I/O.
 pub type OutputSink = Box<dyn std::io::Write + Send>;
 
+/// The `clone` flags the world reads.
+mod clone_flags {
+    /// `CLONE_UNTRACED`: the new task is not traced, whatever the tracer asked.
+    pub(super) const UNTRACED: u64 = 0x0080_0000;
+    /// `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
+    /// `CLONE_NEWPID`, `CLONE_NEWNET` and `CLONE_NEWTIME`.
+    pub(super) const NEW_NAMESPACES: u64 = 0x0002_0000
+        | 0x0200_0000
+        | 0x0400_0000
+        | 0x0800_0000
+        | 0x1000_0000
+        | 0x2000_0000
+        | 0x4000_0000
+        | 0x80;
+}
+
+/// What a subsystem answers a call with.
+pub(crate) enum Answer {
+    /// The return value, how the guest resumes, and the digest of the data it wrote, where it
+    /// wrote any; the world records the call.
+    Reply((i64, Resume, Option<[u8; 8]>)),
+    /// Effects the subsystem built and recorded itself, such as a wait.
+    Done(Effects),
+}
+
+/// The parts of the world a call is routed to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Subsystem {
+    Vfs,
+    Clock,
+    Process,
+    Signals,
+    IoUring,
+    Mappings,
+}
+
+/// Which subsystem answers which calls; a call in none is unmodelled. `futex` and task creation
+/// build their own effects before routing, and are listed for what the world answers.
+const ROUTES: [(Subsystem, &[u32]); 6] = [
+    (Subsystem::Vfs, vfs::HANDLES),
+    (Subsystem::Clock, clock::HANDLES),
+    (Subsystem::Process, process::HANDLES),
+    (Subsystem::Signals, signals::HANDLES),
+    (Subsystem::IoUring, io_uring::HANDLES),
+    (Subsystem::Mappings, mappings::HANDLES),
+];
+
+/// The calls answered before routing: waiting on a word, and creating a task.
+#[cfg(test)]
+const ANSWERED_FIRST: [u32; 3] = [sys::FUTEX, sys::CLONE, sys::CLONE3];
+
+/// The subsystem that answers `nr`, where one does.
+fn route(nr: u32) -> Option<Subsystem> {
+    ROUTES.iter().find(|(_, handles)| handles.contains(&nr)).map(|(subsystem, _)| *subsystem)
+}
+
+/// Every call the minimal world answers.
+#[cfg(test)]
+pub(crate) fn answered() -> impl Iterator<Item = u32> {
+    ROUTES.iter().flat_map(|(_, handles)| handles.iter().copied()).chain(ANSWERED_FIRST)
+}
+
 /// Answers clock, randomness and output, and refuses everything else.
 pub struct MinimalWorld {
-    catalog: FaultCatalog,
     /// Synchronisation words this run has touched, in the order it first touched them.
     ///
     /// Kept so a trace can name a word without naming its address; see [`Self::sync_word`].
@@ -427,6 +558,15 @@ pub struct MinimalWorld {
     output: Option<OutputSink>,
     /// Descriptors the guest holds, and what each refers to.
     open: BTreeMap<i64, OpenFile>,
+    /// File descriptors marked `FD_CLOEXEC`; the mark belongs to the number, not to the file.
+    cloexec: BTreeSet<i64>,
+    /// Space `fallocate` reserved past a file's end under `FALLOC_FL_KEEP_SIZE`: the end of the
+    /// reservation, by inode. A truncate below it gives it back.
+    reserved: BTreeMap<u64, u64>,
+    /// Numbers held by descriptors kept outside this world: sockets, pollers, counters.
+    ///
+    /// One process has one table of numbers, so a file never takes a number a socket holds.
+    foreign: BTreeSet<i64>,
     /// File contents by inode, never on the host. Shared by block with disk images.
     content: BTreeMap<u64, FileBytes>,
     /// Names, each pointing at content; unlinking keeps the content for open descriptors.
@@ -547,11 +687,23 @@ impl MinimalWorld {
     /// The world with only the root, before the standard directories are added.
     fn bare() -> Self {
         Self {
-            catalog: FaultCatalog::default(),
             output: None,
             sync_words: BTreeMap::new(),
             // The three standard descriptors are open, as a Go runtime checks before it starts.
-            open: (0..=2).map(|fd| (fd, OpenFile::default())).collect(),
+            open: (0..=2)
+                .map(|fd| {
+                    (
+                        fd,
+                        OpenFile {
+                            status: status::READ_WRITE | status::LARGEFILE,
+                            ..OpenFile::default()
+                        },
+                    )
+                })
+                .collect(),
+            cloexec: BTreeSet::new(),
+            reserved: BTreeMap::new(),
+            foreign: BTreeSet::new(),
             content: BTreeMap::new(),
             names: [(ROOT.to_owned(), ROOT_INODE)].into_iter().collect(),
             synthetic: BTreeSet::new(),
@@ -655,7 +807,8 @@ impl MinimalWorld {
             self.make_parents(path);
             let inode = self.next_inode;
             self.next_inode += 1;
-            self.content.insert(inode, FileBytes::from_vec(content.clone()));
+            // Shared with the image, block by block, until the guest writes.
+            self.content.insert(inode, content.clone());
             self.names.insert(path.clone(), inode);
         }
         self
@@ -710,7 +863,7 @@ impl MinimalWorld {
     /// Both refusals live here; io_uring has its own, since there is no table row to add.
     fn unmodelled(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         nr: u32,
         args: [u64; 6],
     ) -> Result<i64, KernelError> {
@@ -750,11 +903,7 @@ impl MinimalWorld {
     /// Opens a submission ring, a polled one included.
     ///
     /// A polled queue starts with its poller asleep, so callers wake it with `io_uring_enter`.
-    fn open_ring(
-        &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
-        args: [u64; 6],
-    ) -> Result<i64, KernelError> {
+    fn open_ring(&mut self, ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
         let mut params = [0u8; 120];
         ctx.read_mem(GuestAddr(args[1]), &mut params)?;
         let word = |at: usize| {
@@ -766,8 +915,10 @@ impl MinimalWorld {
             Err(ring::Setup::Unsupported(flag)) => return Err(refuse_submission(ctx, flag)),
         };
         ctx.write_mem(GuestAddr(args[1]), &held.params())?;
-        let fd =
-            self.attach(OpenFile { inode: None, position: 0, durable: false, appending: false });
+        let fd = self.attach(OpenFile {
+            status: status::READ_WRITE | status::LARGEFILE,
+            ..OpenFile::default()
+        });
         self.rings.insert(fd, held);
         ctx.emit(EventKind::Diagnostic {
             code: "BOHR-2004".to_owned(),
@@ -787,7 +938,7 @@ impl MinimalWorld {
     /// `EBUSY`. A bad index is dropped and ends the batch, as in a kernel.
     pub(crate) fn take_submissions(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         args: [u64; 6],
     ) -> Result<Result<Taken, i64>, KernelError> {
         let fd = args[0] as i64;
@@ -839,7 +990,7 @@ impl MinimalWorld {
     /// Posts completions to a ring's queue and moves its tail past them.
     pub(crate) fn post_completions(
         &self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         fd: i64,
         done: &[ring::Completed],
     ) -> Result<(), KernelError> {
@@ -861,7 +1012,7 @@ impl MinimalWorld {
     }
 
     /// Reads one of the counters the two queues are steered by.
-    fn read_u32(ctx: &mut WorldCtx<'_, '_>, at: Option<u64>) -> Result<u32, KernelError> {
+    fn read_u32(ctx: &mut StopCtx<'_, '_>, at: Option<u64>) -> Result<u32, KernelError> {
         let Some(at) = at else {
             return Ok(0);
         };
@@ -876,7 +1027,7 @@ impl MinimalWorld {
     /// calls. Entering or registering a ring stays refused.
     ///
     /// The fallback changes the guest's path, so the timeline says so.
-    fn decline_ring(&mut self, ctx: &mut WorldCtx<'_, '_>) -> Result<i64, KernelError> {
+    fn decline_ring(&mut self, ctx: &mut StopCtx<'_, '_>) -> Result<i64, KernelError> {
         if self.declined_ring {
             return Ok(-errno::ENOSYS);
         }
@@ -894,7 +1045,7 @@ impl MinimalWorld {
     ///
     /// Some calls answer `ENOSYS` on purpose so the caller falls back. A survey counts them with
     /// their kind; a run answers silently.
-    fn unimplemented(&mut self, ctx: &mut WorldCtx<'_, '_>, nr: u32) -> Result<i64, KernelError> {
+    fn unimplemented(&mut self, ctx: &mut StopCtx<'_, '_>, nr: u32) -> Result<i64, KernelError> {
         if let Some(seen) = self.surveying.as_mut() {
             let count = seen.entry(nr).or_default();
             *count += 1;
@@ -913,7 +1064,7 @@ impl MinimalWorld {
     /// The guest is told every byte was accepted, whatever the sink did.
     fn write_out(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         addr: GuestAddr,
         len: usize,
     ) -> Result<(i64, Option<[u8; 8]>), KernelError> {
@@ -936,49 +1087,65 @@ impl MinimalWorld {
         Ok((len as i64, Some(short_digest(&self.transfer))))
     }
 
+    /// The segments a vector names, as `(base, length)`, read out of the guest in one crossing.
+    ///
+    /// At most `MAX_IOVECS`, and none past the end of the address space.
+    fn segments(
+        ctx: &mut StopCtx<'_, '_>,
+        iov: GuestAddr,
+        count: u64,
+    ) -> Result<Vec<(u64, u64)>, KernelError> {
+        let room = (u128::from(u64::MAX) - u128::from(iov.0) + 1) / IOVEC_BYTES as u128;
+        let count = u128::from(count.min(MAX_IOVECS)).min(room) as usize;
+        let mut array = vec![0u8; count * IOVEC_BYTES];
+        ctx.read_mem(iov, &mut array)?;
+        let (entries, _) = array.as_chunks::<IOVEC_BYTES>();
+        Ok(entries
+            .iter()
+            .map(|entry| {
+                let (base, len) = entry.split_at(8);
+                let word = |half: &[u8]| u64::from_le_bytes(half.try_into().unwrap_or_default());
+                (word(base), word(len))
+            })
+            .collect())
+    }
+
     /// How many bytes a vector of segments asks for, without copying any of them.
     pub(crate) fn iov_bytes(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         iov: GuestAddr,
         count: u64,
     ) -> Result<u32, KernelError> {
-        let mut total: u64 = 0;
-        for i in 0..count.min(MAX_IOVECS) {
-            let mut entry = [0u8; IOVEC_BYTES];
-            let Some(at) = offset(iov, i * IOVEC_BYTES as u64) else {
-                break;
-            };
-            ctx.read_mem(at, &mut entry)?;
-            total =
-                total.saturating_add(u64::from_le_bytes(entry[8..].try_into().unwrap_or_default()));
-        }
+        let total = Self::segments(ctx, iov, count)?
+            .iter()
+            .fold(0u64, |total, (_, len)| total.saturating_add(*len));
         Ok(total.min(MAX_TRANSFER as u64) as u32)
     }
 
     /// Joins the segments a gathering write names into one buffer, up to the transfer bound; the
     /// caller gets a short write for the rest.
+    ///
+    /// Two crossings whatever the count: the vector, then every segment's bytes. An empty segment
+    /// is passed over, as Linux passes it, and the bytes after it are written.
     pub(crate) fn gather(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         iov: GuestAddr,
         count: u64,
     ) -> Result<Vec<u8>, KernelError> {
-        let mut joined = Vec::new();
-        for i in 0..count.min(MAX_IOVECS) {
-            let mut entry = [0u8; IOVEC_BYTES];
-            let Some(at) = offset(iov, i * IOVEC_BYTES as u64) else {
-                break;
-            };
-            ctx.read_mem(at, &mut entry)?;
-            let base = u64::from_le_bytes(entry[..8].try_into().unwrap_or_default());
-            let len = u64::from_le_bytes(entry[8..].try_into().unwrap_or_default()) as usize;
-            let take = len.min(MAX_TRANSFER.saturating_sub(joined.len()));
-            if take == 0 {
+        let mut pieces = Vec::new();
+        let mut total = 0usize;
+        for (base, len) in Self::segments(ctx, iov, count)? {
+            let take = usize::try_from(len).unwrap_or(usize::MAX).min(MAX_TRANSFER - total);
+            if take > 0 {
+                pieces.push((GuestAddr(base), take));
+                total += take;
+            }
+            if total == MAX_TRANSFER {
                 break;
             }
-            let start = joined.len();
-            joined.resize(start + take, 0);
-            ctx.read_mem(GuestAddr(base), &mut joined[start..])?;
         }
+        let mut joined = vec![0u8; total];
+        ctx.read_pieces(&pieces, &mut joined)?;
         Ok(joined)
     }
 
@@ -1005,20 +1172,16 @@ impl MinimalWorld {
         let Some(inode) = file.inode else {
             return (bytes.len() as i64, Some(short_digest(bytes)));
         };
-        // An appending descriptor writes at the current end of the file.
-        let start = match at {
-            Some(at) => at as usize,
-            None if file.appending => self.content.get(&inode).map_or(0, |held| held.len()),
-            None => file.position as usize,
-        };
+        let start = self.write_offset(fd, at) as usize;
         if grown_end(start, bytes.len()).is_none() {
             return (-errno::EFBIG, None);
         }
         self.content.entry(inode).or_default().write_at(start, bytes);
+        // The position follows the bytes written, from wherever they landed.
         if at.is_none()
             && let Some(open) = self.open.get_mut(&fd)
         {
-            open.position += bytes.len() as u64;
+            open.position = (start + bytes.len()) as u64;
         }
         (bytes.len() as i64, Some(short_digest(bytes)))
     }
@@ -1026,7 +1189,7 @@ impl MinimalWorld {
     /// Opens a path, creating it where the flags ask for that.
     fn open_at(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         dirfd: i64,
         addr: GuestAddr,
         flags: u64,
@@ -1100,7 +1263,11 @@ impl MinimalWorld {
             durable: flags & O_WRITE_THROUGH != 0,
             // `O_APPEND` is kept on the descriptor.
             appending: flags & O_APPEND != 0,
+            status: flags & status::OPENED | status::LARGEFILE,
         });
+        if flags & O_CLOEXEC != 0 {
+            self.cloexec.insert(fd);
+        }
         if inode.is_some_and(|inode| self.directories.contains(&inode)) {
             self.note_directory(fd, &path);
         }
@@ -1113,7 +1280,7 @@ impl MinimalWorld {
     /// repeat.
     fn list_directory(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         fd: i64,
         addr: GuestAddr,
         capacity: usize,
@@ -1188,7 +1355,7 @@ impl MinimalWorld {
     /// Makes a directory, answering what `mkdir` returns.
     fn make_directory(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         dirfd: i64,
         addr: GuestAddr,
     ) -> Result<i64, KernelError> {
@@ -1229,7 +1396,7 @@ impl MinimalWorld {
     ///
     /// The mapping is made writable so the supervisor can fill it. A guest writing to a read-only
     /// mapping is therefore not faulted, which this model misses.
-    fn map_file(&mut self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Option<Resume> {
+    fn map_file(&mut self, ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Option<Resume> {
         const PROT_WRITE: u64 = 0x2;
         const PROT_READ_WRITE: u64 = 0x1 | 0x2;
         const MAP_SHARED: u64 = 0x1;
@@ -1296,7 +1463,7 @@ impl MinimalWorld {
     /// Takes the address a replaced mapping landed at and fills it with the file it stands for.
     fn mapping_placed(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         ret: i64,
     ) -> Result<Effects, KernelError> {
         let Some(pending) = self.mapping.remove(&ctx.task()) else {
@@ -1348,7 +1515,7 @@ impl MinimalWorld {
     /// Past the file's end the mapping stays zero.
     fn show_range(
         &self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         mapping: Mapping,
         want: std::ops::Range<u64>,
     ) -> Result<(), KernelError> {
@@ -1373,7 +1540,7 @@ impl MinimalWorld {
     /// Only the changed range, since stores map windows far larger than the file.
     fn refresh_mappings(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         inode: u64,
         want: std::ops::Range<u64>,
     ) -> Result<(), KernelError> {
@@ -1390,7 +1557,7 @@ impl MinimalWorld {
     /// A store to mapped memory makes no syscall, so this is how the world learns of it.
     fn collect_mappings(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         inode: u64,
     ) -> Result<(), KernelError> {
         let written: Vec<Mapping> =
@@ -1443,7 +1610,7 @@ impl MinimalWorld {
     /// Carries back what the guest wrote through its mappings of one file.
     pub(crate) fn collect_mapped(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         inode: u64,
     ) -> Result<Vec<(u64, u64)>, KernelError> {
         let ranges: Vec<(u64, u64)> = self
@@ -1457,7 +1624,7 @@ impl MinimalWorld {
     }
 
     /// Forgets the mappings an address range covered, taking back what they held first.
-    fn unmap(&mut self, ctx: &mut WorldCtx<'_, '_>, at: u64, len: u64) -> Result<(), KernelError> {
+    fn unmap(&mut self, ctx: &mut StopCtx<'_, '_>, at: u64, len: u64) -> Result<(), KernelError> {
         let going: Vec<Mapping> = self
             .mappings
             .values()
@@ -1529,18 +1696,58 @@ impl MinimalWorld {
     ///
     /// Programs redirect by number and rely on this.
     fn attach(&mut self, file: OpenFile) -> i64 {
-        let mut fd = FIRST_FREE_FD;
-        while self.open.contains_key(&fd) || fd == RESERVED_FD {
-            fd += 1;
-        }
-        // Files from 3, sockets from 4096, epoll from 8192, counters from 12288; the assert keeps
-        // files below the socket range.
-        assert!(
-            fd < crate::distributed::net::SOCKET_FD_BASE,
-            "the file descriptors have run into the range the sockets are numbered from"
-        );
+        self.attach_from(file, FIRST_FREE_FD)
+    }
+
+    /// Gives a descriptor the lowest free number at or above `at_least`, as `F_DUPFD` asks.
+    fn attach_from(&mut self, file: OpenFile, at_least: i64) -> i64 {
+        let fd = self.lowest_free(at_least);
         self.open.insert(fd, file);
         fd
+    }
+
+    /// The lowest number at or above `at_least` that no descriptor holds, of any kind.
+    fn lowest_free(&self, at_least: i64) -> i64 {
+        let mut fd = at_least.max(0);
+        while self.open.contains_key(&fd) || self.foreign.contains(&fd) || fd == RESERVED_FD {
+            fd += 1;
+        }
+        fd
+    }
+
+    /// Takes the lowest free number at or above `at_least` for a descriptor kept elsewhere.
+    pub(crate) fn claim_number(&mut self, at_least: i64) -> i64 {
+        let fd = self.lowest_free(at_least);
+        self.foreign.insert(fd);
+        fd
+    }
+
+    /// Takes `fd` for a descriptor kept elsewhere; the caller has closed whatever held it.
+    pub(crate) fn claim_exact(&mut self, fd: i64) {
+        self.foreign.insert(fd);
+    }
+
+    /// Gives back a number a descriptor kept elsewhere held.
+    pub(crate) fn release_number(&mut self, fd: i64) {
+        self.foreign.remove(&fd);
+    }
+
+    /// Closes a file descriptor, answering 0, or `EBADF` where it names no file.
+    ///
+    /// The content goes once no name and no descriptor holds it.
+    pub(crate) fn close_number(&mut self, fd: i64) -> i64 {
+        self.dir_of.remove(&fd);
+        self.cloexec.remove(&fd);
+        self.rings.remove(&fd);
+        match self.open.remove(&fd) {
+            Some(file) => {
+                if let Some(inode) = file.inode {
+                    self.collect(inode);
+                }
+                0
+            }
+            None => -errno::EBADF,
+        }
     }
 
     /// Remembers where a descriptor opened on a directory sits.
@@ -1553,7 +1760,7 @@ impl MinimalWorld {
     /// Reads into the guest, either from a stored file or from the endless random source.
     fn read_in(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         fd: i64,
         addr: GuestAddr,
         len: usize,
@@ -1598,7 +1805,7 @@ impl MinimalWorld {
     /// Writes into a stored file, extending it where the write lands past its end.
     fn write_file(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         fd: i64,
         addr: GuestAddr,
         len: usize,
@@ -1633,13 +1840,118 @@ impl MinimalWorld {
             return -errno::EFBIG;
         }
         self.content.entry(inode).or_default().resize(length);
+        // A truncate frees every block past the new end, reserved ones too.
+        if self.reserved.get(&inode).is_some_and(|end| *end > length as u64) {
+            self.reserved.remove(&inode);
+        }
         0
     }
 
-    /// Moves a stored file to another name, replacing whatever was there.
+    /// Whether `len` bytes at `offset` through `fd` need space the file does not hold yet: past
+    /// its end and past what `fallocate` reserved.
+    ///
+    /// Overwriting what a file holds never needs space, as on ext4. A hole inside a sparse file
+    /// counts as held, where ext4 would allocate it on write.
+    pub(crate) fn needs_space(&self, fd: i64, offset: u64, len: u64) -> bool {
+        let Some(Some(inode)) = self.open.get(&fd).map(|f| f.inode) else {
+            return false;
+        };
+        let length = self.content.get(&inode).map_or(0, |held| held.len() as u64);
+        let held = length.max(self.reserved.get(&inode).copied().unwrap_or(0));
+        len > 0 && offset.saturating_add(len) > held
+    }
+
+    /// Whether any name or link sits under `path`.
+    fn has_children(&self, path: &str) -> bool {
+        let prefix = format!("{path}/");
+        self.names.keys().chain(self.links.keys()).any(|name| name.starts_with(&prefix))
+    }
+
+    /// Moves `from` and everything under it to the same places under `to`.
+    ///
+    /// Names are full paths, so a directory's move is its subtree's: the names, the links among
+    /// them, the directories descriptors stand in, and the working directory all follow.
+    fn move_subtree(&mut self, from: &str, to: &str) {
+        let moved = |path: &str| -> Option<String> {
+            if path == from {
+                return Some(to.to_owned());
+            }
+            let rest = path.strip_prefix(from)?;
+            rest.starts_with('/').then(|| format!("{to}{rest}"))
+        };
+        let names: Vec<(String, String, u64)> = self
+            .names
+            .iter()
+            .filter_map(|(path, inode)| moved(path).map(|new| (path.clone(), new, *inode)))
+            .collect();
+        for (old, ..) in &names {
+            self.names.remove(old);
+        }
+        for (_, new, inode) in names {
+            self.names.insert(new, inode);
+        }
+        let links: Vec<(String, String, String)> = self
+            .links
+            .iter()
+            .filter_map(|(path, text)| moved(path).map(|new| (path.clone(), new, text.clone())))
+            .collect();
+        for (old, ..) in &links {
+            self.links.remove(old);
+        }
+        for (_, new, text) in links {
+            self.links.insert(new, text);
+        }
+        for path in self.dir_of.values_mut() {
+            if let Some(new) = moved(path) {
+                *path = new;
+            }
+        }
+        if let Some(new) = moved(&self.cwd) {
+            self.cwd = new;
+        }
+    }
+
+    /// Moves a symbolic link to another name, as `rename` moves any name.
+    ///
+    /// It replaces a file or a link there, never a directory.
+    fn rename_link(&mut self, from: &str, to: &str, no_replace: bool, exchange: bool) -> i64 {
+        let held = self.names.get(to).copied();
+        let taken = held.is_some() || self.links.contains_key(to);
+        if exchange {
+            if !taken {
+                return -errno::ENOENT;
+            }
+            const PASSING: &str = "\0exchange";
+            self.move_subtree(from, PASSING);
+            self.move_subtree(to, from);
+            self.move_subtree(PASSING, to);
+            return 0;
+        }
+        if taken && no_replace {
+            return -errno::EEXIST;
+        }
+        if let Some(replaced) = held {
+            if self.directories.contains(&replaced) {
+                return -errno::EISDIR;
+            }
+            self.names.remove(to);
+            self.collect(replaced);
+        }
+        if let Some(text) = self.links.remove(from) {
+            self.links.insert(to.to_owned(), text);
+        }
+        0
+    }
+
+    /// Moves a stored file or directory to another name, replacing whatever was there, as Linux
+    /// `rename` does.
+    ///
+    /// A directory moves with everything under it, onto nothing or onto an empty directory, and
+    /// never into itself. A file never replaces a directory, nor a directory a file. Two names of
+    /// one file leave both in place.
     fn rename(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         dirs: (i64, i64),
         from: GuestAddr,
         to: GuestAddr,
@@ -1669,6 +1981,9 @@ impl MinimalWorld {
         if flags & !(NOREPLACE | EXCHANGE) != 0 {
             return Ok(-errno::EINVAL);
         }
+        if self.links.contains_key(&from) {
+            return Ok(self.rename_link(&from, &to, flags & NOREPLACE != 0, flags & EXCHANGE != 0));
+        }
         let Some(inode) = self.names.get(&from).copied() else {
             return Ok(-errno::ENOENT);
         };
@@ -1676,30 +1991,56 @@ impl MinimalWorld {
         if !self.parent_exists(&to) {
             return Ok(-errno::ENOENT);
         }
+        // The root is not moved, nor replaced.
+        if from == ROOT || to == ROOT {
+            return Ok(-errno::EBUSY);
+        }
+        // Neither name may sit under the other: a directory never moves into itself.
+        let under = |inner: &str, outer: &str| inner.starts_with(&format!("{outer}/"));
+        if under(&to, &from) || (flags & EXCHANGE != 0 && under(&from, &to)) {
+            return Ok(-errno::EINVAL);
+        }
         let held = self.names.get(&to).copied();
+        let held_link = self.links.contains_key(&to);
         if flags & EXCHANGE != 0 {
-            let Some(other) = held else {
+            if held.is_none() && !held_link {
                 return Ok(-errno::ENOENT);
-            };
-            self.names.insert(from, other);
-            self.names.insert(to, inode);
+            }
+            // Through a name no path can take, so the two subtrees never meet.
+            const PASSING: &str = "\0exchange";
+            self.move_subtree(&from, PASSING);
+            self.move_subtree(&to, &from);
+            self.move_subtree(PASSING, &to);
             return Ok(0);
         }
         // The caller said the name must be free, and it is not.
-        if held.is_some() && flags & NOREPLACE != 0 {
+        if (held.is_some() || held_link) && flags & NOREPLACE != 0 {
             return Ok(-errno::EEXIST);
         }
-        // Renaming a non-empty directory is refused, since names are full paths.
-        if self.directories.contains(&inode) {
-            let prefix = format!("{from}/");
-            if self.names.keys().any(|name| name.starts_with(&prefix)) {
-                return Ok(-errno::ENOTEMPTY);
+        // A link in the way is replaced by a file, never by a directory.
+        if held_link {
+            if self.directories.contains(&inode) {
+                return Ok(-errno::ENOTDIR);
             }
+            self.links.remove(&to);
         }
-        self.names.remove(&from);
-        self.names.insert(to, inode);
+        // Two names of one file: nothing moves.
+        if held == Some(inode) {
+            return Ok(0);
+        }
+        let moving_directory = self.directories.contains(&inode);
+        if let Some(replaced) = held {
+            match (moving_directory, self.directories.contains(&replaced)) {
+                (true, false) => return Ok(-errno::ENOTDIR),
+                (false, true) => return Ok(-errno::EISDIR),
+                (true, true) if self.has_children(&to) => return Ok(-errno::ENOTEMPTY),
+                _ => {}
+            }
+            self.names.remove(&to);
+        }
+        self.move_subtree(&from, &to);
         // The replaced content is freed if nothing else names it.
-        if let Some(replaced) = held.filter(|replaced| *replaced != inode) {
+        if let Some(replaced) = held {
             self.directories.remove(&replaced);
             self.collect(replaced);
         }
@@ -1709,7 +2050,7 @@ impl MinimalWorld {
     /// Writes each entry's `revents` and says how many are ready, or the error the array earned.
     fn poll_ready(
         &self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         addr: GuestAddr,
         count: u64,
     ) -> Result<i64, KernelError> {
@@ -1753,7 +2094,7 @@ impl MinimalWorld {
 
     /// Copies bytes into a guest buffer, reporting the length or that it did not fit.
     fn write_bytes_out(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         addr: GuestAddr,
         capacity: u64,
         bytes: &[u8],
@@ -1766,7 +2107,7 @@ impl MinimalWorld {
     }
 
     /// Writes the machine description, which is the same on every host.
-    fn write_uname(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<i64, KernelError> {
+    fn write_uname(ctx: &mut StopCtx<'_, '_>, addr: GuestAddr) -> Result<i64, KernelError> {
         let mut buf = [0u8; UTSNAME_BYTES];
         for (i, field) in ["Linux", "bohr", PRESENTED_RELEASE, PRESENTED_VERSION, "x86_64", "bohr"]
             .iter()
@@ -1780,7 +2121,7 @@ impl MinimalWorld {
     }
 
     /// Reports the processor set the guest runs on, which is one processor.
-    fn write_affinity(ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+    fn write_affinity(ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
         let size = usize::try_from(args[1]).unwrap_or(0).min(128);
         if size < 8 {
             return Ok(-errno::EINVAL);
@@ -1838,7 +2179,7 @@ impl MinimalWorld {
     /// Writes a `struct stat` for a descriptor, as the guest's C library expects to read it.
     fn write_stat(
         &self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         fd: i64,
         addr: GuestAddr,
     ) -> Result<i64, KernelError> {
@@ -1857,11 +2198,74 @@ impl MinimalWorld {
         self.open.get(&fd).and_then(|file| file.inode)
     }
 
+    /// Answers `fcntl` on a file, as Linux answers each command.
+    ///
+    /// A record lock never conflicts: a node runs one process, whose own POSIX locks never stand
+    /// in its way, so `F_GETLK` writes `F_UNLCK` and a lock is granted at once. Two open-file
+    /// locks on one file, which Linux would let conflict within one process, do not conflict
+    /// here. A command Linux does not know is `EINVAL`.
+    fn fcntl(&mut self, ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+        let fd = args[0] as i64;
+        let Some(file) = self.open.get(&fd).copied() else {
+            return Ok(-errno::EBADF);
+        };
+        let command = args[1] as u32;
+        Ok(match command {
+            fcntl_cmd::DUPFD | fcntl_cmd::DUPFD_CLOEXEC => {
+                let Ok(at_least) = i32::try_from(args[2] as i64) else {
+                    return Ok(-errno::EINVAL);
+                };
+                if at_least < 0 {
+                    return Ok(-errno::EINVAL);
+                }
+                let copy = self.attach_from(file, i64::from(at_least));
+                if let Some(dir) = self.dir_of.get(&fd).cloned() {
+                    self.dir_of.insert(copy, dir);
+                }
+                if command == fcntl_cmd::DUPFD_CLOEXEC {
+                    self.cloexec.insert(copy);
+                }
+                copy
+            }
+            fcntl_cmd::GETFD => i64::from(self.cloexec.contains(&fd)),
+            fcntl_cmd::SETFD => {
+                if args[2] & fcntl_cmd::FD_CLOEXEC != 0 {
+                    self.cloexec.insert(fd);
+                } else {
+                    self.cloexec.remove(&fd);
+                }
+                0
+            }
+            fcntl_cmd::GETFL => file.status as i64,
+            fcntl_cmd::SETFL => {
+                if let Some(open) = self.open.get_mut(&fd) {
+                    open.status = open.status & !status::SETTABLE | args[2] & status::SETTABLE;
+                    open.appending = open.status & O_APPEND != 0;
+                }
+                0
+            }
+            fcntl_cmd::GETLK | fcntl_cmd::OFD_GETLK => {
+                ctx.write_mem(GuestAddr(args[2]), &fcntl_cmd::UNLOCKED.to_le_bytes())?;
+                0
+            }
+            fcntl_cmd::SETLK
+            | fcntl_cmd::SETLKW
+            | fcntl_cmd::OFD_SETLK
+            | fcntl_cmd::OFD_SETLKW
+            | fcntl_cmd::SETLEASE
+            | fcntl_cmd::NOTIFY => 0,
+            fcntl_cmd::GETLEASE => i64::from(fcntl_cmd::UNLOCKED),
+            other if fcntl_cmd::OWNERSHIP.contains(&other) => 0,
+            other if fcntl_cmd::RW_HINTS.contains(&other) => 0,
+            _ => -errno::EINVAL,
+        })
+    }
+
     /// Answers `dup`, `dup2` and `dup3`: a second number for a file already open.
     ///
     /// The copies do not share a position, unlike Linux, since descriptors are held by value. This
     /// misses programs that read through one copy and expect the other to move.
-    fn duplicate(&mut self, from: i64, onto: Option<i64>, exact: bool) -> i64 {
+    fn duplicate(&mut self, from: i64, onto: Option<i64>, exact: bool, flags: u64) -> i64 {
         let Some(file) = self.open.get(&from).copied() else {
             return -errno::EBADF;
         };
@@ -1880,6 +2284,12 @@ impl MinimalWorld {
             return if exact { -errno::EINVAL } else { onto };
         }
         self.open.insert(onto, file);
+        // The copy is marked only where `dup3` asks for it.
+        if exact && flags & O_CLOEXEC != 0 {
+            self.cloexec.insert(onto);
+        } else {
+            self.cloexec.remove(&onto);
+        }
         // The duplicate names the same directory, replacing what the number named.
         match self.dir_of.get(&from).cloned() {
             Some(dir) => self.dir_of.insert(onto, dir),
@@ -1896,7 +2306,7 @@ impl MinimalWorld {
     /// `/proc/self/exe` answers the configured program. No terminator is written.
     fn read_link(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         dirfd: i64,
         at: GuestAddr,
         buf: GuestAddr,
@@ -1939,7 +2349,7 @@ impl MinimalWorld {
     /// The text is kept as given, so log rotation works. The target need not exist, as on Linux.
     fn make_link(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         dirfd: i64,
         target: GuestAddr,
         at: GuestAddr,
@@ -1970,7 +2380,7 @@ impl MinimalWorld {
     /// Answers `newfstatat`: about a name, or about the descriptor itself.
     ///
     /// `stat` has no fallback, so it is always answered.
-    fn stat_at(&self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+    fn stat_at(&self, ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
         match self.stat_target(ctx, args[0], args[1], args[3])? {
             Err(errno) => Ok(errno),
             Ok((inode, length)) => {
@@ -1983,7 +2393,7 @@ impl MinimalWorld {
     /// Answers `statx`, which a kernel with `io_uring` has: the same facts as `newfstatat`.
     ///
     /// Every basic field is filled and the returned mask says so.
-    fn statx_at(&self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+    fn statx_at(&self, ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
         match self.stat_target(ctx, args[0], args[1], args[2])? {
             Err(errno) => Ok(errno),
             Ok((inode, length)) => {
@@ -1996,7 +2406,7 @@ impl MinimalWorld {
     /// What a path relative to a descriptor names, as the inode and length a stat reports.
     fn stat_target(
         &self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         dirfd: u64,
         name_at: u64,
         flags: u64,
@@ -2040,7 +2450,7 @@ impl MinimalWorld {
     /// holds; `ENOSPC` is drawn separately (`docs/API.md` §5.2).
     fn write_statfs(
         &self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         named: bool,
         addr: GuestAddr,
     ) -> Result<i64, KernelError> {
@@ -2112,7 +2522,7 @@ impl MinimalWorld {
     /// Answers `prctl`, for the options a process sets and reads about itself.
     ///
     /// As for an unprivileged process; options this world does not model are `EINVAL`.
-    fn prctl(&mut self, ctx: &mut WorldCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
+    fn prctl(&mut self, ctx: &mut StopCtx<'_, '_>, args: [u64; 6]) -> Result<i64, KernelError> {
         const PR_SET_PDEATHSIG: u64 = 1;
         const PR_GET_PDEATHSIG: u64 = 2;
         const PR_GET_DUMPABLE: u64 = 3;
@@ -2192,7 +2602,7 @@ impl MinimalWorld {
     /// scheduling candidate until a wake releases it.
     fn futex(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         args: [u64; 6],
     ) -> Result<(Option<i64>, Vec<Wake>), KernelError> {
         let word = args[0];
@@ -2223,7 +2633,7 @@ impl MinimalWorld {
                     } else {
                         value
                     };
-                    let at = Tick(ctx.world_now().get().saturating_add(ahead));
+                    let at = ctx.deadline_after(ahead);
                     self.timeouts.insert((at, ctx.task()), (word, seq));
                 }
                 self.waiters.entry(word).or_default().push(Waiter { task: ctx.task(), bits });
@@ -2333,6 +2743,20 @@ impl MinimalWorld {
         self.open.get(&fd).map_or(0, |f| f.position)
     }
 
+    /// Where a write through `fd` lands: at the end of the file for an appending descriptor,
+    /// whatever offset was named, as Linux does for `pwrite` too; otherwise at the named offset,
+    /// or at the descriptor's position.
+    pub(crate) fn write_offset(&self, fd: i64, at: Option<u64>) -> u64 {
+        let Some(file) = self.open.get(&fd) else {
+            return at.unwrap_or(0);
+        };
+        match (file.appending, file.inode, at) {
+            (true, Some(inode), _) => self.content.get(&inode).map_or(0, |held| held.len() as u64),
+            (_, _, Some(at)) => at,
+            _ => file.position,
+        }
+    }
+
     /// The content a descriptor refers to, for the disk model's crash bookkeeping.
     pub(crate) fn inode_of(&self, fd: i64) -> Option<u64> {
         self.open.get(&fd).and_then(|f| f.inode)
@@ -2372,6 +2796,7 @@ impl MinimalWorld {
         DiskImage {
             content,
             names,
+            links: self.links.clone(),
             directories: self.directories.clone(),
             next_inode: self.next_inode,
         }
@@ -2438,6 +2863,7 @@ impl MinimalWorld {
 
         self.content = image.content;
         self.names = image.names;
+        self.links = image.links;
         self.directories = image.directories;
         // The image's numbering, raised past any surviving synthetic file.
         self.next_inode = image.next_inode;
@@ -2451,7 +2877,7 @@ impl MinimalWorld {
     /// What the guest is told the time is: the stop's node-local reading.
     ///
     /// The single choke point for presented time, which the shared-clock injection replaces.
-    pub(crate) fn presented_now(ctx: &WorldCtx<'_, '_>) -> Tick {
+    pub(crate) fn presented_now(ctx: &StopCtx<'_, '_>) -> Tick {
         #[cfg(feature = "chaos-node-clock-shared")]
         return crate::chaos::shared_now(ctx);
         #[cfg(not(feature = "chaos-node-clock-shared"))]
@@ -2461,7 +2887,7 @@ impl MinimalWorld {
     /// What the guest is told the wall time is: the same reading on top of the wall epoch until
     /// the node's clock is stepped, after which it can move back while [`Self::presented_now`]
     /// never does.
-    pub(crate) fn presented_wall(ctx: &WorldCtx<'_, '_>) -> Tick {
+    pub(crate) fn presented_wall(ctx: &StopCtx<'_, '_>) -> Tick {
         #[cfg(feature = "chaos-node-clock-shared")]
         return crate::chaos::shared_now(ctx);
         #[cfg(not(feature = "chaos-node-clock-shared"))]
@@ -2480,7 +2906,7 @@ impl MinimalWorld {
     ///
     /// `pthread_cond_timedwait` and `clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME)` pass wall
     /// times.
-    pub(crate) fn deadline_clock(ctx: &WorldCtx<'_, '_>, wall: bool) -> Tick {
+    pub(crate) fn deadline_clock(ctx: &StopCtx<'_, '_>, wall: bool) -> Tick {
         if wall { Self::presented_wall(ctx) } else { Self::presented_now(ctx) }
     }
 
@@ -2503,7 +2929,7 @@ impl MinimalWorld {
     #[cfg_attr(feature = "chaos-futex-order", allow(unused_variables))]
     fn release(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         word: u64,
         count: usize,
         bits: u32,
@@ -2535,13 +2961,13 @@ impl MinimalWorld {
     }
 
     /// Reads the 32-bit word a futex operation is predicated on.
-    fn read_word(ctx: &mut WorldCtx<'_, '_>, addr: u64) -> Result<u32, KernelError> {
+    fn read_word(ctx: &mut StopCtx<'_, '_>, addr: u64) -> Result<u32, KernelError> {
         let mut buf = [0u8; 4];
         ctx.read_mem(GuestAddr(addr), &mut buf)?;
         Ok(u32::from_le_bytes(buf))
     }
 
-    fn write_word(ctx: &mut WorldCtx<'_, '_>, addr: u64, value: u32) -> Result<(), KernelError> {
+    fn write_word(ctx: &mut StopCtx<'_, '_>, addr: u64, value: u32) -> Result<(), KernelError> {
         ctx.write_mem(GuestAddr(addr), &value.to_le_bytes())
     }
 
@@ -2592,7 +3018,7 @@ impl MinimalWorld {
 
     /// Reads a `timespec` as a count of nanoseconds.
     pub(crate) fn read_timespec(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         addr: GuestAddr,
     ) -> Result<u64, KernelError> {
         let mut buf = [0u8; 16];
@@ -2604,7 +3030,7 @@ impl MinimalWorld {
 
     /// Writes a `timespec` derived from virtual time, and reports what was written.
     fn write_timespec(
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         addr: GuestAddr,
         presented: Tick,
     ) -> Result<[u8; 8], KernelError> {
@@ -2623,7 +3049,7 @@ impl MinimalWorld {
     }
 
     /// Writes a `timeval`, which is the same instant at microsecond resolution.
-    fn write_timeval(ctx: &mut WorldCtx<'_, '_>, addr: GuestAddr) -> Result<[u8; 8], KernelError> {
+    fn write_timeval(ctx: &mut StopCtx<'_, '_>, addr: GuestAddr) -> Result<[u8; 8], KernelError> {
         let now = Self::presented_wall(ctx).get();
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&(now / Tick::SECOND.get()).to_le_bytes());
@@ -2637,7 +3063,7 @@ impl MinimalWorld {
         &mut self,
         nr: u32,
         args: [u64; 6],
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Effects, KernelError> {
         // Waiting builds its own effects.
         if nr == sys::FUTEX {
@@ -2657,612 +3083,62 @@ impl MinimalWorld {
 
         // The host creates the thread; the model records the word it clears on exit.
         if nr == sys::CLONE || nr == sys::CLONE3 {
-            let word = if nr == sys::CLONE {
-                args[3]
+            let (flags, word) = if nr == sys::CLONE {
+                (args[0], args[3])
             } else {
-                let mut buf = [0u8; 8];
+                let mut flags = [0u8; 8];
+                let mut word = [0u8; 8];
                 let Some(at) = offset(GuestAddr(args[0]), CLONE_ARGS_CHILD_TID) else {
                     return Ok(Effects::go(Resume::Emulate { ret: -errno::EFAULT }, SYSCALL_COST));
                 };
-                ctx.read_mem(at, &mut buf)?;
-                u64::from_le_bytes(buf)
+                ctx.read_mem(GuestAddr(args[0]), &mut flags)?;
+                ctx.read_mem(at, &mut word)?;
+                (u64::from_le_bytes(flags), u64::from_le_bytes(word))
             };
+            // A task in namespaces of its own would see a machine the world does not answer for.
+            if flags & clone_flags::NEW_NAMESPACES != 0 {
+                return Err(ctx.refuse(
+                    "BOHR-2001",
+                    format_args!(
+                        "a task in new namespaces is not modelled (clone flags {flags:#x}); see                          docs/PLATFORMS.md §4.2"
+                    ),
+                ));
+            }
             if word != 0 {
                 self.creating.insert(ctx.task(), word);
             }
             ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: false, data_digest: None })?;
+            // An untraced task would run outside the schedule, so the flag is cleared before the
+            // host sees the call: in the register for `clone`, in the guest's arguments for
+            // `clone3`.
+            if flags & clone_flags::UNTRACED != 0 {
+                let kept = flags & !clone_flags::UNTRACED;
+                if nr == sys::CLONE {
+                    let mut regs = ctx.regs()?;
+                    regs.args[0] = kept;
+                    ctx.set_regs(&regs)?;
+                } else {
+                    ctx.write_mem(GuestAddr(args[0]), &kept.to_le_bytes())?;
+                }
+            }
             return Ok(Effects::go(Resume::Continue, SYSCALL_COST));
         }
 
-        let (ret, resume, data_digest) = match nr {
-            sys::CLOCK_GETTIME => {
-                let presented = if Self::reads_wall(args[0]) {
-                    Self::presented_wall(ctx)
-                } else {
-                    Self::presented_now(ctx)
-                };
-                let d = Self::write_timespec(ctx, GuestAddr(args[1]), presented)?;
-                ctx.emit(EventKind::ClockRead { presented })?;
-                (0, Resume::Emulate { ret: 0 }, Some(d))
-            }
-            // Whole seconds, returned and optionally stored, recorded like any clock.
-            sys::TIME => {
-                let seconds = (Self::presented_wall(ctx).get() / Tick::SECOND.get()) as i64;
-                let digest = if args[0] == 0 {
-                    None
-                } else {
-                    let buf = seconds.to_le_bytes();
-                    ctx.write_mem(GuestAddr(args[0]), &buf)?;
-                    Some(short_digest(&buf))
-                };
-                let presented = Self::presented_wall(ctx);
-                ctx.emit(EventKind::ClockRead { presented })?;
-                (seconds, Resume::Emulate { ret: seconds }, digest)
-            }
-            sys::GETTIMEOFDAY => {
-                let d = Self::write_timeval(ctx, GuestAddr(args[0]))?;
-                let presented = Self::presented_wall(ctx);
-                ctx.emit(EventKind::ClockRead { presented })?;
-                (0, Resume::Emulate { ret: 0 }, Some(d))
-            }
-            sys::GETRANDOM => {
-                // Bounded; a larger request gets a short answer.
-                let len = usize::try_from(args[1]).unwrap_or(0).min(MAX_TRANSFER);
-                let mut bytes = vec![0u8; len];
-                ctx.draw_into(&mut bytes, DrawSite::GuestRandom);
-                ctx.write_mem(GuestAddr(args[0]), &bytes)?;
-                (len as i64, Resume::Emulate { ret: len as i64 }, Some(short_digest(&bytes)))
-            }
-            sys::WRITE => {
-                let len = usize::try_from(args[2]).unwrap_or(0);
-                let fd = args[0] as i64;
-                let (ret, d) = if self.file_behind(fd).is_none() && (fd == 1 || fd == 2) {
-                    self.write_out(ctx, GuestAddr(args[1]), len)?
-                } else {
-                    self.write_file(ctx, fd, GuestAddr(args[1]), len, None)?
-                };
-                (ret, Resume::Emulate { ret }, d)
-            }
-            // A gathering write, with or without its own position, is joined and written once.
-            sys::WRITEV | sys::PWRITEV if too_many_iovecs(args[2]) => {
-                (-errno::EINVAL, Resume::Emulate { ret: -errno::EINVAL }, None)
-            }
-            sys::WRITEV | sys::PWRITEV => {
-                let fd = args[0] as i64;
-                let joined = Self::gather(ctx, GuestAddr(args[1]), args[2])?;
-                let at = (nr == sys::PWRITEV).then_some(args[3]);
-                let (ret, d) = self.write_bytes(fd, &joined, at);
-                (ret, Resume::Emulate { ret }, d)
-            }
-            sys::PWRITE64 => {
-                let len = usize::try_from(args[2]).unwrap_or(0);
-                let (ret, d) =
-                    self.write_file(ctx, args[0] as i64, GuestAddr(args[1]), len, Some(args[3]))?;
-                (ret, Resume::Emulate { ret }, d)
-            }
-            sys::READ => {
-                let len = usize::try_from(args[2]).unwrap_or(0);
-                let (ret, d) = self.read_in(ctx, args[0] as i64, GuestAddr(args[1]), len, None)?;
-                (ret, Resume::Emulate { ret }, d)
-            }
-            sys::PREAD64 => {
-                let len = usize::try_from(args[2]).unwrap_or(0);
-                let (ret, d) =
-                    self.read_in(ctx, args[0] as i64, GuestAddr(args[1]), len, Some(args[3]))?;
-                (ret, Resume::Emulate { ret }, d)
-            }
-            // `open` names its path one argument earlier than `openat`.
-            sys::OPEN | sys::OPENAT => {
-                let (dirfd, at) = if nr == sys::OPEN {
-                    (AT_FDCWD, (args[0], args[1]))
-                } else {
-                    (dirfd_of(args[0]), (args[1], args[2]))
-                };
-                let ret = self.open_at(ctx, dirfd, GuestAddr(at.0), at.1)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::CLOSE => {
-                self.dir_of.remove(&(args[0] as i64));
-                self.rings.remove(&(args[0] as i64));
-                let ret = match self.open.remove(&(args[0] as i64)) {
-                    Some(file) => {
-                        if let Some(inode) = file.inode {
-                            self.collect(inode);
-                        }
-                        0
-                    }
-                    None => -errno::EBADF,
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::LSEEK => {
-                let ret = self.seek(args[0] as i64, args[1] as i64, args[2]);
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::FSTAT => {
-                let ret = self.write_stat(ctx, args[0] as i64, GuestAddr(args[1]))?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::FTRUNCATE => {
-                let ret = self.truncate(args[0] as i64, args[1]);
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Nothing crashes in this model; the call is recorded for the crash model above it.
-            sys::FSYNC | sys::FDATASYNC => {
-                let ret = if self.open.contains_key(&(args[0] as i64)) { 0 } else { -errno::EBADF };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // One task runs at a time, so advisory locks are always granted.
-            sys::FLOCK => {
-                let ret = if self.open.contains_key(&(args[0] as i64)) { 0 } else { -errno::EBADF };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // `rmdir` always means a directory.
-            sys::UNLINK | sys::UNLINKAT | sys::RMDIR => {
-                let at = if nr == sys::UNLINKAT { args[1] } else { args[0] };
-                // The content stays for open descriptors. Without `AT_REMOVEDIR` a directory is
-                // refused, as on Linux.
-                const AT_REMOVEDIR: u64 = 0x200;
-                let removing_dir =
-                    nr == sys::RMDIR || (nr == sys::UNLINKAT && args[2] & AT_REMOVEDIR != 0);
-                let dirfd = if nr == sys::UNLINKAT { dirfd_of(args[0]) } else { AT_FDCWD };
-                let ret = match read_c_string(ctx, GuestAddr(at))? {
-                    PathArg::Named(name) => match self.under(dirfd, &name) {
-                        Err(errno) => errno,
-                        Ok(path) => match self.names.get(&path).copied() {
-                            Some(inode) if self.directories.contains(&inode) && !removing_dir => {
-                                -errno::EISDIR
-                            }
-                            Some(inode) if !self.directories.contains(&inode) && removing_dir => {
-                                -errno::ENOTDIR
-                            }
-                            Some(inode) => {
-                                self.names.remove(&path);
-                                // Removed from the directory set too.
-                                self.directories.remove(&inode);
-                                self.collect(inode);
-                                0
-                            }
-                            None => -errno::ENOENT,
-                        },
-                    },
-                    other => other.errno(),
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Three spellings: one that takes no directories and no flags, one that takes
-            // directories, and one that takes both.
-            sys::RENAME | sys::RENAMEAT | sys::RENAMEAT2 => {
-                let (from, to) =
-                    if nr == sys::RENAME { (args[0], args[1]) } else { (args[1], args[3]) };
-                // `renameat2` flags.
-                let flags = if nr == sys::RENAMEAT2 { args[4] } else { 0 };
-                let dirs = if nr == sys::RENAME {
-                    (AT_FDCWD, AT_FDCWD)
-                } else {
-                    (dirfd_of(args[0]), dirfd_of(args[2]))
-                };
-                let ret = self.rename(ctx, dirs, GuestAddr(from), GuestAddr(to), flags)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Access advice has no observable effect.
-            sys::FADVISE64 => (0, Resume::Emulate { ret: 0 }, None),
-            // Nothing here is a terminal.
-            sys::IOCTL => (-errno::ENOTTY, Resume::Emulate { ret: -errno::ENOTTY }, None),
-            // Answered from the same names as `stat` and `openat`.
-            sys::ACCESS | sys::FACCESSAT2 => {
-                let (dirfd, at) = if nr == sys::ACCESS {
-                    (AT_FDCWD, args[0])
-                } else {
-                    (dirfd_of(args[0]), args[1])
-                };
-                let ret = match read_c_string(ctx, GuestAddr(at))? {
-                    PathArg::Named(name) => match self.under(dirfd, &name) {
-                        Ok(path) if self.names.contains_key(&self.resolve(&path)) => 0,
-                        Ok(_) => -errno::ENOENT,
-                        Err(errno) => errno,
-                    },
-                    other => other.errno(),
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Not a symbolic link.
-            sys::READLINK => {
-                let ret =
-                    self.read_link(ctx, AT_FDCWD, GuestAddr(args[0]), GuestAddr(args[1]), args[2])?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // A duplicate onto an open number closes what was there.
-            sys::DUP | sys::DUP2 | sys::DUP3 => {
-                let onto = (nr != sys::DUP).then(|| args[1] as i64);
-                let ret = self.duplicate(args[0] as i64, onto, nr == sys::DUP3);
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // `symlinkat` names its link in the third argument, `symlink` in the second.
-            sys::SYMLINK | sys::SYMLINKAT => {
-                let (dirfd, at) = if nr == sys::SYMLINK {
-                    (AT_FDCWD, args[1])
-                } else {
-                    (dirfd_of(args[1]), args[2])
-                };
-                let ret = self.make_link(ctx, dirfd, GuestAddr(args[0]), GuestAddr(at))?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // `F_DUPFD` makes a real descriptor; flag commands answer zero.
-            sys::FCNTL => {
-                let ret = match self.open.get(&(args[0] as i64)).copied() {
-                    None => -errno::EBADF,
-                    Some(file) => match args[1] as u32 {
-                        fcntl_cmd::DUPFD | fcntl_cmd::DUPFD_CLOEXEC => self.attach(file),
-                        _ => 0,
-                    },
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // From `state.cwd`.
-            sys::GETCWD => {
-                let mut answer = self.cwd.clone().into_bytes();
-                answer.push(0);
-                let ret = Self::write_bytes_out(ctx, GuestAddr(args[0]), args[1], &answer)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::UNAME => {
-                let ret = Self::write_uname(ctx, GuestAddr(args[0]))?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // One fixed identity on every machine.
-            sys::GETUID
-            | sys::GETGID
-            | sys::GETEUID
-            | sys::GETEGID
-            | sys::GETPPID
-            | sys::GETPGRP
-            | sys::SCHED_GETPARAM
-            | sys::SCHED_GETSCHEDULER => (0, Resume::Emulate { ret: 0 }, None),
-            // A signal to another thread waits for its next stop; a thread parked in a held wait
-            // is released with `EINTR`, as on Linux.
-            sys::TGKILL if args[1] as u32 != Self::thread_id(ctx.task()) => {
-                let target = TaskId(i64::from(args[1] as u32).wrapping_sub(GUEST_PID) as u32);
-                let alive = self.born.contains(&target) && !self.ended.contains(&target);
-                let signal = args[2] as u32;
-                let ret = if !alive {
-                    -errno::ESRCH
-                } else if signal == 0 || signal > 64 {
-                    if signal == 0 { 0 } else { -errno::EINVAL }
-                } else {
-                    self.pending_signals.entry(target).or_default().push(signal);
-                    let interrupted = self.interrupt_wait(target);
-                    ctx.emit(EventKind::Syscall {
-                        nr,
-                        args,
-                        ret: 0,
-                        emulated: true,
-                        data_digest: None,
-                    })?;
-                    return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST)
-                        .releasing(interrupted));
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // A fatal signal to itself ends the task, since `abort` retries until it dies.
-            sys::TGKILL | sys::KILL => {
-                let signal = if nr == sys::KILL { args[1] } else { args[2] } as u32;
-                if FATAL_SIGNALS.contains(&signal) {
-                    ctx.emit(EventKind::Syscall {
-                        nr,
-                        args,
-                        ret: 0,
-                        emulated: true,
-                        data_digest: None,
-                    })?;
-                    return Ok(Effects::go(
-                        Resume::Terminate { signal: Some(signal) },
-                        SYSCALL_COST,
-                    ));
-                }
-                (0, Resume::Emulate { ret: 0 }, None)
-            }
-            // No memory figures, so nothing to report.
-            // Zero-filled, so no stack contents leak through.
-            sys::SYSINFO => {
-                ctx.write_mem(GuestAddr(args[0]), &[0u8; SYSINFO_BYTES])?;
-                (0, Resume::Emulate { ret: 0 }, None)
-            }
-            // No per-task accounting, so every field is zero.
-            sys::GETRUSAGE => {
-                ctx.write_mem(GuestAddr(args[1]), &[0u8; RUSAGE_BYTES])?;
-                (0, Resume::Emulate { ret: 0 }, None)
-            }
-            // Fixed limits. `prlimit64` takes its resource one argument along; a new limit is
-            // accepted and ignored.
-            sys::GETRLIMIT | sys::SETRLIMIT | sys::PRLIMIT64 => {
-                let (resource, out) = match nr {
-                    sys::GETRLIMIT => (args[0], args[1]),
-                    sys::SETRLIMIT => (args[0], 0),
-                    _ => (args[1], args[3]),
-                };
-                if out != 0 {
-                    let (soft, hard) = limit_for(resource);
-                    let mut answer = [0u8; RLIMIT_BYTES];
-                    answer[..8].copy_from_slice(&soft.to_le_bytes());
-                    answer[8..].copy_from_slice(&hard.to_le_bytes());
-                    ctx.write_mem(GuestAddr(out), &answer)?;
-                }
-                (0, Resume::Emulate { ret: 0 }, None)
-            }
-            sys::GETDENTS64 => {
-                let ret =
-                    self.list_directory(ctx, args[0] as i64, GuestAddr(args[1]), args[2] as usize)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // `mkdirat` names its path one argument along.
-            sys::MKDIR | sys::MKDIRAT => {
-                let (dirfd, at) = if nr == sys::MKDIR {
-                    (AT_FDCWD, args[0])
-                } else {
-                    (dirfd_of(args[0]), args[1])
-                };
-                let ret = self.make_directory(ctx, dirfd, GuestAddr(at))?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Pipes are stream pairs, which only a cluster provides.
-            sys::PIPE2 => {
-                let ret = self.unimplemented(ctx, nr)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Files, directories and standard descriptors are always ready; unknown ones are
-            // `POLLNVAL`. Otherwise the timeout is spent in virtual time, or the wait is forever.
-            sys::POLL => {
-                let ready = self.poll_ready(ctx, GuestAddr(args[0]), args[1])?;
-                let timeout = args[2] as i32;
-                if ready != 0 || timeout == 0 {
-                    (ready, Resume::Emulate { ret: ready }, None)
-                } else {
-                    ctx.emit(EventKind::Syscall {
-                        nr,
-                        args,
-                        ret: 0,
-                        emulated: true,
-                        data_digest: None,
-                    })?;
-                    if timeout < 0 {
-                        return Ok(Effects::wait(SYSCALL_COST));
-                    }
-                    let ahead = Tick(u64::from(timeout.unsigned_abs()).saturating_mul(1_000_000));
-                    return Ok(Effects::go(Resume::Emulate { ret: 0 }, ahead));
-                }
-            }
-            // Sleeping costs virtual time only.
-            sys::NANOSLEEP | sys::CLOCK_NANOSLEEP => {
-                let request = if nr == sys::NANOSLEEP { args[0] } else { args[2] };
-                let absolute = nr == sys::CLOCK_NANOSLEEP && args[1] & TIMER_ABSTIME != 0;
-                let until = Self::read_timespec(ctx, GuestAddr(request))?;
-                let ahead = if absolute {
-                    until.saturating_sub(Self::deadline_clock(ctx, Self::reads_wall(args[0])).get())
-                } else {
-                    until
-                };
-                ctx.emit(EventKind::ClockRead { presented: Self::presented_now(ctx) })?;
-                return Ok(Effects::go(Resume::Emulate { ret: 0 }, Tick(ahead)));
-            }
-            // One processor, since one task runs at a time.
-            sys::SCHED_GETAFFINITY => {
-                let ret = Self::write_affinity(ctx, args)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // A yield is a switch point the guest names.
-            sys::SCHED_YIELD => {
-                ctx.emit(EventKind::Syscall {
-                    nr,
-                    args,
-                    ret: 0,
-                    emulated: true,
-                    data_digest: None,
-                })?;
-                return Ok(Effects::go(Resume::Emulate { ret: 0 }, SYSCALL_COST).yielding());
-            }
-            // A ring under `[linux] io_uring = "ring"`, otherwise `ENOSYS`.
-            sys::IO_URING_SETUP if self.io_uring => {
-                let ret = self.open_ring(ctx, args)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::IO_URING_SETUP => {
-                let ret = self.decline_ring(ctx)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Registration is refused; callers fall back, as on kernels limiting locked memory.
-            sys::IO_URING_REGISTER if self.io_uring => {
-                let ret = -errno::EINVAL;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Rings are entered through the cluster; here the descriptor is not a ring.
-            sys::IO_URING_ENTER if self.io_uring => {
-                (-errno::EBADF, Resume::Emulate { ret: -errno::EBADF }, None)
-            }
-            // Without a ring, either call ends the run under `BOHR-2004`.
-            sys::IO_URING_ENTER | sys::IO_URING_REGISTER => {
+        let answer = match route(nr) {
+            Some(Subsystem::Vfs) => self.answer_vfs(nr, args, ctx)?,
+            Some(Subsystem::Clock) => self.answer_clock(nr, args, ctx)?,
+            Some(Subsystem::Process) => self.answer_process(nr, args, ctx)?,
+            Some(Subsystem::Signals) => self.answer_signals(nr, args, ctx)?,
+            Some(Subsystem::IoUring) => self.answer_io_uring(nr, args, ctx)?,
+            Some(Subsystem::Mappings) => self.answer_mappings(nr, args, ctx)?,
+            None => {
                 let ret = self.unmodelled(ctx, nr, args)?;
-                (ret, Resume::Emulate { ret }, None)
+                Answer::Reply((ret, Resume::Emulate { ret }, None))
             }
-            // Niceness 0: the raw call returns 20 minus niceness.
-            sys::GETPRIORITY => (20, Resume::Emulate { ret: 20 }, None),
-            // Setting it is accepted and ignored; the tape schedules.
-            sys::SETPRIORITY => (0, Resume::Emulate { ret: 0 }, None),
-            // As for an unprivileged process: ordinary policies are accepted, real-time ones are
-            // `EPERM`.
-            sys::SCHED_SETSCHEDULER => {
-                /// `SCHED_RESET_ON_FORK`, a flag ORed into the policy.
-                const RESET_ON_FORK: u64 = 0x4000_0000;
-                let mut priority = [0u8; 4];
-                ctx.read_mem(GuestAddr(args[2]), &mut priority)?;
-                let ret = match args[1] & !RESET_ON_FORK {
-                    // SCHED_OTHER, SCHED_BATCH, SCHED_IDLE, whose one priority is zero.
-                    0 | 3 | 5 if i32::from_le_bytes(priority) == 0 => 0,
-                    0 | 3 | 5 => -errno::EINVAL,
-                    // SCHED_FIFO, SCHED_RR, SCHED_DEADLINE.
-                    1 | 2 | 6 => -errno::EPERM,
-                    _ => -errno::EINVAL,
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // The ordinary policy's only priority is zero; others are `EINVAL`.
-            sys::SCHED_SETPARAM => {
-                let mut priority = [0u8; 4];
-                ctx.read_mem(GuestAddr(args[1]), &mut priority)?;
-                let ret = if i32::from_le_bytes(priority) == 0 { 0 } else { -errno::EINVAL };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Read-ahead hints are accepted and ignored.
-            sys::READAHEAD => {
-                let ret = if self.is_file(args[0] as i64) { 0 } else { -errno::EBADF };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::STATX => {
-                let ret = self.statx_at(ctx, args)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::PRCTL => {
-                let ret = self.prctl(ctx, args)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // File watching is refused; programs fall back to polling.
-            nr if sys::INOTIFY.contains(&nr) => {
-                let ret = self.unimplemented(ctx, nr)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::CHMOD | sys::FCHMODAT => {
-                let (dirfd, path, mode) = if nr == sys::CHMOD {
-                    (AT_FDCWD as u64, args[0], args[1])
-                } else {
-                    (args[0], args[1], args[2])
-                };
-                let ret = match self.stat_target(ctx, dirfd, path, 0)? {
-                    Ok((Some(inode), _)) => {
-                        self.modes.insert(inode, (mode as u32) & 0o7777);
-                        0
-                    }
-                    Ok((None, _)) => 0,
-                    Err(errno) => errno,
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::FCHMOD => {
-                let ret = match self.open.get(&(args[0] as i64)) {
-                    Some(file) => {
-                        if let Some(inode) = file.inode {
-                            self.modes.insert(inode, (args[1] as u32) & 0o7777);
-                        }
-                        0
-                    }
-                    None => -errno::EBADF,
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Reserve or extend with zeros; hole punching and collapsing are refused.
-            sys::FALLOCATE => {
-                /// `FALLOC_FL_KEEP_SIZE`.
-                const KEEP_SIZE: u64 = 1;
-                let fd = args[0] as i64;
-                let ret = if !self.open.contains_key(&fd) {
-                    -errno::EBADF
-                } else if !self.is_file(fd) {
-                    -errno::ENODEV
-                } else {
-                    match args[1] {
-                        0 => {
-                            let end = args[2].saturating_add(args[3]);
-                            let length = self.length_of(fd).unwrap_or(0);
-                            if end > length { self.truncate(fd, end) } else { 0 }
-                        }
-                        KEEP_SIZE => 0,
-                        _ => -errno::EOPNOTSUPP,
-                    }
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // `sync_file_range` promises nothing durable.
-            sys::SYNC_FILE_RANGE => {
-                let fd = args[0] as i64;
-                let ret = if !self.open.contains_key(&fd) {
-                    -errno::EBADF
-                } else if self.is_file(fd) {
-                    0
-                } else {
-                    -errno::ESPIPE
-                };
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::NEWFSTATAT => {
-                let ret = self.stat_at(ctx, args)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // An unheld descriptor is `EBADF`.
-            sys::FSTATFS if !self.open.contains_key(&(args[0] as i64)) => {
-                (-errno::EBADF, Resume::Emulate { ret: -errno::EBADF }, None)
-            }
-            sys::STATFS | sys::FSTATFS => {
-                let named = if nr == sys::FSTATFS {
-                    self.open.contains_key(&(args[0] as i64))
-                } else {
-                    match read_c_string(ctx, GuestAddr(args[0]))? {
-                        PathArg::Named(name) => self
-                            .under(AT_FDCWD, &name)
-                            .is_ok_and(|path| self.names.contains_key(&self.resolve(&path))),
-                        _ => false,
-                    }
-                };
-                let ret = self.write_statfs(ctx, named, GuestAddr(args[1]))?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            sys::READLINKAT => {
-                let ret = self.read_link(
-                    ctx,
-                    dirfd_of(args[0]),
-                    GuestAddr(args[1]),
-                    GuestAddr(args[2]),
-                    args[3],
-                )?;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // One fixed pid.
-            sys::GETPID => (GUEST_PID, Resume::Emulate { ret: GUEST_PID }, None),
-            // The run's own task id.
-            sys::GETTID => {
-                let ret = i64::from(ctx.task().get()) + GUEST_PID;
-                (ret, Resume::Emulate { ret }, None)
-            }
-            // Let through; the exit arrives as its own stop.
-            sys::EXIT | sys::EXIT_GROUP => (0, Resume::Continue, None),
-            // Only file mappings reach here.
-            sys::MMAP => match self.map_file(ctx, args) {
-                Some(resume) => {
-                    ctx.emit(EventKind::Syscall {
-                        nr,
-                        args,
-                        ret: 0,
-                        emulated: false,
-                        data_digest: None,
-                    })?;
-                    return Ok(Effects::go(resume, SYSCALL_COST));
-                }
-                // An unowned descriptor has no file.
-                None => {
-                    let ret = self.unmodelled(ctx, nr, args)?;
-                    (ret, Resume::Emulate { ret }, None)
-                }
-            },
-            // Let through; the model forgets the mapping.
-            sys::MUNMAP => {
-                self.unmap(ctx, args[0], args[1])?;
-                (0, Resume::Continue, None)
-            }
-            // Nothing written through a mapping, so nothing to carry back. A cluster handles the
-            // other case.
-            sys::MSYNC => (0, Resume::Emulate { ret: 0 }, None),
-            other => {
-                let ret = self.unmodelled(ctx, other, args)?;
-                (ret, Resume::Emulate { ret }, None)
-            }
+        };
+        let (ret, resume, data_digest) = match answer {
+            Answer::Reply(reply) => reply,
+            Answer::Done(effects) => return Ok(effects),
         };
 
         if let Some(inode) = mapped {
@@ -3316,7 +3192,7 @@ impl MinimalWorld {
     /// Turns a `futex` call into effects, recording the waiting and the waking as events.
     fn futex_effects(
         &mut self,
-        ctx: &mut WorldCtx<'_, '_>,
+        ctx: &mut StopCtx<'_, '_>,
         args: [u64; 6],
     ) -> Result<Effects, KernelError> {
         let word = GuestAddr(args[0]);
@@ -3427,7 +3303,7 @@ impl PathArg {
 }
 
 pub(crate) fn read_c_string(
-    ctx: &mut WorldCtx<'_, '_>,
+    ctx: &mut StopCtx<'_, '_>,
     addr: GuestAddr,
 ) -> Result<PathArg, KernelError> {
     // Down to one byte, for paths at the very end of a mapping.
@@ -3467,7 +3343,7 @@ impl WorldModel for MinimalWorld {
     /// Ends every timed wait whose deadline has come with `ETIMEDOUT`.
     ///
     /// Only into the wait that armed it, checked at firing.
-    fn on_deadline(&mut self, ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
+    fn on_deadline(&mut self, ctx: &mut DeadlineCtx<'_, '_>) -> Result<DueEffects, KernelError> {
         let now = ctx.world_now();
         let mut effects = DueEffects::default();
         while let Some(entry) = self.timeouts.first_entry() {
@@ -3484,9 +3360,9 @@ impl WorldModel for MinimalWorld {
 
     fn identity(&self) -> WorldModelId {
         if self.surveying.is_some() {
-            WorldModelId::new("minimal-survey", 2)
+            WorldModelId::new("minimal-survey", 3)
         } else {
-            WorldModelId::new("minimal", 2)
+            WorldModelId::new("minimal", 3)
         }
     }
 
@@ -3521,7 +3397,7 @@ impl WorldModel for MinimalWorld {
             .collect()
     }
 
-    fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError> {
+    fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         // A node's first task is registered at its first stop.
         self.born.insert(ctx.task());
         match &stop.kind {
@@ -3603,8 +3479,27 @@ impl WorldModel for MinimalWorld {
             }
         }
     }
+}
 
-    fn fault_catalog(&self) -> &FaultCatalog {
-        &self.catalog
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every call the world answers is one the syscall filter stops the guest at, and each is
+    /// answered by one subsystem: an admitted call never reaches the world, so an answer for one
+    /// would be code no traced run takes.
+    #[test]
+    fn every_call_answered_is_traced_and_routed_once() {
+        let mut seen = BTreeSet::new();
+        for (_, handles) in ROUTES {
+            for nr in handles {
+                assert!(seen.insert(*nr), "{nr} is routed to two subsystems");
+            }
+        }
+        let untraced: Vec<(u32, Option<&str>)> = answered()
+            .filter(|nr| bohr_trace::syscall_traced(*nr) != Some(true))
+            .map(|nr| (nr, bohr_trace::syscall_name(nr)))
+            .collect();
+        assert!(untraced.is_empty(), "answered and not traced: {untraced:?}");
     }
 }

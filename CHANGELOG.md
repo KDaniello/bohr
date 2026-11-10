@@ -6,6 +6,80 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.1.1 — the ground under the findings
+
+A review of the whole tool after v0.9.1 found 86 defects: answers the model gave unlike Linux, runs
+whose digest depended on the host, verdicts that counted the wrong thing, bundles from others that
+could reach past the guest, costs that grew with the run, and a design that made each of these easy.
+This patch fixes all 86 before the v0.9.x series goes on. It adds no class of error.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.1+1` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Breaking
+
+- **Bundles of the old models are refused by version.** The model fixes change what a run answers:
+  the `distributed` world is version 4 and `minimal` version 3, and a bundle recorded under an older
+  one is refused with `BOHR-4006`, both versions named, instead of reported as diverged.
+  `bohr replay --record <file>` runs such a bundle under this build and writes it anew; whether it
+  holds the same finding is for its reader.
+- **Every guest is executed by a 512-byte path.** The host path is made absolute and padded with
+  leading slashes; a path longer than 512 bytes is refused. `AT_EXECFN`, `argv[0]` and
+  `/proc/self/exe` are the name the scenario starts the program by, so `--binaries` no longer
+  refuses a directory longer than the recorded one.
+- **`Outcome` carries a kind and a code, not text.** Diagnostic codes are `BOHR-NNNN` numbers in
+  one type, and `--json` errors carry `code` and `message`.
+
+### Fixed
+
+- **The model.** `fcntl` locks and status flags, `O_NONBLOCK` and `SOCK_NONBLOCK` on sockets and
+  pipes, `shutdown(SHUT_WR)`, `MSG_PEEK` and `MSG_DONTWAIT`, `rmdir` and `rename` of a non-empty
+  directory, `O_APPEND` positions, `ENOSPC` only where a write allocates, `dup` of sockets and
+  counters, `SO_RCVTIMEO` and `SO_SNDTIMEO`, descriptor numbers under `RLIMIT_NOFILE`,
+  `socketpair` types and `EFD_SEMAPHORE`, timers armed on a drifting node's own clock, a datagram
+  to the node itself, overlapping cuts, a restarted node's symlinks and `/proc/self/exe`, and a
+  gathering write past an empty segment answer as Linux answers them.
+- **Processes.** `exit_group` by a child process ends that process, not every task of its node.
+  `CLONE_UNTRACED` is cleared before the host sees it, and a task in new namespaces is refused.
+- **Verdicts.** A clean bundle is not a finding; a re-run that went elsewhere is kept apart under
+  its own name; ablation runs a control and checks provenance and state; scheduled faults count
+  when they fire; a resumed campaign groups and stops as an uninterrupted one; a failure of the
+  probe alone is not the target's; `reduce` checks its baseline reproduces, and reads the events
+  of every candidate.
+- **Bundles from someone else.** Replay, reduce and ablate run only programs the bundle vouches
+  for; decompression, paths and node counts are bounded; bundle strings are printed without
+  terminal escapes; `--redact` covers `[cluster] programs` and the state. The probe and the
+  `--patch-cpuid` copy run from `bohr-<uid>` under the temporary directory, created 0700 and refused
+  when anyone else could write it, each file named by its content and written `O_EXCL`. The spool
+  is created `O_EXCL`. A failed attach kills the guest instead of letting it run untraced.
+
+### Performance
+
+- **A finding's re-run is a worker's job.** It runs in a process of its own while the pool runs
+  the next generation, where before every worker waited for it.
+- **Logs held only where read.** `run --save` streams its bundle; `hunt --seeds` and replay only
+  digest; reduce and the reducer read a spool. The draw journal of a campaign run keeps the 256
+  draws the corpus takes, where it kept about 32 MB per million system calls, and SDK records are
+  folded as they arrive, where a worker held 53 MB of them.
+- **Fewer copies and crossings.** A prepared state is shared between nodes and copied per block
+  on write; a gathering write reads its segments in one `process_vm_readv`; a guest binary of
+  95–111 MB is hashed once per invocation, not per generation; an edge-triggered poller wakes on
+  its own socket's edges only; the spool compresses on a thread of its own.
+
+### Determinism
+
+Moved to `solved` in [`DETERMINISM.md`](./docs/DETERMINISM.md): `rseq`, which is refused, and
+`sched_getcpu`, answered core 0; the auxiliary vector, laid out in one canonical form whatever the
+host's kernel and CPU; the executed path; the host's stack, address-space and data limits, set to
+what the world answers; the signal state the supervisor would hand down; `MADV_FREE`, carried out
+as `MADV_DONTNEED`; and the order in which the threads of a process a signal ended are reported.
+One guest run from directories of two lengths, on two cores and under `ulimit -s unlimited` reaches
+one digest (`host_independence::the_host_does_not_reach_the_guest`).
+
 ## v0.9.1 — honest findings
 
 v0.9's campaigns returned findings that took hours each to read, and some of them were the tool's

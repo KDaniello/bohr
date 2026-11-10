@@ -17,7 +17,7 @@ use std::{
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use bohr_backend_ptrace::CORE_VARIABLE;
 
-use crate::{CliError, targets};
+use crate::{CliError, private::EXECUTE_VARIABLE, targets};
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 const CORE_VARIABLE: &str = "BOHR_CORE";
 
@@ -42,10 +42,6 @@ const DEFAULT_QUIET_RUNS: u64 = 1000;
 /// A hunt with no budget stops after this long, whatever it is still finding.
 const DEFAULT_TIME: Duration = Duration::from_secs(15 * 60);
 
-fn refused(text: String) -> CliError {
-    CliError::Usage(format!("BOHR-1002: {text}"))
-}
-
 /// A seed range as `a..b`, both ends included.
 pub(crate) fn parse_seeds(text: &str) -> Result<(u64, u64), String> {
     let (from, to) = text.split_once("..").ok_or_else(|| format!("{text:?} is not a..b"))?;
@@ -63,7 +59,7 @@ pub(crate) fn parse_seeds(text: &str) -> Result<(u64, u64), String> {
 /// `[durability]` is removed too: it judges what a restarted node lost, which needs a kill.
 pub(crate) fn without_faults(text: &str) -> Result<String, CliError> {
     let mut value: toml::Table =
-        toml::from_str(text).map_err(|e| refused(format!("the pack's scenario: {e}")))?;
+        toml::from_str(text).map_err(|e| CliError::refused(format!("the pack's scenario: {e}")))?;
     value.remove("faults");
     value.remove("fault");
     value.remove("durability");
@@ -87,52 +83,48 @@ pub(crate) fn without_faults(text: &str) -> Result<String, CliError> {
             }
         }
     }
-    toml::to_string(&value).map_err(|e| refused(format!("cannot write the scenario: {e}")))
+    toml::to_string(&value)
+        .map_err(|e| CliError::refused(format!("cannot write the scenario: {e}")))
 }
 
-/// The scenario with every program that is the pack's binary replaced by `binary`.
+/// Every name the scenario starts the pack's binary by, each of which a `--binary` stands in for.
 ///
-/// Refused where the scenario never names the pack's binary, since it would run something else.
-fn with_program(text: &str, pack: &targets::Pack, binary: &Path) -> Result<String, CliError> {
-    let mut value: toml::Table =
-        toml::from_str(text).map_err(|e| refused(format!("the pack's scenario: {e}")))?;
+/// Refused where the scenario never names the pack's binary, since the stand-in would not run.
+fn named_binary(text: &str, pack: &targets::Pack) -> Result<Vec<String>, CliError> {
+    let value: toml::Table =
+        toml::from_str(text).map_err(|e| CliError::refused(format!("the pack's scenario: {e}")))?;
     let ours = |arg: &toml::Value| {
         arg.as_str()
-            .is_some_and(|p| pack.root.join(p) == pack.binary || Path::new(p) == pack.binary)
+            .filter(|p| pack.root.join(p) == pack.binary || Path::new(p) == pack.binary)
+            .map(str::to_owned)
     };
-    let given = toml::Value::String(absolute(binary));
-    let mut replaced = 0;
-    if let Some(toml::Value::Table(cluster)) = value.get_mut("cluster") {
-        let mut lines: Vec<&mut Vec<toml::Value>> = Vec::new();
-        if let Some(toml::Value::Array(argv)) = cluster.get_mut("argv") {
-            lines.push(argv);
-        }
-        // `programs` and `argv` cannot both be borrowed at once, so each is taken in turn.
-        for argv in lines {
-            if argv.first().is_some_and(ours) {
-                argv[0] = given.clone();
-                replaced += 1;
-            }
-        }
-        if let Some(toml::Value::Array(programs)) = cluster.get_mut("programs") {
-            for program in programs.iter_mut() {
-                if let toml::Value::Array(argv) = program
-                    && argv.first().is_some_and(ours)
-                {
-                    argv[0] = given.clone();
-                    replaced += 1;
-                }
-            }
-        }
+    let cluster = value.get("cluster").and_then(toml::Value::as_table);
+    let argv = cluster.and_then(|c| c.get("argv")).and_then(toml::Value::as_array);
+    let programs = cluster.and_then(|c| c.get("programs")).and_then(toml::Value::as_array);
+    let firsts = argv
+        .and_then(|argv| argv.first())
+        .into_iter()
+        .chain(programs.into_iter().flatten().filter_map(|p| p.as_array()?.first()));
+    let mut names: Vec<String> = firsts.filter_map(ours).collect();
+    names.sort();
+    names.dedup();
+    if !names.is_empty() {
+        return Ok(names);
     }
-    if replaced == 0 {
-        return Err(refused(format!(
-            "pack {}'s scenario names {} nowhere in its argv, so --binary would not be what runs",
-            pack.name,
-            pack.binary.display()
-        )));
+    Err(CliError::refused(format!(
+        "pack {}'s scenario names {} nowhere in its argv, so --binary would not be what runs",
+        pack.name,
+        pack.binary.display()
+    )))
+}
+
+/// The pack's binary as the command line names it: from the pack's root, where the guest runs, so
+/// no host directory reaches the guest.
+fn as_started(pack: &targets::Pack) -> String {
+    match pack.binary.strip_prefix(&pack.root) {
+        Ok(inside) => format!("./{}", inside.to_string_lossy()),
+        Err(_) => absolute(&pack.binary),
     }
-    toml::to_string(&value).map_err(|e| refused(format!("cannot write the scenario: {e}")))
 }
 
 /// Runs a hunt and reports what it found.
@@ -140,10 +132,10 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
     let pack = targets::resolve(&request.pack)?;
     let binary = targets::binary_for(&pack, request.binary.as_deref().map(Path::new))?;
     std::fs::create_dir_all(&request.out)
-        .map_err(|e| refused(format!("cannot use {}: {e}", request.out.display())))?;
+        .map_err(|e| CliError::refused(format!("cannot use {}: {e}", request.out.display())))?;
     let state = request.out.join("campaign");
     if request.seeds.is_none() && state.join("campaign.bin").is_file() && !request.resume {
-        return Err(refused(format!(
+        return Err(CliError::refused(format!(
             "{} already holds a campaign; pass --resume to carry on with it, or name another -o",
             request.out.display()
         )));
@@ -151,8 +143,8 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
 
     // The scenario must arm the pack's oracle, or every run would be clean for lack of checking.
     let text = std::fs::read_to_string(&pack.scenario)
-        .map_err(|e| refused(format!("cannot read {}: {e}", pack.scenario.display())))?;
-    let loaded = bohr_world::config::load(&text)?;
+        .map_err(|e| CliError::refused(format!("cannot read {}: {e}", pack.scenario.display())))?;
+    let loaded = crate::state_dir::load(&text)?;
     let armed = match pack.oracle.as_str() {
         "durability" => loaded.durability.is_some(),
         "liveness" => loaded.liveness.is_some(),
@@ -160,7 +152,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
         _ => true,
     };
     if !armed {
-        return Err(refused(format!(
+        return Err(CliError::refused(format!(
             "pack {} judges by {}, and its scenario has nothing to judge with: {}",
             pack.name,
             pack.oracle,
@@ -171,18 +163,30 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
             }
         )));
     }
-    // The binary checked is the binary run: a `--binary` replaces the pack's in the scenario argv.
+    // The binary checked is the binary run: a `--binary` is executed wherever the scenario starts
+    // the pack's, and the guest still sees the pack's name for it.
+    let (program, stand_in) = match request.binary {
+        Some(_) => {
+            let named = named_binary(&text, &pack)?;
+            let file = absolute(&binary);
+            // This process judges the findings too, so it runs the stand-in as its workers do.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            for name in &named {
+                crate::private::substitute(name, &file);
+            }
+            let stand_in: Vec<String> = named.iter().map(|name| format!("{name}={file}")).collect();
+            (named[0].clone(), Some(stand_in.join("\n")))
+        }
+        None => (as_started(&pack), None),
+    };
     let mut text = text;
-    if request.binary.is_some() {
-        text = with_program(&text, &pack, &binary)?;
-    }
     if request.no_faults {
         text = without_faults(&text)?;
     }
-    let scenario = if request.binary.is_some() || request.no_faults {
+    let scenario = if request.no_faults {
         let written = request.out.join("scenario.toml");
         std::fs::write(&written, &text)
-            .map_err(|e| refused(format!("cannot write {}: {e}", written.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot write {}: {e}", written.display())))?;
         written
     } else {
         pack.scenario.clone()
@@ -197,13 +201,23 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
         scenario.display()
     );
 
-    let me = std::env::current_exe().map_err(|e| refused(format!("cannot find bohr: {e}")))?;
+    let me =
+        std::env::current_exe().map_err(|e| CliError::refused(format!("cannot find bohr: {e}")))?;
     let findings = request.out.join("findings");
     let summary = request.out.join("summary.json");
     let (code, swept) = match request.seeds {
         Some((from, to)) => {
-            let swept =
-                sweep(&me, &scenario, &binary, &pack.root, &findings, from, to, request.jobs)?;
+            let swept = sweep(
+                &me,
+                &scenario,
+                &program,
+                stand_in.as_deref(),
+                &pack.root,
+                &findings,
+                from,
+                to,
+                request.jobs,
+            )?;
             (swept.code(), Some(swept))
         }
         None => {
@@ -240,25 +254,31 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
             if let Some(quiet) = quiet {
                 args.extend(["--quiet-runs".into(), quiet.to_string()]);
             }
-            args.extend(["--".into(), absolute(&binary)]);
+            args.extend(["--".into(), program.clone()]);
             let mut campaign = Command::new(&me);
             campaign.args(&args).current_dir(&pack.root);
+            if let Some(stand_in) = &stand_in {
+                campaign.env(EXECUTE_VARIABLE, stand_in);
+            }
             // Standard output carries only the object, so the campaign's output goes to stderr.
             if crate::json::on() {
                 campaign.stdout(std::io::stderr());
             }
             let status = campaign
                 .status()
-                .map_err(|e| refused(format!("cannot start the campaign: {e}")))?;
+                .map_err(|e| CliError::refused(format!("cannot start the campaign: {e}")))?;
             let code =
                 status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(crate::exit::INTERNAL);
             (code, None)
         }
     };
+    // Judged where the campaign ran, so the relative programs and state its bundles name are
+    // the ones it ran.
+    let findings = std::path::absolute(&findings).unwrap_or(findings);
     if !crate::json::on() {
         if findings.is_dir() {
             // Ablated: a campaign's groups are few, and a verdict without it is a guess.
-            crate::findings::findings(&findings.to_string_lossy(), true)?;
+            from_root(&pack.root, || crate::findings::findings(&findings.to_string_lossy(), true))?;
         }
         return Ok(code);
     }
@@ -289,13 +309,41 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
     });
     // The groups `bohr findings` would print, inside this object.
     if findings.is_dir()
-        && let (serde_json::Value::Object(fields), serde_json::Value::Object(groups)) =
-            (&mut body, crate::findings::groups_json(&findings.to_string_lossy(), true)?)
+        && let (serde_json::Value::Object(fields), serde_json::Value::Object(groups)) = (
+            &mut body,
+            from_root(&pack.root, || {
+                crate::findings::groups_json(&findings.to_string_lossy(), true)
+            })?,
+        )
     {
         fields.extend(groups);
     }
     crate::json::emit("hunt", body);
     Ok(code)
+}
+
+/// Runs `judge` from `root`, the directory the campaign ran in, and comes back.
+///
+/// A finding is run again to be ablated, and its bundle names programs and a prepared state as the
+/// scenario wrote them, relative to the pack's root. The process's directory is moved for the
+/// span of the call; a hunt does nothing else meanwhile.
+fn from_root<T>(root: &Path, judge: impl FnOnce() -> Result<T, CliError>) -> Result<T, CliError> {
+    let here = std::env::current_dir()
+        .map_err(|e| CliError::refused(format!("cannot read the working directory: {e}")))?;
+    std::env::set_current_dir(root)
+        .map_err(|e| CliError::refused(format!("cannot enter {}: {e}", root.display())))?;
+    let judged = judge();
+    std::env::set_current_dir(&here)
+        .map_err(|e| CliError::refused(format!("cannot return to {}: {e}", here.display())))?;
+    judged
+}
+
+/// Keeps the account of the smallest seed of those offered, so the report names the same one
+/// whichever thread finished first.
+fn keep_smallest(slot: &mut Option<(u64, String)>, seed: u64, said: String) {
+    if slot.as_ref().is_none_or(|(at, _)| seed < *at) {
+        *slot = Some((seed, said));
+    }
 }
 
 fn absolute(path: &Path) -> String {
@@ -352,7 +400,8 @@ impl Swept {
 fn sweep(
     me: &Path,
     scenario: &Path,
-    binary: &Path,
+    program: &str,
+    stand_in: Option<&str>,
     root: &Path,
     findings: &Path,
     from: u64,
@@ -360,13 +409,14 @@ fn sweep(
     jobs: usize,
 ) -> Result<Swept, CliError> {
     std::fs::create_dir_all(findings)
-        .map_err(|e| refused(format!("cannot use {}: {e}", findings.display())))?;
+        .map_err(|e| CliError::refused(format!("cannot use {}: {e}", findings.display())))?;
     let seeds: Vec<u64> = (from..=to).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let found: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     let other: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     // Why the first incomplete seed stopped, so nobody has to rerun it to find out.
-    let why: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    // The smallest seed that did not finish, whichever thread met it first.
+    let why: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
     std::thread::scope(|scope| {
         for position in 0..jobs.max(1) {
             let (next, found, other, why) = (&next, &found, &other, &why);
@@ -376,17 +426,35 @@ fn sweep(
                     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(seed) = seeds.get(at) else { break };
                     let bundle = findings.join(format!("seed-{seed}.bohr"));
-                    let status = Command::new(me)
-                        .args(["run", "--seed", &seed.to_string(), "--config"])
-                        .arg(absolute(scenario))
-                        .arg("--save")
-                        .arg(&bundle)
-                        .arg("--")
-                        .arg(absolute(binary))
-                        .current_dir(root)
-                        // A core of its own per sweeping thread, as a campaign gives each worker.
-                        .env(CORE_VARIABLE, position.to_string())
-                        .output();
+                    let run = |save: Option<&Path>| {
+                        let mut command = Command::new(me);
+                        command
+                            .args(["run", "--seed", &seed.to_string(), "--config"])
+                            .arg(absolute(scenario));
+                        if let Some(bundle) = save {
+                            command.arg("--save").arg(bundle);
+                        }
+                        if let Some(stand_in) = stand_in {
+                            command.env(EXECUTE_VARIABLE, stand_in);
+                        }
+                        command
+                            .arg("--")
+                            .arg(program)
+                            .current_dir(root)
+                            // A core of its own per sweeping thread, as a campaign gives each
+                            // worker.
+                            .env(CORE_VARIABLE, position.to_string())
+                            .output()
+                    };
+                    // Only digested; a seed that found something runs again, to the same end,
+                    // with its bundle written, so a clean seed never spools a log.
+                    let first = run(None);
+                    let found_it = first
+                        .as_ref()
+                        .ok()
+                        .and_then(|o| o.status.code())
+                        .is_some_and(|c| c == i32::from(crate::exit::FINDING));
+                    let status = if found_it { run(Some(&bundle)) } else { first };
                     let said = status.as_ref().map_or_else(
                         |e| e.to_string(),
                         |o| {
@@ -415,7 +483,7 @@ fn sweep(
                                 other.push(*seed);
                             }
                             if let Ok(mut first) = why.lock() {
-                                first.get_or_insert_with(|| format!("seed {seed}: {said}"));
+                                keep_smallest(&mut first, *seed, format!("seed {seed}: {said}"));
                             }
                             let _ = std::fs::remove_file(&bundle);
                         }
@@ -429,7 +497,7 @@ fn sweep(
         to,
         found: found.into_inner().unwrap_or_default(),
         incomplete: other.into_inner().unwrap_or_default(),
-        why: why.into_inner().ok().flatten(),
+        why: why.into_inner().ok().flatten().map(|(_, said)| said),
     };
     // Sorted: threads finish seeds in any order.
     swept.found.sort_unstable();
@@ -449,6 +517,16 @@ fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The incomplete seed named is the smallest, in whatever order the threads met them.
+    #[test]
+    fn the_smallest_incomplete_seed_is_named() {
+        let mut slot = None;
+        for seed in [40, 5, 17] {
+            keep_smallest(&mut slot, seed, format!("seed {seed}"));
+        }
+        assert_eq!(slot.map(|(seed, _)| seed), Some(5));
+    }
 
     #[test]
     fn a_seed_range_includes_both_ends() {
@@ -505,7 +583,7 @@ node = 0
 at_tick = 3
 "#;
         let out = without_faults(text).unwrap();
-        let loaded = bohr_world::config::load(&out).unwrap();
+        let loaded = crate::state_dir::load(&out).unwrap();
         assert!(!loaded.asks_for_adversity(), "{out}");
         assert!(out.contains("latency_mean_ticks"), "the world stays: {out}");
         assert!(out.contains("snapshot_depth"), "{out}");

@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use bohr_backend::{Resume, Stop, StopKind};
 use bohr_backend_null::{GuestOp, NullBackend, NullProgram};
 use bohr_kernel::{
-    DueEffects, Effects, FaultCatalog, KernelError, NodeOp, Oracle, RunConfig, RunInputs,
-    RunOutcome, RunReport, Verdict, WorldCtx, WorldModel, run,
+    DeadlineCtx, DueEffects, Effects, KernelError, NodeOp, Oracle, RunConfig, RunInputs,
+    RunOutcome, RunReport, StopCtx, Verdict, WorldModel, run,
 };
 use bohr_tape::Tape;
 use bohr_trace::TraceWriter;
@@ -35,12 +35,11 @@ enum Due {
 /// Answers the scripted calls above and keeps one timer queue.
 struct TestWorld {
     timers: BTreeMap<Tick, Vec<Due>>,
-    catalog: FaultCatalog,
 }
 
 impl TestWorld {
     fn new() -> Self {
-        Self { timers: BTreeMap::new(), catalog: FaultCatalog::default() }
+        Self { timers: BTreeMap::new() }
     }
 
     fn arm(&mut self, at: Tick, due: Due) {
@@ -53,7 +52,7 @@ impl WorldModel for TestWorld {
         WorldModelId::new("kernel-test", 1)
     }
 
-    fn handle(&mut self, stop: &Stop, ctx: &mut WorldCtx<'_, '_>) -> Result<Effects, KernelError> {
+    fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         let StopKind::SyscallEntry { nr, args } = stop.kind else {
             return Err(ctx.refuse("BOHR-2001", "unexpected stop"));
         };
@@ -83,15 +82,11 @@ impl WorldModel for TestWorld {
         }
     }
 
-    fn fault_catalog(&self) -> &FaultCatalog {
-        &self.catalog
-    }
-
     fn next_deadline(&self) -> Option<Tick> {
         self.timers.keys().next().copied()
     }
 
-    fn on_deadline(&mut self, ctx: &mut WorldCtx<'_, '_>) -> Result<DueEffects, KernelError> {
+    fn on_deadline(&mut self, ctx: &mut DeadlineCtx<'_, '_>) -> Result<DueEffects, KernelError> {
         let now = ctx.world_now();
         let mut due = DueEffects::default();
         while let Some((&at, _)) = self.timers.first_key_value() {

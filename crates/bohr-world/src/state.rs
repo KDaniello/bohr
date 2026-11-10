@@ -3,13 +3,18 @@
 //! A real client cannot sync for days before every run, so a run can start from a prepared state.
 //!
 //! The state is a host directory named in the configuration and pinned by digest. The bundle
-//! records which state, never its content, and a replay against another is refused.
+//! records which state, never its content, and a replay against another is refused. The directory
+//! is read by the command line; this crate takes the files it read.
 //!
-//! Every file is held in supervisor memory, which bounds the state's size.
+//! Every file is held in supervisor memory, which bounds the state's size. It is held once: every
+//! node of every run starts from blocks it shares with the image, and copies a block only when it
+//! writes into it.
 
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use bohr_types::Digest;
+
+use crate::bytes::FileBytes;
 
 /// Why a prepared state was refused.
 ///
@@ -21,31 +26,41 @@ pub enum StateError {
     Refused(String),
 }
 
+/// One file of an image: its bytes, in blocks a node's copy shares, and their digest.
+#[derive(Clone, Debug)]
+struct Held {
+    bytes: FileBytes,
+    digest: Digest,
+}
+
+impl Held {
+    fn of(content: Vec<u8>) -> Self {
+        let digest = Digest::of(&content);
+        Self { bytes: FileBytes::from_vec(content), digest }
+    }
+}
+
 /// Files a run starts with, and what they add up to.
+///
+/// A clone shares every file's blocks.
 #[derive(Clone, Debug)]
 pub struct StateImage {
     /// Contents by the path a guest opens them at, in sorted order.
     ///
     /// Sorted, since inode numbers follow insertion order.
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Held>,
     /// What this image is, independently of the machine it was built on.
     digest: Digest,
 }
 
 impl StateImage {
-    /// Reads a directory as the filesystem a node will start from.
-    ///
-    /// Every refusal names the path.
-    ///
-    /// # Errors
-    ///
-    /// Refuses a symlink, anything that is not a regular file, a path that is not UTF-8, and a
-    /// file larger than the world can hold.
-    pub fn from_dir(root: &Path, largest_file: u64) -> Result<Self, StateError> {
-        let mut files = BTreeMap::new();
-        walk(root, root, &mut files, largest_file)?;
+    /// The image of these files, by the path a guest opens each at.
+    #[must_use]
+    pub fn from_files(read: BTreeMap<String, Vec<u8>>) -> Self {
+        let files: BTreeMap<String, Held> =
+            read.into_iter().map(|(path, content)| (path, Held::of(content))).collect();
         let digest = digest_of(&files);
-        Ok(Self { files, digest })
+        Self { files, digest }
     }
 
     /// The same image with the instructions that take a number from the processor replaced.
@@ -59,14 +74,15 @@ impl StateImage {
     pub fn without_hardware_randomness(self) -> (Self, Vec<(String, usize)>) {
         let mut files = BTreeMap::new();
         let mut rewritten = Vec::new();
-        for (path, content) in self.files {
-            match bohr_backend::code::entropy::without_hardware_randomness(&content) {
+        for (path, held) in self.files {
+            let content = held.bytes.to_vec();
+            match bohr_x86::entropy::without_hardware_randomness(&content) {
                 Some((patched, sites)) => {
                     rewritten.push((path.clone(), sites.len()));
-                    files.insert(path, patched);
+                    files.insert(path, Held::of(patched));
                 }
                 None => {
-                    files.insert(path, content);
+                    files.insert(path, held);
                 }
             }
         }
@@ -82,14 +98,15 @@ impl StateImage {
     pub fn with_processor_questions_trapped(self) -> (Self, Vec<(String, usize)>) {
         let mut files = BTreeMap::new();
         let mut rewritten = Vec::new();
-        for (path, content) in self.files {
-            match bohr_backend::code::cpuid::trapped(&content) {
+        for (path, held) in self.files {
+            let content = held.bytes.to_vec();
+            match bohr_x86::cpuid::trapped(&content) {
                 Some((patched, sites)) => {
                     rewritten.push((path.clone(), sites.len()));
-                    files.insert(path, patched);
+                    files.insert(path, Held::of(patched));
                 }
                 None => {
-                    files.insert(path, content);
+                    files.insert(path, held);
                 }
             }
         }
@@ -105,30 +122,30 @@ impl StateImage {
         self.digest
     }
 
-    /// Every file, by the path a guest opens it at.
-    pub fn files(&self) -> impl Iterator<Item = (&String, &Vec<u8>)> {
-        self.files.iter()
+    /// Every file, by the path a guest opens it at, in the blocks a node's copy shares.
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&String, &FileBytes)> {
+        self.files.iter().map(|(path, held)| (path, &held.bytes))
     }
 
     /// How many files, and how many bytes in total.
     #[must_use]
     pub fn size(&self) -> (usize, u64) {
-        (self.files.len(), self.files.values().map(|c| c.len() as u64).sum())
+        (self.files.len(), self.files.values().map(|held| held.bytes.len() as u64).sum())
     }
 
     /// The per-file list a bundle records, as JSON.
     #[must_use]
     pub fn manifest(&self) -> String {
         let mut out = String::from("[");
-        for (i, (path, content)) in self.files.iter().enumerate() {
+        for (i, (path, held)) in self.files.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&format!(
                 "\n  {{\"path\": {:?}, \"len\": {}, \"digest\": \"{}\"}}",
                 path,
-                content.len(),
-                Digest::of(content).to_hex()
+                held.bytes.len(),
+                held.digest.to_hex()
             ));
         }
         out.push_str("\n]\n");
@@ -136,83 +153,14 @@ impl StateImage {
     }
 }
 
-/// Walks a directory, adding every file under the path a guest will open it at.
-fn walk(
-    root: &Path,
-    at: &Path,
-    into: &mut BTreeMap<String, Vec<u8>>,
-    largest_file: u64,
-) -> Result<(), StateError> {
-    let entries = std::fs::read_dir(at).map_err(|e| {
-        StateError::Refused(format!("BOHR-1002: cannot read {}: {e}", at.display()))
-    })?;
-
-    // Sorted, since host directory order varies.
-    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
-
-    for path in paths {
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            StateError::Refused(format!("BOHR-1002: cannot read {}: {e}", path.display()))
-        })?;
-
-        if meta.is_dir() {
-            walk(root, &path, into, largest_file)?;
-            continue;
-        }
-        // Symlinks are refused.
-        if meta.is_symlink() {
-            return Err(StateError::Refused(format!(
-                "BOHR-1002: {} is a symbolic link, which this world does not present",
-                path.display()
-            )));
-        }
-        if !meta.is_file() {
-            return Err(StateError::Refused(format!(
-                "BOHR-1002: {} is not a regular file",
-                path.display()
-            )));
-        }
-        if meta.len() > largest_file {
-            return Err(StateError::Refused(format!(
-                "BOHR-1002: {} is {} bytes and the largest a guest may be shown is {largest_file}",
-                path.display(),
-                meta.len()
-            )));
-        }
-
-        let guest_path = guest_path(root, &path)?;
-        let content = std::fs::read(&path).map_err(|e| {
-            StateError::Refused(format!("BOHR-1002: cannot read {}: {e}", path.display()))
-        })?;
-        into.insert(guest_path, content);
-    }
-    Ok(())
-}
-
-/// The path a guest opens a file at: its place under the root, with forward slashes.
-fn guest_path(root: &Path, path: &Path) -> Result<String, StateError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        StateError::Refused(format!(
-            "BOHR-1002: {} is not under the state directory",
-            path.display()
-        ))
-    })?;
-    let text = relative.to_str().ok_or_else(|| {
-        StateError::Refused(format!("BOHR-1002: {} is not a UTF-8 path", relative.display()))
-    })?;
-    // Absolute with forward slashes, on every host.
-    Ok(format!("/{}", text.replace('\\', "/")))
-}
-
 /// What an image is, independently of the machine it was read on.
-fn digest_of(files: &BTreeMap<String, Vec<u8>>) -> Digest {
+fn digest_of(files: &BTreeMap<String, Held>) -> Digest {
     let mut canonical = Vec::new();
-    for (path, content) in files {
+    for (path, held) in files {
         canonical.extend_from_slice(path.as_bytes());
         canonical.push(0);
-        canonical.extend_from_slice(&(content.len() as u64).to_le_bytes());
-        canonical.extend_from_slice(Digest::of(content).as_bytes());
+        canonical.extend_from_slice(&(held.bytes.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(held.digest.as_bytes());
     }
     Digest::of(&canonical)
 }
@@ -221,67 +169,31 @@ fn digest_of(files: &BTreeMap<String, Vec<u8>>) -> Digest {
 mod tests {
     use super::*;
 
-    fn write(dir: &Path, name: &str, bytes: &[u8]) {
-        let path = dir.join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("a directory of this test's own");
-        }
-        std::fs::write(path, bytes).expect("the file can be written");
+    fn image(files: &[(&str, &[u8])]) -> StateImage {
+        StateImage::from_files(files.iter().map(|(p, c)| ((*p).to_owned(), c.to_vec())).collect())
     }
 
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("bohr-state-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a directory of this test's own");
-        dir
-    }
-
+    /// A node starts from the image's own blocks, and so does a clone of the image: the state is
+    /// held once, however many nodes and runs start from it.
     #[test]
-    fn a_directory_becomes_the_paths_a_guest_will_open() {
-        let dir = scratch("paths");
-        write(&dir, "store.db", b"records");
-        write(&dir, "conf/node.toml", b"id = 1");
-
-        let image = StateImage::from_dir(&dir, 1 << 20).expect("it reads");
-        let paths: Vec<&String> = image.files().map(|(p, _)| p).collect();
-        assert_eq!(paths, vec!["/conf/node.toml", "/store.db"]);
-        assert_eq!(image.size(), (2, 13));
+    fn a_node_shares_the_images_blocks_until_it_writes() {
+        let image = image(&[("/store.db", &vec![7u8; 300_000])]);
+        let (_, held) = image.files().next().expect("one file");
+        let disk = crate::MinimalWorld::new().from_state(&image).disk_image();
+        let inode = disk.names["/store.db"];
+        assert!(disk.content[&inode].same(held), "the node copied the state");
+        let cloned = image.clone();
+        assert!(cloned.files().next().expect("one file").1.same(held), "a clone copied the state");
     }
 
-    /// The digest depends only on content.
-    #[test]
-    fn the_same_content_has_the_same_digest_wherever_it_was_read() {
-        let here = scratch("digest-a");
-        let there = scratch("digest-b");
-        for dir in [&here, &there] {
-            write(dir, "store.db", b"records");
-            write(dir, "conf/node.toml", b"id = 1");
-        }
-
-        let a = StateImage::from_dir(&here, 1 << 20).expect("it reads");
-        let b = StateImage::from_dir(&there, 1 << 20).expect("it reads");
-        assert_eq!(a.digest(), b.digest());
-    }
-
+    /// The digest is over names and contents alone, so a changed byte is another state.
     #[test]
     fn a_changed_byte_is_a_different_state() {
-        let dir = scratch("changed");
-        write(&dir, "store.db", b"records");
-        let before = StateImage::from_dir(&dir, 1 << 20).expect("it reads").digest();
-
-        write(&dir, "store.db", b"recordS");
-        let after = StateImage::from_dir(&dir, 1 << 20).expect("it reads").digest();
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn a_file_too_large_to_present_is_refused_by_name() {
-        let dir = scratch("large");
-        write(&dir, "store.db", &[0u8; 64]);
-
-        let refused = StateImage::from_dir(&dir, 32).expect_err("it is too large");
-        let said = format!("{refused}");
-        assert!(said.contains("store.db"), "{said}");
-        assert!(said.contains("BOHR-1002"), "{said}");
+        let before = image(&[("/store.db", b"records"), ("/conf/node.toml", b"id = 1")]);
+        let again = image(&[("/conf/node.toml", b"id = 1"), ("/store.db", b"records")]);
+        let after = image(&[("/store.db", b"recordS"), ("/conf/node.toml", b"id = 1")]);
+        assert_eq!(before.digest(), again.digest());
+        assert_ne!(before.digest(), after.digest());
+        assert_eq!(before.size(), (2, 13));
     }
 }

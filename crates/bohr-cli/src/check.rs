@@ -27,12 +27,19 @@ use crate::{
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 const CORE_VARIABLE: &str = "BOHR_CORE";
 
-fn refused(text: impl std::fmt::Display) -> CliError {
-    CliError::Usage(format!("BOHR-1002: {text}"))
-}
-
 fn absolute(path: &Path) -> String {
     std::path::absolute(path).unwrap_or_else(|_| path.to_owned()).to_string_lossy().into_owned()
+}
+
+/// A program as the command line names it, from `cwd`, where the guest runs, so no host directory
+/// reaches the guest; absolute where it lies outside.
+fn from_cwd(program: &Path, cwd: &Path) -> String {
+    let program = std::path::absolute(program).unwrap_or_else(|_| program.to_owned());
+    let cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_owned());
+    match program.strip_prefix(&cwd) {
+        Ok(inside) => format!("./{}", inside.to_string_lossy()),
+        Err(_) => program.to_string_lossy().into_owned(),
+    }
 }
 
 /// What one run left behind.
@@ -60,9 +67,10 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 impl Runner {
     pub(crate) fn new(cwd: &Path, scratch: &Path, jobs: usize) -> Result<Self, CliError> {
         std::fs::create_dir_all(scratch)
-            .map_err(|e| refused(format!("cannot use {}: {e}", scratch.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot use {}: {e}", scratch.display())))?;
         Ok(Self {
-            me: std::env::current_exe().map_err(|e| refused(format!("cannot find bohr: {e}")))?,
+            me: std::env::current_exe()
+                .map_err(|e| CliError::refused(format!("cannot find bohr: {e}")))?,
             cwd: cwd.to_owned(),
             scratch: scratch.to_owned(),
             jobs: jobs.max(1),
@@ -122,11 +130,11 @@ impl Runner {
     /// The scenario with every fault taken out, written beside the runs.
     fn without_faults(&self, scenario: &Path) -> Result<PathBuf, CliError> {
         let text = std::fs::read_to_string(scenario)
-            .map_err(|e| refused(format!("cannot read {}: {e}", scenario.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot read {}: {e}", scenario.display())))?;
         let calm = crate::hunt::without_faults(&text)?;
         let file = self.scratch.join(format!("calm-{}.toml", NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&file, calm)
-            .map_err(|e| refused(format!("cannot write {}: {e}", file.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot write {}: {e}", file.display())))?;
         Ok(file)
     }
 }
@@ -154,25 +162,14 @@ fn seconds(ns: u64) -> String {
 /// The program a scenario runs: the first word of its argv.
 pub(crate) fn program_of(scenario: &Path) -> Result<String, CliError> {
     let text = std::fs::read_to_string(scenario)
-        .map_err(|e| refused(format!("cannot read {}: {e}", scenario.display())))?;
-    let table: toml::Table =
-        toml::from_str(&text).map_err(|e| refused(format!("{}: {e}", scenario.display())))?;
-    let cluster = table.get("cluster").and_then(toml::Value::as_table);
-    let first = cluster
-        .and_then(|c| c.get("argv"))
-        .and_then(toml::Value::as_array)
-        .and_then(|argv| argv.first())
-        .or_else(|| {
-            cluster
-                .and_then(|c| c.get("programs"))
-                .and_then(toml::Value::as_array)
-                .and_then(|p| p.first())
-                .and_then(toml::Value::as_array)
-                .and_then(|argv| argv.first())
-        })
-        .and_then(toml::Value::as_str);
-    first.map(str::to_owned).ok_or_else(|| {
-        refused(format!(
+        .map_err(|e| CliError::refused(format!("cannot read {}: {e}", scenario.display())))?;
+    let loaded = bohr_world::config::parse(&text)
+        .map_err(|e| CliError::refused(format!("{}: {e}", scenario.display())))?;
+    let first = loaded.cluster.as_ref().and_then(|cluster| {
+        cluster.argv.first().or_else(|| cluster.programs.first().and_then(|argv| argv.first()))
+    });
+    first.cloned().ok_or_else(|| {
+        CliError::refused(format!(
             "{} names no program: give one after `--`, or an argv in [cluster]",
             scenario.display()
         ))
@@ -966,7 +963,7 @@ pub(crate) struct Request {
 pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
     for name in &request.only {
         if !crate::subjects::CHECKS.contains(&name.as_str()) {
-            return Err(refused(format!(
+            return Err(CliError::refused(format!(
                 "--only {name}: no such check; the checks are {}",
                 crate::subjects::CHECKS.join(", ")
             )));
@@ -1014,7 +1011,7 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
         // A pack whose binary is refused is reported and skipped; the other subjects still run.
         let program = match &subject.pack {
             Some(pack) => match crate::targets::binary_for(pack, None) {
-                Ok(binary) => absolute(&binary),
+                Ok(binary) => from_cwd(&binary, &subject.cwd),
                 Err(e) => {
                     if text {
                         println!("\n  not checked: {e}\n");
@@ -1059,8 +1056,9 @@ pub(crate) fn check(request: &Request) -> Result<u8, CliError> {
                         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
                         .collect();
                     let file = scratch.join(format!("{stem}.toml"));
-                    std::fs::write(&file, text)
-                        .map_err(|e| refused(format!("cannot write {}: {e}", file.display())))?;
+                    std::fs::write(&file, text).map_err(|e| {
+                        CliError::refused(format!("cannot write {}: {e}", file.display()))
+                    })?;
                     materialised = Check { scenario: file, generated: None, ..(*c).clone() };
                     &materialised
                 }
@@ -1227,7 +1225,7 @@ fn write_results(
 ) -> Result<serde_json::Value, CliError> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| refused(format!("cannot use {}: {e}", dir.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot use {}: {e}", dir.display())))?;
     }
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map_or_else(|_| "unknown".to_owned(), |h| h.trim().to_owned());
@@ -1246,7 +1244,7 @@ fn write_results(
     let mut text = serde_json::to_string_pretty(&account).unwrap_or_else(|_| "{}".to_owned());
     text.push('\n');
     std::fs::write(file, text)
-        .map_err(|e| refused(format!("cannot write {}: {e}", file.display())))?;
+        .map_err(|e| CliError::refused(format!("cannot write {}: {e}", file.display())))?;
     Ok(account)
 }
 
@@ -1261,10 +1259,40 @@ pub(crate) struct Sweep {
     pub(crate) program: Option<String>,
 }
 
+/// A new directory under the system's temporary directory, named after `stem`, that only its
+/// owner can read or write.
+///
+/// A name in a shared temporary directory is anyone's to take first, so one already there is
+/// passed over for the next, never accepted: another user cannot plant files or links in it.
+fn private_dir(stem: &str) -> std::io::Result<PathBuf> {
+    let base = std::env::temp_dir();
+    for n in 0..1_000u32 {
+        let path = base.join(format!("{stem}-{}-{n}", std::process::id()));
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let created = std::fs::create_dir(&path);
+        match created {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "every name tried for a scratch directory was taken",
+    ))
+}
+
 /// Runs each seed of a range once and says what was found on which.
 pub(crate) fn sweep(request: &Sweep) -> Result<u8, CliError> {
-    let cwd = std::env::current_dir().map_err(|e| refused(format!("no working directory: {e}")))?;
-    let scratch = std::env::temp_dir().join(format!("bohr-sweep-{}", std::process::id()));
+    let cwd = std::env::current_dir()
+        .map_err(|e| CliError::refused(format!("no working directory: {e}")))?;
+    let scratch = private_dir("bohr-sweep")
+        .map_err(|e| CliError::refused(format!("cannot make a scratch directory: {e}")))?;
     let runner = Runner::new(&cwd, &scratch, request.jobs)?;
     let program = match &request.program {
         Some(p) => p.clone(),
@@ -1434,6 +1462,21 @@ fn print_sweep(request: &Sweep, ran: &[Ran]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch name another took is passed over: the directory made is new and empty.
+    #[test]
+    fn a_scratch_directory_is_never_one_another_made() {
+        let taken =
+            std::env::temp_dir().join(format!("bohr-scratch-test-{}-0", std::process::id()));
+        std::fs::create_dir_all(&taken).expect("taken first");
+        std::fs::write(taken.join("planted"), b"x").expect("planted");
+        let made = private_dir("bohr-scratch-test").expect("a directory");
+        let fresh = std::fs::read_dir(&made).map(|mut d| d.next().is_none()).unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&made);
+        let _ = std::fs::remove_dir_all(&taken);
+        assert_ne!(made, taken, "the directory another made was accepted");
+        assert!(fresh, "the scratch directory was not new");
+    }
 
     fn ran(seed: u64, outcome: &str, code: Option<&str>) -> Ran {
         Ran {

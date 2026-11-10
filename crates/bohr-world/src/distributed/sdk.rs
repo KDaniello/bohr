@@ -16,8 +16,15 @@ pub(crate) const VIOLATION_CODE: &str = "BOHR-2012";
 /// Everything the guests have said about themselves.
 #[derive(Debug, Default)]
 pub(crate) struct SdkRecords {
-    /// Lines as they arrived, verbatim, so fields from newer SDKs survive.
+    /// Lines as they arrived, verbatim, so fields from newer SDKs survive; none where the run
+    /// keeps no log, which nothing would read them from.
     lines: Vec<String>,
+    /// Whether lines are kept at all.
+    pub(crate) unkept: bool,
+    /// Records taken, kept or not; the next record's index.
+    taken: u32,
+    /// Each campaign-scoped promise, by name: how often it was evaluated and how often it held.
+    tallies: std::collections::BTreeMap<String, (u64, u64)>,
     /// What each node's descriptor has received but not yet terminated with a newline.
     partial: std::collections::BTreeMap<(NodeId, i64), String>,
     /// The last sequence number seen from each node, for noticing a gap.
@@ -44,6 +51,11 @@ pub(crate) struct Digested {
 }
 
 impl SdkRecords {
+    /// Each campaign-scoped promise the guests made, as `(name, evaluations, held)`, by name.
+    pub(crate) fn tallies(&self) -> Vec<(String, u64, u64)> {
+        self.tallies.iter().map(|(name, (seen, held))| (name.clone(), *seen, *held)).collect()
+    }
+
     /// The stored section, one record per line.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = String::new();
@@ -108,8 +120,11 @@ impl SdkRecords {
             *last = meta.seq;
         }
 
-        let index = self.lines.len() as u32;
-        self.lines.push(line);
+        let index = self.taken;
+        self.taken += 1;
+        if !self.unkept {
+            self.lines.push(line);
+        }
         digested.events.push(EventKind::SdkRecord { index });
 
         if let Record::Event(name, details, _) = &record
@@ -120,6 +135,11 @@ impl SdkRecords {
         }
 
         if let Record::Assert(assertion, _) = &record {
+            if !assertion.assert_type.is_per_run() {
+                let tally = self.tallies.entry(assertion.message.clone()).or_default();
+                tally.0 += 1;
+                tally.1 += u64::from(assertion.condition);
+            }
             let kind = match assertion.assert_type {
                 bohr_sdk_proto::AssertType::Always => AssertionKind::Always,
                 bohr_sdk_proto::AssertType::AlwaysOrUnreachable => {
@@ -152,5 +172,53 @@ impl SdkRecords {
                 digested.violated.get_or_insert(detail);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bohr_types::NodeId;
+
+    use super::SdkRecords;
+
+    /// A record line of one promise, as an SDK writes it.
+    fn promise(kind: &str, name: &str, held: bool, seq: u64) -> String {
+        format!(
+            "{{\"antithesis_assert\":{{\"hit\":true,\"must_hit\":true,\"assert_type\":\"{kind}\",\
+             \"display_type\":\"x\",\"message\":\"{name}\",\"condition\":{held},\"id\":\"{name}\",\
+             \"location\":{{\"file\":\"a.rs\",\"function\":\"f\",\"begin_line\":1,\
+             \"begin_column\":1}}}},\"bohr\":{{\"schema\":1,\"seq\":{seq},\"node\":0}}}}\n"
+        )
+    }
+
+    /// Records read without being kept say to the run what kept ones say, and fold the campaign's
+    /// promises the same: a campaign reads the tallies and needs no record.
+    #[test]
+    fn records_not_kept_tally_what_kept_ones_hold() {
+        let mut lines = String::new();
+        let mut seq = 0;
+        for i in 0..50 {
+            for (kind, name, held) in [
+                ("sometimes", "a leader changed", i % 7 == 0),
+                ("reachable", "a snapshot was taken", true),
+                ("always", "the log is ordered", true),
+            ] {
+                seq += 1;
+                lines.push_str(&promise(kind, name, held, seq));
+            }
+        }
+        let mut kept = SdkRecords::default();
+        let mut unkept = SdkRecords { unkept: true, ..SdkRecords::default() };
+        let said = kept.accept(NodeId(0), 9, lines.as_bytes());
+        let said_unkept = unkept.accept(NodeId(0), 9, lines.as_bytes());
+
+        assert_eq!(said.events, said_unkept.events, "the run is told the same");
+        assert!(unkept.to_bytes().is_empty(), "no record was kept");
+        assert_eq!(kept.tallies(), unkept.tallies());
+        assert_eq!(
+            unkept.tallies(),
+            [("a leader changed".to_owned(), 50, 8), ("a snapshot was taken".to_owned(), 50, 50)],
+            "an `always` is the run's outcome, not the campaign's"
+        );
     }
 }

@@ -182,6 +182,22 @@ impl DrawRecord {
     }
 }
 
+/// Which of a run's draws a journal keeps; every draw is counted either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Keep {
+    /// Every draw, as a bundle records them.
+    #[default]
+    All,
+    /// The first `at_most` draws that read bytes inside the first `prefix` bytes of the tape:
+    /// what a campaign remembers of a run, and all a run that keeps no log is asked for.
+    Prefix {
+        /// The tape's written prefix, in bytes.
+        prefix: u64,
+        /// The most records kept.
+        at_most: usize,
+    },
+}
+
 /// Append-only list of draws made during one run.
 ///
 /// Equal by records alone; which odds draws fired is not stored.
@@ -190,6 +206,9 @@ pub struct Journal {
     records: Vec<DrawRecord>,
     /// Positions of the odds draws that fired, increasing.
     fired: Vec<usize>,
+    keep: Keep,
+    /// Draws made, kept or not.
+    made: usize,
 }
 
 impl PartialEq for Journal {
@@ -207,12 +226,29 @@ impl Journal {
         Self::default()
     }
 
+    /// An empty journal that keeps only what `keep` names, and counts every draw.
+    #[must_use]
+    pub fn keeping(keep: Keep) -> Self {
+        Self { keep, ..Self::default() }
+    }
+
     /// A journal of records that were written down somewhere and read back.
     ///
     /// Takes records, which may carry site codes unknown to this build.
     #[must_use]
     pub fn from_records(records: Vec<DrawRecord>) -> Self {
-        Self { records, fired: Vec::new() }
+        let made = records.len();
+        Self { records, made, ..Self::default() }
+    }
+
+    /// Whether a draw of `len` bytes at `offset` is one this journal keeps.
+    fn keeps(&self, offset: u64, len: u32) -> bool {
+        match self.keep {
+            Keep::All => true,
+            Keep::Prefix { prefix, at_most } => {
+                len > 0 && offset < prefix && self.records.len() < at_most
+            }
+        }
     }
 
     /// Records one draw.
@@ -224,6 +260,10 @@ impl Journal {
         len: u32,
         value: u64,
     ) {
+        self.made += 1;
+        if !self.keeps(offset.get(), len) {
+            return;
+        }
         self.records.push(DrawRecord {
             offset: offset.get(),
             event: event.get(),
@@ -245,7 +285,7 @@ impl Journal {
         drawn: u64,
         fired: bool,
     ) {
-        if fired {
+        if fired && self.keeps(offset.get(), 2) {
             self.fired.push(self.records.len());
         }
         self.push(offset, event, site, 2, drawn);
@@ -259,25 +299,26 @@ impl Journal {
         self.fired.binary_search(&index).is_ok()
     }
 
-    /// The records, in the order they were drawn.
+    /// The records kept, in the order they were drawn: every draw, unless the journal was made
+    /// [`keeping`](Self::keeping) fewer.
     #[inline]
     #[must_use]
     pub fn records(&self) -> &[DrawRecord] {
         &self.records
     }
 
-    /// How many draws were made.
+    /// How many draws were made, kept or not.
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.records.len()
+    pub const fn len(&self) -> usize {
+        self.made
     }
 
     /// Whether nothing was drawn.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.made == 0
     }
 
     /// The whole journal as the bytes of the `DRAW_JOURNAL` bundle section.

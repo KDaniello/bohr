@@ -24,6 +24,69 @@ const AT_RANDOM: u64 = 25;
 /// Terminator of the auxiliary vector.
 const AT_NULL: u64 = 0;
 
+/// An entry the loader skips, which keeps the vector one length when the host omits an entry.
+const AT_IGNORE: u64 = 1;
+
+/// The executed path's string, which the kernel copies to the top of the new stack.
+const AT_EXECFN: u64 = 31;
+
+/// The length every executed path is padded to with leading slashes.
+///
+/// The kernel copies the path onto the new stack, so its length moves every address below it.
+/// Repeated slashes name the same file; a longer path is refused before the guest starts.
+pub(super) const EXECUTED_PATH_BYTES: usize = 512;
+
+/// Keys of the auxiliary vector the canonical one fixes or passes on, as `<elf.h>` numbers them.
+mod at {
+    pub(super) const PHDR: u64 = 3;
+    pub(super) const PHENT: u64 = 4;
+    pub(super) const PHNUM: u64 = 5;
+    pub(super) const PAGESZ: u64 = 6;
+    pub(super) const BASE: u64 = 7;
+    pub(super) const FLAGS: u64 = 8;
+    pub(super) const ENTRY: u64 = 9;
+    pub(super) const UID: u64 = 11;
+    pub(super) const EUID: u64 = 12;
+    pub(super) const GID: u64 = 13;
+    pub(super) const EGID: u64 = 14;
+    pub(super) const PLATFORM: u64 = 15;
+    pub(super) const HWCAP: u64 = 16;
+    pub(super) const CLKTCK: u64 = 17;
+    pub(super) const SECURE: u64 = 23;
+    pub(super) const HWCAP2: u64 = 26;
+    pub(super) const MINSIGSTKSZ: u64 = 51;
+}
+
+/// The auxiliary vector every guest starts with: each key in this order, its value either fixed
+/// here or, where `None`, the host's, which describes the program and its stack rather than the
+/// machine.
+///
+/// The host's own vector differs in length and values by CPU and kernel, and its length moves the
+/// stack. `AT_HWCAP` is the x86-64-v2 baseline; `AT_MINSIGSTKSZ` is larger than any CPU's, so a
+/// signal stack sized by it fits everywhere; the ids are the world's fixed identity.
+const CANONICAL_AUXV: [(u64, Option<u64>); 20] = [
+    (AT_SYSINFO_EHDR, Some(0)),
+    (at::MINSIGSTKSZ, Some(8192)),
+    (at::HWCAP, Some(0x178b_fbff)),
+    (at::PAGESZ, Some(4096)),
+    (at::CLKTCK, Some(100)),
+    (at::PHDR, None),
+    (at::PHENT, None),
+    (at::PHNUM, None),
+    (at::BASE, None),
+    (at::FLAGS, Some(0)),
+    (at::ENTRY, None),
+    (at::UID, Some(0)),
+    (at::EUID, Some(0)),
+    (at::GID, Some(0)),
+    (at::EGID, Some(0)),
+    (at::SECURE, Some(0)),
+    (AT_RANDOM, None),
+    (at::HWCAP2, Some(0)),
+    (AT_EXECFN, None),
+    (at::PLATFORM, None),
+];
+
 /// The variable a campaign names a worker's core in; without it, core nought.
 pub const CORE_VARIABLE: &str = "BOHR_CORE";
 
@@ -135,6 +198,8 @@ mod failed {
     pub(super) const NAMESPACES: i32 = 108;
     pub(super) const HANDOVER: i32 = 109;
     pub(super) const COVERAGE: i32 = 110;
+    pub(super) const LIMITS: i32 = 111;
+    pub(super) const SIGNALS: i32 = 112;
 }
 
 /// What a child exit code means, where it means anything.
@@ -150,6 +215,10 @@ pub(super) fn setup_failure(code: i32) -> Option<&'static str> {
         failed::NAMESPACES => "the guest could not be placed in its own namespaces",
         failed::HANDOVER => "the guest could not be handed over to the supervisor",
         failed::COVERAGE => "the coverage counters could not be placed in the guest",
+        failed::LIMITS => {
+            "the host's hard limits are below the guest's: an 8 MiB stack and unlimited memory"
+        }
+        failed::SIGNALS => "the guest's signal dispositions could not be reset",
         _ => return None,
     })
 }
@@ -185,10 +254,17 @@ pub(super) fn spawn_traced(
         let named = format!("{}={}", coverage::COVERAGE_FD_VAR, coverage::COVERAGE_FD);
         envp.push(CString::new(named).unwrap_or_default());
     }
-    let path = CString::new(program.as_bytes()).map_err(|_| BackendError::CannotStart {
+    let path = CString::new(executed_path(program)?).map_err(|_| BackendError::CannotStart {
         program: program.clone(),
         reason: "program path contains a NUL".to_owned(),
     })?;
+
+    // Built before the fork: the child of a multithreaded process may not allocate, since another
+    // thread could have held the allocator's lock at the fork.
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
 
     let filter = syscalls::filter_program(allocations).map_err(|e| BackendError::CannotStart {
         program: program.clone(),
@@ -227,6 +303,16 @@ pub(super) fn spawn_traced(
         }
         return Err(BackendError::CannotStart { program: program.clone(), reason });
     }
+    // Above the coverage counters' number, so the child's `dup2` onto it cannot close a pipe end.
+    for end in report.iter_mut().chain(go.iter_mut()) {
+        // SAFETY: a descriptor this call opened; the copy replaces it.
+        let lifted = unsafe { libc::fcntl(*end, libc::F_DUPFD_CLOEXEC, coverage::COVERAGE_FD + 1) };
+        if lifted >= 0 {
+            // SAFETY: the original, which nothing else holds.
+            unsafe { libc::close(*end) };
+            *end = lifted;
+        }
+    }
 
     // The guest's parent exits before the attach. As a subreaper this process adopts the guest,
     // which `ptrace_scope = 1` (Ubuntu's default) requires for attaching.
@@ -252,7 +338,9 @@ pub(super) fn spawn_traced(
         // SAFETY: the child of a fork, single-threaded by definition, calling only
         // async-signal-safe functions.
         unsafe {
-            intermediate_setup(&path, &argv, &envp, &filter, isolate, report[1], go[0], coverage)
+            intermediate_setup(
+                &path, &argv_ptrs, &envp_ptrs, &filter, isolate, report, go, coverage,
+            )
         }
     }
 
@@ -285,21 +373,65 @@ pub(super) fn spawn_traced(
     let options = trace_options();
     // SAFETY: `guest` is our descendant, so attaching is permitted.
     let seized = unsafe { libc::ptrace(libc::PTRACE_SEIZE, guest, 0, options) };
+    if seized < 0 {
+        let reason = format!("attaching to the guest: {}", last_error());
+        // An untraced guest must never run: told to stop, then killed and reaped.
+        // SAFETY: our own descriptor; `guest` is our adopted descendant.
+        unsafe {
+            libc::write(go[1], b"a".as_ptr().cast(), 1);
+            libc::close(go[1]);
+            libc::kill(guest, libc::SIGKILL);
+            libc::waitpid(guest, &mut status, libc::__WALL);
+        }
+        return Err(BackendError::CannotStart { program: program.clone(), reason });
+    }
     // Release the guest to install its filter only after the attach: with no tracer, a tracing
     // filter turns every syscall into ENOSYS.
     // SAFETY: our own descriptor, written once and then closed.
     unsafe {
-        libc::write(go[1], b"g".as_ptr().cast(), 1);
+        libc::write(go[1], GO.as_ptr().cast(), 1);
         libc::close(go[1]);
-    }
-    if seized < 0 {
-        return Err(BackendError::CannotStart {
-            program: program.clone(),
-            reason: format!("attaching to the guest: {}", last_error()),
-        });
     }
     Ok(guest)
 }
+
+/// The path the guest is executed by: absolute, from this process's directory, which the guest
+/// inherits, and padded with leading slashes to [`EXECUTED_PATH_BYTES`].
+fn executed_path(program: &str) -> Result<Vec<u8>, BackendError> {
+    let absolute = std::path::absolute(program).map_err(|e| BackendError::CannotStart {
+        program: program.to_owned(),
+        reason: format!("cannot make the program's path absolute: {e}"),
+    })?;
+    let bytes = absolute.as_os_str().as_bytes();
+    if bytes.len() > EXECUTED_PATH_BYTES {
+        return Err(BackendError::CannotStart {
+            program: program.to_owned(),
+            reason: format!(
+                "the program's path is {} bytes, longer than the {EXECUTED_PATH_BYTES} every \
+                 guest is executed by; move it to a shorter one",
+                bytes.len()
+            ),
+        });
+    }
+    let mut padded = vec![b'/'; EXECUTED_PATH_BYTES - bytes.len()];
+    padded.extend_from_slice(bytes);
+    Ok(padded)
+}
+
+/// What a guest's `AT_EXECFN` reads: the name it was started by, padded with leading slashes to
+/// the executed path's length, or the name's last bytes where it is longer.
+pub(super) fn execfn_label(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    if bytes.len() >= EXECUTED_PATH_BYTES {
+        return bytes[bytes.len() - EXECUTED_PATH_BYTES..].to_vec();
+    }
+    let mut label = vec![b'/'; EXECUTED_PATH_BYTES - bytes.len()];
+    label.extend_from_slice(bytes);
+    label
+}
+
+/// The byte that releases a traced guest; anything else, or the end of the pipe, stops it.
+const GO: &[u8; 1] = b"g";
 
 /// Trace options every task carries, set when the guest is attached before it runs.
 pub(super) const fn trace_options() -> libc::c_int {
@@ -330,17 +462,21 @@ fn describe_setup_failure(status: libc::c_int) -> String {
 /// Must only be called in the child of a `fork`. It never returns.
 unsafe fn intermediate_setup(
     path: &CString,
-    argv: &[CString],
-    envp: &[CString],
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
     filter: &[seccompiler::sock_filter],
     isolate: bool,
-    report: libc::c_int,
-    go: libc::c_int,
+    [report_read, report]: [libc::c_int; 2],
+    [go, go_write]: [libc::c_int; 2],
     coverage: Option<libc::c_int>,
 ) -> ! {
     // SAFETY: every call below is made under this function's own contract (`# Safety` above),
     // which its caller upholds.
     unsafe {
+        // The supervisor's ends. Holding `go`'s write end would keep the guest waiting on itself if
+        // the supervisor died.
+        libc::close(report_read);
+        libc::close(go_write);
         // Support was checked before the fork, so a failure here stops the launch.
         if isolate && !enter_namespaces() {
             libc::_exit(failed::NAMESPACES);
@@ -373,8 +509,8 @@ unsafe fn intermediate_setup(
 /// address space is still shared with nothing.
 unsafe fn child_setup(
     path: &CString,
-    argv: &[CString],
-    envp: &[CString],
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
     filter: &[seccompiler::sock_filter],
     go: libc::c_int,
     coverage: Option<libc::c_int>,
@@ -385,10 +521,17 @@ unsafe fn child_setup(
         // Moves the counters to the descriptor the environment names. `dup2` clears close-on-exec
         // on the copy, so it survives `execve`; the original keeps it, so other spawns do not
         // inherit it.
-        if let Some(fd) = coverage
-            && libc::dup2(fd, coverage::COVERAGE_FD) < 0
-        {
-            libc::_exit(failed::COVERAGE);
+        if let Some(fd) = coverage {
+            // `dup2` onto itself changes nothing, so a map already at the number has its flag
+            // cleared by name.
+            let placed = if fd == coverage::COVERAGE_FD {
+                libc::fcntl(fd, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(fd, coverage::COVERAGE_FD)
+            };
+            if placed < 0 {
+                libc::_exit(failed::COVERAGE);
+            }
         }
         // Address randomisation would place every mapping differently on every run.
         if libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong) == -1 {
@@ -412,6 +555,41 @@ unsafe fn child_setup(
         let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         libc::setrlimit(libc::RLIMIT_CORE, &none);
 
+        // The limits the world answers, not the host's: the stack's also chooses the mapping
+        // layout. Only the soft limits move, so a host whose hard limit is lower is refused.
+        let mut held: libc::rlimit = std::mem::zeroed();
+        for (resource, soft) in [
+            (libc::RLIMIT_STACK, bohr_backend::GUEST_STACK_BYTES),
+            (libc::RLIMIT_AS, libc::RLIM_INFINITY),
+            (libc::RLIMIT_DATA, libc::RLIM_INFINITY),
+        ] {
+            if libc::getrlimit(resource, &mut held) == -1 {
+                libc::_exit(failed::LIMITS);
+            }
+            let wanted = libc::rlimit { rlim_cur: soft, rlim_max: held.rlim_max };
+            if held.rlim_max != libc::RLIM_INFINITY && held.rlim_max < soft
+                || libc::setrlimit(resource, &wanted) == -1
+            {
+                libc::_exit(failed::LIMITS);
+            }
+        }
+
+        // Every disposition at its default and nothing blocked, as a fresh process has them: the
+        // supervisor ignores `SIGPIPE`, and an ignored signal survives `execve`.
+        let mut default: libc::sigaction = std::mem::zeroed();
+        default.sa_sigaction = libc::SIG_DFL;
+        for signal in 1..=64 {
+            if signal != libc::SIGKILL && signal != libc::SIGSTOP {
+                // Numbers the kernel reserves for itself are refused, and nothing is lost by that.
+                libc::sigaction(signal, &default, std::ptr::null_mut());
+            }
+        }
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        if libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) == -1 {
+            libc::_exit(failed::SIGNALS);
+        }
+
         // Installing a filter requires no-new-privileges, which persists across the exec.
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
             libc::_exit(failed::NO_NEW_PRIVS);
@@ -425,7 +603,7 @@ unsafe fn child_setup(
         // Wait for the tracer. With none attached, `SECCOMP_RET_TRACE` fails the syscall with
         // ENOSYS, which shows up later as a segfault in the loader.
         let mut ready = [0u8; 1];
-        if libc::read(go, ready.as_mut_ptr().cast(), 1) != 1 {
+        if libc::read(go, ready.as_mut_ptr().cast(), 1) != 1 || ready != *GO {
             libc::_exit(failed::HANDOVER);
         }
         libc::close(go);
@@ -445,12 +623,7 @@ unsafe fn child_setup(
             libc::_exit(failed::SECCOMP);
         }
 
-        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
-        argv_ptrs.push(std::ptr::null());
-        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
-        envp_ptrs.push(std::ptr::null());
-
-        libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
         libc::_exit(failed::EXECVE)
     }
 }
@@ -525,59 +698,94 @@ unsafe fn write_proc(path: &std::ffi::CStr, line: &[u8]) -> bool {
     }
 }
 
-/// Rewrites the auxiliary vector on the guest's stack.
+/// Lays the guest's initial stack out again with the canonical auxiliary vector, and names the
+/// new stack pointer.
 ///
-/// Called at the stop after `execve`, when the stack pointer points at `argc`. Walks past the
-/// arguments and environment to the vector and neutralises the two entries that carry host state.
-pub(super) fn neutralise_auxv(pid: libc::pid_t, rsp: u64) -> Result<AuxvReport, BackendError> {
-    let mut addr = rsp;
-    let argc = read_word(pid, addr)?;
-    // Checked arithmetic: `argc` comes from guest memory. The kernel bounds it by `ARG_MAX`, but a
-    // release build would wrap silently, and the walk runs again at every `execve`.
+/// Called at the stop after `execve`, when the stack pointer points at `argc`. The pointer arrays
+/// and the vector are rewritten below the random bytes, the lowest thing the kernel placed above
+/// them, so the new pointer depends on the strings alone and not on how many entries the host
+/// kernel wrote. `execfn`, where given, replaces the executed path's string, which the spawn
+/// padded to one length.
+pub(super) fn canonical_stack(
+    pid: libc::pid_t,
+    rsp: u64,
+    execfn: Option<&[u8]>,
+) -> Result<(u64, AuxvReport), BackendError> {
     let bad = || BackendError::BadAddress { addr: GuestAddr(rsp), len: 8 };
-    addr = argc
-        .checked_add(1)
-        .and_then(|slots| slots.checked_mul(8))
-        .and_then(|argv| addr.checked_add(8)?.checked_add(argv))
-        .ok_or_else(bad)?; // argv, including its NULL
-
-    // envp, including its NULL.
+    let argc = read_word(pid, rsp)?;
+    // Bounded: `argc` comes from guest memory, and the walk runs again at every `execve`.
+    if argc > 1 << 20 {
+        return Err(bad());
+    }
+    let mut addr = rsp + 8;
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        argv.push(read_word(pid, addr)?);
+        addr += 8;
+    }
+    addr += 8; // argv's NULL
+    let mut envp = Vec::new();
     loop {
         let word = read_word(pid, addr)?;
         addr = addr.checked_add(8).ok_or_else(bad)?;
         if word == 0 {
             break;
         }
+        envp.push(word);
+        if envp.len() > 1 << 20 {
+            return Err(bad());
+        }
     }
-
-    let mut report = AuxvReport::default();
+    let mut host = std::collections::BTreeMap::new();
     loop {
         let key = read_word(pid, addr)?;
         if key == AT_NULL {
             break;
         }
-        let value_at = addr + 8;
-        match key {
-            AT_SYSINFO_EHDR => {
-                write_word(pid, value_at, 0)?;
-                report.vdso_disabled = true;
-            }
-            AT_RANDOM => {
-                let buf = read_word(pid, value_at)?;
-                write_bytes(pid, buf, &[0u8; 16])?;
-                report.at_random_zeroed = true;
-            }
-            _ => {}
+        host.insert(key, read_word(pid, addr + 8)?);
+        addr = addr.checked_add(16).ok_or_else(bad)?;
+        if host.len() > 256 {
+            return Err(bad());
         }
-        addr += 16;
     }
-    Ok(report)
+
+    let mut report = AuxvReport {
+        vdso_disabled: host.get(&AT_SYSINFO_EHDR).is_some_and(|v| *v != 0),
+        at_random_zeroed: false,
+    };
+    let random = host.get(&AT_RANDOM).copied().ok_or_else(bad)?;
+    write_bytes(pid, random, &[0u8; 16])?;
+    report.at_random_zeroed = true;
+    if let (Some(label), Some(at)) = (execfn, host.get(&AT_EXECFN)) {
+        write_bytes(pid, *at, label)?;
+    }
+
+    let mut words =
+        Vec::with_capacity(argv.len() + envp.len() + 4 + 2 * (CANONICAL_AUXV.len() + 1));
+    words.push(argc);
+    words.extend(&argv);
+    words.push(0);
+    words.extend(&envp);
+    words.push(0);
+    for (key, fixed) in CANONICAL_AUXV {
+        match fixed.or_else(|| host.get(&key).copied()) {
+            Some(value) => words.extend([key, value]),
+            None => words.extend([AT_IGNORE, 0]),
+        }
+    }
+    words.extend([AT_NULL, 0]);
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    // The x86-64 ABI enters a program with the stack pointer on a 16-byte boundary.
+    let top = random & !15;
+    let new_rsp = top.checked_sub(bytes.len() as u64).ok_or_else(bad)? & !15;
+    write_bytes(pid, new_rsp, &bytes)?;
+    Ok((new_rsp, report))
 }
 
 /// What the auxiliary vector rewrite did.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct AuxvReport {
-    /// Whether a VDSO entry was present and cleared.
+    /// Whether the host's vector named a VDSO, which the canonical one does not.
     pub vdso_disabled: bool,
     /// Whether the random bytes were present and zeroed.
     pub at_random_zeroed: bool,
@@ -587,10 +795,6 @@ fn read_word(pid: libc::pid_t, addr: u64) -> Result<u64, BackendError> {
     let mut buf = [0u8; 8];
     super::mem::read(pid, addr, &mut buf)?;
     Ok(u64::from_le_bytes(buf))
-}
-
-fn write_word(pid: libc::pid_t, addr: u64, value: u64) -> Result<(), BackendError> {
-    write_bytes(pid, addr, &value.to_le_bytes())
 }
 
 fn write_bytes(pid: libc::pid_t, addr: u64, data: &[u8]) -> Result<(), BackendError> {

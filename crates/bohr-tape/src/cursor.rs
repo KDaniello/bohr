@@ -7,7 +7,7 @@ use bohr_types::{EventId, TapeOffset};
 
 use crate::{
     MAX_PROBABILITY_DENOMINATOR, TapeError, draw_width_bytes,
-    journal::{DrawSite, Journal},
+    journal::{DrawSite, Journal, Keep},
     tape::{Tape, TapeReader},
 };
 
@@ -25,6 +25,13 @@ pub struct TapeCursor<'a> {
 impl<'a> TapeCursor<'a> {
     pub(crate) fn new(tape: &'a Tape) -> Self {
         Self { reader: tape.reader(), pos: 0, event: EventId::ZERO, journal: Journal::new() }
+    }
+
+    /// The same cursor, its journal keeping only what `keep` names.
+    #[must_use]
+    pub fn keeping(mut self, keep: Keep) -> Self {
+        self.journal = Journal::keeping(keep);
+        self
     }
 
     /// Current offset.

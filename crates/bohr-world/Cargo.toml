@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 bohr-backend.workspace = true
+bohr-x86.workspace = true
 bohr-kernel.workspace = true
 bohr-sdk-proto.workspace = true
 bohr-tape.workspace = true

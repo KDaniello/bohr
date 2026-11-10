@@ -10,9 +10,8 @@
 //! A generation ends with its slowest item, so it is several times larger than the worker count;
 //! see `docs/ARCHITECTURE.md` §6.2.
 
-use bohr_backend::CoverageMap;
 use bohr_tape::Journal;
-use bohr_types::{Digest, Seed};
+use bohr_types::{CoverageMap, Digest, Seed};
 
 use crate::{
     choices::Choices,
@@ -56,10 +55,11 @@ pub struct RunResult {
     ///
     /// Summed and reported, so a campaign that injected nothing is visible.
     pub adversity: u32,
-    /// Campaign-scoped properties the guest evaluated, and whether each held this time.
+    /// Campaign-scoped properties the guest evaluated, as `(name, evaluations, held)`: how often
+    /// each was evaluated in this run and how often it held.
     ///
     /// Only campaign-scoped kinds such as `sometimes`; an `always` is already in `outcome`.
-    pub observed: Vec<(String, bool)>,
+    pub observed: Vec<(String, u64, u64)>,
 }
 
 /// A finding, once, however many runs reached it.
@@ -276,8 +276,8 @@ impl Campaign {
             self.adversity += u64::from(result.adversity);
             self.guest_edges = self.guest_edges.max(result.guest_edges);
 
-            for (name, held) in &result.observed {
-                self.properties.observe(name, *held, result.digest);
+            for (name, evaluations, held) in &result.observed {
+                self.properties.observe_tally(name, *evaluations, *held, result.digest);
             }
 
             if let Some(kind) = &result.outcome {
@@ -288,7 +288,12 @@ impl Campaign {
                     prefix: item.prefix.clone(),
                     generation: self.generation,
                 };
-                if self.findings.insert(result.digest, finding).is_none() {
+                // The first run to reach a finding is kept: a later one of the same digest is the
+                // same run, met again.
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.findings.entry(result.digest)
+                {
+                    slot.insert(finding);
                     progress.fresh_findings += 1;
                 }
             }
@@ -342,7 +347,7 @@ mod tests {
     fn covering(edges: &[usize]) -> CoverageMap {
         let mut map = CoverageMap::new();
         for at in edges {
-            map.as_bytes_mut()[*at % bohr_backend::DEFAULT_COVERAGE_MAP_BYTES] = 1;
+            map.as_bytes_mut()[*at % bohr_types::DEFAULT_COVERAGE_MAP_BYTES] = 1;
         }
         map
     }
@@ -492,8 +497,8 @@ mod tests {
             .iter()
             .map(|item| RunResult {
                 observed: vec![
-                    ("a leader was elected".to_owned(), item.index == 0),
-                    ("a leader changed under a partition".to_owned(), false),
+                    ("a leader was elected".to_owned(), 1, u64::from(item.index == 0)),
+                    ("a leader changed under a partition".to_owned(), 1, 0),
                 ],
                 ..answer(item)
             })
@@ -504,6 +509,24 @@ mod tests {
         assert_eq!(properties.unsatisfied(), vec!["a leader changed under a partition"]);
         assert_eq!(properties.tallies()["a leader was elected"].evaluations, 2);
         assert_eq!(properties.tallies()["a leader was elected"].satisfied, 1);
+    }
+
+    /// A finding reached again in a later generation keeps the generation it was first reached in.
+    #[test]
+    fn a_finding_keeps_the_generation_it_was_first_reached_in() {
+        let mut campaign = Campaign::new(Seed(9));
+        let crash = |item: &WorkItem| RunResult {
+            digest: Digest::of(b"the same run"),
+            outcome: Some("crashed".to_owned()),
+            ..answer(item)
+        };
+        for _ in 0..3 {
+            let planned = campaign.plan(2);
+            let results = planned.iter().map(crash).collect();
+            campaign.fold(&planned, results);
+        }
+        let found = &campaign.findings()[&Digest::of(b"the same run")];
+        assert_eq!(found.generation, 0, "the generation moved to a later meeting");
     }
 
     /// A result answered twice by a reissued item is folded once.

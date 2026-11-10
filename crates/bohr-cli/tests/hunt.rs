@@ -20,9 +20,14 @@ fn bohr(args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), report)
 }
 
-/// A repository holding one pack, `targets/demo`, whose binary is a built guest.
+/// A repository holding one pack, `targets/demo`, whose binary is the built guest `program`.
 fn repository(tag: &str, pinned: Option<&str>) -> Option<PathBuf> {
-    let guest = root().join("testdata/guests/build/file_write_sync");
+    repository_of(tag, pinned, "file_write_sync")
+}
+
+/// [`repository`], with another guest as the pack's binary.
+fn repository_of(tag: &str, pinned: Option<&str>, program: &str) -> Option<PathBuf> {
+    let guest = root().join("testdata/guests/build").join(program);
     if !guest.is_file() {
         return None;
     }
@@ -73,6 +78,33 @@ fn a_pack_is_hunted_in_one_command() {
     assert!(matches!(code, 0 | 1), "{report}");
     assert!(dir.join("searched/summary.json").is_file(), "{report}");
     assert!(dir.join("searched/campaign/campaign.bin").is_file(), "it can be resumed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hunt started outside the pack's repository judges its findings where the campaign ran: a
+/// scenario naming its program by a relative path is still ablated.
+///
+/// The pack's program fails on its own, so every campaign has a finding to judge.
+#[test]
+fn a_hunt_from_elsewhere_ablates_its_findings() {
+    let Some(dir) = repository_of("elsewhere", None, "fails_loudly") else { return };
+    std::fs::write(
+        dir.join("demo.toml"),
+        "[cluster]\nnodes = 1\nargv = [\"bin/demo\"]\n[faults]\nkill_probability = \"1/4\"\n",
+    )
+    .unwrap();
+    let pack = dir.join("targets/demo").to_string_lossy().into_owned();
+    let out = dir.join("out").to_string_lossy().into_owned();
+    // The test's own directory, not the repository's. Standard output, which comes first, is the
+    // one object; the campaign's account follows it.
+    let (_, report) = bohr(&["hunt", &pack, "--runs", "32", "--json", "-o", &out]);
+    let body: serde_json::Value = serde_json::from_str(report.lines().next().unwrap_or("{}"))
+        .unwrap_or_else(|_| panic!("not one JSON object: {report}"));
+    let groups = body["groups"].as_array().cloned().unwrap_or_default();
+    assert!(!groups.is_empty(), "the kills found nothing to judge: {report}");
+    for group in groups {
+        assert_ne!(group["triage"], "not ablated", "a finding was not ablated: {group}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

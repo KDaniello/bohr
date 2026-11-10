@@ -11,111 +11,40 @@
 
 use std::path::{Path, PathBuf};
 
-use bohr_reducer::Violation;
-use bohr_trace::{Bundle, EventKind, Outcome, SectionId};
+use bohr_trace::{Bundle, Outcome};
 
 use crate::CliError;
 
 /// One bundle, as grouping sees it.
 struct Read {
     path: PathBuf,
+    /// Whether the run it holds went clean, which no finding does.
+    clean: bool,
     events: u64,
     signature: String,
     /// What the run found, in words, with its code.
     verdict: bohr_report::narrate::Verdict,
-}
-
-/// The signature a bundle's violation is grouped by.
-///
-/// A hang is named by its words with digits removed, since the manifest lacks the stop reason:
-/// "event budget reached at 1000000" and "at 1000001" are the same hang.
-pub(crate) fn signature_of(outcome: &Outcome, events: &[bohr_trace::Event]) -> String {
-    if let Outcome::GuestHung(said) = outcome {
-        let words: String = said.chars().filter(|c| !c.is_ascii_digit()).collect();
-        return format!("GuestHung {}", words.split_whitespace().collect::<Vec<_>>().join(" "));
-    }
-    Violation::of(outcome, bohr_kernel::StopReason::GuestFinished, events).map_or_else(
-        || {
-            let verdict = bohr_report::narrate::verdict(outcome);
-            format!("{}: {}", verdict.code, verdict.headline)
-        },
-        |v| v.describe(),
-    )
-}
-
-/// The programs a run executed, by file name, in the order the run started them.
-pub(crate) fn programs_of(records: &[bohr_trace::BinaryRecord]) -> String {
-    let mut names: Vec<String> = Vec::new();
-    for record in records.iter().filter(|r| r.role != "library" && r.role != "loader") {
-        let name = record.path.rsplit('/').next().unwrap_or(&record.path).to_owned();
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    if names.is_empty() { "?".to_owned() } else { names.join("+") }
-}
-
-/// Whether an event is one a run's group is read from: how tasks exited, what was asserted and
-/// diagnosed, and what the world did to the nodes. The rest is the bulk of a log.
-pub(crate) const fn telling(event: &bohr_trace::Event) -> bool {
-    matches!(
-        event.kind,
-        EventKind::TaskExited { .. }
-            | EventKind::Assertion { .. }
-            | EventKind::Diagnostic { .. }
-            | EventKind::FaultFired { .. }
-            | EventKind::NodeState { .. }
-    )
-}
-
-/// The group of a run: the programs it ran, its violation's signature, and where it fell.
-///
-/// The place splits one crash class into its defects: two panics at two frames are two groups. A
-/// run that kept no output is grouped by the first two alone.
-pub(crate) fn group_of(
-    programs: &str,
-    outcome: &Outcome,
-    events: &[bohr_trace::Event],
-    tails: &[bohr_trace::OutputTail],
-) -> String {
-    let base = format!("{programs}: {}", signature_of(outcome, events));
-    let failing = bohr_report::narrate::failing_nodes(events);
-    match bohr_report::locate::locate(tails, &failing) {
-        Some(place) => format!("{base} @ {}", place.signature()),
-        None => base,
-    }
-}
-
-/// What a bundle is grouped by; see [`group_of`].
-pub(crate) fn signature(
-    bundle: &Bundle,
-    outcome: &Outcome,
-    events: &[bohr_trace::Event],
-) -> String {
-    let records: Vec<bohr_trace::BinaryRecord> = bundle
-        .section(SectionId::Binaries)
-        .and_then(|raw| serde_json::from_slice(raw).ok())
-        .unwrap_or_default();
-    let tails: Vec<bohr_trace::OutputTail> = bundle
-        .section(SectionId::GuestOutput)
-        .and_then(|raw| serde_json::from_slice(raw).ok())
-        .unwrap_or_default();
-    group_of(&programs_of(&records), outcome, events, &tails)
+    /// What the bundle alone says the finding is, before any ablation.
+    triaged: bohr_findings::triage::Verdict,
 }
 
 fn read(path: &Path) -> Result<Read, CliError> {
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {}: {e}", path.display())))?;
-    let bundle = Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
-    let manifest = bundle.manifest().map_err(|e| CliError::Usage(e.to_string()))?;
-    let (events, _) = bundle
-        .section(SectionId::Events)
-        .map_or_else(|| (Vec::new(), None), bohr_trace::read_events_lossy);
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {}: {e}", path.display())))?;
+    let bundle = Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))?;
+    let manifest = bundle.manifest().map_err(|e| CliError::usage(e.to_string()))?;
+    // Only the events a group and a verdict are read from are kept, as a campaign keeps them when
+    // it names the group: the rest is the bulk of the log.
+    let events = bohr_findings::group::telling_events(&bundle)
+        .map_err(|e| CliError::usage(e.to_string()))?;
     Ok(Read {
         path: path.to_owned(),
+        clean: matches!(manifest.outcome, Outcome::Clean),
         events: manifest.counters.events,
-        signature: signature(&bundle, &manifest.outcome, &events),
+        signature: bohr_findings::group::signature(&bundle, &manifest.outcome, &events)
+            .map_err(|e| CliError::usage(e.to_string()))?,
         verdict: bohr_report::narrate::verdict(&manifest.outcome),
+        triaged: bohr_findings::triage::triage(&bundle, &events, None, &nonproduction_of(&bundle)),
     })
 }
 
@@ -125,20 +54,30 @@ type Groups = Vec<(String, Vec<Read>)>;
 /// How many bundles `dir` holds, and their groups, largest first.
 fn grouped(dir: &str) -> Result<(usize, Groups), CliError> {
     let listed = std::fs::read_dir(dir)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {dir}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {dir}: {e}")))?;
     let mut paths: Vec<PathBuf> = listed
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "bohr"))
+        // A re-run that did not reproduce its finding is the tool's failure, kept for whoever
+        // looks into it and never counted.
+        .filter(|path| {
+            !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(UNREPRODUCED))
+        })
         .collect();
     paths.sort();
 
     let mut groups: std::collections::BTreeMap<String, Vec<Read>> =
         std::collections::BTreeMap::new();
-    // An unreadable bundle is named and skipped.
+    let mut counted = 0;
+    // An unreadable bundle is named and skipped; a clean one is no finding and is named apart.
     for path in &paths {
         match read(path) {
-            Ok(one) => groups.entry(one.signature.clone()).or_default().push(one),
+            Ok(one) if one.clean => eprintln!("clean, not a finding: {}", path.display()),
+            Ok(one) => {
+                counted += 1;
+                groups.entry(one.signature.clone()).or_default().push(one);
+            }
             Err(e) => eprintln!("unreadable, left out: {}: {e}", path.display()),
         }
     }
@@ -148,13 +87,16 @@ fn grouped(dir: &str) -> Result<(usize, Groups), CliError> {
     }
     // Largest group first, then by signature, so the same directory prints the same way.
     ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    Ok((paths.len(), ordered))
+    Ok((counted, ordered))
 }
+
+/// The name a finding's re-run is kept under when it did not reproduce the finding.
+pub(crate) const UNREPRODUCED: &str = "unreproduced-";
 
 /// The groups as the body of a `bohr.findings` object, for any command that reports a directory.
 pub(crate) fn groups_json(dir: &str, ablate: bool) -> Result<serde_json::Value, CliError> {
     let (count, ordered) = grouped(dir)?;
-    let judged: Vec<Judged> = ordered.iter().map(|(_, m)| judge(&m[0].path, ablate)).collect();
+    let judged: Vec<Judged> = ordered.iter().map(|(_, m)| judge(&m[0], ablate)).collect();
     Ok(as_json(count, &ordered, &judged, &first_seen(dir)))
 }
 
@@ -177,40 +119,42 @@ fn first_seen(dir: &str) -> std::collections::BTreeMap<String, (u64, u64)> {
 
 /// What a group's smallest bundle was judged to be, and the faults it needed where it was ablated.
 struct Judged {
-    verdict: crate::triage::Verdict,
+    verdict: bohr_findings::triage::Verdict,
     necessary: Vec<bohr_trace::FaultKind>,
     grade: Option<bohr_trace::FaultGrade>,
 }
 
-/// Triages one bundle, ablating it first where asked. An ablation that cannot run leaves the
-/// bundle unjudged, never unreported.
-fn judge(path: &Path, ablate: bool) -> Judged {
-    let unjudged =
-        || Judged { verdict: crate::triage::Verdict::Unjudged, necessary: Vec::new(), grade: None };
-    let Ok(bytes) = std::fs::read(path) else { return unjudged() };
-    let Ok(bundle) = Bundle::parse(&bytes) else { return unjudged() };
-    let ablation = if ablate {
-        match crate::ablate::ablation_of(&bundle, None) {
-            Ok(ablation) => Some(ablation),
-            Err(e) => {
-                eprintln!("not ablated: {}: {e}", path.display());
-                None
-            }
+/// Triages a group's smallest bundle, ablating it first where asked. An ablation that cannot run
+/// leaves the bundle judged as far as it alone allows, never unreported.
+///
+/// Without ablation the verdict is the one reading the bundle gave; with it the bundle is read
+/// again, which costs nothing beside the trials an ablation runs.
+fn judge(head: &Read, ablate: bool) -> Judged {
+    let alone = || Judged { verdict: head.triaged.clone(), necessary: Vec::new(), grade: None };
+    if !ablate {
+        return alone();
+    }
+    let Ok(bytes) = std::fs::read(&head.path) else { return alone() };
+    let Ok(bundle) = Bundle::parse(&bytes) else { return alone() };
+    let Ok(events) = bohr_findings::group::telling_events(&bundle) else { return alone() };
+    let ablation = match crate::ablate::ablation_of(&bundle, None) {
+        Ok(ablation) => ablation,
+        Err(e) => {
+            eprintln!("not ablated: {}: {e}", head.path.display());
+            return alone();
         }
-    } else {
-        None
     };
+    // The kinds it needed, or, where any one of several sufficed, those.
+    let needed = ablation.necessary();
     Judged {
-        verdict: crate::triage::triage(&bundle, ablation.as_ref()),
-        // The kinds it needed, or, where any one of several sufficed, those.
-        necessary: ablation
-            .as_ref()
-            .map(|a| {
-                let needed = a.necessary();
-                if needed.is_empty() { a.alternatives.clone() } else { needed }
-            })
-            .unwrap_or_default(),
-        grade: ablation.as_ref().and_then(crate::ablate::Ablation::grade),
+        verdict: bohr_findings::triage::triage(
+            &bundle,
+            &events,
+            Some(&ablation),
+            &nonproduction_of(&bundle),
+        ),
+        necessary: if needed.is_empty() { ablation.alternatives.clone() } else { needed },
+        grade: ablation.grade(),
     }
 }
 
@@ -253,7 +197,7 @@ fn as_json(
 /// it needed (`bohr ablate`); without it a group is triaged as far as its bundle alone allows.
 pub(crate) fn findings(dir: &str, ablate: bool) -> Result<u8, CliError> {
     let (count, ordered) = grouped(dir)?;
-    let judged: Vec<Judged> = ordered.iter().map(|(_, m)| judge(&m[0].path, ablate)).collect();
+    let judged: Vec<Judged> = ordered.iter().map(|(_, m)| judge(&m[0], ablate)).collect();
     let first = first_seen(dir);
     if crate::json::on() {
         crate::json::emit("findings", as_json(count, &ordered, &judged, &first));
@@ -271,7 +215,7 @@ pub(crate) fn findings(dir: &str, ablate: bool) -> Result<u8, CliError> {
                 smallest.verdict.headline,
                 smallest.verdict.code
             );
-            println!("       grouped as {signature}");
+            println!("       grouped as {}", bohr_report::text::printable(signature));
             let needs = if judged.necessary.is_empty() {
                 String::new()
             } else {
@@ -294,4 +238,64 @@ pub(crate) fn findings(dir: &str, ablate: bool) -> Result<u8, CliError> {
         }
     }
     Ok(crate::exit::CLEAN)
+}
+
+/// The words the pack of a bundle's programs declares non-production; none where they belong to no
+/// installed pack, or the list of programs does not read.
+fn nonproduction_of(bundle: &Bundle) -> Vec<String> {
+    let binaries = bundle.binaries().unwrap_or_default();
+    let digests: Vec<&str> = binaries.iter().map(|b| b.blake3.as_str()).collect();
+    crate::targets::pack_of(&digests).map(|pack| pack.nonproduction).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use bohr_trace::SectionId;
+
+    use super::*;
+
+    /// A finding whose output section does not read is left out as unreadable, not grouped as a
+    /// run that printed nothing.
+    #[test]
+    fn a_bundle_whose_output_does_not_read_is_not_grouped() {
+        let golden = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/bundles/two-tasks-seed0.bohr");
+        let bundle =
+            Bundle::parse(&std::fs::read(golden).expect("the golden corpus")).expect("parse");
+        let mut manifest = bundle.manifest().expect("manifest");
+        manifest.outcome = Outcome::GuestCrashed("killed by signal 11".to_owned());
+        let mut writer = bundle.to_writer();
+        writer.section(SectionId::Manifest, serde_json::to_vec(&manifest).expect("json"));
+        writer.section(SectionId::GuestOutput, b"not json".to_vec());
+        let dir =
+            std::env::temp_dir().join(format!("bohr-unreadable-tails-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("finding-000000000000.bohr"), writer.finish(bundle.run_id))
+            .expect("written");
+        let found = groups_json(&dir.to_string_lossy(), false).expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found["findings"], 0, "{found}");
+    }
+
+    /// A clean bundle, and a re-run that did not reproduce its finding, are no findings.
+    #[test]
+    fn a_clean_or_unreproduced_bundle_is_no_finding() {
+        let golden = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/bundles/clock-and-random-seed0.bohr");
+        let bytes = std::fs::read(&golden).expect("the golden corpus");
+        let dir = std::env::temp_dir().join(format!("bohr-clean-findings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("finding-000000000000.bohr"), &bytes).expect("written");
+        std::fs::write(dir.join(format!("{UNREPRODUCED}111111111111.bohr")), &bytes)
+            .expect("written");
+        let found = groups_json(&dir.to_string_lossy(), false).expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found["findings"], 0, "{found}");
+        assert_eq!(found["groups"].as_array().map(Vec::len), Some(0), "{found}");
+        assert!(
+            crate::ablate::ablation(&bytes, None)
+                .is_err_and(|e| e.to_string().contains("BOHR-5003")),
+            "a clean bundle was ablated"
+        );
+    }
 }

@@ -24,7 +24,7 @@ pub enum Arg {
 /// `None` for unknown numbers, which the caller prints as is.
 #[must_use]
 pub fn syscall_name(nr: u32) -> Option<&'static str> {
-    entry(nr).map(|(_, name, _)| *name)
+    entry(nr).map(|(_, name, ..)| *name)
 }
 
 /// The arguments a call reads, in ABI order, or nothing where this build has never heard of it.
@@ -32,7 +32,7 @@ pub fn syscall_name(nr: u32) -> Option<&'static str> {
 /// `None` means all six, for bundles from other builds.
 #[must_use]
 pub fn syscall_args(nr: u32) -> Option<&'static [Arg]> {
-    entry(nr).map(|(_, _, args)| args.as_slice())
+    entry(nr).map(|(_, _, args, _)| args.as_slice())
 }
 
 /// How many calls this build can name, for a check that the table was read at all.
@@ -41,18 +41,28 @@ pub fn named_syscalls() -> usize {
     parsed().len()
 }
 
+/// Whether the syscall filter stops the guest at a call and hands it to the world, rather than
+/// letting it through to the host; `None` for a number this table does not hold.
+#[must_use]
+pub fn syscall_traced(nr: u32) -> Option<bool> {
+    entry(nr).map(|(_, _, _, traced)| *traced)
+}
+
 /// One row, found by binary search.
-fn entry(nr: u32) -> Option<&'static (u32, &'static str, Vec<Arg>)> {
+fn entry(nr: u32) -> Option<&'static Row> {
     let table = parsed();
-    let at = table.binary_search_by_key(&nr, |(number, _, _)| *number).ok()?;
+    let at = table.binary_search_by_key(&nr, |(number, ..)| *number).ok()?;
     table.get(at)
 }
 
+/// One row: the number, the name, what the call reads, and whether the filter traces it.
+type Row = (u32, &'static str, Vec<Arg>, bool);
+
 /// The table, parsed once and sorted so a lookup is a binary search.
-fn parsed() -> &'static [(u32, &'static str, Vec<Arg>)] {
-    static PARSED: OnceLock<Vec<(u32, &'static str, Vec<Arg>)>> = OnceLock::new();
+fn parsed() -> &'static [Row] {
+    static PARSED: OnceLock<Vec<Row>> = OnceLock::new();
     PARSED.get_or_init(|| {
-        let mut entries: Vec<(u32, &'static str, Vec<Arg>)> = TABLE
+        let mut entries: Vec<Row> = TABLE
             .lines()
             .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
             .filter_map(|line| {
@@ -60,11 +70,12 @@ fn parsed() -> &'static [(u32, &'static str, Vec<Arg>)] {
                 let number = columns.next()?.trim().parse().ok()?;
                 let name = columns.next()?.trim();
                 let shape = columns.next()?.trim();
-                Some((number, name, args_of(shape)))
+                let traced = columns.next()?.trim() == "trace";
+                Some((number, name, args_of(shape), traced))
             })
             .collect();
-        entries.sort_unstable_by_key(|(number, _, _)| *number);
-        entries.dedup_by_key(|(number, _, _)| *number);
+        entries.sort_unstable_by_key(|(number, ..)| *number);
+        entries.dedup_by_key(|(number, ..)| *number);
         entries
     })
 }

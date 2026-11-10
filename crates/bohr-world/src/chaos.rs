@@ -23,7 +23,7 @@ pub(crate) const fn first_waiter(_choices: usize) -> usize {
 ///
 /// Removes per-node clock skew.
 #[cfg(feature = "chaos-node-clock-shared")]
-pub(crate) fn shared_now(ctx: &bohr_kernel::WorldCtx<'_, '_>) -> bohr_types::Tick {
+pub(crate) fn shared_now(ctx: &bohr_kernel::StopCtx<'_, '_>) -> bohr_types::Tick {
     ctx.world_now()
 }
 

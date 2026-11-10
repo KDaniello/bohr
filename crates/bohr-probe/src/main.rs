@@ -23,9 +23,6 @@ use std::{
 
 use bohr_sdk_proto::json::{self, Json};
 
-/// The SDK event a round is reported under; the world reads only the probe node's.
-const PROBE_EVENT: &str = "bohr_probe";
-
 /// Longest a node may take to answer: three beats, and never more than a second.
 const MOST_WAIT: Duration = Duration::from_secs(1);
 
@@ -101,25 +98,24 @@ fn main() -> ExitCode {
     }
 }
 
-/// Writes one round as one SDK event.
+/// Writes one round as one SDK event, the world reading only the probe node's.
 fn report(requests: &[Request], answered: Answers) {
-    let items = answered
-        .into_iter()
-        .map(|(index, answer)| {
-            let mut item = BTreeMap::new();
-            item.insert("request".to_owned(), Json::Int(index as i64));
-            match answer {
-                Ok(result) => {
-                    item.insert("result".to_owned(), reduced(&result, &requests[index].fields))
-                }
-                Err(why) => item.insert("unanswered".to_owned(), Json::Str(why)),
-            };
-            Json::Object(item)
-        })
-        .collect();
-    let mut details = BTreeMap::new();
-    details.insert("round".to_owned(), Json::Array(items));
-    bohr_sdk::send_event(PROBE_EVENT, Json::Object(details));
+    let round = bohr_sdk_proto::probe::Round(
+        answered
+            .into_iter()
+            .map(|(index, answer)| {
+                let answer = match answer {
+                    Ok(result) => bohr_sdk_proto::probe::Answer::Result(reduced(
+                        &result,
+                        &requests[index].fields,
+                    )),
+                    Err(why) => bohr_sdk_proto::probe::Answer::Unanswered(why),
+                };
+                (index, answer)
+            })
+            .collect(),
+    );
+    bohr_sdk::send_event(bohr_sdk_proto::probe::PROBE_EVENT, round.to_details());
 }
 
 /// Reads the plan the tool wrote.

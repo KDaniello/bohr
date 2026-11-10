@@ -12,6 +12,14 @@ use bohr_tape::Journal;
 use bohr_trace::{AssertionKind, Event, EventKind, Outcome};
 use bohr_types::{EventId, NodeId, Seed, TaskId, Tick};
 
+/// The keys these scenarios set moments with, as the world names them.
+const MOMENTS: &[&str] = &["at_tick", "heal_at_tick", "until_tick", "restart_after_ticks"];
+
+/// The default limits, with the moments named.
+fn limits() -> Limits {
+    Limits { moments: MOMENTS, ..Limits::default() }
+}
+
 /// A configuration with three things scheduled, only one of which matters.
 const SCENARIO: &str = "\
 [network]
@@ -123,7 +131,7 @@ fn reduce(limits: Limits) -> (Reduction, u32) {
 /// The first property: what comes out still goes wrong the same way.
 #[test]
 fn a_reduction_still_reproduces_what_it_started_from() {
-    let (reduction, _) = reduce(Limits::default());
+    let (reduction, _) = reduce(limits());
     let (violation, _) = answer(reduction.best());
     let asked = promise_broken("every ping is answered");
     assert!(
@@ -137,20 +145,20 @@ fn a_reduction_still_reproduces_what_it_started_from() {
 fn a_reduction_is_monotonic() {
     let input = Scenario::new(Seed(1), vec![0xAA; 64], SCENARIO.to_owned());
     let (_, before) = answer(&input);
-    let (reduction, _) = reduce(Limits::default());
+    let (reduction, _) = reduce(limits());
     assert!(reduction.size() <= before, "{:?} is not smaller than {before:?}", reduction.size());
 }
 
 /// The reduction removes the noise and moves the kill earlier.
 #[test]
 fn a_reduction_removes_what_does_not_matter_and_brings_forward_what_does() {
-    let (reduction, probes) = reduce(Limits::default());
+    let (reduction, probes) = reduce(limits());
     let doc = ConfigDoc::parse(reduction.best().config());
 
     let tables: Vec<&str> = doc.entries().iter().map(|e| e.table.as_str()).collect();
     assert_eq!(tables, vec!["fault"], "the scenery was kept or the cause was removed");
 
-    let fires_at = doc.moments()[0].ticks;
+    let fires_at = doc.moments(MOMENTS)[0].ticks;
     assert!(fires_at < 100, "the fault still fires at tick {fires_at}");
 
     let (_, size) = answer(reduction.best());
@@ -162,7 +170,7 @@ fn a_reduction_removes_what_does_not_matter_and_brings_forward_what_does() {
 #[test]
 fn the_budget_is_never_exceeded() {
     for replays in [4u32, 8, 25, 200] {
-        let (reduction, probes) = reduce(Limits { replays, keep: Keep::Both });
+        let (reduction, probes) = reduce(Limits { replays, keep: Keep::Both, moments: MOMENTS });
         assert!(reduction.spent().total() <= replays, "spent {:?} of {replays}", reduction.spent());
         assert!(probes <= replays, "{probes} probes against a budget of {replays}");
     }
@@ -171,7 +179,7 @@ fn the_budget_is_never_exceeded() {
 /// Whatever the budget, the answer is one that was proven — never one that ran out mid-probe.
 #[test]
 fn a_reduction_cut_short_still_answers_with_something_proven() {
-    let (reduction, _) = reduce(Limits { replays: 6, keep: Keep::Both });
+    let (reduction, _) = reduce(Limits { replays: 6, keep: Keep::Both, moments: MOMENTS });
     let (violation, size) = answer(reduction.best());
     let asked = promise_broken("every ping is answered");
     assert!(violation.is_some_and(|found| asked.reproduced_by(&found)));
@@ -185,7 +193,7 @@ fn proposing_twice_without_accepting_proposes_the_same_candidate() {
     let (violation, size) = answer(&input);
     let baseline =
         Baseline { violation: violation.expect("reproduces"), size, journal: Journal::new() };
-    let reduction = Reduction::new(input, baseline, Limits::default()).expect("a budget");
+    let reduction = Reduction::new(input, baseline, limits()).expect("a budget");
     assert_eq!(reduction.next(), reduction.next());
 }
 
@@ -201,7 +209,7 @@ fn a_candidate_the_world_would_refuse_does_not_end_the_reduction() {
         size,
         journal: Journal::new(),
     };
-    let limits = Limits { replays: 200, keep: Keep::Both };
+    let limits = Limits { replays: 200, keep: Keep::Both, moments: MOMENTS };
     let mut reduction = Reduction::new(input, baseline, limits).expect("a workable budget");
 
     let mut refused = 0;
@@ -294,7 +302,7 @@ fn a_drawn_kill_is_fired_sooner_and_one_not_needed_is_removed() {
     let (violation, size, journal, _) = drawn_kills(&input);
     assert_eq!(size.events, 350);
     let baseline = Baseline { violation: violation.expect("reproduces"), size, journal };
-    let limits = Limits { replays: 200, keep: Keep::Events };
+    let limits = Limits { replays: 200, keep: Keep::Events, moments: MOMENTS };
     let mut reduction = Reduction::new(input, baseline, limits).expect("a budget");
     while let Some(candidate) = reduction.next() {
         let id = candidate.id;
@@ -319,8 +327,7 @@ fn no_scenario_is_proposed_twice() {
     let input = Scenario::new(Seed(1), killing_at(&[5, 300, 700]), SCENARIO.to_owned());
     let (violation, size, journal, _) = drawn_kills(&input);
     let baseline = Baseline { violation: violation.expect("reproduces"), size, journal };
-    let mut reduction =
-        Reduction::new(input.clone(), baseline, Limits::default()).expect("a budget");
+    let mut reduction = Reduction::new(input.clone(), baseline, limits()).expect("a budget");
     let mut seen = vec![input];
     while let Some(candidate) = reduction.next() {
         assert!(!seen.contains(&candidate.scenario), "a scenario was proposed twice");

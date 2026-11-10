@@ -15,11 +15,6 @@ use crate::{
     probe::{ProbeSpec, Property},
 };
 
-/// The largest file a prepared state may hold.
-///
-/// The same bound as for guest files, since every byte lives in supervisor memory per node.
-const MAX_STATE_FILE_BYTES: u64 = 1 << 26;
-
 /// Why a configuration was refused.
 ///
 /// One variant, since callers react to every refusal the same way.
@@ -60,8 +55,12 @@ pub struct LoadedConfig {
     pub liveness: Option<LivenessConfig>,
     /// Whether an answer given before a sync and lost to a crash is a finding.
     pub durability: Option<DurabilityConfig>,
-    /// The filesystem every node starts from, where the scenario prepared one.
+    /// The filesystem every node starts from, where the scenario prepared one and the caller read
+    /// it from [`Self::state_source`].
     pub state: Option<StateImage>,
+    /// Where the prepared state is on the host, and the digest it is pinned to, as the scenario
+    /// names them.
+    pub state_source: Option<StateSource>,
     /// What `getcwd` answers, where the scenario says.
     pub cwd: Option<String>,
     /// The implementations a differential run compares, and the values it compares them by.
@@ -476,12 +475,24 @@ struct RawFault {
     drift_ppm: Option<i32>,
 }
 
+/// The most nodes a cluster may have.
+pub const MAX_NODES: u32 = 1024;
+
+/// The keys of a scenario that name a moment the world acts at, which a reduction may bring
+/// forward.
+///
+/// Listed by name: `latency_mean_ticks` is also ticks, but lowering it makes a different scenario.
+pub const MOMENT_KEYS: [&str; 4] = ["at_tick", "heal_at_tick", "until_tick", "restart_after_ticks"];
+
 /// Parses and validates a configuration file's text.
+///
+/// Pure: a `[state]` is named in [`LoadedConfig::state_source`] and left unread, for the caller
+/// that may read the host to fill [`LoadedConfig::state`].
 ///
 /// # Errors
 ///
 /// Returns the key it refuses and why.
-pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
+pub fn parse(text: &str) -> Result<LoadedConfig, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| {
         ConfigError::Refused(format!("BOHR-1002: configuration does not parse: {e}"))
     })?;
@@ -800,6 +811,13 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     "BOHR-1002: [cluster] takes argv or programs, not both".to_owned(),
                 ));
             }
+            // A cluster past this is no test a host can run, and each node costs memory up front.
+            if c.nodes > MAX_NODES {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: [cluster] nodes = {} is past the {MAX_NODES} a world holds",
+                    c.nodes
+                )));
+            }
             if !c.programs.is_empty() && c.programs.len() != c.nodes as usize {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: [cluster] names {} programs for {} nodes",
@@ -831,7 +849,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     };
 
     let run = run_limits(raw.run.as_ref(), cluster.as_ref().map(|c| c.nodes))?;
-    let (state, cwd) = state(raw.state.as_ref())?;
+    let (state_source, cwd) = state(raw.state.as_ref());
     let differential =
         differential(raw.differential.as_ref(), raw.faults.as_ref(), cluster.as_ref())?;
     let liveness = liveness(raw.liveness.as_ref(), &raw.partition)?;
@@ -870,7 +888,8 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         run,
         liveness,
         durability,
-        state,
+        state: None,
+        state_source,
         cwd,
         differential,
         coverage_bytes: coverage(raw.coverage.as_ref())?,
@@ -1339,27 +1358,21 @@ fn differential(
     }))
 }
 
-/// Reads `[state]`, and checks the pin where the file carries one.
-fn state(raw: Option<&RawState>) -> Result<(Option<StateImage>, Option<String>), ConfigError> {
+/// Where a prepared state is on the host, and the digest it is pinned to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StateSource {
+    /// The directory, as the scenario names it.
+    pub dir: String,
+    /// The digest the scenario pins it to, where it pins one.
+    pub digest: Option<String>,
+}
+
+/// Reads `[state]`: where the state is and what it is pinned to, and the working directory.
+fn state(raw: Option<&RawState>) -> (Option<StateSource>, Option<String>) {
     let Some(raw) = raw else {
-        return Ok((None, None));
+        return (None, None);
     };
-
-    let image = StateImage::from_dir(std::path::Path::new(&raw.dir), MAX_STATE_FILE_BYTES)
-        .map_err(|e| ConfigError::Refused(e.to_string()))?;
-
-    // The pin names the exact state; it is checked at load.
-    if let Some(pinned) = raw.digest.as_deref() {
-        let actual = image.digest().to_hex();
-        if pinned.trim_start_matches("blake3:") != actual {
-            return Err(ConfigError::Refused(format!(
-                "BOHR-1002: state.digest names {pinned}, and {} holds {actual}",
-                raw.dir
-            )));
-        }
-    }
-
-    Ok((Some(image), raw.cwd.clone()))
+    (Some(StateSource { dir: raw.dir.clone(), digest: raw.digest.clone() }), raw.cwd.clone())
 }
 
 /// Reads `[durability]`, refusing a watch nothing could ever trip.
@@ -1486,9 +1499,20 @@ fn probability(text: Option<&str>, key: &str) -> Result<(u32, u32), ConfigError>
 mod tests {
     use super::*;
 
+    /// A cluster past the bound is refused before a node is made.
+    #[test]
+    fn a_cluster_past_the_bound_is_refused() {
+        assert!(parse("[cluster]\nnodes = 1024\n").is_ok());
+        let refused = parse("[cluster]\nnodes = 4294967295\n");
+        assert!(
+            matches!(&refused, Err(ConfigError::Refused(why)) if why.contains("nodes")),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn a_full_scenario_parses_into_the_world_types() {
-        let loaded = load(
+        let loaded = parse(
             r#"
             [cluster]
             nodes = 5
@@ -1529,7 +1553,7 @@ mod tests {
 
     #[test]
     fn a_symmetric_cut_lists_both_directions() {
-        let loaded = load(
+        let loaded = parse(
             r#"
             [[partition]]
             at_tick = 1
@@ -1547,7 +1571,7 @@ mod tests {
     #[test]
     fn a_coverage_map_too_small_to_read_or_too_large_to_hold_is_refused() {
         let sized = |bytes: &str| {
-            load(&format!(
+            parse(&format!(
                 "[coverage]
 shm_size = {bytes}
 "
@@ -1559,7 +1583,7 @@ shm_size = {bytes}
         assert!(sized("16").is_err(), "a map of sixteen counters was accepted");
         assert!(sized("134217728").is_err(), "a map of 128 MiB was accepted");
         assert!(
-            load(
+            parse(
                 "[coverage]
 mode = \"shm\"
 "
@@ -1571,7 +1595,7 @@ mode = \"shm\"
 
     #[test]
     fn a_denominator_past_the_draw_is_refused_with_the_nearest_value() {
-        let err = load("[network]\ndrop_probability = \"1/100000\"\n").expect_err("refused");
+        let err = parse("[network]\ndrop_probability = \"1/100000\"\n").expect_err("refused");
         let text = err.to_string();
         assert!(text.contains("BOHR-1003") && text.contains("1/65536"), "got: {text}");
     }
@@ -1579,65 +1603,65 @@ mode = \"shm\"
     #[test]
     fn a_fault_window_is_read_and_an_empty_or_late_one_is_refused() {
         let faults = "[faults]\nkill_probability = \"1/1000\"\narm_after_ticks = 5\n";
-        let loaded = load(&format!("{faults}disarm_after_ticks = 9\n")).expect("a window");
+        let loaded = parse(&format!("{faults}disarm_after_ticks = 9\n")).expect("a window");
         assert_eq!(loaded.fault_policy.disarm_after, Some(bohr_types::Tick(9)));
 
-        let empty = load(&format!("{faults}disarm_after_ticks = 5\n")).expect_err("refused");
+        let empty = parse(&format!("{faults}disarm_after_ticks = 5\n")).expect_err("refused");
         assert!(empty.to_string().contains("faults.disarm_after_ticks is 5"), "got: {empty}");
 
-        let late = load(&format!("[run]\nhorizon_ticks = 9\n{faults}disarm_after_ticks = 9\n"))
+        let late = parse(&format!("[run]\nhorizon_ticks = 9\n{faults}disarm_after_ticks = 9\n"))
             .expect_err("refused");
         assert!(late.to_string().contains("would close after the run ended"), "got: {late}");
     }
 
     #[test]
     fn an_ablation_names_kinds_and_refuses_a_name_that_is_none() {
-        let loaded = load("[faults]\nkill_probability = \"1/1000\"\nablate = [\"disk_tear\"]\n")
+        let loaded = parse("[faults]\nkill_probability = \"1/1000\"\nablate = [\"disk_tear\"]\n")
             .expect("an ablation");
         assert!(loaded.fault_policy.suppressed.contains(bohr_trace::FaultKind::DiskTear));
         assert!(!loaded.fault_policy.suppressed.contains(bohr_trace::FaultKind::NodeKill));
-        let err = load("[faults]\nablate = [\"disk_torn\"]\n").expect_err("refused");
+        let err = parse("[faults]\nablate = [\"disk_torn\"]\n").expect_err("refused");
         assert!(err.to_string().contains("\"disk_torn\""), "got: {err}");
     }
 
     #[test]
     fn an_unknown_key_is_refused_not_skipped() {
-        assert!(load("[network]\nlatencccy = 5\n").is_err(), "silent skipping hides typos");
+        assert!(parse("[network]\nlatencccy = 5\n").is_err(), "silent skipping hides typos");
     }
 
     #[test]
     fn lenient_disk_semantics_are_refused_until_they_exist() {
-        let err = load("[disk]\nsync_semantics = \"lenient\"\n").expect_err("refused");
+        let err = parse("[disk]\nsync_semantics = \"lenient\"\n").expect_err("refused");
         assert!(err.to_string().contains("strict"));
     }
 
     /// The ring is asked for by name, absent by default, and a third value is a typo.
     #[test]
     fn a_ring_is_named_or_absent() {
-        assert_eq!(load("").unwrap().linux.io_uring, IoUring::Absent);
+        assert_eq!(parse("").unwrap().linux.io_uring, IoUring::Absent);
         assert_eq!(
-            load("[linux]\nio_uring = \"absent\"\n").unwrap().linux.io_uring,
+            parse("[linux]\nio_uring = \"absent\"\n").unwrap().linux.io_uring,
             IoUring::Absent
         );
-        assert_eq!(load("[linux]\nio_uring = \"ring\"\n").unwrap().linux.io_uring, IoUring::Ring);
-        let err = load("[linux]\nio_uring = \"sqpoll\"\n").expect_err("refused");
+        assert_eq!(parse("[linux]\nio_uring = \"ring\"\n").unwrap().linux.io_uring, IoUring::Ring);
+        let err = parse("[linux]\nio_uring = \"sqpoll\"\n").expect_err("refused");
         assert!(err.to_string().contains("BOHR-1002"), "{err}");
     }
 
     /// A ring with drawn disk stalls is refused.
     #[test]
     fn a_ring_with_stalling_syncs_is_refused() {
-        let err = load("[linux]\nio_uring = \"ring\"\n[disk]\nstall_probability = \"1/10\"\n")
+        let err = parse("[linux]\nio_uring = \"ring\"\n[disk]\nstall_probability = \"1/10\"\n")
             .expect_err("refused");
         assert!(err.to_string().contains("stall"), "{err}");
-        assert!(load("[disk]\nstall_probability = \"1/10\"\n").is_ok(), "without a ring it runs");
+        assert!(parse("[disk]\nstall_probability = \"1/10\"\n").is_ok(), "without a ring it runs");
     }
 
     /// An implementation names the node it replaces.
     #[test]
     fn an_implementation_stands_in_for_a_node_the_cluster_has() {
         let compared = |first: &str, second: &str| {
-            load(&format!(
+            parse(&format!(
                 r#"
                 [cluster]
                 nodes = 2
@@ -1681,7 +1705,7 @@ mode = \"shm\"
     #[test]
     fn a_projection_source_carries_the_node_that_holds_it() {
         let read = |source: &str| {
-            load(&format!(
+            parse(&format!(
                 r#"
                 [cluster]
                 nodes = 2
@@ -1719,7 +1743,7 @@ mode = \"shm\"
     /// Each chain oracle is a predefined probe asking every node unless narrowed.
     #[test]
     fn the_chain_oracles_are_probes_of_every_node() {
-        let loaded = load(
+        let loaded = parse(
             r#"
             [cluster]
             nodes = 3
@@ -1746,7 +1770,7 @@ mode = \"shm\"
     /// A probe written by hand names its call, its value and its property, and only what it asks.
     #[test]
     fn a_probe_reads_its_params_as_json() {
-        let loaded = load(
+        let loaded = parse(
             r#"
             [cluster]
             nodes = 2
@@ -1774,7 +1798,7 @@ mode = \"shm\"
     #[test]
     fn a_probe_that_could_not_mean_anything_is_refused() {
         let refused = |text: &str, says: &str| {
-            let err = load(text).expect_err("refused");
+            let err = parse(text).expect_err("refused");
             assert!(err.to_string().contains(says), "{says:?} not in: {err}");
         };
         let cluster = "[cluster]\nnodes = 2\nargv = [\"./node\"]\n";

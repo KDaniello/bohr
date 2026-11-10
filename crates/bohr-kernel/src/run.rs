@@ -1,7 +1,7 @@
 //! The run loop: one guest driven from its first instruction to the ending the run is judged on.
 //! It owns task bookkeeping and the order of everything; what a stop means belongs to the world.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bohr_backend::{DeterminismBackend, GuestExit, GuestSpec, Resume, Stop, StopKind};
 use bohr_tape::{DrawSite, Journal, Tape, TapeCursor};
@@ -12,8 +12,8 @@ use crate::{
     KernelError, StopReason,
     clock::{Clock, MAX_DRIFT_PPM, NodeClock},
     ports::{
-        DueEffects, EventSink, NodeOp, Observer, Oracle, Progress, Recorded, RunOutcome, TaskState,
-        Verdict, Wake, WorldCtx, WorldModel,
+        DeadlineCtx, DueEffects, EventSink, NodeOp, Observer, Oracle, Progress, Recorded,
+        RunOutcome, StopCtx, TaskState, Verdict, Wake, WorldModel,
     },
     schedule::SchedulePolicy,
 };
@@ -52,6 +52,11 @@ pub struct RunConfig {
     /// exhausted budget also advances the clock by the units the guest consumed
     /// (`docs/ARCHITECTURE.md` §4.2).
     pub ticks_per_progress_unit: Option<u64>,
+    /// Which of its draws the run's journal keeps; every one is counted.
+    ///
+    /// All by default, as a bundle records them. A run that keeps no log may keep only what its
+    /// caller reads back.
+    pub draws: bohr_tape::Keep,
 }
 
 /// The SDK fault points a run may arm, by name, and the odds each is armed on a node.
@@ -64,7 +69,7 @@ pub struct Arming<'a> {
     /// The odds each is armed on a node.
     pub odds: (u32, u32),
     /// A node never armed, whatever is listed: the probe's, which is not the cluster's.
-    pub except: Option<u32>,
+    pub except: Option<NodeId>,
 }
 
 impl Arming<'_> {
@@ -88,6 +93,7 @@ impl Default for RunConfig {
             horizon: None,
             ends_with: None,
             ticks_per_progress_unit: None,
+            draws: bohr_tape::Keep::All,
         }
     }
 }
@@ -218,9 +224,39 @@ struct TaskEntry {
     faulted_on: Option<u32>,
     /// Taken off the books when its node ended; the later backend exit is expected.
     retired: bool,
+    /// The first task of its process: what `exit_group` ends is the tasks sharing this.
+    group: TaskId,
+}
+
+/// What a task counts as in the loop's indices, read from its slot and whether it was retired.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Standing {
+    /// Ready for the scheduler, where its node runs.
+    Pending,
+    /// Waiting on the world.
+    Blocked,
+    /// Executing on the host, which still owes the loop its next stop.
+    Running,
+    /// Out of both queues for good; its reports are dropped.
+    Retired,
+}
+
+impl TaskEntry {
+    const fn standing(&self) -> Standing {
+        match (&self.slot, self.retired) {
+            (Slot::Pending(_), _) => Standing::Pending,
+            (Slot::Blocked, _) => Standing::Blocked,
+            (Slot::Out, false) => Standing::Running,
+            (Slot::Out, true) => Standing::Retired,
+        }
+    }
 }
 
 /// The loop's books: one entry per task the run knows, and what it knows about each node.
+///
+/// Every stop asks what is ready, waiting and running; the answers are kept as the entries change,
+/// so a stop costs the same with ten tasks as with ten thousand. An entry changes only through
+/// [`Tasks::change`], [`Tasks::add`] and [`Tasks::note_task_gone`], which keep them in step.
 #[derive(Clone, Default)]
 struct Tasks {
     entries: BTreeMap<TaskId, TaskEntry>,
@@ -228,14 +264,65 @@ struct Tasks {
     per_node: BTreeMap<NodeId, usize>,
     node_state: BTreeMap<NodeId, NodeLifecycle>,
     last_run: Option<TaskId>,
+    /// The tasks standing `Pending`, in identifier order.
+    pending: BTreeSet<TaskId>,
+    /// How many stand `Blocked`.
+    blocked: usize,
+    /// How many stand `Running`.
+    running: usize,
 }
 
 impl Tasks {
     /// Enters a task the run has just learned of.
-    fn add(&mut self, task: TaskId, node: NodeId, slot: Slot) {
+    /// Adds a task, of the process `group` names: itself for a process's first task.
+    fn add(&mut self, task: TaskId, node: NodeId, slot: Slot, group: TaskId) {
         *self.per_node.entry(node).or_default() += 1;
-        self.entries
-            .insert(task, TaskEntry { node: Some(node), slot, faulted_on: None, retired: false });
+        let entry = TaskEntry { node: Some(node), slot, faulted_on: None, retired: false, group };
+        let standing = entry.standing();
+        if let Some(old) = self.entries.insert(task, entry) {
+            self.leave(task, old.standing());
+        }
+        self.enter(task, standing);
+    }
+
+    /// Changes one task's entry, keeping the indices in step with it.
+    fn change<R>(&mut self, task: TaskId, f: impl FnOnce(&mut TaskEntry) -> R) -> Option<R> {
+        let entry = self.entries.get_mut(&task)?;
+        let before = entry.standing();
+        let out = f(entry);
+        let after = entry.standing();
+        if before != after {
+            self.leave(task, before);
+            self.enter(task, after);
+        }
+        Some(out)
+    }
+
+    fn enter(&mut self, task: TaskId, standing: Standing) {
+        match standing {
+            Standing::Pending => {
+                self.pending.insert(task);
+            }
+            Standing::Blocked => self.blocked += 1,
+            Standing::Running => self.running += 1,
+            Standing::Retired => {}
+        }
+    }
+
+    fn leave(&mut self, task: TaskId, standing: Standing) {
+        match standing {
+            Standing::Pending => {
+                self.pending.remove(&task);
+            }
+            Standing::Blocked => self.blocked -= 1,
+            Standing::Running => self.running -= 1,
+            Standing::Retired => {}
+        }
+    }
+
+    /// Records the signal a task stopped on.
+    fn note_fault(&mut self, task: TaskId, signal: u32) {
+        self.change(task, |entry| entry.faulted_on = Some(signal));
     }
 
     /// The node a task belongs to, where this run still knows.
@@ -243,6 +330,11 @@ impl Tasks {
     /// `None` for a forgotten node, never node 0 (§8 rule 2).
     fn node_for(&self, task: TaskId) -> Option<NodeId> {
         self.entries.get(&task).and_then(|e| e.node)
+    }
+
+    /// The process a task belongs to, named by its first task.
+    fn group_of(&self, task: TaskId) -> Option<TaskId> {
+        self.entries.get(&task).map(|e| e.group)
     }
 
     fn has_tasks(&self, node: NodeId) -> bool {
@@ -255,42 +347,40 @@ impl Tasks {
     /// gone.
     fn release(&mut self, wakes: impl IntoIterator<Item = Wake>) {
         for released in wakes {
-            if let Some(entry) = self.entries.get_mut(&released.task)
-                && entry.slot == Slot::Blocked
-            {
-                entry.slot = Slot::Pending(Resume::Emulate { ret: released.ret });
-            }
+            self.change(released.task, |entry| {
+                if entry.slot == Slot::Blocked {
+                    entry.slot = Slot::Pending(Resume::Emulate { ret: released.ret });
+                }
+            });
         }
     }
 
     fn set_slot(&mut self, task: TaskId, slot: Slot) {
-        if let Some(entry) = self.entries.get_mut(&task) {
-            entry.slot = slot;
-        }
+        self.change(task, |entry| entry.slot = slot);
     }
 
     /// Takes the action a pending task resumes with, leaving it out of both queues.
     fn take_pending(&mut self, task: TaskId) -> Option<Resume> {
-        let entry = self.entries.get_mut(&task)?;
-        match std::mem::replace(&mut entry.slot, Slot::Out) {
+        self.change(task, |entry| match std::mem::replace(&mut entry.slot, Slot::Out) {
             Slot::Pending(resume) => Some(resume),
             other => {
                 entry.slot = other;
                 None
             }
-        }
+        })
+        .flatten()
     }
 
     fn unblock(&mut self, task: TaskId) {
-        if let Some(entry) = self.entries.get_mut(&task)
-            && entry.slot == Slot::Blocked
-        {
-            entry.slot = Slot::Out;
-        }
+        self.change(task, |entry| {
+            if entry.slot == Slot::Blocked {
+                entry.slot = Slot::Out;
+            }
+        });
     }
 
     fn take_faulted(&mut self, task: TaskId) -> Option<u32> {
-        self.entries.get_mut(&task).and_then(|e| e.faulted_on.take())
+        self.change(task, |e| e.faulted_on.take()).flatten()
     }
 
     fn is_retired(&self, task: TaskId) -> bool {
@@ -299,14 +389,31 @@ impl Tasks {
 
     /// Whether anything is still owed a turn: a task ready, or one waiting on the world.
     fn anything_outstanding(&self) -> bool {
-        self.entries.values().any(|e| matches!(e.slot, Slot::Pending(_) | Slot::Blocked))
+        debug_assert!(self.in_step(), "the task indices drifted from the entries");
+        !self.pending.is_empty() || self.blocked > 0
     }
 
     /// Whether a task the host is executing still owes the loop its next stop.
     ///
     /// A retired task does not; its reports are dropped.
     fn in_flight(&self) -> bool {
-        self.entries.values().any(|e| matches!(e.slot, Slot::Out) && !e.retired)
+        debug_assert!(self.in_step(), "the task indices drifted from the entries");
+        self.running > 0
+    }
+
+    /// Whether the indices say what a scan of the entries says; checked in debug builds, where
+    /// every test run is the proof.
+    fn in_step(&self) -> bool {
+        let standing = |s| self.entries.values().filter(|e| e.standing() == s).count();
+        let pending: BTreeSet<TaskId> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.standing() == Standing::Pending)
+            .map(|(t, _)| *t)
+            .collect();
+        pending == self.pending
+            && standing(Standing::Blocked) == self.blocked
+            && standing(Standing::Running) == self.running
     }
 
     fn schedulable(&self, task: TaskId) -> bool {
@@ -320,13 +427,7 @@ impl Tasks {
     /// The pending tasks a scheduler may choose from, in identifier order.
     fn runnable_into(&self, out: &mut Vec<TaskId>) {
         out.clear();
-        out.extend(
-            self.entries
-                .iter()
-                .filter(|(_, e)| matches!(e.slot, Slot::Pending(_)))
-                .map(|(t, _)| *t)
-                .filter(|t| self.schedulable(*t)),
-        );
+        out.extend(self.pending.iter().copied().filter(|t| self.schedulable(*t)));
     }
 
     /// The tasks of a node, in identifier order.
@@ -336,17 +437,17 @@ impl Tasks {
 
     /// Takes a task off its node's books for good, as when its node ended around it.
     fn retire(&mut self, task: TaskId) {
-        let Some(entry) = self.entries.get_mut(&task) else {
-            return;
-        };
-        if let Some(node) = entry.node.take()
+        let node = self.change(task, |entry| {
+            entry.slot = Slot::Out;
+            entry.faulted_on = None;
+            entry.retired = true;
+            entry.node.take()
+        });
+        if let Some(node) = node.flatten()
             && let Some(n) = self.per_node.get_mut(&node)
         {
             *n -= 1;
         }
-        entry.slot = Slot::Out;
-        entry.faulted_on = None;
-        entry.retired = true;
     }
 
     /// Forgets a task that has ended, and marks its node dead once its last task is gone, so a
@@ -355,6 +456,7 @@ impl Tasks {
         let Some(entry) = self.entries.remove(&task) else {
             return;
         };
+        self.leave(task, entry.standing());
         if let Some(node) = entry.node
             && let Some(n) = self.per_node.get_mut(&node)
         {
@@ -380,7 +482,7 @@ pub fn run(inputs: RunInputs<'_, '_>) -> Result<RunReport, KernelError> {
         specs,
         config,
         clock: Clock::new(),
-        cursor: tape.cursor(),
+        cursor: tape.cursor().keeping(config.draws),
         next_event: EventId::ZERO,
         recorded: Recorded::new(),
         tasks: Tasks::default(),
@@ -462,7 +564,7 @@ impl Run<'_, '_> {
         let seed = u64::from_le_bytes(drawn);
         self.armed = (0..self.specs.len() as u32)
             .map(|node| {
-                if self.arming.except == Some(node) {
+                if self.arming.except == Some(NodeId(node)) {
                     return Vec::new();
                 }
                 self.arming
@@ -481,7 +583,7 @@ impl Run<'_, '_> {
             let spec = self.spec_for(node)?;
             self.say_armed(node)?;
             let first = self.backend.spawn(node, &spec)?;
-            self.tasks.add(first, node, Slot::Pending(Resume::Continue));
+            self.tasks.add(first, node, Slot::Pending(Resume::Continue), first);
             self.tasks.node_state.insert(node, NodeLifecycle::Running);
         }
         Ok(())
@@ -566,7 +668,7 @@ impl Run<'_, '_> {
             return Ok(());
         }
         let due = {
-            let mut ctx = WorldCtx::detached(
+            let mut ctx = DeadlineCtx::new(
                 &mut self.clock,
                 &mut self.cursor,
                 &mut *self.backend,
@@ -675,13 +777,11 @@ impl Run<'_, '_> {
     /// Answers one stop: the kernel's own bookkeeping first, then the world's interpretation.
     fn on_stop(&mut self, stop: &Stop) -> Result<(), KernelError> {
         match &stop.kind {
-            StopKind::TaskCreated { parent, .. } => return self.on_created(stop.task, *parent),
-            StopKind::TaskExited { status } => return self.on_exited(stop.task, status),
-            StopKind::Signal { signal } => {
-                if let Some(entry) = self.tasks.entries.get_mut(&stop.task) {
-                    entry.faulted_on = Some(*signal);
-                }
+            StopKind::TaskCreated { parent, thread, .. } => {
+                return self.on_created(stop.task, *parent, *thread);
             }
+            StopKind::TaskExited { status } => return self.on_exited(stop.task, status),
+            StopKind::Signal { signal } => self.tasks.note_fault(stop.task, *signal),
             _ => {}
         }
 
@@ -690,16 +790,15 @@ impl Run<'_, '_> {
             .node_for(stop.task)
             .ok_or(KernelError::Invariant("a stop arrived for a task with no node"))?;
         let effects = {
-            let mut ctx = WorldCtx::new(
+            let at = DeadlineCtx::new(
                 &mut self.clock,
                 &mut self.cursor,
                 &mut *self.backend,
                 &mut *self.sink,
                 &mut self.next_event,
-                node,
-                stop.task,
                 &mut self.recorded,
             );
+            let mut ctx = StopCtx::new(at, node, stop.task);
             self.world.handle(stop, &mut ctx)?
         };
         self.metrics.stops += 1;
@@ -760,13 +859,20 @@ impl Run<'_, '_> {
         self.apply_node_ops(&effects.node_ops)
     }
 
-    /// A task appeared; it and its event belong to the creator's node.
-    fn on_created(&mut self, task: TaskId, parent: TaskId) -> Result<(), KernelError> {
+    /// A task appeared; it and its event belong to the creator's node, and to its creator's process
+    /// where it is a thread of it, or to a process of its own.
+    fn on_created(
+        &mut self,
+        task: TaskId,
+        parent: TaskId,
+        thread: bool,
+    ) -> Result<(), KernelError> {
         let node = self
             .tasks
             .node_for(parent)
             .ok_or(KernelError::Invariant("a task was created by one this run has no node for"))?;
-        self.tasks.add(task, node, Slot::Pending(Resume::Continue));
+        let group = if thread { self.tasks.group_of(parent).unwrap_or(parent) } else { task };
+        self.tasks.add(task, node, Slot::Pending(Resume::Continue), group);
         self.world.task_created(task, parent);
         self.emit(node, task, EventKind::TaskSpawned { parent })?;
         self.tasks.set_slot(parent, Slot::Pending(Resume::Continue));
@@ -821,10 +927,16 @@ impl Run<'_, '_> {
     fn apply_node_ops(&mut self, ops: &[NodeOp]) -> Result<(), KernelError> {
         for op in ops {
             match *op {
-                // The host ended them; nothing is killed or narrated.
+                // The host ended the caller's process; nothing is killed or narrated. Another
+                // process of the node, a child it forked, lives on as on Linux.
                 NodeOp::Ended { node, by } => {
-                    let gone: Vec<TaskId> =
-                        self.tasks.of_node(node).map(|(t, _)| t).filter(|t| *t != by).collect();
+                    let group = self.tasks.group_of(by);
+                    let gone: Vec<TaskId> = self
+                        .tasks
+                        .of_node(node)
+                        .filter(|(t, e)| *t != by && Some(e.group) == group)
+                        .map(|(t, _)| t)
+                        .collect();
                     for task in gone {
                         // Off the books, so the node is `Dead` once the spared task goes.
                         self.tasks.retire(task);
@@ -874,7 +986,7 @@ impl Run<'_, '_> {
                     let spec = self.spec_for(node)?;
                     self.say_armed(node)?;
                     let first = self.backend.spawn(node, &spec)?;
-                    self.tasks.add(first, node, Slot::Pending(Resume::Continue));
+                    self.tasks.add(first, node, Slot::Pending(Resume::Continue), first);
                     self.tasks.node_state.insert(node, NodeLifecycle::Running);
                 }
             }
@@ -997,4 +1109,51 @@ fn draw_node_clock(cursor: &mut TapeCursor<'_>, max_skew: Tick) -> Result<NodeCl
     let drift = cursor.draw_range(drift_span, DrawSite::ClockSkew)? as i32 - MAX_DRIFT_PPM as i32;
 
     Ok(NodeClock::new(offset, drift))
+}
+
+#[cfg(test)]
+mod tests {
+    use bohr_backend::Resume;
+    use bohr_types::{NodeId, TaskId};
+
+    use super::{NodeLifecycle, Slot, Tasks};
+    use crate::ports::Wake;
+
+    /// The ready set, the waiting count and the running count follow every way a task moves:
+    /// picked, blocked, woken, retired with its node, and gone.
+    #[test]
+    fn the_books_say_what_a_scan_would() {
+        let mut tasks = Tasks::default();
+        tasks.node_state.insert(NodeId(0), NodeLifecycle::Running);
+        for t in 1..=3 {
+            tasks.add(TaskId(t), NodeId(0), Slot::Pending(Resume::Continue), TaskId(t));
+        }
+        let mut ready = Vec::new();
+        tasks.runnable_into(&mut ready);
+        assert_eq!(ready, [TaskId(1), TaskId(2), TaskId(3)]);
+
+        assert!(tasks.take_pending(TaskId(2)).is_some());
+        assert!(tasks.in_flight());
+        tasks.set_slot(TaskId(2), Slot::Blocked);
+        assert!(!tasks.in_flight());
+        tasks.runnable_into(&mut ready);
+        assert_eq!(ready, [TaskId(1), TaskId(3)]);
+
+        tasks.release([Wake { task: TaskId(2), ret: 0 }]);
+        tasks.runnable_into(&mut ready);
+        assert_eq!(ready, [TaskId(1), TaskId(2), TaskId(3)]);
+
+        tasks.retire(TaskId(1));
+        tasks.note_task_gone(TaskId(3));
+        tasks.runnable_into(&mut ready);
+        assert_eq!(ready, [TaskId(2)]);
+        assert!(tasks.anything_outstanding());
+        assert!(!tasks.in_flight(), "a retired task owes no stop");
+        assert!(tasks.in_step());
+
+        assert!(tasks.take_pending(TaskId(2)).is_some());
+        tasks.note_task_gone(TaskId(2));
+        assert!(!tasks.anything_outstanding());
+        assert!(tasks.in_step());
+    }
 }

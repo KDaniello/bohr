@@ -1,0 +1,12 @@
+[package]
+name = "bohr-x86"
+description = "x86-64 machine code as a supervisor needs it: instruction lengths, symbols, and the instructions that leak a machine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

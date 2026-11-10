@@ -20,14 +20,15 @@ mod hunt;
 mod init;
 mod json;
 mod mcp;
+mod private;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod probe;
 mod reduce;
 mod replay;
+mod state_dir;
 mod subjects;
 mod survey;
 mod targets;
-mod triage;
 mod wire;
 
 use std::process::ExitCode;
@@ -59,43 +60,69 @@ mod exit {
 }
 
 /// The scheduler `bohr selftest` uses: uniform, since its guests check the machinery.
-const SELFTEST_SCHEDULER: &str = "random";
-
-/// Interleaving policies this build implements.
-///
-/// Only policies that exist; a listed but missing one would silently run something else.
-const SCHEDULERS: [&str; 3] = ["pct", "random", "fair"];
+const SELFTEST_SCHEDULER: execute::Scheduler = execute::Scheduler::Random;
 
 /// Failures that stop a command before it produces a verdict.
-#[derive(Debug)]
-pub(crate) enum CliError {
-    /// The invocation or configuration cannot be acted on.
-    Usage(String),
-    /// The tool reached a state it does not define behaviour for.
-    Internal(String),
+pub(crate) struct CliError {
+    /// Whose doing it was, which the exit code says.
+    internal: bool,
+    /// The class of what happened, where the message named one.
+    code: Option<bohr_types::Code>,
+    /// What happened, after the code.
+    message: String,
 }
 
 /// A configuration the world refused is a usage error; the parser's message says what is wrong.
 impl From<bohr_world::ConfigError> for CliError {
     fn from(error: bohr_world::ConfigError) -> Self {
-        Self::Usage(error.to_string())
+        Self::usage(error.to_string())
     }
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Usage(m) | Self::Internal(m) => write!(f, "{m}"),
+        match self.code {
+            Some(code) => write!(f, "{code}: {}", self.message),
+            None => write!(f, "{}", self.message),
         }
     }
 }
 
+impl std::fmt::Debug for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
 impl CliError {
-    const fn code(&self) -> u8 {
-        match self {
-            Self::Usage(_) => exit::USAGE,
-            Self::Internal(_) => exit::INTERNAL,
+    /// The invocation or configuration cannot be acted on. A text opening with `BOHR-NNNN: `
+    /// carries that code, read here once.
+    pub(crate) fn usage(text: impl Into<String>) -> Self {
+        Self::of(false, text.into())
+    }
+
+    /// The tool reached a state it does not define behaviour for.
+    pub(crate) fn internal(text: impl Into<String>) -> Self {
+        Self::of(true, text.into())
+    }
+
+    /// A refusal of what the invocation or a file asked for, `BOHR-1002`.
+    pub(crate) fn refused(text: impl std::fmt::Display) -> Self {
+        Self { internal: false, code: Some(bohr_types::Code(1002)), message: text.to_string() }
+    }
+
+    fn of(internal: bool, text: String) -> Self {
+        match bohr_types::Code::leading(&text) {
+            Some((code, rest)) if text[9..].starts_with(": ") || rest.is_empty() => {
+                Self { internal, code: Some(code), message: rest.to_owned() }
+            }
+            _ => Self { internal, code: None, message: text },
         }
+    }
+
+    /// The exit code this error ends the process with.
+    const fn exit(&self) -> u8 {
+        if self.internal { exit::INTERNAL } else { exit::USAGE }
     }
 }
 
@@ -112,142 +139,26 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run a program deterministically.
-    Run {
-        /// Seed the run is derived from.
-        #[arg(long)]
-        seed: Option<u64>,
-        /// Use this tape instead of deriving one from a seed.
-        #[arg(long, value_name = "FILE")]
-        tape: Option<String>,
-        /// Run this many times and require every run to be identical.
-        #[arg(long, default_value_t = 1)]
-        repeat: usize,
-        /// Write a scenario bundle even for a clean run.
-        #[arg(long, value_name = "FILE")]
-        save: Option<String>,
-        /// Write what the run came to as one line of JSON, for a program to read.
-        #[arg(long, value_name = "FILE")]
-        facts: Option<String>,
-        /// How execution is interleaved.
-        #[arg(long, default_value = "pct")]
-        scheduler: String,
-        /// Exit with code 4 if the run could not be fully guaranteed.
-        #[arg(long)]
-        strict_determinism: bool,
-        /// Abandon a run that records more than this many events.
-        #[arg(long, value_name = "N")]
-        max_events: Option<u64>,
-        /// World configuration file: cluster, network, disk and scheduled faults.
-        #[arg(long, value_name = "FILE")]
-        config: Option<String>,
-        /// Replace `RDRAND` and `RDSEED` in the prepared files with instructions that repeat.
-        #[arg(long)]
-        patch_rdrand: bool,
-        /// Make the processor identification instruction fault, so this world answers it.
-        #[arg(long)]
-        patch_cpuid: bool,
-        /// The program to run, after `--`. A `[differential]` scenario names its own.
-        #[arg(last = true)]
-        program: Vec<String>,
-    },
+    Run(RunArgs),
 
     /// Replay a stored bundle and check it produces what it recorded.
-    Replay {
-        /// Where to find the recorded objects when their paths have moved.
-        #[arg(long, value_name = "DIR")]
-        binaries: Option<String>,
-        /// Check the digest and say so; print nothing else.
-        #[arg(long)]
-        verify_only: bool,
-        /// Stop before the first instruction and print a debugger attach line.
-        #[arg(long)]
-        gdb: bool,
-        /// Stop the world at this event and hand it to a debugger.
-        #[arg(long, value_name = "EVENT")]
-        break_at: Option<u64>,
-        /// The bundles to replay.
-        #[arg(required = true)]
-        bundle: Vec<String>,
-    },
+    Replay(ReplayArgs),
 
     /// Run the guests built into this binary and check they reproduce.
     ///
     /// Needs no program on disk and no privileges, so it checks determinism on any machine.
-    Selftest {
-        /// Seed the runs are derived from.
-        #[arg(long, default_value_t = 0)]
-        seed: u64,
-        /// How many times to repeat each guest.
-        #[arg(long, default_value_t = 100)]
-        repeat: usize,
-        /// Run only this guest.
-        #[arg(long, value_enum)]
-        guest: Option<Demo>,
-        /// Write a scenario bundle per guest into this directory.
-        #[arg(long, value_name = "DIR")]
-        save_dir: Option<String>,
-    },
+    Selftest(SelftestArgs),
 
     /// Search for a finding.
     ///
     /// A campaign depends only on its master seed and run budget: `--runs` reproduces exactly for
     /// any `-j`. `--time` records how many runs it reached, so `--runs` can repeat it. See
     /// `docs/API.md` §7.2.
-    Explore {
-        /// Wall-clock budget: `90s`, `30m`, `1h`, `2d`, or bare seconds. Not reproducible alone.
-        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
-        time: Option<std::time::Duration>,
-        /// Run budget. The reproducible one.
-        #[arg(long, value_name = "N")]
-        runs: Option<u64>,
-        /// Stop after this many runs that added no new group of findings.
-        #[arg(long, value_name = "N")]
-        quiet_runs: Option<u64>,
-        /// How many workers.
-        #[arg(long, short = 'j', default_value_t = 1)]
-        jobs: usize,
-        /// Where findings are written.
-        #[arg(long, value_name = "DIR", default_value = "findings")]
-        findings: String,
-        /// A corpus to carry in and write back out.
-        #[arg(long, value_name = "DIR")]
-        corpus: Option<String>,
-        /// Write the campaign down here between generations, and resume it if it already is.
-        #[arg(long, value_name = "DIR")]
-        resume: Option<String>,
-        /// World configuration: cluster, network, disk and drawn faults.
-        #[arg(long, value_name = "FILE")]
-        config: Option<String>,
-        /// Reproduces the whole campaign.
-        #[arg(long, value_name = "U64", default_value_t = 0)]
-        master_seed: u64,
-        /// Write a machine-readable account of the campaign here.
-        #[arg(long, value_name = "FILE")]
-        summary: Option<String>,
-        /// Search a guest built into this binary instead of a program on disk.
-        #[arg(long, value_enum)]
-        guest: Option<Demo>,
-        /// The program to search, after `--`.
-        #[arg(last = true)]
-        program: Vec<String>,
-    },
+    Explore(ExploreArgs),
 
     /// Carry out a campaign's runs. Started by `bohr explore`.
     #[command(hide = true)]
-    ExploreWorker {
-        /// Take items on stdin and answer each on stdout until stdin closes.
-        #[arg(long)]
-        serve: bool,
-        /// World configuration, the same file the campaign was given.
-        #[arg(long, value_name = "FILE")]
-        config: Option<String>,
-        /// The guest built into this binary to run.
-        #[arg(long, value_enum)]
-        guest: Option<Demo>,
-        /// The program to run, after `--`.
-        #[arg(last = true)]
-        program: Vec<String>,
-    },
+    ExploreWorker(ExploreWorkerArgs),
 
     /// Hunt a target from its pack: build or check its binary, run its campaign, group findings.
     Hunt {
@@ -290,52 +201,10 @@ enum Command {
     ///
     /// Each check is a property of runs (they repeat, stay clean without faults, find what was
     /// seeded), the same code for every subject. See `docs/API.md` §7.9.
-    Check {
-        /// Subjects: a pack name, a defect's directory name, or the path of either's file.
-        subjects: Vec<String>,
-        /// Every subject in this repository.
-        #[arg(long)]
-        all: bool,
-        /// Only these checks, comma-separated.
-        #[arg(long, value_delimiter = ',', value_name = "CHECKS")]
-        only: Vec<String>,
-        /// Fewer repeats, and nothing that sweeps a range of seeds.
-        #[arg(long)]
-        quick: bool,
-        /// Print what would be checked, and run nothing.
-        #[arg(long)]
-        plan: bool,
-        /// How many runs at once.
-        #[arg(long, short = 'j', default_value_t = 4)]
-        jobs: usize,
-        /// Where results are written, one JSON file per subject.
-        #[arg(short = 'o', long, value_name = "DIR", default_value = "target/check")]
-        out: String,
-    },
+    Check(CheckArgs),
 
     /// Run each seed of a range once and say what was found on which.
-    Sweep {
-        /// The scenario.
-        scenario: String,
-        /// The seeds, `a..b`, both ends included.
-        #[arg(long, value_name = "A..B", value_parser = hunt::parse_seeds)]
-        seeds: (u64, u64),
-        /// Count the seeds that found this: an outcome kind or a diagnostic code.
-        #[arg(long, value_name = "CODE")]
-        expect: Option<String>,
-        /// Exit 0 only if at least this many seeds found what --expect names.
-        #[arg(long, value_name = "N", requires = "expect")]
-        at_least: Option<u64>,
-        /// Take every fault out of the scenario first.
-        #[arg(long)]
-        no_faults: bool,
-        /// How many runs at once.
-        #[arg(long, short = 'j', default_value_t = 4)]
-        jobs: usize,
-        /// The program, after `--`; the first word of the scenario's argv when not given.
-        #[arg(last = true)]
-        program: Vec<String>,
-    },
+    Sweep(SweepArgs),
 
     /// Group the findings in a directory by what went wrong, each group led by its smallest run.
     Findings {
@@ -364,23 +233,7 @@ enum Command {
     ///
     /// Every unmodelled call is answered `ENOSYS` so the next one is reached; the result says
     /// nothing about the program's correctness. Writes no bundle, and exits 4 when it found any.
-    Survey {
-        /// Seed the run is derived from.
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
-        /// World configuration file, where the program is a cluster.
-        #[arg(long, value_name = "FILE")]
-        config: Option<String>,
-        /// Make the processor identification instruction fault, as `bohr run` does.
-        #[arg(long)]
-        patch_cpuid: bool,
-        /// Abandon the survey after this many events.
-        #[arg(long, value_name = "N")]
-        max_events: Option<u64>,
-        /// The program to survey, after `--`.
-        #[arg(last = true)]
-        program: Vec<String>,
-    },
+    Survey(SurveyArgs),
 
     /// Report what this host can and cannot do, and what to type about it.
     Doctor {
@@ -515,6 +368,231 @@ enum Command {
     },
 }
 
+/// The arguments of `bohr run`.
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// Seed the run is derived from.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Use this tape instead of deriving one from a seed.
+    #[arg(long, value_name = "FILE")]
+    tape: Option<String>,
+    /// Run this many times and require every run to be identical.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// Write a scenario bundle even for a clean run.
+    #[arg(long, value_name = "FILE")]
+    save: Option<String>,
+    /// Write what the run came to as one line of JSON, for a program to read.
+    #[arg(long, value_name = "FILE")]
+    facts: Option<String>,
+    /// How execution is interleaved.
+    #[arg(long, value_enum, default_value_t = execute::Scheduler::Pct)]
+    scheduler: execute::Scheduler,
+    /// Exit with code 4 if the run could not be fully guaranteed.
+    #[arg(long)]
+    strict_determinism: bool,
+    /// Abandon a run that records more than this many events.
+    #[arg(long, value_name = "N")]
+    max_events: Option<u64>,
+    /// World configuration file: cluster, network, disk and scheduled faults.
+    #[arg(long, value_name = "FILE")]
+    config: Option<String>,
+    /// Replace `RDRAND` and `RDSEED` in the prepared files with instructions that repeat.
+    #[arg(long)]
+    patch_rdrand: bool,
+    /// Make the processor identification instruction fault, so this world answers it.
+    #[arg(long)]
+    patch_cpuid: bool,
+    /// The program to run, after `--`. A `[differential]` scenario names its own.
+    #[arg(last = true)]
+    program: Vec<String>,
+}
+
+/// The arguments of `bohr replay`.
+#[derive(clap::Args, Debug)]
+struct ReplayArgs {
+    /// Where to find the recorded objects when their paths have moved.
+    #[arg(long, value_name = "DIR")]
+    binaries: Option<String>,
+    /// Check the digest and say so; print nothing else.
+    #[arg(long)]
+    verify_only: bool,
+    /// Stop before the first instruction and print a debugger attach line.
+    #[arg(long)]
+    gdb: bool,
+    /// Stop the world at this event and hand it to a debugger.
+    #[arg(long, value_name = "EVENT")]
+    break_at: Option<u64>,
+    /// Run the bundle under this build and write what it reaches here, whatever model it was
+    /// recorded under, rather than compare.
+    #[arg(long, value_name = "FILE")]
+    record: Option<std::path::PathBuf>,
+    /// The bundles to replay.
+    #[arg(required = true)]
+    bundle: Vec<String>,
+}
+
+/// The arguments of `bohr selftest`.
+#[derive(clap::Args, Debug)]
+struct SelftestArgs {
+    /// Seed the runs are derived from.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// How many times to repeat each guest.
+    #[arg(long, default_value_t = 100)]
+    repeat: usize,
+    /// Run only this guest.
+    #[arg(long, value_enum)]
+    guest: Option<Demo>,
+    /// Write a scenario bundle per guest into this directory.
+    #[arg(long, value_name = "DIR")]
+    save_dir: Option<String>,
+}
+
+/// The arguments of `bohr explore`.
+#[derive(clap::Args, Debug)]
+struct ExploreArgs {
+    /// Wall-clock budget: `90s`, `30m`, `1h`, `2d`, or bare seconds. Not reproducible alone.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    time: Option<std::time::Duration>,
+    /// Run budget. The reproducible one.
+    #[arg(long, value_name = "N")]
+    runs: Option<u64>,
+    /// Stop after this many runs that added no new group of findings.
+    #[arg(long, value_name = "N")]
+    quiet_runs: Option<u64>,
+    /// How many workers.
+    #[arg(long, short = 'j', default_value_t = 1)]
+    jobs: usize,
+    /// Where findings are written.
+    #[arg(long, value_name = "DIR", default_value = "findings")]
+    findings: String,
+    /// A corpus to carry in and write back out.
+    #[arg(long, value_name = "DIR")]
+    corpus: Option<String>,
+    /// Write the campaign down here between generations, and resume it if it already is.
+    #[arg(long, value_name = "DIR")]
+    resume: Option<String>,
+    /// World configuration: cluster, network, disk and drawn faults.
+    #[arg(long, value_name = "FILE")]
+    config: Option<String>,
+    /// Reproduces the whole campaign.
+    #[arg(long, value_name = "U64", default_value_t = 0)]
+    master_seed: u64,
+    /// Write a machine-readable account of the campaign here.
+    #[arg(long, value_name = "FILE")]
+    summary: Option<String>,
+    /// Search a guest built into this binary instead of a program on disk.
+    #[arg(long, value_enum)]
+    guest: Option<Demo>,
+    /// The program to search, after `--`.
+    #[arg(last = true)]
+    program: Vec<String>,
+}
+
+/// The arguments of `bohr explore-worker`.
+#[derive(clap::Args, Debug)]
+struct ExploreWorkerArgs {
+    /// Take items on stdin and answer each on stdout until stdin closes.
+    #[arg(long)]
+    serve: bool,
+    /// World configuration, the same file the campaign was given.
+    #[arg(long, value_name = "FILE")]
+    config: Option<String>,
+    /// The guest built into this binary to run.
+    #[arg(long, value_enum)]
+    guest: Option<Demo>,
+    /// Run one finding again with its log kept and write its bundle here.
+    #[arg(long, value_name = "FILE")]
+    record: Option<std::path::PathBuf>,
+    /// Where a recording that reached another digest is written.
+    #[arg(long, value_name = "FILE")]
+    apart: Option<std::path::PathBuf>,
+    /// The recorded finding's seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// The recorded finding's tape prefix, in hex.
+    #[arg(long)]
+    prefix: Option<String>,
+    /// The digest the recording must reach.
+    #[arg(long)]
+    expect: Option<String>,
+    /// The program to run, after `--`.
+    #[arg(last = true)]
+    program: Vec<String>,
+}
+
+/// The arguments of `bohr check`.
+#[derive(clap::Args, Debug)]
+struct CheckArgs {
+    /// Subjects: a pack name, a defect's directory name, or the path of either's file.
+    subjects: Vec<String>,
+    /// Every subject in this repository.
+    #[arg(long)]
+    all: bool,
+    /// Only these checks, comma-separated.
+    #[arg(long, value_delimiter = ',', value_name = "CHECKS")]
+    only: Vec<String>,
+    /// Fewer repeats, and nothing that sweeps a range of seeds.
+    #[arg(long)]
+    quick: bool,
+    /// Print what would be checked, and run nothing.
+    #[arg(long)]
+    plan: bool,
+    /// How many runs at once.
+    #[arg(long, short = 'j', default_value_t = 4)]
+    jobs: usize,
+    /// Where results are written, one JSON file per subject.
+    #[arg(short = 'o', long, value_name = "DIR", default_value = "target/check")]
+    out: String,
+}
+
+/// The arguments of `bohr sweep`.
+#[derive(clap::Args, Debug)]
+struct SweepArgs {
+    /// The scenario.
+    scenario: String,
+    /// The seeds, `a..b`, both ends included.
+    #[arg(long, value_name = "A..B", value_parser = hunt::parse_seeds)]
+    seeds: (u64, u64),
+    /// Count the seeds that found this: an outcome kind or a diagnostic code.
+    #[arg(long, value_name = "CODE")]
+    expect: Option<String>,
+    /// Exit 0 only if at least this many seeds found what --expect names.
+    #[arg(long, value_name = "N", requires = "expect")]
+    at_least: Option<u64>,
+    /// Take every fault out of the scenario first.
+    #[arg(long)]
+    no_faults: bool,
+    /// How many runs at once.
+    #[arg(long, short = 'j', default_value_t = 4)]
+    jobs: usize,
+    /// The program, after `--`; the first word of the scenario's argv when not given.
+    #[arg(last = true)]
+    program: Vec<String>,
+}
+
+/// The arguments of `bohr survey`.
+#[derive(clap::Args, Debug)]
+struct SurveyArgs {
+    /// Seed the run is derived from.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// World configuration file, where the program is a cluster.
+    #[arg(long, value_name = "FILE")]
+    config: Option<String>,
+    /// Make the processor identification instruction fault, as `bohr run` does.
+    #[arg(long)]
+    patch_cpuid: bool,
+    /// Abandon the survey after this many events.
+    #[arg(long, value_name = "N")]
+    max_events: Option<u64>,
+    /// The program to survey, after `--`.
+    #[arg(last = true)]
+    program: Vec<String>,
+}
+
 /// The world a campaign runs in, read once and carried with the text it came from.
 ///
 /// The text is kept because a finding's bundle stores the configuration itself.
@@ -525,8 +603,8 @@ fn read_scenario(
         return Ok(None);
     };
     let text = std::fs::read_to_string(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    Ok(Some((bohr_world::config::load(&text)?, text)))
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    Ok(Some((crate::state_dir::load(&text)?, text)))
 }
 
 /// What a campaign was pointed at: a guest built in, or a program on disk, and never both.
@@ -534,10 +612,10 @@ fn subject_of(guest: Option<Demo>, program: Vec<String>) -> Result<explore::Subj
     match (guest, program.is_empty()) {
         (Some(demo), true) => Ok(explore::Subject::Demo(demo)),
         (None, false) => Ok(explore::Subject::Program(program)),
-        (Some(_), false) => Err(CliError::Usage(
+        (Some(_), false) => Err(CliError::usage(
             "BOHR-1001: name a built-in guest or a program, not both".to_owned(),
         )),
-        (None, true) => Err(CliError::Usage(
+        (None, true) => Err(CliError::usage(
             "BOHR-1001: nothing to search; name a program after `--` or a guest with --guest"
                 .to_owned(),
         )),
@@ -585,30 +663,29 @@ pub(crate) fn run_config_for(
     config
 }
 
-/// Writes a copy of a program with its processor questions made to fault, and names the copy.
+/// Writes a copy of a program with its processor questions made to fault, executed wherever the
+/// program is started.
 ///
-/// Always a copy; `ARCHITECTURE.md` §5.8 forbids rewriting the user's file. The copy sits beside
-/// the original with a suffix.
-fn trapped_copy(program: &str) -> Result<String, CliError> {
+/// Always a copy; `ARCHITECTURE.md` §5.8 forbids rewriting the user's file. The copy is placed in
+/// the user's private directory, and the guest still sees the program's own name.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn trap_copy(program: &str) -> Result<(), CliError> {
     let bytes = std::fs::read(program)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {program}: {e}")))?;
-    let Some((patched, sites)) = bohr_backend::code::cpuid::trapped(&bytes) else {
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {program}: {e}")))?;
+    let Some((patched, sites)) = bohr_x86::cpuid::trapped(&bytes) else {
         eprintln!("no processor questions to trap in {program}");
-        return Ok(program.to_owned());
+        return Ok(());
     };
-    let into = std::env::temp_dir().join(format!(
-        "{}.bohr-trapped",
-        std::path::Path::new(program).file_name().unwrap_or_default().to_string_lossy()
-    ));
-    std::fs::write(&into, &patched)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", into.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&into, std::fs::Permissions::from_mode(0o755));
-    }
-    eprintln!("trapped {} processor question(s) in {program}", sites.len());
-    Ok(into.to_string_lossy().into_owned())
+    let copy = private::place("trapped", &patched)?;
+    private::substitute(program, &copy);
+    eprintln!("trapped {} processor question(s) in {program}, executed from {copy}", sites.len());
+    Ok(())
+}
+
+/// Nothing executes a program on this platform, so there is nothing to trap.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn trap_copy(_program: &str) -> Result<(), CliError> {
+    Ok(())
 }
 
 /// One guest specification per node, from a command line and the configuration.
@@ -650,6 +727,17 @@ pub(crate) fn specs_for(
             vec![bohr_backend::GuestSpec { argv, env: Vec::new(), executable: None }]
         }
     };
+    // A stand-in file keeps the name the scenario gives, so the guest and its digest do not see
+    // where this host keeps it.
+    let specs = specs
+        .into_iter()
+        .map(|mut spec| {
+            if spec.executable.is_none() {
+                spec.executable = spec.argv.first().and_then(|name| private::substitute_for(name));
+            }
+            spec
+        })
+        .collect();
     with_probe(specs, loaded)
 }
 
@@ -752,7 +840,7 @@ fn compare_implementations(
             eprintln!("{}    {}", verdict.headline, verdict.code);
             Ok(exit::FINDING)
         }
-        bohr_kernel::Verdict::Clean | bohr_kernel::Verdict::Skipped => Err(CliError::Internal(
+        bohr_kernel::Verdict::Clean | bohr_kernel::Verdict::Skipped => Err(CliError::internal(
             "BOHR-5004: a differential run compared nothing. Every implementation has to produce \
              every projection, and one that produced none leaves a run that looks clean and checked \
              nothing."
@@ -768,7 +856,10 @@ fn main() -> ExitCode {
         Err(e) if std::env::args().any(|a| a == "--json") && e.use_stderr() => {
             let message = e.to_string();
             let first = message.lines().next().unwrap_or("").trim_start_matches("error: ");
-            println!("{}", json::error(&format!("BOHR-1001: {first}"), exit::USAGE));
+            println!(
+                "{}",
+                json::error(&CliError::usage(format!("BOHR-1001: {first}")), exit::USAGE)
+            );
             return ExitCode::from(exit::USAGE);
         }
         Err(e) => e.exit(),
@@ -778,11 +869,11 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             if json::on() {
-                println!("{}", json::error(&e.to_string(), e.code()));
+                println!("{}", json::error(&e, e.exit()));
             } else {
                 eprintln!("error: {e}");
             }
-            ExitCode::from(e.code())
+            ExitCode::from(e.exit())
         }
     }
 }
@@ -794,193 +885,10 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             Ok(exit::CLEAN)
         }
         Command::Mcp => mcp::serve(),
-        Command::Run {
-            seed,
-            tape,
-            repeat,
-            save,
-            facts,
-            scheduler,
-            strict_determinism,
-            max_events,
-            config: config_path,
-            patch_rdrand,
-            patch_cpuid,
-            program,
-        } => {
-            if !SCHEDULERS.contains(&scheduler.as_str()) {
-                return Err(CliError::Usage(format!(
-                    "BOHR-1002: no scheduler named {scheduler}; this build has {}",
-                    SCHEDULERS.join(", ")
-                )));
-            }
-            let tape = load_tape(seed, tape.as_deref())?;
-            // The text is kept: a bundle stores the configuration verbatim.
-            let config_text =
-                match config_path.as_deref() {
-                    Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-                        CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}"))
-                    })?),
-                    None => None,
-                };
-            let mut loaded = match config_text.as_deref() {
-                Some(text) => Some(bohr_world::config::load(text)?),
-                None => None,
-            };
-            // Printed before the run: the patched guest is not the one that shipped.
-            if patch_rdrand {
-                let state = loaded.as_mut().and_then(|scenario| scenario.state.take());
-                match state {
-                    Some(image) => {
-                        let (patched, rewritten) = image.without_hardware_randomness();
-                        for (path, sites) in &rewritten {
-                            eprintln!("patched {sites} hardware randomness site(s) in {path}");
-                        }
-                        if rewritten.is_empty() {
-                            eprintln!("no hardware randomness to patch in the prepared files");
-                        }
-                        if let Some(scenario) = loaded.as_mut() {
-                            scenario.state = Some(patched);
-                        }
-                    }
-                    None => {
-                        return Err(CliError::Usage(
-                            "BOHR-1001: --patch-rdrand rewrites the prepared files, and this \
-                             scenario prepares none; see [state] in docs/API.md §3"
-                                .to_owned(),
-                        ));
-                    }
-                }
-            }
-            // The program itself is not a prepared file, so a patched copy is written and run. The
-            // copy's path is what the bundle records, so it is printed.
-            let mut program = program;
-            if patch_cpuid {
-                if let Some(state) = loaded.as_mut().and_then(|scenario| scenario.state.take()) {
-                    let (patched, rewritten) = state.with_processor_questions_trapped();
-                    for (path, sites) in &rewritten {
-                        eprintln!("trapped {sites} processor question(s) in {path}");
-                    }
-                    if let Some(scenario) = loaded.as_mut() {
-                        scenario.state = Some(patched);
-                    }
-                }
-                if let Some(first) = program.first().cloned() {
-                    let copy = trapped_copy(&first)?;
-                    if let Some(slot) = program.first_mut() {
-                        *slot = copy;
-                    }
-                }
-            }
-            let config = run_config_for(loaded.as_ref(), max_events);
-            run_program(
-                program,
-                &tape,
-                repeat,
-                save.as_deref(),
-                facts.as_deref(),
-                strict_determinism,
-                &scheduler,
-                config,
-                loaded.as_ref(),
-                config_text.as_deref().unwrap_or(""),
-            )
-        }
-        Command::Replay { binaries, verify_only, gdb, break_at, bundle } => {
-            // Refused before replaying, which can take as long as the original run.
-            let break_at =
-                match (gdb, break_at) {
-                    (true, Some(_)) => return Err(CliError::Usage(
-                        "BOHR-1001: --gdb is --break-at 0; naming both says two different things"
-                            .to_owned(),
-                    )),
-                    (true, None) => Some(0),
-                    (false, at) => at,
-                };
-            if break_at.is_some() {
-                if json::on() {
-                    return Err(CliError::Usage(
-                        "BOHR-1001: a hand-over is a world frozen for a person at a debugger; \
-                         --json has nothing to write about it"
-                            .to_owned(),
-                    ));
-                }
-                if verify_only {
-                    return Err(CliError::Usage(
-                        "BOHR-1001: --verify-only checks a digest, and a hand-over never reaches \
-                         one"
-                        .to_owned(),
-                    ));
-                }
-                if bundle.len() > 1 {
-                    return Err(CliError::Usage(
-                        "BOHR-1001: a hand-over is one frozen world; name one bundle".to_owned(),
-                    ));
-                }
-            }
-            Ok(replay_bundles(&bundle, binaries.as_deref(), verify_only, break_at))
-        }
-        Command::Explore {
-            time,
-            runs,
-            quiet_runs,
-            jobs,
-            findings,
-            corpus,
-            resume,
-            config,
-            master_seed,
-            summary,
-            guest,
-            program,
-        } => {
-            let subject = subject_of(guest, program)?;
-            let scenario = read_scenario(config.as_deref())?;
-            if time.is_none() && runs.is_none() && quiet_runs.is_none() {
-                return Err(CliError::Usage(
-                    "BOHR-1001: a campaign needs a budget: --runs for one that reproduces, \
-                     --time for one that does not, --quiet-runs for one that stops when it finds \
-                     nothing new"
-                        .to_owned(),
-                ));
-            }
-            explore::explore(&explore::Request {
-                master: Seed(master_seed),
-                runs,
-                time,
-                quiet_runs,
-                jobs,
-                findings: findings.into(),
-                corpus: corpus.map(Into::into),
-                resume: resume.map(Into::into),
-                summary: summary.map(Into::into),
-                scenario_path: config.map(Into::into),
-                scenario,
-                subject,
-            })
-        }
-        Command::ExploreWorker { serve, config, guest, program } => {
-            let scenario = read_scenario(config.as_deref())?;
-            let request = explore::Request {
-                master: Seed(0),
-                runs: None,
-                time: None,
-                quiet_runs: None,
-                jobs: 1,
-                findings: std::path::PathBuf::new(),
-                corpus: None,
-                resume: None,
-                summary: None,
-                scenario_path: config.map(Into::into),
-                scenario,
-                subject: subject_of(guest, program)?,
-            };
-            if serve {
-                explore::serve(&request)
-            } else {
-                Err(CliError::Usage("BOHR-1001: a worker takes --serve".to_owned()))
-            }
-        }
+        Command::Run(args) => run_command(args),
+        Command::Replay(args) => replay_command(args),
+        Command::Explore(args) => explore_command(args),
+        Command::ExploreWorker(args) => explore_worker_command(args),
         Command::Hunt {
             pack,
             time,
@@ -1006,49 +914,8 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             binary,
             master_seed,
         }),
-        Command::Check { subjects, all, only, quick, plan, jobs, out } => {
-            let subjects = if all {
-                if !subjects.is_empty() {
-                    return Err(CliError::Usage(
-                        "BOHR-1001: --all names every subject; naming some as well says two things"
-                            .to_owned(),
-                    ));
-                }
-                subjects::all()?
-            } else if subjects.is_empty() {
-                return Err(CliError::Usage(
-                    "BOHR-1001: name a subject to check, or pass --all".to_owned(),
-                ));
-            } else {
-                subjects.iter().map(|s| subjects::resolve(s)).collect::<Result<_, _>>()?
-            };
-            check::check(&check::Request {
-                subjects,
-                only,
-                options: check::Options { quick },
-                plan,
-                jobs,
-                out: out.into(),
-            })
-        }
-        Command::Sweep { scenario, seeds, expect, at_least, no_faults, jobs, program } => {
-            if program.len() > 1 {
-                return Err(CliError::Usage(
-                    "BOHR-1001: a sweep runs one program; its arguments belong in the scenario's \
-                     argv"
-                        .to_owned(),
-                ));
-            }
-            check::sweep(&check::Sweep {
-                scenario: scenario.into(),
-                seeds,
-                expect,
-                at_least,
-                no_faults,
-                jobs,
-                program: program.into_iter().next(),
-            })
-        }
+        Command::Check(args) => check_command(args),
+        Command::Sweep(args) => sweep_command(args),
         Command::Findings { dir, ablate } => findings::findings(&dir, ablate),
         Command::Init { nodes, out, program } => init::init(program, nodes, &out),
         Command::Reduce { bundle, out, budget, keep, binaries } => {
@@ -1063,27 +930,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                 report(&bundle, out.as_deref().unwrap_or("report.html"), redact)
             }
         }
-        Command::Survey { seed, config, max_events, patch_cpuid, program } => {
-            if program.is_empty() {
-                return Err(CliError::Usage(
-                    "BOHR-1002: a survey needs a program, after `--`".to_owned(),
-                ));
-            }
-            // Prepared as a run would be, so the survey sees the same program.
-            let program = if patch_cpuid {
-                let mut program = program;
-                if let Some(first) = program.first().cloned() {
-                    let copy = trapped_copy(&first)?;
-                    if let Some(slot) = program.first_mut() {
-                        *slot = copy;
-                    }
-                }
-                program
-            } else {
-                program
-            };
-            survey::run(program, seed, config.as_deref(), max_events, patch_cpuid)
-        }
+        Command::Survey(args) => survey_command(args),
         Command::Note { bundle, text } => note(&bundle, &text),
         Command::Ablate { bundle, binaries } => ablate::ablate(&bundle, binaries.as_deref()),
         Command::Confirm { bundle, out, runs } => confirm::confirm(&bundle, &out, runs),
@@ -1092,10 +939,313 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
         }
         Command::Explain { bundle } => explain(&bundle),
         Command::Doctor { target, syscalls } => doctor::run(target.as_deref(), syscalls),
-        Command::Selftest { seed, repeat, guest, save_dir } => {
-            selftest(Seed(seed), repeat, guest, save_dir.as_deref())
+        Command::Selftest(args) => selftest_command(args),
+    }
+}
+
+/// `bohr run`.
+fn run_command(args: RunArgs) -> Result<u8, CliError> {
+    let RunArgs {
+        seed,
+        tape,
+        repeat,
+        save,
+        facts,
+        scheduler,
+        strict_determinism,
+        max_events,
+        config: config_path,
+        patch_rdrand,
+        patch_cpuid,
+        program,
+    } = args;
+    let tape = load_tape(seed, tape.as_deref())?;
+    // The text is kept: a bundle stores the configuration verbatim.
+    let config_text = match config_path.as_deref() {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?,
+        ),
+        None => None,
+    };
+    let mut loaded = match config_text.as_deref() {
+        Some(text) => Some(crate::state_dir::load(text)?),
+        None => None,
+    };
+    // Printed before the run: the patched guest is not the one that shipped.
+    if patch_rdrand {
+        let state = loaded.as_mut().and_then(|scenario| scenario.state.take());
+        match state {
+            Some(image) => {
+                let (patched, rewritten) = image.without_hardware_randomness();
+                for (path, sites) in &rewritten {
+                    eprintln!("patched {sites} hardware randomness site(s) in {path}");
+                }
+                if rewritten.is_empty() {
+                    eprintln!("no hardware randomness to patch in the prepared files");
+                }
+                if let Some(scenario) = loaded.as_mut() {
+                    scenario.state = Some(patched);
+                }
+            }
+            None => {
+                return Err(CliError::usage(
+                    "BOHR-1001: --patch-rdrand rewrites the prepared files, and this \
+                     scenario prepares none; see [state] in docs/API.md §3"
+                        .to_owned(),
+                ));
+            }
         }
     }
+    // The program itself is not a prepared file, so a patched copy is written and run.
+    if patch_cpuid {
+        if let Some(state) = loaded.as_mut().and_then(|scenario| scenario.state.take()) {
+            let (patched, rewritten) = state.with_processor_questions_trapped();
+            for (path, sites) in &rewritten {
+                eprintln!("trapped {sites} processor question(s) in {path}");
+            }
+            if let Some(scenario) = loaded.as_mut() {
+                scenario.state = Some(patched);
+            }
+        }
+        if let Some(first) = program.first() {
+            trap_copy(first)?;
+        }
+    }
+    let config = run_config_for(loaded.as_ref(), max_events);
+    run_program(
+        program,
+        &tape,
+        repeat,
+        save.as_deref(),
+        facts.as_deref(),
+        strict_determinism,
+        scheduler.name(),
+        config,
+        loaded.as_ref(),
+        config_text.as_deref().unwrap_or(""),
+    )
+}
+
+/// `bohr replay`.
+fn replay_command(args: ReplayArgs) -> Result<u8, CliError> {
+    let ReplayArgs { binaries, verify_only, gdb, break_at, record, bundle } = args;
+    if let Some(out) = record {
+        return record_again(
+            &bundle,
+            binaries.as_deref(),
+            verify_only || gdb || break_at.is_some(),
+            &out,
+        );
+    }
+    // Refused before replaying, which can take as long as the original run.
+    let break_at = match (gdb, break_at) {
+        (true, Some(_)) => {
+            return Err(CliError::usage(
+                "BOHR-1001: --gdb is --break-at 0; naming both says two different things"
+                    .to_owned(),
+            ));
+        }
+        (true, None) => Some(0),
+        (false, at) => at,
+    };
+    if break_at.is_some() {
+        if json::on() {
+            return Err(CliError::usage(
+                "BOHR-1001: a hand-over is a world frozen for a person at a debugger; \
+                 --json has nothing to write about it"
+                    .to_owned(),
+            ));
+        }
+        if verify_only {
+            return Err(CliError::usage(
+                "BOHR-1001: --verify-only checks a digest, and a hand-over never reaches \
+                 one"
+                .to_owned(),
+            ));
+        }
+        if bundle.len() > 1 {
+            return Err(CliError::usage(
+                "BOHR-1001: a hand-over is one frozen world; name one bundle".to_owned(),
+            ));
+        }
+    }
+    Ok(replay_bundles(&bundle, binaries.as_deref(), verify_only, break_at))
+}
+
+/// `bohr replay --record`: one bundle run again under this build and written anew.
+fn record_again(
+    bundle: &[String],
+    binaries: Option<&str>,
+    asked_more: bool,
+    out: &std::path::Path,
+) -> Result<u8, CliError> {
+    let [path] = bundle else {
+        return Err(CliError::usage(
+            "BOHR-1001: --record writes one bundle anew; name one".to_owned(),
+        ));
+    };
+    if asked_more {
+        return Err(CliError::usage(
+            "BOHR-1001: --record runs the bundle under this build and compares nothing, so it \
+             takes no --verify-only, --gdb or --break-at"
+                .to_owned(),
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let completed = replay::record_again(&bytes, binaries, out)?;
+    let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
+    eprintln!(
+        "{path}: recorded again as {} · {} {} · {}",
+        out.display(),
+        verdict.headline,
+        verdict.code,
+        completed.report.digest
+    );
+    Ok(if matches!(completed.report.outcome, Outcome::Clean) { exit::CLEAN } else { exit::FINDING })
+}
+
+/// `bohr selftest`.
+fn selftest_command(args: SelftestArgs) -> Result<u8, CliError> {
+    let SelftestArgs { seed, repeat, guest, save_dir } = args;
+    selftest(Seed(seed), repeat, guest, save_dir.as_deref())
+}
+
+/// `bohr explore`.
+fn explore_command(args: ExploreArgs) -> Result<u8, CliError> {
+    let ExploreArgs {
+        time,
+        runs,
+        quiet_runs,
+        jobs,
+        findings,
+        corpus,
+        resume,
+        config,
+        master_seed,
+        summary,
+        guest,
+        program,
+    } = args;
+    let subject = subject_of(guest, program)?;
+    let scenario = read_scenario(config.as_deref())?;
+    if time.is_none() && runs.is_none() && quiet_runs.is_none() {
+        return Err(CliError::usage(
+            "BOHR-1001: a campaign needs a budget: --runs for one that reproduces, \
+             --time for one that does not, --quiet-runs for one that stops when it finds \
+             nothing new"
+                .to_owned(),
+        ));
+    }
+    explore::explore(&explore::Request {
+        master: Seed(master_seed),
+        runs,
+        time,
+        quiet_runs,
+        jobs,
+        findings: findings.into(),
+        corpus: corpus.map(Into::into),
+        resume: resume.map(Into::into),
+        summary: summary.map(Into::into),
+        scenario_path: config.map(Into::into),
+        scenario,
+        subject,
+    })
+}
+
+/// `bohr explore-worker`.
+fn explore_worker_command(args: ExploreWorkerArgs) -> Result<u8, CliError> {
+    let ExploreWorkerArgs { serve, config, guest, record, apart, seed, prefix, expect, program } =
+        args;
+    let scenario = read_scenario(config.as_deref())?;
+    let request = explore::Request {
+        master: Seed(0),
+        runs: None,
+        time: None,
+        quiet_runs: None,
+        jobs: 1,
+        findings: std::path::PathBuf::new(),
+        corpus: None,
+        resume: None,
+        summary: None,
+        scenario_path: config.map(Into::into),
+        scenario,
+        subject: subject_of(guest, program)?,
+    };
+    match (serve, record, apart, seed, expect) {
+        (true, None, ..) => explore::serve(&request),
+        (false, Some(path), Some(apart), Some(seed), Some(expect)) => {
+            let prefix = explore::unhex(prefix.as_deref().unwrap_or(""))?;
+            explore::record(&request, Seed(seed), prefix, &expect, &path, &apart)
+        }
+        _ => Err(CliError::usage(
+            "BOHR-1001: a worker takes --serve, or --record with --apart, --seed and --expect"
+                .to_owned(),
+        )),
+    }
+}
+
+/// `bohr check`.
+fn check_command(args: CheckArgs) -> Result<u8, CliError> {
+    let CheckArgs { subjects, all, only, quick, plan, jobs, out } = args;
+    let subjects = if all {
+        if !subjects.is_empty() {
+            return Err(CliError::usage(
+                "BOHR-1001: --all names every subject; naming some as well says two things"
+                    .to_owned(),
+            ));
+        }
+        subjects::all()?
+    } else if subjects.is_empty() {
+        return Err(CliError::usage(
+            "BOHR-1001: name a subject to check, or pass --all".to_owned(),
+        ));
+    } else {
+        subjects.iter().map(|s| subjects::resolve(s)).collect::<Result<_, _>>()?
+    };
+    check::check(&check::Request {
+        subjects,
+        only,
+        options: check::Options { quick },
+        plan,
+        jobs,
+        out: out.into(),
+    })
+}
+
+/// `bohr sweep`.
+fn sweep_command(args: SweepArgs) -> Result<u8, CliError> {
+    let SweepArgs { scenario, seeds, expect, at_least, no_faults, jobs, program } = args;
+    if program.len() > 1 {
+        return Err(CliError::usage(
+            "BOHR-1001: a sweep runs one program; its arguments belong in the scenario's \
+             argv"
+                .to_owned(),
+        ));
+    }
+    check::sweep(&check::Sweep {
+        scenario: scenario.into(),
+        seeds,
+        expect,
+        at_least,
+        no_faults,
+        jobs,
+        program: program.into_iter().next(),
+    })
+}
+
+/// `bohr survey`.
+fn survey_command(args: SurveyArgs) -> Result<u8, CliError> {
+    let SurveyArgs { seed, config, max_events, patch_cpuid, program } = args;
+    if program.is_empty() {
+        return Err(CliError::usage("BOHR-1002: a survey needs a program, after `--`".to_owned()));
+    }
+    // Prepared as a run would be, so the survey sees the same program.
+    if patch_cpuid && let Some(first) = program.first() {
+        trap_copy(first)?;
+    }
+    survey::run(program, seed, config.as_deref(), max_events, patch_cpuid)
 }
 
 /// The tape a run is driven by: a stored one, or one derived from a seed.
@@ -1106,13 +1256,13 @@ fn load_tape(seed: Option<u64>, file: Option<&str>) -> Result<Tape, CliError> {
         return Ok(Tape::from_seed(Seed(seed.unwrap_or(0))));
     };
     if seed.is_some() {
-        return Err(CliError::Usage(
+        return Err(CliError::usage(
             "BOHR-1004: --seed and --tape name different runs; give one".to_owned(),
         ));
     }
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    Tape::from_container(&bytes).map_err(|e| CliError::Usage(e.to_string()))
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    Tape::from_container(&bytes).map_err(|e| CliError::usage(e.to_string()))
 }
 
 /// Replays every named bundle, reporting the worst outcome any of them reached.
@@ -1171,9 +1321,9 @@ fn replay_bundles(
             Err(e) => {
                 eprintln!("{path}: {e}");
                 answers.push(serde_json::json!({
-                    "bundle": path, "result": "refused", "exit": e.code(), "detail": e.to_string(),
+                    "bundle": path, "result": "refused", "exit": e.exit(), "detail": e.to_string(),
                 }));
-                worst = worst.max(e.code());
+                worst = worst.max(e.exit());
             }
         }
     }
@@ -1188,10 +1338,13 @@ fn replay_bundles(
 /// Derived from the bundle's scenario by the code that planned the probe, so request `i` on the
 /// page is the probe's request `i`. No scenario or no probe gives no lanes.
 fn chain_lanes(bundle: &bohr_trace::Bundle) -> Vec<bohr_report::chain::Lane> {
-    let Some(text) = bundle.section(bohr_trace::SectionId::Config) else {
+    let Ok(text) = bundle.config_text() else {
         return Vec::new();
     };
-    let Ok(loaded) = bohr_world::config::load(&String::from_utf8_lossy(text)) else {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let Ok(loaded) = crate::state_dir::load(text) else {
         return Vec::new();
     };
     bohr_world::probe::requests_of(&loaded.probes)
@@ -1219,8 +1372,8 @@ fn chain_lanes(bundle: &bohr_trace::Bundle) -> Vec<bohr_report::chain::Lane> {
 /// The sidecar exists only for a run too long to draw whole; the page names it.
 fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))?;
 
     // Strips one `.html` suffix only.
     let stem = out.strip_suffix(".html").unwrap_or(out);
@@ -1236,7 +1389,7 @@ fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
         .unwrap_or_else(|| path.to_owned());
     let lanes = chain_lanes(&bundle);
     let rendered = bohr_report::render_chain(&bundle, Some(&short), Some(&named), &lanes)
-        .map_err(|e| CliError::Usage(e.to_string()))?;
+        .map_err(|e| CliError::usage(e.to_string()))?;
 
     if rendered.html.len() > bohr_report::MOST_BYTES {
         eprintln!(
@@ -1247,21 +1400,21 @@ fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
         );
     }
     std::fs::write(out, &rendered.html)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {out}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {out}: {e}")))?;
     let mut written = vec![out.to_owned()];
 
     if let Some(events) = &rendered.sidecar {
         std::fs::write(&sidecar_name, events)
-            .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {sidecar_name}: {e}")))?;
+            .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {sidecar_name}: {e}")))?;
         written.push(sidecar_name.clone());
     }
 
     if redact {
         // Written beside the original, which the person who ran it keeps.
-        let cleaned = bohr_trace::redact(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+        let cleaned = bohr_trace::redact(&bundle).map_err(|e| CliError::usage(e.to_string()))?;
         let name = format!("{}.redacted.bohr", path.trim_end_matches(".bohr"));
         std::fs::write(&name, cleaned)
-            .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {name}: {e}")))?;
+            .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {name}: {e}")))?;
         written.push(name);
     }
     wrote("page", path, &written);
@@ -1287,8 +1440,8 @@ pub(crate) fn wrote(kind: &str, bundle: &str, written: &[String]) {
 /// No timestamp and no author, so two identical invocations produce identical bytes.
 fn note(path: &str, text: &str) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))?;
 
     let mut notes = bundle
         .section(bohr_trace::SectionId::Notes)
@@ -1306,10 +1459,10 @@ fn note(path: &str, text: &str) -> Result<u8, CliError> {
     // never a truncated file.
     let staged = format!("{path}.writing");
     std::fs::write(&staged, writer.finish(bundle.run_id))
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {staged}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {staged}: {e}")))?;
     std::fs::rename(&staged, path).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
-        CliError::Usage(format!("BOHR-1002: cannot replace {path}: {e}"))
+        CliError::usage(format!("BOHR-1002: cannot replace {path}: {e}"))
     })?;
     if json::on() {
         let lines: Vec<&str> = notes.lines().collect();
@@ -1378,17 +1531,17 @@ fn parse_virtual(text: &str) -> Result<u64, String> {
 fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Result<u8, CliError> {
     for kind in &selection.kind {
         if !bohr_report::text::KINDS.contains(&kind.as_str()) {
-            return Err(CliError::Usage(format!(
+            return Err(CliError::usage(format!(
                 "BOHR-1001: no kind of event named {kind:?}; the kinds are {}",
                 bohr_report::text::KINDS.join(", ")
             )));
         }
     }
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))?;
     let mut model =
-        bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+        bohr_report::RunModel::of(&bundle).map_err(|e| CliError::usage(e.to_string()))?;
     model.events.retain(|e| selection.admits(e));
 
     if json::on() {
@@ -1408,7 +1561,7 @@ fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Resul
         "text" => bohr_report::text::write_log_with(&model.events, &model.records),
         "json" => bohr_report::jsonl::write_log(&model.events),
         other => {
-            return Err(CliError::Usage(format!(
+            return Err(CliError::usage(format!(
                 "BOHR-1001: no format named {other:?}; this build writes text and json"
             )));
         }
@@ -1425,9 +1578,9 @@ fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Resul
 /// How a stored run got to what it found, from the bundle alone.
 fn explain(path: &str) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
-    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
-    let model = bohr_report::RunModel::of(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+    let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::usage(e.to_string()))?;
+    let model = bohr_report::RunModel::of(&bundle).map_err(|e| CliError::usage(e.to_string()))?;
     let story = bohr_report::narrate::story(&model, path);
     if json::on() {
         let mut story = bohr_report::narrate::story_json(&story);
@@ -1494,20 +1647,20 @@ fn run_program(
     config_toml: &str,
 ) -> Result<u8, CliError> {
     if repeat == 0 {
-        return Err(CliError::Usage("BOHR-1002: --repeat must be at least 1".to_owned()));
+        return Err(CliError::usage("BOHR-1002: --repeat must be at least 1".to_owned()));
     }
     // A differential scenario names its own programs.
     if let Some(scenario) = loaded.filter(|l| l.differential.is_some()) {
         // Refused, since a differential run would ignore them.
         if save.is_some() {
-            return Err(CliError::Usage(
+            return Err(CliError::usage(
                 "BOHR-1002: --save has nothing to write for a differential run, which produces a \
                  group of executions rather than one"
                     .to_owned(),
             ));
         }
         if repeat != 1 {
-            return Err(CliError::Usage(
+            return Err(CliError::usage(
                 "BOHR-1002: --repeat is not carried out for a differential run; the comparison \
                  between implementations is what such a run repeats"
                     .to_owned(),
@@ -1518,16 +1671,28 @@ fn run_program(
 
     let path = program.first().cloned().unwrap_or_default();
     if path.is_empty() {
-        return Err(CliError::Usage(
+        return Err(CliError::usage(
             "BOHR-1001: a run needs a program after `--`, or a scenario that names its own"
                 .to_owned(),
         ));
     }
-    if !std::path::Path::new(&path).is_file() {
-        return Err(CliError::Usage(format!("BOHR-1001: {path} is not a file")));
+    // A stand-in is what runs, so it is what must be there.
+    let executed = private::substitute_for(&path).unwrap_or_else(|| path.clone());
+    if !std::path::Path::new(&executed).is_file() {
+        return Err(CliError::usage(format!("BOHR-1001: {executed} is not a file")));
     }
 
     let target = execute::Target::Program(specs_for(program, loaded, None)?);
+    // The log is held only where it is read: repetitions compare it event by event, and facts
+    // read the guest's records and the log's size. A bundle to save is spooled and streamed into
+    // its file; a run nobody reads is only digested.
+    let record = if repeat > 1 || facts.is_some() || json::on() {
+        execute::Record::Log
+    } else if save.is_some() {
+        execute::Record::Spool
+    } else {
+        execute::Record::DigestOnly
+    };
     let exec = execute::Execution {
         target: &target,
         tape,
@@ -1535,7 +1700,7 @@ fn run_program(
         // A guest writing to standard output would break the one object `--json` promises there.
         output: if json::on() { execute::Output::Discard } else { execute::Output::Deliver },
         policy: scheduler,
-        record: execute::Record::Log,
+        record,
         scenario: loaded,
         config_toml,
     };
@@ -1559,16 +1724,14 @@ fn run_program(
             let armed = loaded.is_some_and(bohr_world::LoadedConfig::asks_for_adversity);
             report_run(&path, repeat, &completed, armed, save);
             if let Some(file) = save {
-                let bytes = execute::to_bundle(&completed, tape, None)?;
-                std::fs::write(file, bytes)
-                    .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
+                execute::write_bundle(&completed, tape, None, std::path::Path::new(file))?;
                 eprintln!("  saved {file}");
             }
             if let Some(file) = facts {
-                let mut line = crate::facts::Facts::of(&completed).to_json();
+                let mut line = crate::facts::of(&completed).to_json();
                 line.push('\n');
                 std::fs::write(file, line)
-                    .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
+                    .map_err(|e| CliError::usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
             }
             // A degraded run is always reported; it changes the exit code only under `--strict`.
             let code = if !matches!(completed.report.outcome, Outcome::Clean) {
@@ -1589,7 +1752,7 @@ fn run_program(
                         "found": verdict.found,
                         "headline": verdict.headline,
                         "code": verdict.code,
-                        "facts": crate::facts::Facts::of(&completed),
+                        "facts": crate::facts::of(&completed),
                         "saved": save,
                         "exit": code,
                     }),
@@ -1615,7 +1778,7 @@ fn run_program(
     _loaded: Option<&bohr_world::LoadedConfig>,
     _config_toml: &str,
 ) -> Result<u8, CliError> {
-    Err(CliError::Usage(format!(
+    Err(CliError::usage(format!(
         "BOHR-1001: cannot run {}: this build has no syscall backend. \
          `bohr selftest` exercises the guests built into the binary.",
         program.first().map_or("<program>", String::as_str)
@@ -1754,11 +1917,11 @@ fn selftest(
     save_dir: Option<&str>,
 ) -> Result<u8, CliError> {
     if repeat == 0 {
-        return Err(CliError::Usage("BOHR-1002: --repeat must be at least 1".to_owned()));
+        return Err(CliError::usage("BOHR-1002: --repeat must be at least 1".to_owned()));
     }
     if let Some(dir) = save_dir {
         std::fs::create_dir_all(dir)
-            .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot use {dir}: {e}")))?;
+            .map_err(|e| CliError::usage(format!("BOHR-1002: cannot use {dir}: {e}")))?;
     }
 
     let config = RunConfig::default();
@@ -1774,7 +1937,7 @@ fn selftest(
             tape: &tape,
             config,
             output: if json::on() { execute::Output::Discard } else { execute::Output::Deliver },
-            policy: SELFTEST_SCHEDULER,
+            policy: SELFTEST_SCHEDULER.name(),
             record: execute::Record::Log,
             scenario: None,
             config_toml: "",
@@ -1799,7 +1962,7 @@ fn selftest(
                     let path = format!("{dir}/{}.bohr", guest.name());
                     let bytes = execute::to_bundle(&completed, &tape, None)?;
                     std::fs::write(&path, bytes).map_err(|e| {
-                        CliError::Usage(format!("BOHR-1002: cannot write {path}: {e}"))
+                        CliError::usage(format!("BOHR-1002: cannot write {path}: {e}"))
                     })?;
                     eprintln!("  saved {path}");
                     saved = Some(path);

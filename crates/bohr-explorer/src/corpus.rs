@@ -5,9 +5,8 @@
 //!
 //! An entry is kept when it reaches coverage nothing before it reached.
 
-use bohr_backend::CoverageMap;
-use bohr_tape::Journal;
-use bohr_types::Seed;
+use bohr_tape::{Journal, Keep};
+use bohr_types::{CoverageMap, Seed};
 
 use crate::mutate::Operator;
 
@@ -77,6 +76,13 @@ pub struct Entry {
 ///
 /// A traced cluster makes hundreds of thousands of draws; the earliest ones matter most.
 const REMEMBERED_DRAWS: usize = 256;
+
+/// What a run's journal need keep for the corpus: the draws [`corpus_draws`] takes, so a run
+/// that keeps no log holds 256 records instead of one per draw.
+#[must_use]
+pub const fn corpus_keep(prefix_len: usize) -> Keep {
+    Keep::Prefix { prefix: prefix_len as u64, at_most: REMEMBERED_DRAWS }
+}
 
 /// The part of a run's journal the corpus can use: the first draws inside the prefix that
 /// consumed bytes, at most `REMEMBERED_DRAWS`.
@@ -270,6 +276,25 @@ mod tests {
             map.as_bytes_mut()[*at] = 1;
         }
         map
+    }
+
+    /// A run asked to keep only what the corpus takes keeps exactly that, and still counts every
+    /// draw it made.
+    #[test]
+    fn a_bounded_journal_keeps_what_the_corpus_takes() {
+        const PREFIX: usize = 4096;
+        let mut whole = Journal::new();
+        let mut bounded = Journal::keeping(corpus_keep(PREFIX));
+        for i in 0..2_000u64 {
+            let offset = TapeOffset((i * 7) % (2 * PREFIX as u64));
+            let len = (i % 5) as u32;
+            for journal in [&mut whole, &mut bounded] {
+                journal.push(offset, EventId(i), bohr_tape::DrawSite::NetDelay, len, i);
+            }
+        }
+        assert_eq!(bounded.records(), corpus_draws(&whole, PREFIX).records());
+        assert_eq!(bounded.records().len(), REMEMBERED_DRAWS);
+        assert_eq!(bounded.len(), whole.len(), "every draw is counted");
     }
 
     fn offer(corpus: &mut Corpus, coverage: &CoverageMap, prefix: &[u8], draws: &Journal) -> bool {

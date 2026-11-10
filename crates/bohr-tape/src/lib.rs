@@ -27,16 +27,13 @@ mod journal;
 mod tape;
 
 pub use cursor::TapeCursor;
-pub use journal::{DRAW_RECORD_BYTES, DrawRecord, DrawSite, Journal};
+pub use journal::{DRAW_RECORD_BYTES, DrawRecord, DrawSite, Journal, Keep};
 pub use tape::{TAPE_HEADER_BYTES, TAPE_MAGIC, Tape, TapeReader};
 
 /// Version of the `.tape` container layout.
 pub const TAPE_FORMAT_VERSION: u16 = 1;
 
-/// Version of the draw ABI: the mapping from tape bytes to decisions.
-///
-/// A bundle recording a different value is refused. See `docs/API.md` §9.
-pub const TAPE_ABI: u16 = 2;
+pub use bohr_types::TAPE_ABI;
 
 /// Largest denominator the boolean draw can express.
 ///

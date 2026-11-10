@@ -329,7 +329,7 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
     use bohr_backend_ptrace::doctor;
 
     let bytes = std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
     let Some(report) = doctor::inspect_target(&bytes) else {
         return Ok(vec![Check::new(
             "target",
@@ -388,7 +388,7 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
     std::fs::read(path)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
     Ok(vec![Check::new(
         "target",
         Verdict::Skip,

@@ -518,7 +518,7 @@ fn programs(model: &RunModel, page: &mut String) {
         let _ = writeln!(
             page,
             "<tr><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>",
-            escape::text(&binary.role),
+            escape::text(binary.role.as_str()),
             escape::text(&binary.path),
             escape::text(&binary.blake3)
         );

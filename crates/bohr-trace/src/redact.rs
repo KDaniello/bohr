@@ -18,6 +18,7 @@ struct Removed {
     records: usize,
     config_lines: usize,
     output: bool,
+    state: bool,
 }
 
 /// Rewrites a bundle without what §4.6 says must not travel.
@@ -50,6 +51,12 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
         writer.remove(SectionId::GuestOutput);
         removed.output = true;
     }
+    // The prepared state's file list names the recording host's files; the manifest keeps the
+    // digest a replay checks against.
+    if bundle.section(SectionId::StateManifest).is_some() {
+        writer.remove(SectionId::StateManifest);
+        removed.state = true;
+    }
 
     // The bundle notes that it is redacted.
     let mut notes = bundle
@@ -61,11 +68,12 @@ pub fn redact(bundle: &Bundle) -> Result<Vec<u8>, TraceError> {
     }
     notes.push_str(&format!(
         "redacted: {} binary paths hashed, {} record payloads removed, {} configuration lines \
-         removed{}\n",
+         removed{}{}\n",
         removed.paths,
         removed.records,
         removed.config_lines,
-        if removed.output { ", guest output removed" } else { "" }
+        if removed.output { ", guest output removed" } else { "" },
+        if removed.state { ", the prepared state's file list removed" } else { "" }
     ));
     writer.section(SectionId::Notes, notes.into_bytes());
 
@@ -228,9 +236,12 @@ fn drop_argv_and_env(config: &[u8]) -> Result<(Vec<u8>, usize), TraceError> {
 const REMOVED_LINE: &str = "# removed by bohr report --redact\n";
 
 /// Whether a key names what a program was started with.
+/// Keys whose values are a program's command line or environment, or a path on the recording host:
+/// `argv`, `env`, each node's `programs`, and the prepared state's `dir` and `cwd`. Matched by name
+/// wherever it appears, so a key of the same name elsewhere goes too.
 fn is_forbidden(key: &str) -> bool {
     let key = key.trim().trim_matches(['"', '\'']);
-    key == "argv" || key == "env"
+    matches!(key, "argv" | "env" | "programs" | "dir" | "cwd")
 }
 
 /// The name of the table a line opens, where it opens one.
@@ -293,7 +304,7 @@ mod tests {
         let binaries = serde_json::to_vec(&vec![crate::BinaryRecord {
             path: "builtin:two-tasks".to_owned(),
             blake3: String::new(),
-            role: "builtin".to_owned(),
+            role: crate::BinaryRole::Builtin,
             args: Vec::new(),
         }])
         .expect("json");
@@ -309,7 +320,7 @@ mod tests {
         let binaries = serde_json::to_vec(&vec![crate::BinaryRecord {
             path: "/home/someone/secret-project/target/release/app".to_owned(),
             blake3: "blake3:abc".to_owned(),
-            role: "executable".to_owned(),
+            role: crate::BinaryRole::Executable,
             args: vec!["--token".to_owned(), "hunter2".to_owned()],
         }])
         .expect("json");
@@ -327,6 +338,22 @@ mod tests {
     fn binaries_that_cannot_be_read_are_refused_rather_than_passed_through() {
         let outcome = hash_paths(b"{not json at all");
         assert!(matches!(outcome, Err(TraceError::RedactionIncomplete { .. })), "{outcome:?}");
+    }
+
+    /// Each node's command line and the recording host's paths go, wherever the scenario wrote
+    /// them.
+    #[test]
+    fn every_command_line_and_host_path_is_removed() {
+        let config =
+            b"[cluster]\nnodes = 2\nprograms = [[\"./client\", \"--token\", \"hunter2\"], \
+                       [\"./server\"]]\n\n[state]\ndir = \"/home/someone/chain-data\"\n\
+                       cwd = \"/home/someone/work\"\n";
+        let (rewritten, count) = drop_argv_and_env(config).expect("removable");
+        let text = String::from_utf8(rewritten).expect("text");
+        assert_eq!(count, 3, "{text}");
+        for secret in ["hunter2", "client", "/home/someone"] {
+            assert!(!text.contains(secret), "{secret} survived: {text}");
+        }
     }
 
     #[test]

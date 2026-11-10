@@ -1502,6 +1502,19 @@ redb_64_runs_ms = { j1 = { v0_8 = 2_950, v0_9_1 = 2_841 }, j4 = { v0_8 = 809, v0
 peak_rss_mb = { v0_8 = 30.3, v0_9_1 = 30.6 }
 ablation = "three findings ablated and triaged in 7 s"                               # P9.1.3
 
+[v0_9_1_1.gates]
+G9_1_1_1 = "86 of 86 items and 7 of 7 shared changes, each with its test"
+G9_1_1_2 = "make pr 51 s, make gate 161 s, mutation harness 77 s; 860 workspace tests pass on Linux"
+G9_1_1_3 = "bank 6 of 6; CometBFT and geth re-recorded to the same fatal line; redb's v0.9.1 tapes run clean under the new models and a 5-minute hunt re-found the class, 283 findings in 4 groups"
+G9_1_1_4 = "check-docs.sh passes; every row moved to solved cites a test that exists"
+
+[v0_9_1_1.perf]                                                                      # against v0.9.1's binary on the same VM, 8 cores, 8 GB, best of 3
+redb_2000_runs_j4_ms = { v0_9_1 = 28_730, v0_9_1_1 = 29_731 }                        # +3.5%
+storm_200k_ms = { v0_9_1 = 819, v0_9_1_1 = 755 }
+startup_ms = { v0_9_1 = 4, v0_9_1_1 = 3 }
+redb_64_runs_ms = { j1 = { v0_9_1 = 2_754, v0_9_1_1 = 2_927 }, j4 = { v0_9_1 = 784, v0_9_1_1 = 833 } }  # +6%: 627 faults landed against 551
+peak_rss_mb = { v0_9_1 = 30.6, v0_9_1_1 = 6.4 }
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

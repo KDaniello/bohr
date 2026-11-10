@@ -1,62 +1,24 @@
 {
-  "findings": 3,
+  "findings": 1,
   "groups": [
     {
       "bundles": [
         {
-          "events": 7,
-          "path": "findings/clock-and-random-seed0.bohr"
-        }
-      ],
-      "code": "Clean",
-      "count": 1,
-      "counts": false,
-      "first_after_s": null,
-      "first_run": null,
-      "grade": null,
-      "necessary": [],
-      "signature": "builtin:clock-and-random: Clean: nothing was found",
-      "smallest": "findings/clock-and-random-seed0.bohr",
-      "triage": "not ablated",
-      "verdict": "nothing was found"
-    },
-    {
-      "bundles": [
-        {
-          "events": 2,
-          "path": "findings/large-random-seed0.bohr"
-        }
-      ],
-      "code": "Clean",
-      "count": 1,
-      "counts": false,
-      "first_after_s": null,
-      "first_run": null,
-      "grade": null,
-      "necessary": [],
-      "signature": "builtin:large-random: Clean: nothing was found",
-      "smallest": "findings/large-random-seed0.bohr",
-      "triage": "not ablated",
-      "verdict": "nothing was found"
-    },
-    {
-      "bundles": [
-        {
           "events": 11,
-          "path": "findings/two-tasks-seed0.bohr"
+          "path": "findings/crashed.bohr"
         }
       ],
-      "code": "Clean",
+      "code": "GuestCrashed",
       "count": 1,
       "counts": false,
       "first_after_s": null,
       "first_run": null,
       "grade": null,
       "necessary": [],
-      "signature": "builtin:two-tasks: Clean: nothing was found",
-      "smallest": "findings/two-tasks-seed0.bohr",
+      "signature": "builtin:two-tasks: GuestCrashed: a guest was killed by signal 11 (SIGSEGV)",
+      "smallest": "findings/crashed.bohr",
       "triage": "not ablated",
-      "verdict": "nothing was found"
+      "verdict": "a guest was killed by signal 11 (SIGSEGV)"
     }
   ],
   "schema": "bohr.findings/1",

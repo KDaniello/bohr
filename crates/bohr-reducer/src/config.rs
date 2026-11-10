@@ -33,11 +33,6 @@ pub struct Moment {
     pub ticks: u64,
 }
 
-/// Keys that name a moment the world acts at.
-///
-/// Listed by name: `latency_mean_ticks` is also ticks, but lowering it makes a different scenario.
-const MOMENT_KEYS: [&str; 4] = ["at_tick", "heal_at_tick", "until_tick", "restart_after_ticks"];
-
 impl ConfigDoc {
     /// Reads a document.
     #[must_use]
@@ -78,16 +73,17 @@ impl ConfigDoc {
         &self.entries
     }
 
-    /// The moments the world acts at, in the order they are written.
+    /// The moments the world acts at, in the order they are written: the lines that set one of
+    /// `keys`, which the world names, since the scenario's schema is the world's.
     #[must_use]
-    pub fn moments(&self) -> Vec<Moment> {
+    pub fn moments(&self, keys: &[&str]) -> Vec<Moment> {
         self.lines
             .iter()
             .enumerate()
             .filter_map(|(at, line)| {
                 let (key, value) = line.split_once('=')?;
                 let key = key.trim();
-                if !MOMENT_KEYS.contains(&key) {
+                if !keys.contains(&key) {
                     return None;
                 }
                 let ticks = value.trim().replace('_', "").parse().ok()?;
@@ -173,6 +169,9 @@ fn join(lines: &[String]) -> String {
 mod tests {
     use super::*;
 
+    /// The keys the world names as moments, as these scenarios use them.
+    const MOMENTS: [&str; 4] = ["at_tick", "heal_at_tick", "until_tick", "restart_after_ticks"];
+
     const SCENARIO: &str = "\
 # a comment somebody wrote
 [network]
@@ -225,21 +224,21 @@ stall_probability = \"1/500\"
     #[test]
     fn a_moment_is_found_and_brought_forward() {
         let doc = ConfigDoc::parse(SCENARIO);
-        let moments = doc.moments();
+        let moments = doc.moments(&MOMENTS);
         let at_ticks: Vec<u64> = moments.iter().map(|m| m.ticks).collect();
         assert_eq!(at_ticks, vec![9_000_000_000, 18_446_744_073_709_551_615, 9_000_000_100]);
 
         let sooner = doc.moved(&moments[0], 1);
         assert!(sooner.to_toml().contains("at_tick = 1"), "{}", sooner.to_toml());
         assert!(sooner.to_toml().contains("node_kill"), "another entry was disturbed");
-        assert_eq!(sooner.moments()[0].ticks, 1);
+        assert_eq!(sooner.moments(&MOMENTS)[0].ticks, 1);
     }
 
     /// A tick count that is not a moment is left alone.
     #[test]
     fn a_duration_is_not_a_moment() {
         let doc = ConfigDoc::parse("[network]\nlatency_mean_ticks = 500_000\n");
-        assert!(doc.moments().is_empty(), "a latency was taken for a moment");
+        assert!(doc.moments(&MOMENTS).is_empty(), "a latency was taken for a moment");
     }
 
     #[test]

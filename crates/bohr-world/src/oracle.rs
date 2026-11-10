@@ -1,8 +1,22 @@
-//! Judging a single run from what it recorded.
+//! Judging a single run from what it recorded, and a set of runs against each other.
 //!
 //! Beside the models, so an oracle and the diagnostics it reads change together.
 
 use bohr_kernel::{Oracle, RunOutcome, Verdict};
+
+/// Decides whether a set of runs, one tape driving several implementations of one specification,
+/// counts as a finding.
+///
+/// A port of its own, with no default answer: an oracle either compares a group or is not one,
+/// so nothing that composes oracles can stop comparing by leaving a method out.
+pub trait GroupOracle {
+    /// Stable identity, recorded in the bundle and checked before a replay.
+    fn identity(&self) -> OracleId;
+
+    /// Judges the runs against each other: `Agree`, a finding, or `Skipped` where nothing was
+    /// compared. Implementations of one specification must agree; a disagreement is a bug in one.
+    fn judge_group(&mut self, runs: &[RunOutcome]) -> Verdict;
+}
 use bohr_trace::Outcome;
 use bohr_types::OracleId;
 
@@ -112,20 +126,16 @@ impl Oracle for ProbeOracle {
 
 /// Reports implementations of one specification that did not produce the same thing.
 ///
-/// Judges a group; `judge` has no opinion on a single run.
+/// Judges a group by what each execution projects.
 ///
 /// Implementations share a tape but not conditions, so the projection must be a value the
 /// specification fixes under any schedule. See `docs/ARCHITECTURE.md` §5.20.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgreementOracle;
 
-impl Oracle for AgreementOracle {
+impl GroupOracle for AgreementOracle {
     fn identity(&self) -> OracleId {
         OracleId::new("agreement", 1)
-    }
-
-    fn judge(&mut self, _run: &RunOutcome) -> Verdict {
-        Verdict::Skipped
     }
 
     fn judge_group(&mut self, runs: &[RunOutcome]) -> Verdict {
@@ -203,21 +213,6 @@ impl Oracle for Panel {
             }
         }
         Verdict::Clean
-    }
-
-    /// The same rule for a group, stated explicitly.
-    ///
-    /// `Skipped` only when every member skips.
-    fn judge_group(&mut self, runs: &[RunOutcome]) -> Verdict {
-        let mut answered = false;
-        for member in &mut self.members {
-            match member.judge_group(runs) {
-                Verdict::Finding(outcome) => return Verdict::Finding(outcome),
-                Verdict::Clean | Verdict::Agree => answered = true,
-                Verdict::Skipped => {}
-            }
-        }
-        if answered { Verdict::Agree } else { Verdict::Skipped }
     }
 }
 
@@ -327,5 +322,27 @@ mod tests {
             projections: Vec::new(),
         };
         assert_eq!(panel.judge(&run), Verdict::Finding(Outcome::InternalError("first".to_owned())));
+    }
+
+    /// A group agrees when every execution projected the same, disagrees on any label that
+    /// differed, and is skipped where nothing was compared.
+    #[test]
+    fn a_group_is_judged_by_what_its_executions_projected() {
+        let run = |value: &[u8]| RunOutcome {
+            digest: bohr_types::Digest::of(b"run"),
+            events: 0,
+            ticks: bohr_types::Tick(0),
+            exit: Some(0),
+            killed_by: None,
+            diagnostics: Vec::new(),
+            projections: vec![("state root".to_owned(), bohr_types::Digest::of(value))],
+        };
+        let mut oracle = AgreementOracle;
+        assert_eq!(oracle.judge_group(&[run(b"a"), run(b"a")]), Verdict::Agree);
+        assert!(matches!(
+            oracle.judge_group(&[run(b"a"), run(b"b")]),
+            Verdict::Finding(Outcome::ImplementationsDisagreed(label)) if label == "state root"
+        ));
+        assert_eq!(oracle.judge_group(&[run(b"a")]), Verdict::Skipped, "one is no comparison");
     }
 }

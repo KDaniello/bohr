@@ -23,7 +23,8 @@ pub const WALL_EPOCH: Tick = Tick(1_735_689_600 * 1_000_000_000);
 /// monotonic time keeps rising, as `settimeofday` does on Linux.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NodeClock {
-    offset: u64,
+    /// Signed, so a change of rate leaves the reading where it was, faster or slower.
+    offset: i64,
     /// Rate difference in parts per million, positive for a clock that runs fast.
     drift_ppm: i32,
     /// How far the wall reading has been stepped from the monotonic one.
@@ -39,6 +40,7 @@ impl NodeClock {
     #[must_use]
     pub const fn new(offset: u64, drift_ppm: i32) -> Self {
         assert_drift_in_bounds(drift_ppm);
+        let offset = if offset > i64::MAX as u64 { i64::MAX } else { offset as i64 };
         Self { offset, drift_ppm, wall_step: 0 }
     }
 
@@ -56,8 +58,38 @@ impl NodeClock {
         let reading = i128::from(self.read(at).get());
         let elapsed = i128::from(at.get());
         let drifted = elapsed + (elapsed * i128::from(drift_ppm)) / 1_000_000;
-        let offset = u64::try_from((reading - drifted).max(0)).unwrap_or(u64::MAX);
+        let offset = (reading - drifted).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
         Self { offset, drift_ppm, wall_step: self.wall_step }
+    }
+
+    /// The earliest world time, not before `from`, at which this clock reads at least `reading`.
+    ///
+    /// How a node's own duration becomes a deadline on the world clock: a slow clock needs more
+    /// world time to show the same span, so a timer armed this way never fires early by the
+    /// node's own reading.
+    #[must_use]
+    pub const fn world_at(self, reading: Tick, from: Tick) -> Tick {
+        if self.read(from).get() >= reading.get() {
+            return from;
+        }
+        // The inverse of `read`, then a step either way past its rounding.
+        let rate = 1_000_000 + self.drift_ppm as i128;
+        let wanted = reading.get() as i128 - self.offset as i128;
+        let mut at = (wanted * 1_000_000 + rate - 1) / rate;
+        if at < from.get() as i128 {
+            at = from.get() as i128;
+        }
+        if at > u64::MAX as i128 {
+            return Tick(u64::MAX);
+        }
+        let mut at = at as u64;
+        while self.read(Tick(at)).get() < reading.get() && at < u64::MAX {
+            at += 1;
+        }
+        while at > from.get() && self.read(Tick(at - 1)).get() >= reading.get() {
+            at -= 1;
+        }
+        Tick(at)
     }
 
     /// The same clock with its wall reading stepped by `by` ticks, back where `by` is negative.
@@ -133,6 +165,20 @@ impl Clock {
         self.now
     }
 
+    /// The world time at which `node`'s clock will have moved `ahead` past what it reads now.
+    ///
+    /// A node with no clock of its own reads the world clock, and its deadline is plain.
+    #[must_use]
+    pub fn deadline_on(&self, node: NodeId, ahead: u64) -> Tick {
+        match self.nodes.get(&node) {
+            Some(clock) => {
+                let target = Tick(clock.read(self.now).get().saturating_add(ahead));
+                clock.world_at(target, self.now)
+            }
+            None => Tick(self.now.get().saturating_add(ahead)),
+        }
+    }
+
     /// What `node` reads.
     ///
     /// Only what the guest is told; the run is ordered by the world clock.
@@ -171,6 +217,33 @@ impl Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clock that starts running fast keeps its reading at the change, as NTP slews one.
+    #[test]
+    fn a_change_of_rate_leaves_the_reading_where_it_was() {
+        let at = Tick(1_000 * Tick::SECOND.get());
+        for (from, to) in [(-200, 200), (200, -200), (0, 200), (-200, 0)] {
+            let before = NodeClock::new(0, from);
+            let after = before.rebased(at, to);
+            assert_eq!(after.read(at), before.read(at), "{from} to {to} ppm stepped the clock");
+        }
+    }
+
+    /// A node's span becomes a world deadline the node's clock has fully passed, and no later.
+    #[test]
+    fn a_deadline_is_never_early_by_the_nodes_own_clock() {
+        let span = 10 * Tick::SECOND.get();
+        for drift in [-200, -1, 0, 1, 200] {
+            let mut clock = Clock::new();
+            clock.advance(Tick(3 * Tick::SECOND.get()));
+            clock.set_node_clock(NodeId(0), NodeClock::new(17, drift));
+            let start = clock.now_on(NodeId(0));
+            let at = clock.deadline_on(NodeId(0), span);
+            let node = NodeClock::new(17, drift);
+            assert!(node.read(at).get() >= start.get() + span, "{drift} ppm woke early");
+            assert!(node.read(Tick(at.get() - 1)).get() < start.get() + span, "{drift} ppm late");
+        }
+    }
 
     #[test]
     fn time_only_moves_forward() {

@@ -138,6 +138,14 @@ pub struct PtraceBackend {
     allocations: bool,
     /// Tasks killed and forgotten, as `(pid, group)`, whose deaths no wait has collected yet.
     dying: Vec<(libc::pid_t, libc::pid_t)>,
+    /// Exits already reaped and not yet reported, in the order they are reported.
+    exits: std::collections::VecDeque<Stop>,
+    /// The tasks those exits belong to: dead on the host, still known until each is reported.
+    reaped: std::collections::BTreeSet<TaskId>,
+    /// The signal the world ended a thread group with, by group, for the threads the kill takes.
+    ended_by: BTreeMap<libc::pid_t, u32>,
+    /// Reports collected while a dead group was reaped, for tasks outside it, in arrival order.
+    held: std::collections::VecDeque<(libc::pid_t, libc::c_int)>,
 }
 
 impl Default for PtraceBackend {
@@ -150,7 +158,7 @@ impl PtraceBackend {
     /// A backend that has probed what this host can do, with a coverage map of the default size.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_coverage_bytes(bohr_backend::DEFAULT_COVERAGE_MAP_BYTES)
+        Self::with_coverage_bytes(bohr_types::DEFAULT_COVERAGE_MAP_BYTES)
     }
 
     /// The same, with a coverage map of `bytes` counters.
@@ -174,6 +182,10 @@ impl PtraceBackend {
             affinity_before: None,
             allocations: false,
             dying: Vec::new(),
+            exits: std::collections::VecDeque::new(),
+            reaped: std::collections::BTreeSet::new(),
+            ended_by: BTreeMap::new(),
+            held: std::collections::VecDeque::new(),
         }
     }
 
@@ -235,6 +247,65 @@ impl PtraceBackend {
         self.tasks.get_mut(&id).ok_or(BackendError::NoSuchTask { task: id })
     }
 
+    /// A fatal signal killed `id`'s whole thread group on the host: every other thread of it is
+    /// reaped now, and one exit per thread is queued in task order, each with the group's signal.
+    ///
+    /// The host reports the threads' deaths in an order of its own, which the trace must not see.
+    fn group_died(&mut self, id: TaskId, signal: u32) -> Result<(), BackendError> {
+        let group = self.task(id)?.group;
+        let signal = self.ended_by.remove(&group).unwrap_or(signal);
+        let mut members: Vec<(TaskId, libc::pid_t)> = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.group == group)
+            .map(|(member, task)| (*member, task.pid))
+            .collect();
+        // Collected in whatever order they end, with every other report that arrives meanwhile kept
+        // for the ordinary wait. A guest is its pid namespace's first process, whose last thread
+        // waits in the kernel until every other process there is reaped, a traced child of
+        // another group included, so waiting for one thread in particular can wait for ever.
+        let mut left: std::collections::BTreeSet<libc::pid_t> =
+            members.iter().filter(|(member, _)| *member != id).map(|(_, pid)| *pid).collect();
+        // Ten seconds, polled each millisecond: dying threads end at once.
+        for _ in 0..10_000 {
+            loop {
+                let mut status = 0;
+                // SAFETY: `status` is a local; any child of ours may report.
+                let reported =
+                    unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+                if reported <= 0 {
+                    break;
+                }
+                let died = libc::WIFEXITED(status) || libc::WIFSIGNALED(status);
+                if !(died && left.remove(&reported)) && !left.contains(&reported) {
+                    self.held.push_back((reported, status));
+                }
+            }
+            if left.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !left.is_empty() {
+            return Err(BackendError::Lost(format!(
+                "{} threads of a process a signal ended did not end",
+                left.len()
+            )));
+        }
+        members.sort_by_key(|(member, _)| *member);
+        for (member, _) in members {
+            self.reaped.insert(member);
+            if self.current == Some(member) {
+                self.current = None;
+            }
+            self.exits.push_back(Stop {
+                task: member,
+                kind: StopKind::TaskExited { status: GuestExit::Signalled(signal) },
+            });
+        }
+        Ok(())
+    }
+
     /// Removes a task that has ended, so the table does not grow with every thread a guest creates.
     fn forget(&mut self, id: TaskId) {
         if let Some(task) = self.tasks.remove(&id) {
@@ -283,6 +354,70 @@ impl PtraceBackend {
         let regs = get_regs(task.pid)?;
         self.task_mut(id)?.regs = Some(regs);
         Ok(regs)
+    }
+
+    /// Resumes `task` as `action` says; a ptrace refusal is returned as it came.
+    fn resume_now(&mut self, task: TaskId, action: Resume) -> Result<(), BackendError> {
+        // Step over an instruction the supervisor answered, whichever way the task resumes.
+        if let Some(width) = self.task_mut(task)?.pending_skip.take()
+            && !matches!(action, Resume::Terminate { .. })
+        {
+            let mut regs = self.cached_regs(task)?;
+            regs.rip = regs.rip.wrapping_add(width);
+            self.store_regs(task, &regs)?;
+        }
+
+        match action {
+            Resume::Continue | Resume::ContinueWithBudget { .. } => {
+                self.release(task, libc::PTRACE_CONT, 0)?;
+            }
+            Resume::DeliverSignal { signal } => {
+                self.release(task, libc::PTRACE_CONT, libc::c_long::from(signal))?;
+            }
+            // At a seccomp stop, a call numbered -1 is skipped and returns what is in `rax`, so the
+            // answer is written here in one stop. A signal with the answer needs the exit stop,
+            // because an event stop cannot carry one.
+            Resume::Emulate { ret } => {
+                let mut regs = self.cached_regs(task)?;
+                regs.orig_rax = u64::MAX;
+                regs.rax = ret as u64;
+                self.store_regs(task, &regs)?;
+                self.release(task, libc::PTRACE_CONT, 0)?;
+            }
+            Resume::EmulateAndSignal { ret, signal } => {
+                let mut regs = self.cached_regs(task)?;
+                regs.orig_rax = u64::MAX;
+                self.store_regs(task, &regs)?;
+                let state = self.task_mut(task)?;
+                state.pending_return = Some(ret);
+                state.pending_signal = Some(signal);
+                self.release(task, libc::PTRACE_SYSCALL, 0)?;
+            }
+            Resume::Rewrite { nr, args } => {
+                let mut regs = self.cached_regs(task)?;
+                regs.orig_rax = u64::from(nr);
+                regs.rdi = args[0];
+                regs.rsi = args[1];
+                regs.rdx = args[2];
+                regs.r10 = args[3];
+                regs.r8 = args[4];
+                regs.r9 = args[5];
+                self.store_regs(task, &regs)?;
+                self.task_mut(task)?.reporting_exit = true;
+                self.release(task, libc::PTRACE_SYSCALL, 0)?;
+            }
+            Resume::Terminate { signal } => {
+                // The other threads die of the kill; they are reported dying of what ended this
+                // one.
+                let group = self.task(task)?.group;
+                let others = self.tasks.iter().any(|(t, other)| *t != task && other.group == group);
+                if let (Some(signal), true) = (signal, others) {
+                    self.ended_by.insert(group, signal);
+                }
+                self.kill(task)?;
+            }
+        }
+        Ok(())
     }
 
     /// Writes registers and keeps the cache in step with what the task now holds.
@@ -338,7 +473,6 @@ impl DeterminismBackend for PtraceBackend {
             progress_unit: ProgressUnit::Syscalls,
             hands_over_to_debugger: true,
             max_tasks: 4096,
-            checkpoints: false,
         }
     }
 
@@ -387,8 +521,13 @@ impl DeterminismBackend for PtraceBackend {
             }
         }
 
-        let regs = get_regs(pid)?;
-        let report = spawn::neutralise_auxv(pid, regs.rsp)?;
+        // The guest reads the name it was started by in `AT_EXECFN`, not the path this host
+        // executed it from.
+        let mut regs = get_regs(pid)?;
+        let label = spawn::execfn_label(spec.argv.first().map_or("", String::as_str));
+        let (rsp, report) = spawn::canonical_stack(pid, regs.rsp, Some(&label))?;
+        regs.rsp = rsp;
+        set_regs(pid, &regs)?;
         if !report.vdso_disabled {
             self.notes.push("vdso_absent_from_auxv".to_owned());
         }
@@ -414,15 +553,27 @@ impl DeterminismBackend for PtraceBackend {
 
     fn next_stop(&mut self) -> Result<Option<Stop>, BackendError> {
         loop {
+            if let Some(exit) = self.exits.pop_front() {
+                self.reaped.remove(&exit.task);
+                self.forget(exit.task);
+                return Ok(Some(exit));
+            }
             if self.current.is_none() {
                 return Ok(None);
             }
 
             let mut status = 0;
             // Any traced task may report: a new `clone`d thread stops before its first
-            // instruction. `__WALL` includes threads, which the default wait skips.
-            // SAFETY: `status` is a local we own.
-            let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
+            // instruction. `__WALL` includes threads, which the default wait skips. A report held
+            // while a dead group was reaped comes first.
+            let pid = match self.held.pop_front() {
+                Some((pid, held)) => {
+                    status = held;
+                    pid
+                }
+                // SAFETY: `status` is a local we own.
+                None => unsafe { libc::waitpid(-1, &mut status, libc::__WALL) },
+            };
             if pid < 0 {
                 return Err(BackendError::Lost(format!(
                     "waiting for any task: {}",
@@ -455,13 +606,8 @@ impl DeterminismBackend for PtraceBackend {
                 }));
             }
             if libc::WIFSIGNALED(status) {
-                self.forget(id);
-                return Ok(Some(Stop {
-                    task: id,
-                    kind: StopKind::TaskExited {
-                        status: GuestExit::Signalled(libc::WTERMSIG(status) as u32),
-                    },
-                }));
+                self.group_died(id, libc::WTERMSIG(status) as u32)?;
+                continue;
             }
             if !libc::WIFSTOPPED(status) {
                 return Err(BackendError::Lost(describe_status(status)));
@@ -484,7 +630,14 @@ impl DeterminismBackend for PtraceBackend {
             {
                 let shares_memory = is_event(status, libc::PTRACE_EVENT_CLONE);
                 let child_pid = i32::try_from(event_message(pid)?).unwrap_or(-1);
-                let group = if shares_memory { self.task(id)?.group } else { child_pid };
+                // The kernel's own answer: a `clone` without `CLONE_THREAD` is reported as a clone
+                // event too, and is a process of its own.
+                let group = thread_group_of(child_pid).unwrap_or(if shares_memory {
+                    self.task(id)?.group
+                } else {
+                    child_pid
+                });
+                let thread = group == self.task(id)?.group;
 
                 let parent = self.task(id)?;
                 let (node, program) = (parent.node, parent.program.clone());
@@ -506,7 +659,7 @@ impl DeterminismBackend for PtraceBackend {
                 self.current = None;
                 return Ok(Some(Stop {
                     task: child,
-                    kind: StopKind::TaskCreated { parent: id, shares_memory },
+                    kind: StopKind::TaskCreated { parent: id, shares_memory, thread },
                 }));
             }
 
@@ -516,8 +669,10 @@ impl DeterminismBackend for PtraceBackend {
             // The exec is not reported above the boundary: the task keeps its identity, and the
             // filter admits `execve` without asking the world.
             if is_event(status, libc::PTRACE_EVENT_EXEC) {
-                let regs = get_regs(pid)?;
-                let report = spawn::neutralise_auxv(pid, regs.rsp)?;
+                let mut regs = get_regs(pid)?;
+                let (rsp, report) = spawn::canonical_stack(pid, regs.rsp, None)?;
+                regs.rsp = rsp;
+                set_regs(pid, &regs)?;
                 if !report.vdso_disabled {
                     self.notes.push("vdso_absent_from_auxv".to_owned());
                 }
@@ -605,59 +760,23 @@ impl DeterminismBackend for PtraceBackend {
     }
 
     fn resume(&mut self, task: TaskId, action: Resume) -> Result<(), BackendError> {
-        // Step over an instruction the supervisor answered, whichever way the task resumes.
-        if let Some(width) = self.task_mut(task)?.pending_skip.take()
-            && !matches!(action, Resume::Terminate { .. })
-        {
-            let mut regs = self.cached_regs(task)?;
-            regs.rip = regs.rip.wrapping_add(width);
-            self.store_regs(task, &regs)?;
+        // Dead with its group; its exit is already queued.
+        if self.reaped.contains(&task) {
+            return Ok(());
         }
-
-        match action {
-            Resume::Continue | Resume::ContinueWithBudget { .. } => {
-                self.release(task, libc::PTRACE_CONT, 0)?;
-            }
-            Resume::DeliverSignal { signal } => {
-                self.release(task, libc::PTRACE_CONT, libc::c_long::from(signal))?;
-            }
-            // At a seccomp stop, a call numbered -1 is skipped and returns what is in `rax`, so the
-            // answer is written here in one stop. A signal with the answer needs the exit stop,
-            // because an event stop cannot carry one.
-            Resume::Emulate { ret } => {
-                let mut regs = self.cached_regs(task)?;
-                regs.orig_rax = u64::MAX;
-                regs.rax = ret as u64;
-                self.store_regs(task, &regs)?;
-                self.release(task, libc::PTRACE_CONT, 0)?;
-            }
-            Resume::EmulateAndSignal { ret, signal } => {
-                let mut regs = self.cached_regs(task)?;
-                regs.orig_rax = u64::MAX;
-                self.store_regs(task, &regs)?;
-                let state = self.task_mut(task)?;
-                state.pending_return = Some(ret);
-                state.pending_signal = Some(signal);
-                self.release(task, libc::PTRACE_SYSCALL, 0)?;
-            }
-            Resume::Rewrite { nr, args } => {
-                let mut regs = self.cached_regs(task)?;
-                regs.orig_rax = u64::from(nr);
-                regs.rdi = args[0];
-                regs.rsi = args[1];
-                regs.rdx = args[2];
-                regs.r10 = args[3];
-                regs.r8 = args[4];
-                regs.r9 = args[5];
-                self.store_regs(task, &regs)?;
-                self.task_mut(task)?.reporting_exit = true;
-                self.release(task, libc::PTRACE_SYSCALL, 0)?;
-            }
-            Resume::Terminate { .. } => {
-                self.kill(task)?;
-            }
+        match self.resume_now(task, action) {
+            // A fatal signal to its thread group took the task out of its stop: its death is
+            // waited for like any other, with the group's.
+            Err(lost) => match self.task(task).map(|t| t.pid) {
+                Ok(pid) if left_its_stop(pid) => {
+                    self.task_mut(task)?.regs = None;
+                    self.current = Some(task);
+                    Ok(())
+                }
+                _ => Err(lost),
+            },
+            done => done,
         }
-        Ok(())
     }
 
     fn read_mem(
@@ -668,6 +787,16 @@ impl DeterminismBackend for PtraceBackend {
     ) -> Result<(), BackendError> {
         let pid = self.task(task)?.pid;
         mem::read(pid, addr.0, out)
+    }
+
+    fn read_mem_vectored(
+        &mut self,
+        task: TaskId,
+        pieces: &[(GuestAddr, usize)],
+        out: &mut [u8],
+    ) -> Result<(), BackendError> {
+        let pid = self.task(task)?.pid;
+        mem::read_pieces(pid, pieces, out)
     }
 
     fn write_mem(
@@ -716,6 +845,13 @@ impl DeterminismBackend for PtraceBackend {
     }
 
     fn kill(&mut self, task: TaskId) -> Result<(), BackendError> {
+        // Already dead and reaped, so its pid may be another process's: nothing is signalled, and
+        // the exit the caller now does not expect is withdrawn.
+        if self.reaped.remove(&task) {
+            self.exits.retain(|exit| exit.task != task);
+            self.forget(task);
+            return Ok(());
+        }
         let (pid, group) = {
             let t = self.task(task)?;
             (t.pid, t.group)
@@ -938,7 +1074,7 @@ fn decode_cpu_identification(pid: libc::pid_t, rip: u64) -> Option<(u32, u32, u6
     }
     // Either `CPUID` itself, where the processor faults on it, or the trap byte it was rewritten
     // to. Matched by bytes, because the kernel maps the program and its offsets are unknown here.
-    if code != [0x0F, 0xA2] && code[0] != bohr_backend::code::cpuid::TRAP[0] {
+    if code != [0x0F, 0xA2] && code[0] != bohr_x86::cpuid::TRAP[0] {
         return None;
     }
     // The leaf is in `eax`, the sub-leaf in `ecx`.
@@ -1008,6 +1144,22 @@ fn probe_in_child(probe: impl FnOnce() -> bool) -> bool {
         }
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
     }
+}
+
+/// The thread group a task belongs to, as `/proc` names it.
+fn thread_group_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok())
+}
+
+/// Whether a task the supervisor held stopped has left the stop without being resumed: killed with
+/// its thread group, its death not yet collected.
+fn left_its_stop(pid: libc::pid_t) -> bool {
+    // SAFETY: the struct is plain data; `regs` is ours and large enough.
+    let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; a task not in a stop answers `ESRCH` and is not touched.
+    let rc = unsafe { libc::ptrace(libc::PTRACE_GETREGS, pid, 0, std::ptr::from_mut(&mut regs)) };
+    rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 fn get_regs(pid: libc::pid_t) -> Result<libc::user_regs_struct, BackendError> {

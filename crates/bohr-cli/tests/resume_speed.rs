@@ -5,10 +5,9 @@
 //! --ignored --nocapture` prints what the gate records. It lives here because the explorer may not
 //! read a clock.
 
-use bohr_backend::CoverageMap;
 use bohr_explorer::{Campaign, RunResult};
 use bohr_tape::Journal;
-use bohr_types::{Digest, EventId, Seed, TapeOffset};
+use bohr_types::{CoverageMap, Digest, EventId, Seed, TapeOffset};
 
 fn result(index: u32, cell: usize) -> RunResult {
     let mut coverage = CoverageMap::new();

@@ -89,14 +89,16 @@ pub(crate) struct Request {
 /// Exits 0 when nothing was found and 1 when something was.
 pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     std::fs::create_dir_all(&request.findings).map_err(|e| {
-        CliError::Usage(format!("BOHR-1002: cannot use {}: {e}", request.findings.display()))
+        CliError::usage(format!("BOHR-1002: cannot use {}: {e}", request.findings.display()))
     })?;
 
     let jobs = request.jobs.max(1);
     let mut pool = Pool::start(request, jobs)?;
-    let (mut campaign, mut pending) = match &request.resume {
-        Some(dir) => resume::load(dir, request)?,
-        None => (Campaign::new(request.master), Vec::new()),
+    // Read once: it hashes every program the campaign runs, which may be a hundred megabytes.
+    let asked = request.resume.as_ref().map(|_| resume::question(request));
+    let (mut campaign, mut pending) = match (&request.resume, &asked) {
+        (Some(dir), Some(asked)) => resume::load(dir, request, asked)?,
+        _ => (Campaign::new(request.master), Vec::new()),
     };
     #[allow(clippy::disallowed_methods)]
     let started = Instant::now();
@@ -111,7 +113,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     {
         let carried = load_corpus(dir)?;
         if !carried.is_empty() {
-            let results = carry_out(&mut pool, &carried, None)?;
+            // Within the time budget like any generation; a cut warm-up adopts what it ran.
+            let deadline = request.time.map(|budget| (started, budget));
+            let results = carry_out(&mut pool, &carried, deadline)?;
             campaign.adopt(&carried, results);
             eprintln!("carried {} tapes in from {}", carried.len(), dir.display());
         }
@@ -123,7 +127,31 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     // A resumed campaign carries on from the groups it had reached, as an uninterrupted one would.
     let mut groups =
         if request.resume.is_some() { Groups::read(&request.findings) } else { Groups::default() };
-    while more_to_do(request, campaign.runs() + pending.len() as u64, started, &groups) {
+    // A generation's new findings are recorded by processes of their own while the next generation
+    // runs, and counted at the run they were found by. The budget is checked with every recording
+    // in, so a campaign stops where it would have had it waited.
+    let mut recording: Option<Recording> = None;
+    // A stopped campaign's recordings that never ended are recorded now, noted where they were
+    // found.
+    if request.resume.is_some()
+        && let Some(left) = Recording::left_over(request, &campaign)?
+    {
+        let (at, new) = left.finish()?;
+        groups.note(request, &new, at, started)?;
+        saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
+    }
+    loop {
+        if !more_to_do(request, campaign.runs() + pending.len() as u64, started, &groups) {
+            match recording.take() {
+                Some(done) => {
+                    let (at, new) = done.finish()?;
+                    groups.note(request, &new, at, started)?;
+                    saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
+                    continue;
+                }
+                None => break,
+            }
+        }
         let planned = campaign.plan(GENERATION_ITEMS);
         let size = generation_size(request, campaign.runs()).max(pending.len());
         let deadline = request.time.map(|budget| (started, budget));
@@ -134,18 +162,21 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         }
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         campaign.fold(&planned, std::mem::take(&mut pending));
-        // Saved after folding, so a finding reached twice in a generation is written once.
-        let new = save_new_findings(request, &campaign, &known)?;
-        groups.note(request, &new, campaign.runs(), started)?;
-        saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
+        if let Some(done) = recording.take() {
+            let (at, new) = done.finish()?;
+            groups.note(request, &new, at, started)?;
+            saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
+        }
+        // Started after folding, so a finding reached twice in a generation is written once.
+        recording = Some(Recording::start(request, &campaign, &known)?);
         // Saved after every whole generation, so a stopped campaign resumes from the last one.
-        if let Some(dir) = &request.resume {
-            resume::save(dir, request, &campaign, &pending)?;
+        if let (Some(dir), Some(asked)) = (&request.resume, &asked) {
+            resume::save(dir, request, &campaign, &pending, asked)?;
         }
     }
 
-    if let Some(dir) = &request.resume {
-        resume::save(dir, request, &campaign, &pending)?;
+    if let (Some(dir), Some(asked)) = (&request.resume, &asked) {
+        resume::save(dir, request, &campaign, &pending, asked)?;
     }
     drop(pool);
     let mut view = campaign.clone();
@@ -153,8 +184,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         let planned = campaign.plan(GENERATION_ITEMS);
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         view.fold(&planned[..pending.len()], pending);
-        let new = save_new_findings(request, &view, &known)?;
-        groups.note(request, &new, view.runs(), started)?;
+        let (_, new) = Recording::start(request, &view, &known)?.finish()?;
+        let at = partial_noted_at(request.resume.is_some(), campaign.runs(), view.runs());
+        groups.note(request, &new, at, started)?;
         saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
     }
     let campaign = view;
@@ -165,7 +197,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     report(&campaign, started, saved.len() as u64);
     if let Some(path) = &request.summary {
         std::fs::write(path, summary(request, &campaign)).map_err(|e| {
-            CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
+            CliError::usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
         })?;
     }
 
@@ -174,7 +206,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     // guest.
     let armed = request.scenario.as_ref().is_some_and(|(c, _)| c.asks_for_adversity());
     if campaign.findings().is_empty() && armed && campaign.adversity() == 0 {
-        return Err(CliError::Internal(format!(
+        return Err(CliError::internal(format!(
             "BOHR-5006: this scenario asks for adversity and none of it landed in {} runs. The \
              runs happened and nothing went wrong in them because nothing was made to; a moment \
              written down or armed after the run ends fires into nothing. Check faults.arm_after \
@@ -200,19 +232,228 @@ fn elapsed_since(started: Instant) -> Duration {
     started.elapsed()
 }
 
-/// Writes the findings a fold added, and says where.
-fn save_new_findings(
-    request: &Request,
-    campaign: &Campaign,
-    known: &std::collections::BTreeSet<bohr_types::Digest>,
-) -> Result<Vec<Saved>, CliError> {
-    let mut saved = Vec::new();
-    for (digest, finding) in campaign.findings() {
-        if !known.contains(digest) {
-            saved.extend(save_finding(request, finding)?);
-        }
+/// The new findings of one generation, each being recorded by a process of its own.
+///
+/// The re-run is a worker's job: a coordinator that traced a guest itself would collect its own
+/// workers' exits in the backend's wait for any child, and would hold every worker idle. While
+/// recordings run, [`IN_FLIGHT`] in the findings directory names them, so a campaign stopped
+/// before they end records them when it is resumed.
+struct Recording {
+    /// The run count the generation reached, which its new groups are noted at.
+    at: u64,
+    /// At most this many recordings run at once.
+    jobs: usize,
+    findings: Vec<Pending>,
+    /// Where [`IN_FLIGHT`] is written, where any recording runs.
+    in_flight: Option<PathBuf>,
+}
+
+/// One finding's recording.
+struct Pending {
+    path: PathBuf,
+    apart: PathBuf,
+    /// How to start the recording, until it has ended; `None` for a bundle already written.
+    command: Option<Command>,
+    child: Option<std::process::Child>,
+    /// Whether this campaign writes the bundle, rather than found it written.
+    fresh: bool,
+}
+
+/// The file naming the recordings a campaign has not collected yet: the run count they are noted
+/// at, then one finding's digest a line.
+const IN_FLIGHT: &str = "recording-in-flight";
+
+impl Recording {
+    /// Starts recording every finding of `campaign` that `known` does not hold.
+    fn start(
+        request: &Request,
+        campaign: &Campaign,
+        known: &std::collections::BTreeSet<bohr_types::Digest>,
+    ) -> Result<Self, CliError> {
+        let new: Vec<&bohr_explorer::Finding> = campaign
+            .findings()
+            .iter()
+            .filter(|(digest, _)| !known.contains(digest))
+            .map(|(_, finding)| finding)
+            .collect();
+        Self::of(request, &new, campaign.runs())
     }
-    Ok(saved)
+
+    /// The recordings a stopped campaign left uncollected, as [`IN_FLIGHT`] names them, noted at
+    /// the run count it names; nothing where the file is absent.
+    fn left_over(request: &Request, campaign: &Campaign) -> Result<Option<Self>, CliError> {
+        let Ok(text) = std::fs::read_to_string(request.findings.join(IN_FLIGHT)) else {
+            return Ok(None);
+        };
+        let mut lines = text.lines();
+        let at = lines.next().and_then(|line| line.trim().parse::<u64>().ok()).unwrap_or(0);
+        let named: std::collections::BTreeSet<&str> = lines.map(str::trim).collect();
+        let left: Vec<&bohr_explorer::Finding> = campaign
+            .findings()
+            .values()
+            .filter(|finding| named.contains(finding.digest.to_string().as_str()))
+            .collect();
+        Self::of(request, &left, at).map(Some)
+    }
+
+    fn of(
+        request: &Request,
+        findings: &[&bohr_explorer::Finding],
+        at: u64,
+    ) -> Result<Self, CliError> {
+        let me = std::env::current_exe()
+            .map_err(|e| CliError::internal(format!("BOHR-3006: cannot find this binary: {e}")))?;
+        let mut pending = Vec::new();
+        let mut listed = format!("{at}\n");
+        for finding in findings {
+            let short = format!("{}", finding.digest);
+            let short = short.rsplit(':').next().unwrap_or(&short);
+            let short = &short[..12.min(short.len())];
+            let path = request.findings.join(format!("finding-{short}.bohr"));
+            let apart =
+                request.findings.join(format!("{}{short}.bohr", crate::findings::UNREPRODUCED));
+            // A bundle already under its digest's name is the same run, written before the
+            // campaign was resumed, and is only read for its group.
+            if path.is_file() {
+                pending.push(Pending { path, apart, command: None, child: None, fresh: false });
+                continue;
+            }
+            let mut command = Command::new(&me);
+            command.args(["explore-worker", "--record"]).arg(&path).arg("--apart").arg(&apart);
+            command.args([
+                "--seed",
+                &finding.seed.0.to_string(),
+                "--prefix",
+                &hex(&finding.prefix),
+            ]);
+            command.args(["--expect", &finding.digest.to_string()]);
+            if let Some(config) = &request.scenario_path {
+                command.arg("--config").arg(config);
+            }
+            command.args(request.subject.as_args());
+            // A core past the workers' own, where the host has one.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            command.env(bohr_backend_ptrace::CORE_VARIABLE, request.jobs.to_string());
+            listed.push_str(&finding.digest.to_string());
+            listed.push('\n');
+            pending.push(Pending { path, apart, command: Some(command), child: None, fresh: true });
+        }
+        let in_flight = if pending.iter().any(|p| p.command.is_some()) {
+            let file = request.findings.join(IN_FLIGHT);
+            std::fs::create_dir_all(&request.findings)
+                .and_then(|()| std::fs::write(&file, listed))
+                .map_err(|e| {
+                    CliError::usage(format!("BOHR-1002: cannot write {}: {e}", file.display()))
+                })?;
+            Some(file)
+        } else {
+            None
+        };
+        let mut recording = Self { at, jobs: request.jobs.max(1), findings: pending, in_flight };
+        recording.fill()?;
+        Ok(recording)
+    }
+
+    /// Starts waiting recordings until [`Self::jobs`] run.
+    fn fill(&mut self) -> Result<(), CliError> {
+        let running = self.findings.iter().filter(|p| p.child.is_some()).count();
+        for pending in self
+            .findings
+            .iter_mut()
+            .filter(|p| p.child.is_none())
+            .take(self.jobs - running.min(self.jobs))
+        {
+            if let Some(command) = pending.command.as_mut() {
+                pending.child = Some(command.spawn().map_err(|e| {
+                    CliError::internal(format!(
+                        "BOHR-3006: cannot start a finding's recording: {e}"
+                    ))
+                })?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for every recording and reads each bundle written for its group.
+    ///
+    /// A recording kept apart went elsewhere, which its worker said; it is not counted. One that
+    /// wrote nothing at all failed for a reason of the host's, and runs once more before the
+    /// campaign is refused.
+    fn finish(mut self) -> Result<(u64, Vec<Saved>), CliError> {
+        let mut saved = Vec::new();
+        for at in 0..self.findings.len() {
+            if self.findings[at].command.is_some() && self.findings[at].child.is_none() {
+                self.fill()?;
+            }
+            let pending = &mut self.findings[at];
+            let fresh = pending.fresh;
+            if let Some(mut child) = pending.child.take() {
+                let lost = |e: std::io::Error| {
+                    CliError::internal(format!("BOHR-3006: a finding's recording was lost: {e}"))
+                };
+                let mut status = child.wait().map_err(lost)?;
+                if !pending.path.is_file() && !pending.apart.is_file() {
+                    if let Some(command) = pending.command.as_mut() {
+                        status = command.status().map_err(lost)?;
+                    }
+                    if !pending.path.is_file() && !pending.apart.is_file() {
+                        return Err(CliError::internal(format!(
+                            "BOHR-3006: the recording of {} wrote nothing, twice ({status}); its \
+                             finding would go uncounted",
+                            pending.path.display()
+                        )));
+                    }
+                }
+                pending.command = None;
+            }
+            if let Some(group) = group_of_bundle(&pending.path) {
+                saved.push(Saved { path: pending.path.clone(), group, fresh });
+            }
+        }
+        if let Some(file) = &self.in_flight {
+            let _ = std::fs::remove_file(file);
+        }
+        Ok((self.at, saved))
+    }
+}
+
+/// The group of the finding a bundle holds, or nothing where the bundle does not read.
+fn group_of_bundle(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let bundle = bohr_trace::Bundle::parse(&bytes).ok()?;
+    let manifest = bundle.manifest().ok()?;
+    let events: Vec<bohr_trace::Event> = bundle
+        .event_log()
+        .ok()?
+        .map(|raw| bohr_trace::read_events_where(raw, bohr_findings::group::telling).0)
+        .unwrap_or_default();
+    bohr_findings::group::signature(&bundle, &manifest.outcome, &events).ok()
+}
+
+/// Bytes as lower-case hex, the form a recording is handed its tape's prefix in.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Bytes back from [`hex`].
+pub(crate) fn unhex(text: &str) -> Result<Vec<u8>, CliError> {
+    let bad = || CliError::usage(format!("BOHR-1001: {text:?} is not hex"));
+    if !text.len().is_multiple_of(2) {
+        return Err(bad());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(text.get(at..at + 2).ok_or_else(bad)?, 16).map_err(|_| bad()))
+        .collect()
+}
+
+/// The run count a generation cut short notes its new groups at.
+///
+/// A campaign that will be resumed folds the same generation whole later, and a group is noted at
+/// the count that whole generation reaches; so the resumed campaign notes it where one never cut
+/// would, and stops on quiet at the same run. One that ends here notes at the runs it made.
+fn partial_noted_at(resumable: bool, folded: u64, reached: u64) -> u64 {
+    if resumable { folded + GENERATION_ITEMS as u64 } else { reached }
 }
 
 /// Whether the budget has anything left, given the runs done so far.
@@ -288,10 +529,14 @@ impl Groups {
             .collect();
         let path = request.findings.join(FIRST_SEEN);
         let text =
-            serde_json::to_string_pretty(&listed).map_err(|e| CliError::Internal(e.to_string()))?;
-        std::fs::write(&path, text).map_err(|e| {
-            CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
-        })
+            serde_json::to_string_pretty(&listed).map_err(|e| CliError::internal(e.to_string()))?;
+        // Through a part file, so a campaign stopped mid-write resumes from the last whole list.
+        let part = path.with_extension("json.part");
+        let cannot = |e: std::io::Error| {
+            CliError::usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
+        };
+        std::fs::write(&part, text).map_err(cannot)?;
+        std::fs::rename(&part, &path).map_err(cannot)
     }
 }
 
@@ -344,7 +589,7 @@ fn carry_out(
             Err((item, why)) => {
                 eprintln!("  a worker stopped: {why}; its run will be reissued");
                 if !failed.insert(item.index) {
-                    return Err(CliError::Internal(format!(
+                    return Err(CliError::internal(format!(
                         "BOHR-3006: run {} never came back, twice; the campaign cannot be \
                          repeated from here. The worker's own error is above and says what \
                          stopped it — a worker that will not start twice has usually been refused \
@@ -415,7 +660,7 @@ impl Pool {
     fn spawn(&self, slot: usize, life: u64) -> Result<Worker, CliError> {
         let mut command =
             Command::new(std::env::current_exe().map_err(|e| {
-                CliError::Internal(format!("BOHR-3006: cannot find this binary: {e}"))
+                CliError::internal(format!("BOHR-3006: cannot find this binary: {e}"))
             })?);
         command.args(&self.request_args);
         command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
@@ -425,7 +670,7 @@ impl Pool {
         command.env(bohr_backend_ptrace::CORE_VARIABLE, slot.to_string());
         let mut child = command
             .spawn()
-            .map_err(|e| CliError::Internal(format!("BOHR-3006: cannot start a worker: {e}")))?;
+            .map_err(|e| CliError::internal(format!("BOHR-3006: cannot start a worker: {e}")))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let sender = self.sender.clone();
@@ -467,7 +712,7 @@ impl Pool {
             }
             self.restart(slot)?;
         }
-        Err(CliError::Internal(format!(
+        Err(CliError::internal(format!(
             "BOHR-3006: worker {slot} would not take work twice in a row; the host is refusing \
              to start it"
         )))
@@ -477,7 +722,7 @@ impl Pool {
     fn next_answer(&mut self) -> Result<(usize, Answer), CliError> {
         loop {
             let (slot, life, frame) = self.answers.recv().map_err(|_| {
-                CliError::Internal("BOHR-3006: every worker's reader has gone".to_owned())
+                CliError::internal("BOHR-3006: every worker's reader has gone".to_owned())
             })?;
             let Some(worker) = self.workers.get_mut(slot) else { continue };
             // Ignore messages from a replaced process.
@@ -567,7 +812,7 @@ pub(crate) fn serve(request: &Request) -> Result<u8, CliError> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let cannot_write =
-        |e: std::io::Error| CliError::Internal(format!("BOHR-3006: cannot write a result: {e}"));
+        |e: std::io::Error| CliError::internal(format!("BOHR-3006: cannot write a result: {e}"));
     while let Some(frame) = read_frame(&mut input) {
         let mut answer = wire::results_header();
         for item in wire::decode_work(&frame)? {
@@ -587,11 +832,14 @@ fn carry_out_one(request: &Request, item: &WorkItem) -> Result<RunResult, CliErr
         Some((loaded, text)) => (Some(loaded), text.as_str()),
         None => (None, ""),
     };
-    // No log: a trace follows from its tape, so anyone who needs it replays the run.
+    // No log: a trace follows from its tape, so anyone who needs it replays the run. Of the
+    // draws, only what the corpus takes is kept.
+    let mut config = crate::run_config_for(scenario, None);
+    config.draws = bohr_explorer::corpus_keep(item.prefix.len());
     let completed = execute::run_with(execute::Execution {
         target: &target,
         tape: &tape,
-        config: crate::run_config_for(scenario, None),
+        config,
         output: execute::Output::Discard,
         policy: SCHEDULER,
         record: execute::Record::DigestOnly,
@@ -601,11 +849,12 @@ fn carry_out_one(request: &Request, item: &WorkItem) -> Result<RunResult, CliErr
 
     Ok(RunResult {
         index: item.index,
-        observed: campaign_properties(&completed.sdk_records),
+        observed: completed.properties,
         digest: completed.report.digest,
         outcome: match &completed.report.outcome {
             bohr_trace::Outcome::Clean => None,
-            other => Some(format!("{other:?}")),
+            // The kind and what it said, as a campaign has always written a finding's kind.
+            other => Some(format!("{}({:?})", other.kind().name(), other.detail())),
         },
         coverage: completed.coverage.unwrap_or_default(),
         guest_edges: completed.coverage_edges,
@@ -615,10 +864,8 @@ fn carry_out_one(request: &Request, item: &WorkItem) -> Result<RunResult, CliErr
     })
 }
 
-/// How a campaign's runs are interleaved.
-///
-/// Priority-based (PCT), which guarantees which orderings it reaches.
-const SCHEDULER: &str = "pct";
+/// How a campaign's runs are interleaved: PCT, which guarantees which orderings it reaches.
+const SCHEDULER: &str = execute::Scheduler::Pct.name();
 
 /// The target to run, from what the campaign was pointed at.
 fn target_for(request: &Request) -> Result<execute::Target, CliError> {
@@ -631,7 +878,7 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
             Ok(execute::Target::Program(crate::specs_for(argv.clone(), loaded, None)?))
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-        Subject::Program(_) => Err(CliError::Usage(
+        Subject::Program(_) => Err(CliError::usage(
             "BOHR-1001: this build has no interceptor; search a built-in guest with --guest"
                 .to_owned(),
         )),
@@ -645,31 +892,18 @@ struct Saved {
     fresh: bool,
 }
 
-/// Writes a finding's bundle and returns it with its group. A bundle already under its digest's
-/// name is the same run, written before the campaign was resumed: it is read for its group, so a
-/// campaign run twice into one directory counts its groups the same way.
-fn save_finding(
+/// Runs one finding's tape again with its log kept and writes its bundle to `path`; a run that
+/// reached another digest than `expect` is written to `apart` and named for what it is.
+pub(crate) fn record(
     request: &Request,
-    finding: &bohr_explorer::Finding,
-) -> Result<Option<Saved>, CliError> {
-    let short = format!("{}", finding.digest);
-    let short = short.rsplit(':').next().unwrap_or(&short);
-    let path = request.findings.join(format!("finding-{}.bohr", &short[..12.min(short.len())]));
-    if path.is_file() {
-        let Ok(bundle) = std::fs::read(&path).map(|b| bohr_trace::Bundle::parse(&b)) else {
-            return Ok(None);
-        };
-        let Ok(bundle) = bundle else { return Ok(None) };
-        let Ok(manifest) = bundle.manifest() else { return Ok(None) };
-        let events: Vec<bohr_trace::Event> = bundle
-            .section(bohr_trace::SectionId::Events)
-            .map(|raw| bohr_trace::read_events_where(raw, crate::findings::telling).0)
-            .unwrap_or_default();
-        let group = crate::findings::signature(&bundle, &manifest.outcome, &events);
-        return Ok(Some(Saved { path, group, fresh: false }));
-    }
-    // Re-run with the log kept; the same tape gives the same run.
-    let tape = Tape::with_prefix(finding.seed, finding.prefix.clone());
+    seed: Seed,
+    prefix: Vec<u8>,
+    expect: &str,
+    path: &Path,
+    apart: &Path,
+) -> Result<u8, CliError> {
+    // The same tape gives the same run.
+    let tape = Tape::with_prefix(seed, prefix);
     let target = target_for(request)?;
     let (scenario, config_text) = match &request.scenario {
         Some((loaded, text)) => (Some(loaded), text.as_str()),
@@ -687,27 +921,22 @@ fn save_finding(
         config_toml: config_text,
     })?;
 
-    execute::write_bundle(&completed, &tape, None, &path)?;
+    // A re-run that went elsewhere is this tool's failure. It is kept apart, named for what it
+    // is, and the finding is not counted on its word.
+    if completed.report.digest.to_string() != expect {
+        execute::write_bundle(&completed, &tape, None, apart)?;
+        eprintln!(
+            "BOHR-2011: the finding {expect} ran again to {}, not to itself; its re-run is kept at \
+             {}",
+            completed.report.digest,
+            apart.display()
+        );
+        return Ok(crate::exit::INTERNAL);
+    }
+    execute::write_bundle(&completed, &tape, None, path)?;
     let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
     eprintln!("  found  {}    {} · {}", verdict.headline, verdict.code, path.display());
-    // The group from the few events it is read from, streamed from the spool.
-    let events = match &completed.spooled {
-        Some(spooled) => {
-            spooled.events_where(crate::findings::telling).map(|(e, _)| e).unwrap_or_default()
-        }
-        None => bohr_trace::read_events_lossy(&completed.log)
-            .0
-            .into_iter()
-            .filter(crate::findings::telling)
-            .collect(),
-    };
-    let group = crate::findings::group_of(
-        &crate::findings::programs_of(&completed.binaries),
-        &completed.report.outcome,
-        &events,
-        &completed.output_tails,
-    );
-    Ok(Some(Saved { path, group, fresh: true }))
+    Ok(crate::exit::FINDING)
 }
 
 /// What the campaign amounted to.
@@ -888,11 +1117,35 @@ fn load_corpus(dir: &Path) -> Result<Vec<WorkItem>, CliError> {
     Ok(carried)
 }
 
-/// Writes the corpus out, one tape per file.
+/// Writes the corpus out, one tape per file, in place of the tapes the directory held.
+///
+/// A campaign that kept nothing leaves the directory as it found it, so the tapes carried in are
+/// not lost to a guest that reports no coverage. The new tapes are written before the old go, so
+/// an interrupted save loses nothing either.
 fn save_corpus(dir: &Path, campaign: &Campaign) -> Result<(), CliError> {
+    let entries = campaign.corpus().entries();
+    if entries.is_empty() {
+        return Ok(());
+    }
     std::fs::create_dir_all(dir)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot use {}: {e}", dir.display())))?;
-    // Cleared first, so evicted entries do not come back next time.
+        .map_err(|e| CliError::usage(format!("BOHR-1002: cannot use {}: {e}", dir.display())))?;
+    let cannot = |path: &Path, e: std::io::Error| {
+        CliError::usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
+    };
+    let mut written = Vec::new();
+    for (n, entry) in entries.iter().enumerate() {
+        let item = WorkItem {
+            index: n as u32,
+            seed: entry.seed,
+            prefix: entry.prefix.clone(),
+            origin: entry.origin,
+        };
+        let part = dir.join(format!("entry-{n:05}.tape.part"));
+        std::fs::write(&part, wire::encode_work(std::slice::from_ref(&item)))
+            .map_err(|e| cannot(&part, e))?;
+        written.push(part);
+    }
+    // Evicted entries go, so they do not come back next time.
     if let Ok(existing) = std::fs::read_dir(dir) {
         for path in existing.flatten().map(|e| e.path()) {
             if path.extension().is_some_and(|x| x == "tape") {
@@ -900,39 +1153,11 @@ fn save_corpus(dir: &Path, campaign: &Campaign) -> Result<(), CliError> {
             }
         }
     }
-
-    for (n, entry) in campaign.corpus().entries().iter().enumerate() {
-        let item = WorkItem {
-            index: n as u32,
-            seed: entry.seed,
-            prefix: entry.prefix.clone(),
-            origin: entry.origin,
-        };
-        let path = dir.join(format!("entry-{n:05}.tape"));
-        std::fs::write(&path, wire::encode_work(std::slice::from_ref(&item))).map_err(|e| {
-            CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
-        })?;
+    for part in written {
+        let path = part.with_extension("");
+        std::fs::rename(&part, &path).map_err(|e| cannot(&path, e))?;
     }
     Ok(())
-}
-
-/// The campaign-scoped promises a guest made in this run.
-///
-/// Only `sometimes` and `reachable`; an `always` is already this run's outcome.
-///
-/// Unparsable lines are skipped; the supervisor already counts and reports them.
-fn campaign_properties(records: &[u8]) -> Vec<(String, bool)> {
-    String::from_utf8_lossy(records)
-        .lines()
-        .filter_map(|line| match bohr_sdk_proto::Record::parse_line(line) {
-            Ok(bohr_sdk_proto::Record::Assert(assertion, _))
-                if !assertion.assert_type.is_per_run() =>
-            {
-                Some((assertion.message, assertion.condition))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 /// A campaign written down in a directory between generations, and taken up again.
@@ -949,20 +1174,37 @@ mod resume {
     use super::{Request, Subject};
     use crate::{CliError, wire};
 
-    fn refused(text: String) -> CliError {
-        CliError::Usage(format!("BOHR-1002: {text}"))
-    }
-
     /// What the campaign was asked, so a resume can tell this question from another.
-    fn question(request: &Request) -> String {
-        let mut asked = format!("{:?}", request.subject);
-        if let Subject::Program(argv) = &request.subject
-            && let Some(bytes) = argv.first().and_then(|p| std::fs::read(p).ok())
-        {
-            asked.push_str(&bohr_types::Digest::of(&bytes).to_hex());
+    ///
+    /// The subject, the scenario's text, every program it starts and its prepared state by their
+    /// bytes, and the tool's version, whose model and probe are part of every run: a rebuilt
+    /// program or a regenerated state is another question.
+    pub(super) fn question(request: &Request) -> String {
+        let mut asked = format!("{:?} {}", request.subject, env!("CARGO_PKG_VERSION"));
+        let mut programs: Vec<String> = Vec::new();
+        if let Subject::Program(argv) = &request.subject {
+            programs.extend(argv.first().cloned());
         }
-        if let Some((_, text)) = &request.scenario {
+        if let Some((loaded, text)) = &request.scenario {
             asked.push_str(text);
+            if let Some(cluster) = &loaded.cluster {
+                programs.extend(cluster.argv.first().cloned());
+                programs.extend(cluster.programs.iter().filter_map(|argv| argv.first().cloned()));
+            }
+            if let Some(state) = &loaded.state {
+                asked.push_str(&state.manifest());
+            }
+        }
+        programs.sort();
+        programs.dedup();
+        for program in programs {
+            // A stand-in is what runs, so it is what the question names.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let program = crate::private::substitute_for(&program).unwrap_or(program);
+            if let Ok(bytes) = std::fs::read(&program) {
+                asked.push_str(&program);
+                asked.push_str(&bohr_types::Digest::of(&bytes).to_hex());
+            }
         }
         bohr_trace::short_digest(asked.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -971,13 +1213,14 @@ mod resume {
     pub(super) fn load(
         dir: &Path,
         request: &Request,
+        asked: &str,
     ) -> Result<(Campaign, Vec<RunResult>), CliError> {
         let state = dir.join("campaign.bin");
         if !state.is_file() {
             return Ok((Campaign::new(request.master), Vec::new()));
         }
         let header = std::fs::read_to_string(dir.join("campaign.toml"))
-            .map_err(|e| refused(format!("cannot read {}: {e}", dir.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot read {}: {e}", dir.display())))?;
         let field = |key: &str| {
             header.lines().find_map(|line| {
                 line.strip_prefix(key)
@@ -986,23 +1229,23 @@ mod resume {
             })
         };
         if field("master_seed") != Some(request.master.get().to_string()) {
-            return Err(refused(format!(
+            return Err(CliError::refused(format!(
                 "{} holds a campaign with master seed {}, not {}",
                 dir.display(),
                 field("master_seed").unwrap_or_default(),
                 request.master.get()
             )));
         }
-        if field("question") != Some(question(request)) {
-            return Err(refused(format!(
+        if field("question").as_deref() != Some(asked) {
+            return Err(CliError::refused(format!(
                 "{} holds a campaign of another program, binary or scenario; resume it with the \
                  ones it was started with, or name a new directory",
                 dir.display()
             )));
         }
         let bytes = std::fs::read(&state)
-            .map_err(|e| refused(format!("cannot read {}: {e}", state.display())))?;
-        let damaged = || refused(format!("{} is damaged", state.display()));
+            .map_err(|e| CliError::refused(format!("cannot read {}: {e}", state.display())))?;
+        let damaged = || CliError::refused(format!("{} is damaged", state.display()));
         let len = bytes
             .get(..8)
             .and_then(|b| b.try_into().ok())
@@ -1013,7 +1256,8 @@ mod resume {
             .and_then(|n| n.checked_add(8))
             .filter(|n| *n <= bytes.len())
             .ok_or_else(damaged)?;
-        let campaign = Campaign::from_state(&bytes[8..split]).map_err(|e| refused(e.0))?;
+        let campaign =
+            Campaign::from_state(&bytes[8..split]).map_err(|e| CliError::refused(e.0))?;
         let pending = wire::decode_results(&bytes[split..])?;
         eprintln!(
             "resumed {} at {} runs, generation {}",
@@ -1030,9 +1274,10 @@ mod resume {
         request: &Request,
         campaign: &Campaign,
         pending: &[RunResult],
+        asked: &str,
     ) -> Result<(), CliError> {
         std::fs::create_dir_all(dir)
-            .map_err(|e| refused(format!("cannot use {}: {e}", dir.display())))?;
+            .map_err(|e| CliError::refused(format!("cannot use {}: {e}", dir.display())))?;
         let state = campaign.to_state();
         let mut bytes = (state.len() as u64).to_le_bytes().to_vec();
         bytes.extend_from_slice(&state);
@@ -1046,7 +1291,7 @@ mod resume {
             request.master.get(),
             campaign.runs() + pending.len() as u64,
             campaign.generation(),
-            question(request)
+            asked
         );
         // The header first: its fields never change, so it matches either state file.
         for (name, content) in [("campaign.toml", header.into_bytes()), ("campaign.bin", bytes)] {
@@ -1054,7 +1299,7 @@ mod resume {
             let part = dir.join(format!("{name}.part"));
             std::fs::write(&part, content)
                 .and_then(|()| std::fs::rename(&part, &at))
-                .map_err(|e| refused(format!("cannot write {}: {e}", at.display())))?;
+                .map_err(|e| CliError::refused(format!("cannot write {}: {e}", at.display())))?;
         }
         Ok(())
     }
@@ -1063,6 +1308,66 @@ mod resume {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request for a program on disk, run under a scenario naming another program per node.
+    fn asking(program: &Path, node_program: &Path) -> Request {
+        let text = format!(
+            "[cluster]\nnodes = 2\nprograms = [[{:?}], [{:?}]]\n",
+            program.to_string_lossy(),
+            node_program.to_string_lossy()
+        );
+        let loaded = crate::state_dir::load(&text).expect("the scenario loads");
+        Request {
+            master: Seed(7),
+            runs: Some(0),
+            time: None,
+            quiet_runs: None,
+            jobs: 1,
+            findings: PathBuf::from("out/findings"),
+            corpus: None,
+            resume: None,
+            summary: None,
+            subject: Subject::Program(vec![program.to_string_lossy().into_owned()]),
+            scenario_path: None,
+            scenario: Some((loaded, text)),
+        }
+    }
+
+    /// A program a node runs, rebuilt, makes another question: a resume would run something else.
+    #[test]
+    fn a_rebuilt_node_program_is_another_question() {
+        let dir = std::env::temp_dir().join(format!("bohr-question-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let (main, node) = (dir.join("main"), dir.join("node"));
+        std::fs::write(&main, b"main").expect("written");
+        std::fs::write(&node, b"node, first build").expect("written");
+        let before = resume::question(&asking(&main, &node));
+        assert_eq!(before, resume::question(&asking(&main, &node)), "one question, asked twice");
+        std::fs::write(&node, b"node, rebuilt").expect("written");
+        let after = resume::question(&asking(&main, &node));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(before, after, "a rebuilt node program read as the same question");
+    }
+
+    /// A generation cut short notes its groups where a whole one would, when it will be resumed.
+    #[test]
+    fn a_cut_generation_notes_its_groups_where_a_whole_one_would() {
+        let whole = GENERATION_ITEMS as u64;
+        assert_eq!(partial_noted_at(true, whole, whole + 9), 2 * whole);
+        assert_eq!(partial_noted_at(false, whole, whole + 9), whole + 9);
+    }
+
+    /// A campaign that kept nothing leaves the tapes it was given where they were.
+    #[test]
+    fn an_empty_corpus_leaves_the_tapes_carried_in() {
+        let dir = std::env::temp_dir().join(format!("bohr-corpus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("entry-00000.tape"), b"carried in").expect("written");
+        save_corpus(&dir, &Campaign::new(Seed(1))).expect("saved");
+        let kept = std::fs::read(dir.join("entry-00000.tape")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, b"carried in", "the carried tape was deleted with nothing in its place");
+    }
 
     /// The object is the `--summary` account plus what this invocation wrote; the two agree.
     #[test]

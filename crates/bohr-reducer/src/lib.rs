@@ -29,7 +29,7 @@ pub use reduction::{
     Baseline, Candidate, CandidateId, CandidateOutcome, Keep, Limits, Pass, Reduction, Spent,
 };
 pub use scenario::{Edit, Scenario, Size};
-pub use violation::{Class, FailedAssertion, Violation};
+pub use violation::{FailedAssertion, Violation};
 
 /// Why a reduction could not start.
 #[derive(Debug, thiserror::Error)]

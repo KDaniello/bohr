@@ -9,7 +9,7 @@ use bohr_reducer::{
 use bohr_tape::Tape;
 use bohr_testkit::{Judged, judge_scenario, violation::PingPong};
 use bohr_types::Seed;
-use bohr_world::config::load;
+use bohr_world::config::parse;
 
 /// Rounds that record about forty thousand events while every one of them is answered.
 const ROUNDS: usize = 4600;
@@ -51,7 +51,7 @@ fn config_text() -> String {
 
 /// Carries out one scenario, in the form a reduction is entitled to know about it.
 fn carry_out(scenario: &Scenario) -> (Option<Violation>, Size, bohr_tape::Journal, Judged) {
-    let loaded = load(scenario.config()).expect("a configuration this test wrote");
+    let loaded = parse(scenario.config()).expect("a configuration this test wrote");
     let fixture = PingPong::new(ROUNDS);
     let tape = Tape::with_prefix(scenario.seed(), scenario.prefix().to_vec());
 
@@ -66,6 +66,7 @@ fn carry_out(scenario: &Scenario) -> (Option<Violation>, Size, bohr_tape::Journa
             sdk_output: Some("/bohr/records.jsonl".to_owned()),
             liveness: loaded.liveness,
             durability: loaded.durability,
+            programs: Vec::new(),
         },
         &tape,
         RunConfig::default(),
@@ -91,6 +92,11 @@ fn baseline() -> (Scenario, Baseline, Judged) {
     (scenario, baseline, judged)
 }
 
+/// The default limits, with the moments the world names.
+fn limits() -> Limits {
+    Limits { moments: &bohr_world::config::MOMENT_KEYS, ..Limits::default() }
+}
+
 /// How far a reduction gets and what it spends.
 #[test]
 fn a_forty_thousand_event_scenario_reduces_to_a_readable_one() {
@@ -102,7 +108,7 @@ fn a_forty_thousand_event_scenario_reduces_to_a_readable_one() {
         before.size.events
     );
 
-    let limits = Limits::default();
+    let limits = limits();
     let mut reduction =
         Reduction::new(scenario, before.clone(), limits).expect("a workable budget");
     let mut probes = 0u32;
@@ -136,8 +142,7 @@ fn a_forty_thousand_event_scenario_reduces_to_a_readable_one() {
 #[test]
 fn the_reduced_scenario_still_reproduces_what_it_started_from() {
     let (scenario, before, _) = baseline();
-    let mut reduction =
-        Reduction::new(scenario, before.clone(), Limits::default()).expect("a budget");
+    let mut reduction = Reduction::new(scenario, before.clone(), limits()).expect("a budget");
     while let Some(candidate) = reduction.next() {
         let (violation, size, journal, _) = carry_out(&candidate.scenario);
         reduction.accept(&CandidateOutcome { id: candidate.id, violation, size, journal });
@@ -157,7 +162,7 @@ fn the_reduced_scenario_still_reproduces_what_it_started_from() {
 #[test]
 fn the_result_names_only_what_mattered() {
     let (scenario, before, _) = baseline();
-    let mut reduction = Reduction::new(scenario, before, Limits::default()).expect("a budget");
+    let mut reduction = Reduction::new(scenario, before, limits()).expect("a budget");
     while let Some(candidate) = reduction.next() {
         let (violation, size, journal, _) = carry_out(&candidate.scenario);
         reduction.accept(&CandidateOutcome { id: candidate.id, violation, size, journal });
@@ -165,11 +170,11 @@ fn the_result_names_only_what_mattered() {
 
     let doc = ConfigDoc::parse(reduction.best().config());
     let kept: Vec<&str> = doc.entries().iter().map(|entry| entry.table.as_str()).collect();
-    eprintln!("kept: {kept:?} · moments: {:?}", doc.moments());
+    eprintln!("kept: {kept:?} · moments: {:?}", doc.moments(&bohr_world::config::MOMENT_KEYS));
     assert!(kept.len() <= 2, "the result still lists {kept:?}");
     // The unreachable heal stays; moving it forward would undo the partition.
     let fires_at: Vec<u64> = doc
-        .moments()
+        .moments(&bohr_world::config::MOMENT_KEYS)
         .iter()
         .filter(|moment| moment.key == "at_tick")
         .map(|moment| moment.ticks)

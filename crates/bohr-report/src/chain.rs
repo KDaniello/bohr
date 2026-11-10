@@ -26,9 +26,6 @@ pub struct Lane {
     pub value: String,
 }
 
-/// The name a probe gives its records.
-const PROBE_EVENT: &str = "bohr_probe";
-
 const WIDTH: u64 = 960;
 const LEFT: u64 = 80;
 const RIGHT: u64 = 20;
@@ -78,20 +75,13 @@ fn dots(model: &RunModel, lanes: &[Lane]) -> Vec<Dot> {
         let Some(Record::Event(name, details, _)) = model.records.get(index as usize) else {
             continue;
         };
-        if name != PROBE_EVENT {
+        if name != bohr_sdk_proto::probe::PROBE_EVENT {
             continue;
         }
-        let Some(Json::Array(round)) = details.get("round") else { continue };
-        for item in round {
-            let Some(lane) = item
-                .get("request")
-                .and_then(Json::as_int)
-                .and_then(|i| usize::try_from(i).ok())
-                .and_then(|i| lanes.get(i))
-            else {
-                continue;
-            };
-            let Some(result) = item.get("result") else { continue };
+        let Some(round) = bohr_sdk_proto::probe::Round::from_details(details) else { continue };
+        for (request, answer) in &round.0 {
+            let Some(lane) = lanes.get(*request) else { continue };
+            let bohr_sdk_proto::probe::Answer::Result(result) = answer else { continue };
             let Some(value) = result.get(&lane.value).map(text_of) else { continue };
             let key = lane.key.as_ref().and_then(|k| result.get(k)).map(text_of);
             if seen.insert((lane.node, key.clone(), value.clone())) {
@@ -127,10 +117,14 @@ fn outages(model: &RunModel, end: u64) -> Vec<(u32, u64, u64)> {
     out
 }
 
-/// Where the violation was seen: the first probe diagnostic.
-fn seen_at(model: &RunModel) -> Option<u64> {
-    model.events.iter().find_map(|e| match &e.kind {
-        EventKind::Diagnostic { code, .. } if code.starts_with("BOHR-204") => Some(e.tick.get()),
+/// Where the violation was seen: the first diagnostic of a broken probe property.
+///
+/// A notice that shares the codes' range, such as a full key table, is not a violation.
+fn seen_at(events: &[bohr_trace::Event]) -> Option<u64> {
+    events.iter().find_map(|e| match &e.kind {
+        EventKind::Diagnostic { code, .. } if bohr_trace::PROBE_CODES.contains(&code.as_str()) => {
+            Some(e.tick.get())
+        }
         _ => None,
     })
 }
@@ -208,7 +202,7 @@ pub fn svg(model: &RunModel, lanes: &[Lane]) -> Option<String> {
             escape::text(&label)
         );
     }
-    if let Some(at) = seen_at(model) {
+    if let Some(at) = seen_at(&model.events) {
         let _ = writeln!(
             out,
             "<line x1=\"{0}\" x2=\"{0}\" y1=\"{1}\" y2=\"{2}\" stroke=\"#b00\" stroke-dasharray=\"4 3\"/>\
@@ -238,6 +232,23 @@ pub fn svg(model: &RunModel, lanes: &[Lane]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full key table, numbered next to the probe's properties, is not where a violation was
+    /// seen.
+    #[test]
+    fn a_capacity_notice_is_not_a_violation_seen() {
+        use bohr_trace::Event;
+        use bohr_types::{EventId, NodeId, TaskId, Tick};
+        let said = |tick: u64, code: &str| Event {
+            id: EventId(tick),
+            tick: Tick(tick),
+            node: NodeId(0),
+            task: TaskId(0),
+            kind: EventKind::Diagnostic { code: code.to_owned(), message: String::new() },
+        };
+        let events = [said(5, "BOHR-2045"), said(9, bohr_trace::UNIQUE_CODE)];
+        assert_eq!(seen_at(&events), Some(9));
+    }
 
     #[test]
     fn a_key_reads_as_a_height_in_either_base() {
