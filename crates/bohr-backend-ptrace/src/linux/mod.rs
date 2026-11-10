@@ -152,6 +152,8 @@ pub struct PtraceBackend {
     affinity_before: Option<libc::cpu_set_t>,
     /// Whether `brk`, `mremap` and anonymous `mmap` stop, for a world that refuses allocations.
     allocations: bool,
+    /// Tasks killed and forgotten, as `(pid, group)`, whose deaths no wait has collected yet.
+    dying: Vec<(libc::pid_t, libc::pid_t)>,
 }
 
 impl Default for PtraceBackend {
@@ -189,6 +191,7 @@ impl PtraceBackend {
             covered: CoverageMap::with_bytes(bytes),
             affinity_before: None,
             allocations: false,
+            dying: Vec::new(),
         }
     }
 
@@ -467,6 +470,7 @@ impl DeterminismBackend for PtraceBackend {
             // out of a pid that no longer exists.
             let Some(id) = self.by_pid.get(&pid).copied() else {
                 if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    self.dying.retain(|&(dead, _)| dead != pid);
                     continue;
                 }
                 let (node, program) = self.whose_group(pid);
@@ -796,6 +800,7 @@ impl DeterminismBackend for PtraceBackend {
         //
         // The death arrives at the ordinary wait instead, like every other, and is dropped there:
         // this task is already forgotten and there is nobody left to tell.
+        self.dying.push((pid, group));
         self.forget(task);
         Ok(())
     }
@@ -891,26 +896,90 @@ fn limits() -> Vec<String> {
     ]
 }
 
-/// Ends guests that were released to a debugger.
+/// Kills every task of the run, and reaps it unless it was released to a debugger.
 ///
-/// Until a hand-over the kernel does this: every task carries an option that ties its life to the
-/// supervisor's. Releasing it clears that option so the guest outlives the detach, which leaves
-/// this as the only thing that can end it — and the guest is not our child, so nothing else will.
+/// Not left to `PTRACE_O_EXITKILL`, which acts when this process exits: a command of many runs
+/// would keep each run's survivors until then. A released guest has that option cleared.
 impl Drop for PtraceBackend {
     fn drop(&mut self) {
         if let Some(set) = self.affinity_before.take() {
             // SAFETY: a set this thread reported for itself; pid 0 is this thread.
             unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
         }
-        if !self.handed_over {
-            return;
-        }
         for task in self.tasks.values() {
             // SAFETY: both identifiers belong to a task we started. The process may already be
             // gone, in which case the signal is refused and nothing else happens.
             unsafe { libc::syscall(libc::SYS_tgkill, task.group, task.pid, libc::SIGKILL) };
         }
+        if self.handed_over {
+            return;
+        }
+        let known = self.tasks.values().map(|task| (task.pid, task.group));
+        let left = reap(known.chain(self.dying.iter().copied()));
+        if left > 0 {
+            eprintln!(
+                "bohr: {left} tasks of a finished run did not end within a second, left behind"
+            );
+        }
     }
+}
+
+/// Kills and reaps `tasks` and everything they started, never blocking; returns how many are left.
+///
+/// Every wait polls: an isolated guest is the init of its own pid namespace, and an init that exits
+/// waits for its traced threads to be reaped — by this caller, so a blocking wait waits on itself.
+fn reap(tasks: impl Iterator<Item = (libc::pid_t, libc::pid_t)>) -> usize {
+    // What the table names, its threads, and their children, transitively: a thread or a fork
+    // that arrived after the last wait is in no table but is still ours to end.
+    let mut left = std::collections::BTreeSet::<libc::pid_t>::new();
+    let mut queue: Vec<libc::pid_t> = tasks.flat_map(|(pid, group)| [pid, group]).collect();
+    while let Some(pid) = queue.pop() {
+        if !left.insert(pid) {
+            continue;
+        }
+        let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+        for thread in threads.flatten() {
+            let Some(tid) = thread.file_name().to_str().and_then(|s| s.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            queue.push(tid);
+            if let Ok(children) = std::fs::read_to_string(thread.path().join("children")) {
+                queue.extend(
+                    children.split_whitespace().filter_map(|c| c.parse::<libc::pid_t>().ok()),
+                );
+            }
+        }
+    }
+    for &pid in &left {
+        // SAFETY: a task of this run or one it started; one already gone refuses the signal.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    // A thousand polls a millisecond apart, about a second, counted rather than timed: the host
+    // clock is read nowhere in the backend, and a bound on attempts needs none.
+    for _ in 0..1000 {
+        if left.is_empty() {
+            break;
+        }
+        left.retain(|&pid| {
+            let mut status = 0;
+            // SAFETY: a task of this run; `status` is a local we own.
+            let rc = unsafe { libc::waitpid(pid, &raw mut status, libc::__WALL | libc::WNOHANG) };
+            if rc == 0 {
+                return true;
+            }
+            if rc > 0 && libc::WIFSTOPPED(status) {
+                // SAFETY: the task is ours and stopped; continued with SIGKILL pending, it dies.
+                unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) };
+                return true;
+            }
+            false
+        });
+        if !left.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    left.len()
 }
 
 /// Trace options every task carries. A task created by `clone` inherits none of them, so they are

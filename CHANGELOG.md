@@ -6,6 +6,108 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.7.0 — findings at real scale
+
+A finding against a real client is not yet something to send: the bundle holds the whole run, and
+the maintainer it goes to has nothing to read. v0.7 shrinks a real client's finding by moving its
+faults as well as removing them, writes the letter a maintainer receives and the SARIF code scanning
+reads, and stops a long reduction from filling the host with the guests of runs it has finished. It
+is not published.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.7.0` |
+| `tape_abi` | `2` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every bundle of v0.6 replays to its digest: the tape is read as it was, and a journal is stored
+byte for byte as before. Figures are under `[v0_7.*]` in
+[`benches/baseline.toml`](./benches/baseline.toml). `make pr`, `make gate` (13 of 13) and the
+mutation harness (13 of 13) are green on Ubuntu 24.04, with 715 tests; one gate of this version
+fails, two are not measured and one half of a fourth was not done, and are listed below with what
+was measured instead.
+
+### Reduction
+
+- **Faults moved as well as removed.** After the configuration, `bohr reduce` spends a fifth of
+  its budget on the faults that fired: those the failure does not need are dropped, and a node
+  fault it needs is fired at an earlier chance — the first after the fault before it, then an
+  eighth, a quarter and half of the way — so the run before it shrinks with it. Then the events,
+  then the tape. The configuration stays first: it is read before the tape, and an entry removed
+  would move every fault moved before it.
+- **No scenario is replayed twice.** A candidate already answered is skipped and not charged to
+  the budget.
+- **The same violation, not a neighbouring one.** A candidate is kept only where its class and its
+  signature equal the original's, so a reduction cannot drift to another failure that is smaller.
+- **Measured on two real clients**, at `--budget 200`:
+
+| Finding | Events | Kept | Replays | Wall time | 100 replays of the result |
+|---|---:|---:|---:|---:|---|
+| a real client, A | 27,577 → 5,923 | 21.5% | 200 | 471 s | 100 of 100 |
+| a real client, B | 1,278 → 1,267 | 99.1% | 200 | 688 s | 100 of 100 |
+
+  Which client and seed each is stays out of the tree until its maintainers have it. In A the
+  configuration pass removed what the failure does not need in three replays, and every fault left
+  is one it does; what is left is what the node does between them, thousands of events no edit of
+  the tape removes. B is short to begin with, and there is little before its failure to take away.
+  v0.6.0's reducer reaches 5,847 events on A in 25 replays, 76 fewer, with the same violation:
+  on this finding v0.7 is not smaller, and its faults pass has nothing left to move.
+
+### Reports a maintainer receives
+
+- **`bohr report finding.bohr --disclosure -o report.md`**: a Markdown draft ordered by what a
+  maintainer asks first — is this my program, can I make it happen, how far can I believe it. The
+  program and its blake3, and the source commit where a target pack names that digest; the
+  violation and the steps before it; the reproduction command with the digest it must reach; and
+  what a run under a model cannot claim. Nothing is sent.
+- **`bohr report findings/ --sarif -o findings.sarif`**: SARIF 2.1.0, one result per finding group
+  and never one per seed, led by the group's smallest bundle. The rule is the violation's code, the
+  location the guest's own source line where its records name one and the bundle where they do not,
+  and a fingerprint stable across campaigns keeps one alert open for one defect.
+
+### Fixed
+
+- **A long command kept the guests of every run it finished.** A guest alive at the end of a run
+  stayed stopped until the process exited, so a reduction of a real client held 61 stopped nodes of 59 MB
+  each and ran the 4 GB host out of memory in 47 minutes. Every task the backend knows of, the
+  threads and children found under them, and the nodes killed whose deaths were not yet collected,
+  are now killed and reaped as the run is dropped, without a blocking wait: an isolated guest is
+  the init of its own pid namespace, and an init that exits waits for its traced threads to be
+  reaped by the very process that would be waiting for it. What is still there after a second is
+  left and said.
+- **The plainer-draws pass fired faults.** It wrote zeros over a disk latency's or a memory
+  refusal's odds, and zero is the value that fires; every odds draw is now written as the one that
+  does not.
+- **The reduction test reduced nothing.** Its campaign never found anything, so it passed on an
+  empty input; it now reduces a real finding and replays the result.
+
+### Speed
+
+Against v0.6.0's binary on one host, alternately, the mean of four rounds and of six for the
+campaign: an intercepted call costs 4.1 µs against 4.0, a guest starts in 2.78 ms against 2.63, a
+64-run campaign takes 2,926 ms against 2,887 at one worker and 893 against 851 at four, and a
+worker peaks at 14.2 MB against 14.1. Each is within the 10% P7.3 allows.
+
+### What it does not do
+
+- **Shrink a real finding tenfold (G7.1).** A keeps 21.5% and B 99.1%; the bound was 10%. The
+  reducer moves a finding's faults, not what a real node does between them, and a short finding
+  has little else in it. Neither is a target
+  pinned before a publicly fixed defect, as G7.1 asked: both are findings the packs produce today. The `op-reth` finding is not measured: at
+  75 s a replay, 200 replays are four hours, past P7.2's hour before the first result.
+- **Share a prefix between replays (P7.1).** The ptrace backend has no checkpoint, so every
+  candidate runs from the first instruction; replay from the nearest checkpoint is not built.
+- **Replay across vendors (G7.6).** There is no AMD runner; every bundle here was made and replayed
+  on one vendor's processors.
+- **Upload SARIF to code scanning (G7.5, second half).** The log validates against the 2.1.0
+  schema; no upload to a repository was made.
+- **Symbolise a crash.** A SARIF location is a source line only where the guest's own records name
+  one; a signal or an exit status carries none.
+- **Move a fault onto a chance that belongs to it alone.** The earlier chances a node fault is moved
+  to are the node-fault draws before it, which may be another node's, and a candidate kept with no
+  fault at that chance is counted as refused.
+
 ## v0.6.0 — every fault real
 
 **The tape ABI is 2.** Every bundle recorded by an earlier release is refused by name — `BOHR-4005:

@@ -146,6 +146,18 @@ impl<'a> TapeCursor<'a> {
         Ok(value == 1)
     }
 
+    /// True with probability `num/den`, consuming two bytes whatever the probability is.
+    ///
+    /// Not [`Self::draw_bool`], which charges nothing for a certainty: there an override or a
+    /// zeroed default would change what a request costs in tape.
+    pub fn draw_odds(&mut self, num: u32, den: u32, site: DrawSite) -> bool {
+        let offset = TapeOffset(self.pos);
+        let drawn = self.take_uint(2);
+        let fired = den != 0 && drawn < (u64::from(num) << 16) / u64::from(den);
+        self.journal.push_odds(offset, self.event, site, drawn, fired);
+        fired
+    }
+
     /// An index into `weights`, proportional to weight, consuming a fixed four bytes.
     ///
     /// Same hazard and same fix as [`Self::draw_bool`]: `draw_range(sum)` would tie the width to
@@ -228,6 +240,24 @@ mod tests {
     use bohr_types::Seed;
 
     use super::*;
+
+    /// An odds draw costs two bytes at every probability, certainties and a zero denominator
+    /// included, and reads and journals exactly what a range of 65,536 at that offset would.
+    #[test]
+    fn an_odds_draw_is_two_bytes_whatever_the_odds() {
+        let tape = Tape::from_seed(Seed(9));
+        for (num, den) in [(0, 1), (1, 0), (1, 1), (3, 2), (1, 2000), (1, 2)] {
+            let mut odds = tape.cursor();
+            let mut range = tape.cursor();
+            let fired = odds.draw_odds(num, den, DrawSite::NodeFault);
+            let raw = range.draw_range(1 << 16, DrawSite::NodeFault).expect("draw");
+            assert_eq!(odds.position().get(), 2, "{num}/{den} cost another width");
+            assert_eq!(odds.journal().records(), range.journal().records(), "{num}/{den}");
+            let expected = den != 0 && raw < (u64::from(num) << 16) / u64::from(den);
+            assert_eq!(fired, expected, "{num}/{den}");
+            assert_eq!(odds.journal().fired(0), fired);
+        }
+    }
 
     #[test]
     fn an_exponential_draw_costs_four_bytes_and_journals_the_uniform() {

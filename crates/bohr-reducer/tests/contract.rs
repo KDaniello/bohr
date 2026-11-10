@@ -242,3 +242,108 @@ fn a_candidate_the_world_would_refuse_does_not_end_the_reduction() {
         "the scenario that came out no longer reproduces what went in"
     );
 }
+
+/// A node that draws whether it dies at every call, and a defect reached only by a death after
+/// the tenth call: the run then lasts fifty calls more and breaks its promise.
+///
+/// Read off the prefix the way the world reads it — two bytes of odds per call, and one byte of
+/// kind after a draw that fired — and journalled as the world journals it.
+fn drawn_kills(scenario: &Scenario) -> (Option<Violation>, Size, Journal, Vec<(u64, u8)>) {
+    const CALLS: u64 = 1_000;
+    const FIRES_BELOW: u64 = 33;
+    let prefix = scenario.prefix();
+    let mut journal = Journal::new();
+    let mut kills = Vec::new();
+    let mut at = 0usize;
+    for call in 0..CALLS {
+        let odds = u64::from(u16::from_le_bytes([prefix[at], prefix[at + 1]]));
+        let fired = odds < FIRES_BELOW;
+        journal.push_odds(
+            bohr_types::TapeOffset(at as u64),
+            EventId(call),
+            bohr_tape::DrawSite::NodeFault,
+            odds,
+            fired,
+        );
+        at += 2;
+        if fired {
+            let kind = prefix[at];
+            journal.push(
+                bohr_types::TapeOffset(at as u64),
+                EventId(call),
+                bohr_tape::DrawSite::NodeFault,
+                1,
+                u64::from(kind),
+            );
+            at += 1;
+            kills.push((call, kind));
+        }
+        if kills.iter().any(|(when, _)| *when >= 10) {
+            let events = call + 50;
+            let size = Size { events, draws: journal.len() as u64 };
+            return (Some(promise_broken("every ping is answered")), size, journal, kills);
+        }
+    }
+    (None, Size { events: CALLS, draws: journal.len() as u64 }, journal, kills)
+}
+
+/// A prefix that kills at the calls given, as kind 7, and nowhere else.
+fn killing_at(calls: &[u64]) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    for call in 0..1_000u64 {
+        if calls.contains(&call) {
+            prefix.extend_from_slice(&[0, 0, 7]);
+        } else {
+            prefix.extend_from_slice(&[0xAA, 0xAA]);
+        }
+    }
+    prefix
+}
+
+/// The fault pass on drawn kills: the kill the finding does not need goes, and the one it needs
+/// fires at an earlier chance — as the same kind, after the tenth call, and never before it.
+///
+/// Without the tape pass, which would make the kind plainer as well and hide whether it travelled.
+#[test]
+fn a_drawn_kill_is_fired_sooner_and_one_not_needed_is_removed() {
+    let input = Scenario::new(Seed(1), killing_at(&[300, 700]), String::new());
+    let (violation, size, journal, _) = drawn_kills(&input);
+    assert_eq!(size.events, 350);
+    let baseline = Baseline { violation: violation.expect("reproduces"), size, journal };
+    let limits = Limits { replays: 200, keep: Keep::Events };
+    let mut reduction = Reduction::new(input, baseline, limits).expect("a budget");
+    while let Some(candidate) = reduction.next() {
+        let id = candidate.id;
+        let (violation, size, journal, _) = drawn_kills(&candidate.scenario);
+        reduction.accept(&CandidateOutcome { id, violation, size, journal });
+    }
+
+    let (violation, size, _, kills) = drawn_kills(reduction.best());
+    assert!(violation.is_some(), "the result no longer reproduces");
+    assert!(size.events < 100, "{} events is not a reduction of 350", size.events);
+    assert_eq!(kills.len(), 1, "a kill the finding does not need was kept: {kills:?}");
+    let (when, kind) = kills[0];
+    assert!(when >= 10, "the kill moved to where the defect cannot be reached");
+    assert_eq!(kind, 7, "the kill moved and fired as another kind");
+    assert!(reduction.spent().faults > 0);
+    assert!(reduction.spent().total() <= 200);
+}
+
+/// A candidate already answered is never run twice: every scenario a reduction proposes is one
+/// it has not seen.
+#[test]
+fn no_scenario_is_proposed_twice() {
+    let input = Scenario::new(Seed(1), killing_at(&[5, 300, 700]), SCENARIO.to_owned());
+    let (violation, size, journal, _) = drawn_kills(&input);
+    let baseline = Baseline { violation: violation.expect("reproduces"), size, journal };
+    let mut reduction =
+        Reduction::new(input.clone(), baseline, Limits::default()).expect("a budget");
+    let mut seen = vec![input];
+    while let Some(candidate) = reduction.next() {
+        assert!(!seen.contains(&candidate.scenario), "a scenario was proposed twice");
+        seen.push(candidate.scenario.clone());
+        let id = candidate.id;
+        let (violation, size, journal, _) = drawn_kills(&candidate.scenario);
+        reduction.accept(&CandidateOutcome { id, violation, size, journal });
+    }
+}

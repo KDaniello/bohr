@@ -13,11 +13,13 @@
 
 pub mod chain;
 pub mod describe;
+pub mod disclosure;
 mod escape;
 mod html;
 pub mod jsonl;
 mod model;
 pub mod narrate;
+pub mod sarif;
 pub mod text;
 mod window;
 

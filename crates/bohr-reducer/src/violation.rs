@@ -171,11 +171,10 @@ impl Violation {
             Class::UnsupportedSyscall => Signature::Refused(refused_call(outcome)),
             _ => Signature::ClassAlone,
         };
-        // **An empty signature is matched by everything of its class.** `is_subset` on an empty
-        // set is true of any candidate, so a crash whose events carried no bad exit -- a truncated
-        // log -- reduced towards any crash at all, and the scenario that came out reproduced
-        // something else. Refused here, the way a clean baseline is refused one layer up: a
-        // finding this build cannot tell apart from its neighbours is not one it can shrink.
+        // **An empty signature tells nothing apart.** A crash whose events carried no bad exit --
+        // a truncated log -- would be one finding with every other crash whose log was cut short.
+        // Refused here, the way a clean baseline is refused one layer up: a finding this build
+        // cannot tell apart from its neighbours is not one it can shrink.
         if signature.is_empty() {
             return None;
         }
@@ -206,30 +205,13 @@ impl Violation {
         }
     }
 
-    /// Whether `candidate` still reproduces this.
+    /// Whether `candidate` still reproduces this: the same class and the same signature.
     ///
-    /// Containment rather than equality: a smaller scenario that also trips a second assertion is
-    /// still a reproducer for the first, and demanding equality would throw away reductions that
-    /// worked. What may not change is the shape and the promise named.
+    /// Equality, not containment: a run that also trips a second assertion is another group's
+    /// finding in `bohr findings`, and a defect nobody asked about.
     #[must_use]
     pub fn reproduced_by(&self, candidate: &Self) -> bool {
-        if self.class != candidate.class {
-            return false;
-        }
-        match (&self.signature, &candidate.signature) {
-            (Signature::Assertions(mine), Signature::Assertions(theirs)) => mine.is_subset(theirs),
-            (Signature::Exits(mine), Signature::Exits(theirs)) => mine.is_subset(theirs),
-            (Signature::NoProgress(mine), Signature::NoProgress(theirs)) => mine == theirs,
-            (Signature::Silent(mine), Signature::Silent(theirs)) => mine.is_subset(theirs),
-            (Signature::Probed(mine), Signature::Probed(theirs)) => mine.is_subset(theirs),
-            (Signature::Lost(mine), Signature::Lost(theirs)) => mine.is_subset(theirs),
-            (Signature::Disagreement(mine), Signature::Disagreement(theirs)) => {
-                mine.is_subset(theirs)
-            }
-            (Signature::Refused(mine), Signature::Refused(theirs)) => mine == theirs,
-            (Signature::ClassAlone, Signature::ClassAlone) => true,
-            _ => false,
-        }
+        self.class == candidate.class && self.signature == candidate.signature
     }
 }
 
@@ -429,23 +411,24 @@ mod tests {
         assert!(!here.reproduced_by(&there), "a promise from another file was accepted");
     }
 
-    /// A smaller scenario that also trips something else still reproduces what was asked for.
+    /// A candidate that also trips something else is another group's finding, so it is not a
+    /// reproduction of this one, however small it is.
     #[test]
-    fn a_candidate_that_breaks_more_still_reproduces_what_was_asked_for() {
+    fn a_candidate_that_breaks_more_is_a_different_finding() {
         let asked = violated(&broke("log is monotonic", "src/log.rs:214"));
         let mut more = broke("log is monotonic", "src/log.rs:214");
         more.extend(broke("index agrees with log", "src/index.rs:9"));
-        assert!(asked.reproduced_by(&violated(&more)));
+        assert!(!asked.reproduced_by(&violated(&more)));
     }
 
-    /// A silence names the nodes that were silent, and a smaller scenario that silences more of
-    /// them still reproduces it — the same containment an exit set has, and for the same reason.
+    /// A silence is identified by exactly who was silent, in both directions.
     #[test]
     fn a_silence_is_identified_by_who_was_silent() {
         let one = quiet(&[NodeId(1)]);
         let both = quiet(&[NodeId(1), NodeId(2)]);
-        assert!(one.reproduced_by(&both), "silencing more still silences node 1");
-        assert!(!both.reproduced_by(&one), "and silencing fewer does not");
+        assert!(one.reproduced_by(&quiet(&[NodeId(1)])));
+        assert!(!one.reproduced_by(&both), "silencing more is another finding");
+        assert!(!both.reproduced_by(&one), "and silencing fewer is too");
     }
 
     /// The reason this outcome exists rather than reusing `PropertyViolated`.
@@ -462,15 +445,15 @@ mod tests {
         assert!(!promise.reproduced_by(&silence));
     }
 
-    /// A disagreement is identified by which promises were broken, and a candidate that breaks
-    /// more still reproduces the one that was asked for.
+    /// A disagreement is identified by exactly which promises were broken.
     #[test]
     fn a_disagreement_is_identified_by_what_was_disagreed_about() {
         let root = disagreed("state-root");
         let both = disagreed("state-root, receipts-root");
 
-        assert!(root.reproduced_by(&both), "differing about more still differs about the root");
-        assert!(!both.reproduced_by(&root), "and differing about less does not");
+        assert!(root.reproduced_by(&disagreed("state-root")));
+        assert!(!root.reproduced_by(&both), "differing about more is another finding");
+        assert!(!both.reproduced_by(&root), "and differing about less is too");
     }
 
     /// Not by what they came to. Two candidates reach different values by construction — that is

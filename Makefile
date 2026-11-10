@@ -67,11 +67,11 @@ test-fast: ## L0-L2: unit, property, integration. No Linux required. Under a min
 
 .PHONY: test-linux
 test-linux: guests ## L3-L4: the real ptrace backend against real guests
-	$(CARGO) nextest run $(RUN_FLAGS) --test determinism
+	$(CARGO) nextest run $(RUN_FLAGS) --test determinism --test guest_capabilities
 
 .PHONY: test-det
 test-det: guests ## The determinism gates only (docs/TESTING.md 7)
-	$(CARGO) nextest run --test determinism
+	$(CARGO) nextest run --test determinism --test guest_capabilities
 
 .PHONY: test-portability
 test-portability: build ## Produce bundles here and replay them, as two machines would

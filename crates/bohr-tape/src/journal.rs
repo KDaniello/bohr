@@ -191,10 +191,23 @@ impl DrawRecord {
 }
 
 /// Append-only list of draws made during one run.
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+///
+/// Equal by its records alone: which odds draws fired is known to the run that made them and is
+/// never stored, so a journal read back from a bundle equals the one its run produced.
+#[derive(Clone, Default, Debug)]
 pub struct Journal {
     records: Vec<DrawRecord>,
+    /// Positions of the odds draws that fired, increasing.
+    fired: Vec<usize>,
 }
+
+impl PartialEq for Journal {
+    fn eq(&self, other: &Self) -> bool {
+        self.records == other.records
+    }
+}
+
+impl Eq for Journal {}
 
 impl Journal {
     /// An empty journal.
@@ -210,7 +223,7 @@ impl Journal {
     /// refusing to reconstruct it would lose the draws it does understand along with them.
     #[must_use]
     pub fn from_records(records: Vec<DrawRecord>) -> Self {
-        Self { records }
+        Self { records, fired: Vec::new() }
     }
 
     /// Records one draw.
@@ -230,6 +243,32 @@ impl Journal {
             pad: 0,
             len,
         });
+    }
+
+    /// Records an odds draw: the bytes it read, as any draw, and whether it fired.
+    ///
+    /// The bytes and not the outcome go into the record, so the stored section is what it always
+    /// was; the outcome is kept beside it for a reduction, which needs to know which faults landed.
+    pub fn push_odds(
+        &mut self,
+        offset: TapeOffset,
+        event: EventId,
+        site: DrawSite,
+        drawn: u64,
+        fired: bool,
+    ) {
+        if fired {
+            self.fired.push(self.records.len());
+        }
+        self.push(offset, event, site, 2, drawn);
+    }
+
+    /// Whether the record at `index` is an odds draw that fired, where this run recorded it.
+    ///
+    /// Always false for a journal read back from bytes, which do not say.
+    #[must_use]
+    pub fn fired(&self, index: usize) -> bool {
+        self.fired.binary_search(&index).is_ok()
     }
 
     /// The records, in the order they were drawn.
@@ -299,6 +338,21 @@ mod tests {
         .to_bytes();
         bytes[26] = 1;
         assert_eq!(DrawRecord::from_bytes(&bytes), Err(TapeError::ReservedNotZero));
+    }
+
+    /// What fired is kept beside the records and never in them: the bytes are what they were, and
+    /// a journal read back equals the one written.
+    #[test]
+    fn an_odds_draw_keeps_its_bytes_and_says_whether_it_fired() {
+        let mut j = Journal::new();
+        j.push_odds(TapeOffset(0), EventId(1), DrawSite::NodeFault, 0x1234, false);
+        j.push_odds(TapeOffset(2), EventId(2), DrawSite::NodeFault, 7, true);
+        assert_eq!(j.records()[1].value, 7);
+        assert!(!j.fired(0));
+        assert!(j.fired(1));
+        let back = Journal::from_records(j.records().to_vec());
+        assert_eq!(back, j);
+        assert!(!back.fired(1), "a stored journal cannot say what fired");
     }
 
     #[test]

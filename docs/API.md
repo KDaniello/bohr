@@ -1753,11 +1753,41 @@ strike a line out of — so `--keep events` edits the tape as well.
 verified, never with the thing it was trying. Two replays are reserved off the top, one to
 establish what is being reduced and one to confirm the answer, so a budget below three is refused.
 
-**What it minimises, in order.** Entries the world was told to act on — a partition, a grey window,
-a scheduled fault — are removed first, and what survives has its moment brought forward: a defect
-whose decisive fault fires at the first tick instead of the nine-billionth is the same defect
-reached in a fraction of the events. Deliveries come next, then the remaining decisions on the
-tape, which improve the number and rarely change the answer.
+**What it minimises, in order — the order that removes most per replay.**
+
+1. *The configuration.* Entries the world was told to act on — a probe, a partition, a grey
+   window, a scheduled fault — are removed, and what survives has its moment brought forward. It
+   goes first because the configuration is read before the tape: an entry removed changes what
+   every later draw decides, and a fault moved before it would be moved again.
+2. *The faults the run drew.* Every odds draw journals whether it fired, so the faults that landed
+   are read off the journal: a kill, a dropped packet, an I/O error. Those the finding does not need
+   are removed by delta debugging. Then each node fault that is left, from the last back, is fired
+   at an earlier chance of the same kind — at the very first chance after the fault before it, then
+   at an eighth, a quarter and half of the way. A kill decides how long everything after it takes,
+   so one kill fired sooner removes more of a run than any other move.
+3. *Deliveries*, then *the remaining decisions on the tape*, in spans halving from the whole set
+   to one decision; these improve the number and rarely change the answer.
+
+What the budget holds past the two reserved replays is divided 15 / 20 / 40 per cent among the
+first three, and the tape pass runs on what is left; `--keep tape` runs the tape pass alone and
+`--keep events` stops before it. **No candidate is replayed twice:** one already answered is counted
+as refused without a replay, since a candidate that was kept is the scenario now held and is never
+proposed again.
+
+**The same finding, not a neighbouring one.** A candidate counts only with the original's class and
+exactly its signature. A smaller run that also crashes a second node is a different finding, and is
+refused however small it is. The signature is `bohr findings`' grouping for a crash and an
+assertion; for a hang it is the reason the run stopped making progress, where `bohr findings` reads
+the words of the verdict, so two hangs one keeps together the other may file apart.
+
+What reduction does not do: share the work of two candidates with a common beginning. That needs
+a backend that can hold a guest and go on from it twice (`DeterminismBackend::checkpoint`), and the
+ptrace backend cannot; every candidate runs from the first instruction. A fault moved earlier
+leaves the faults after it on bytes that now belong to other decisions — the signature check
+refuses the candidates that broke, so a finding that needs three kills in order shrinks less than
+one that needs one. And an earlier chance is any node's: the journal does not say whose call drew
+it, so a kill moved there may kill another node, and the signature check refuses that too; under
+`guided` targeting most chances have odds of zero and the probe there is spent.
 
 **A bundle that records nothing going wrong is refused** with `BOHR-5003` rather than reduced to
 nothing: reduction preserves what went wrong, and there is no such thing to preserve.
@@ -1851,6 +1881,20 @@ failure silenced. A hang is named by its words with the numbers taken out. Group
 largest first, each led by its smallest bundle, which is the one to reduce and to read. Two defects
 of one program that leave one signature are one group; that is what a reduction already treats as
 the same finding.
+
+**`bohr report <bundle> --disclosure [-o report.md]`** writes a disclosure draft in Markdown: what
+a maintainer receives. In order — the target (each program by name and blake3, and the source
+repository and commit where a pack under `targets/` of the current directory names that digest),
+what went wrong and where,
+the steps before it, the reproduction command with the trace digest it reaches, what was run with
+the configuration verbatim, and what the run cannot claim. A bundle that records nothing going wrong
+is refused with `BOHR-5003`. Nothing is sent: the draft is for a person to read, edit and send.
+
+**`bohr report <bundle|dir> --sarif [-o finding.sarif]`** writes SARIF 2.1.0, one result per group
+of the directory's findings, grouped as above and each led by its smallest bundle. The rule is the
+violation's code; the location is the source line of the guest's own promise where its records name
+one, and the bundle otherwise, because code scanning refuses a result without a location. A crash
+carries no line, and none is invented.
 
 ### 7.8 `bohr init` — a first scenario
 
@@ -2071,7 +2115,7 @@ to do.
 | `BOHR-4010` | replay of a redacted bundle needed a removed payload (§4.6) |
 | `BOHR-5001` | internal invariant violated — please file an issue with the bundle |
 | `BOHR-5002` | invalid draw request (`draw_range(0)`) |
-| `BOHR-5003` | the scenario handed to a reduction reproduces nothing |
+| `BOHR-5003` | the bundle handed to a reduction or a disclosure records nothing going wrong |
 | `BOHR-5004` | a differential run compared nothing: an implementation produced no projection (§5.8) |
 | `BOHR-5005` | this world showed the guest a state no machine could, so the run is not evidence about it (§5.1) |
 | `BOHR-5006` | a campaign armed adversity and none of it landed, so its clean runs are about a guest under no pressure |

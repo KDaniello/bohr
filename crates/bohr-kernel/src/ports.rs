@@ -502,6 +502,12 @@ impl<'a, 't> WorldCtx<'a, 't> {
         Ok(self.cursor.draw_bool(num, den, site)?)
     }
 
+    /// Draws a boolean with probability `num/den` at a fixed two bytes; see
+    /// [`bohr_tape::TapeCursor::draw_odds`].
+    pub fn draw_odds(&mut self, num: u32, den: u32, site: DrawSite) -> bool {
+        self.cursor.draw_odds(num, den, site)
+    }
+
     /// Draws raw bytes.
     pub fn draw_into(&mut self, out: &mut [u8], site: DrawSite) {
         self.cursor.draw_into(out, site);
