@@ -1,6 +1,6 @@
 //! `bohr hunt` against a pack made for the test: one command, a pinned binary, a scenario.
 //!
-//! Linux only, and skipped where the guest has not been built, like the other tests of real guests.
+//! Linux only; skips when the guest is not built.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -89,8 +89,7 @@ fn a_changed_binary_is_refused_before_it_runs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The binary given in place of the pack's is the one that runs: with the pack's own file gone, a
-/// hunt given a copy with the same digest still runs every seed.
+/// A given binary with the pack's digest runs in place of the pack's own, even when that is gone.
 #[test]
 fn a_given_binary_is_the_one_that_runs() {
     let Some(dir) = repository("given", None) else { return };

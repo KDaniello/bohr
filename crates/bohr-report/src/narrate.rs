@@ -1,15 +1,13 @@
 //! What a run found, said in three levels: a verdict, the evidence before it, the commands next.
 //!
-//! **Readability here is not simplification, but order.** A reader wants first what broke and
-//! where, then what led there, then the raw log; the log alone gives the third and leaves the
-//! first two to be dug out of it. Every level keeps the codes and numbers of the one below — a
-//! verdict without its code cannot be searched for, and a code without its verdict cannot be read.
+//! Ordered as a reader asks: what broke and where, what led there, then the raw log. Every level
+//! keeps the codes and numbers of the one below.
 //!
-//! The evidence is gathered by rule, not by knowing the program: the faults, the node changes, the
-//! failed tasks and the diagnostics recorded before the violation, nearest last.
+//! Evidence is gathered by rule: faults, node changes, failed tasks and diagnostics before the
+//! violation, nearest last.
 //!
-//! What this does not do: say why. Evidence is what came before the violation and touched the run;
-//! that it caused it is not shown, and the story is titled "how it got there" for that reason.
+//! It never says why. The evidence came before the violation, and causation is not shown; hence
+//! the title "how it got there".
 
 use std::fmt::Write as _;
 
@@ -170,7 +168,7 @@ fn step_text(event: &Event) -> Option<String> {
         EventKind::Assertion { name, condition: false, kind, .. } => {
             format!("assertion \"{name}\" did not hold: it {}", describe::assertion_promise(*kind))
         }
-        // Diagnostics a reader acts on, not the supervisor's notes about the machine it presented.
+        // Only diagnostics a reader acts on.
         EventKind::Diagnostic { code, message } if code != "BOHR-2007" => {
             format!("{code}: {message}")
         }
@@ -185,8 +183,7 @@ fn step_text(event: &Event) -> Option<String> {
 pub fn story(model: &RunModel, bundle: &str) -> Story {
     let manifest = &model.manifest;
     let verdict = verdict(&manifest.outcome);
-    // Where the violation was seen, not where it was judged: an oracle that reads a code judges at
-    // the end of the run, and the first diagnostic carrying that code is the moment it happened.
+    // Where the violation was seen: the first diagnostic with its code.
     let seen = verdict.code.starts_with("BOHR-").then(|| {
         model.events.iter().find_map(|e| match &e.kind {
             EventKind::Diagnostic { code, .. } if *code == verdict.code => Some(e.id.get()),
@@ -213,8 +210,7 @@ pub fn story(model: &RunModel, bundle: &str) -> Story {
             })
         })
         .collect();
-    // The violation itself is a step even where nothing above names it: an exit the oracle judged
-    // is the end of the story whether or not it left a diagnostic.
+    // The violation is always the last step.
     if verdict.found
         && let Some(at) = at
         && !steps.iter().any(|s| s.violation)

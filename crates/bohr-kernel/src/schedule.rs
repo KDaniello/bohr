@@ -12,8 +12,7 @@ use crate::KernelError;
 /// Every choice draws from the tape, so a policy is reproducible from the seed and a mutated tape
 /// explores a different interleaving.
 pub trait SchedulePolicy {
-    /// Stable name, recorded in the bundle so that runs made under different policies are not
-    /// compared as if they were alike.
+    /// Stable name, recorded in the bundle.
     fn identity(&self) -> &'static str;
 
     /// Chooses from a non-empty, deterministically ordered set of runnable tasks.
@@ -25,14 +24,12 @@ pub trait SchedulePolicy {
 
     /// A task asked to give up the processor.
     ///
-    /// Policies that keep one task running until something moves it need this, since a spin on a
-    /// flag makes no other progress the policy could notice.
+    /// Policies that run one task in long stretches switch here, since a spin shows no progress.
     fn yielded(&mut self, _task: TaskId) {}
 
     /// A task ended and will never be scheduled again.
     ///
-    /// Identifiers are never reused, so anything a policy remembers about one is dead weight from
-    /// here on: a guest that creates threads in a loop would otherwise grow the policy without end.
+    /// Ids are never reused, so the policy can forget it and stay bounded.
     fn forget(&mut self, _task: TaskId) {}
 
     /// An independent copy in the same state, for a run that branches from a checkpoint.
@@ -68,30 +65,21 @@ impl SchedulePolicy for RandomPolicy {
 
 /// Probabilistic Concurrency Testing (Burckhardt et al., ASPLOS 2010).
 ///
-/// Each task holds a priority and the highest runnable one always runs, so a run is a small number
-/// of long uninterrupted stretches rather than a fine shuffle. At `d−1` points chosen in advance
-/// the running task is demoted below every other, which forces one specific reordering.
+/// The highest-priority runnable task always runs, so a run is a few long stretches. At `d−1`
+/// points drawn in advance the running task is demoted below all others.
 ///
-/// The guarantee is what makes it the default: for `n` tasks and `k` steps, a bug that needs `d`
-/// particular orderings is found with probability at least `1/(n·k^(d−1))` per run. Uniform choice
-/// offers no such bound, and most real concurrency bugs have a depth of one to three.
+/// For `n` tasks and `k` steps, a bug needing `d` orderings is found with probability at least
+/// `1/(n·k^(d−1))` per run. Most real concurrency bugs have depth one to three.
 ///
-/// **`steps` is a window, not the run.** A run of millions of steps is longer than any estimate
-/// worth writing down, and change points drawn once over the first thousand leave the rest of it
-/// with a priority order nothing can disturb — which is not exploration, it is a fixed schedule
-/// with a shuffled beginning. So the points are drawn again for each window, and the guarantee is
-/// the same statement made once per window rather than once per run.
+/// `steps` is a window: change points are drawn again for each window, so the bound holds per
+/// window in runs of any length.
 ///
-/// **A yield is not a demotion.** It says "let somebody else go now", and that is all it is taken
-/// to mean: the task is passed over once and is back in contention at the next decision. Demoting
-/// it instead put it below the priced band for good, and a task there is runnable at every decision
-/// and picked at none — measured against a real execution client that never got past its startup
-/// under this policy while coming up in full under uniform choice.
+/// A yield passes the task over once and leaves its priority alone. A demoted yielder would never
+/// run again, and a real execution client then never finishes starting.
 #[derive(Clone, Debug)]
 pub struct PctPolicy {
     depth: u32,
-    /// How many steps one window of change points is spread over, and so how often the priority
-    /// order is disturbed. Not an estimate of the run: a run is as long as the guest makes it.
+    /// Steps one window of change points is spread over.
     steps: u64,
     priorities: BTreeMap<TaskId, u64>,
     /// Steps at which the running task is demoted, in the order they will be used.
@@ -103,17 +91,14 @@ pub struct PctPolicy {
     armed_through: u64,
     /// A task that has just given up its turn, passed over once and then forgotten.
     ///
-    /// One slot is enough, and that is a fact about the caller rather than a simplification: the
-    /// run loop picks one task, runs it, and only then asks again, so at most one task can have
-    /// yielded between two picks.
+    /// One slot: the run loop runs one task between picks, so at most one can have yielded.
     stood_aside: Option<TaskId>,
     /// The priority a newly seen task is placed above, keeping fresh tasks in contention.
     next_priority: u64,
 }
 
-/// Floor of the band where tape-priced priorities live. Demotions count down from just below it,
-/// so a demoted task sits under every priced one and under every task demoted before it — the
-/// ordering the PCT guarantee is stated over.
+/// Floor of the tape-priced priorities. Demotions count down below it, so each demoted task sits
+/// under every priced one and every earlier demotion, as PCT requires.
 const PRICED_FLOOR: u64 = 1 << 63;
 
 impl PctPolicy {
@@ -135,9 +120,7 @@ impl PctPolicy {
 
     /// Draws the change points for the window that begins where the last one ended.
     ///
-    /// Once per window rather than once per run, because a run is as long as the guest makes it and
-    /// a window is a number written down here. Every window costs the same draws in the same place,
-    /// so the tape stays a function of the run's shape rather than of anything the guest computed.
+    /// Every window costs the same draws at the same place in its sequence.
     fn arm(&mut self, cursor: &mut TapeCursor<'_>) -> Result<(), KernelError> {
         let base = self.armed_through;
         for _ in 1..self.depth {
@@ -146,8 +129,7 @@ impl PctPolicy {
             self.change_points.push(at);
         }
         self.armed_through = base.saturating_add(self.steps);
-        // Used in ascending order so the demotions happen in the order the run reaches them, and a
-        // point drawn twice simply demotes twice at that step.
+        // Ascending; a point drawn twice demotes twice.
         self.change_points.sort_unstable();
         self.change_points.reverse();
         Ok(())
@@ -166,9 +148,7 @@ impl SchedulePolicy for PctPolicy {
     }
 
     fn yielded(&mut self, task: TaskId) {
-        // Passed over once, and no priority is touched: the call says "let somebody else go now",
-        // and a task that meant to stop being scheduled would have blocked instead. It costs no
-        // entropy either way — the guest asked, rather than the tape.
+        // Passed over once; no priority changes and nothing is drawn.
         self.stood_aside = Some(task);
     }
 
@@ -190,8 +170,7 @@ impl SchedulePolicy for PctPolicy {
         }
         self.step += 1;
 
-        // A task is given its priority when it is first seen rather than when it is created: the
-        // policy is told about tasks by being asked to schedule them.
+        // A task gets its priority when first offered for scheduling.
         for task in runnable {
             if !self.priorities.contains_key(task) {
                 let spread = cursor.draw_range(self.steps, DrawSite::SchedPriority)?;
@@ -202,16 +181,14 @@ impl SchedulePolicy for PctPolicy {
 
         while self.change_points.last().is_some_and(|at| *at <= self.step) {
             self.change_points.pop();
-            // Demoting the task that would run next is what makes the change a reordering: it hands
-            // execution to whoever was second, at exactly this step.
+            // Demoting the next task hands this step to the second.
             if let Some(current) = self.highest(runnable, |_| true) {
                 self.priorities.insert(current, self.next_demotion);
                 self.next_demotion = self.next_demotion.saturating_sub(1);
             }
         }
 
-        // Whoever gave up its turn is skipped, but only while somebody else can take it: a task
-        // standing aside for an empty room would be standing aside for ever.
+        // The yielder is skipped only if another task can run.
         let aside = self.stood_aside.take();
         self.highest(runnable, |task| Some(task) != aside)
             .or_else(|| self.highest(runnable, |_| true))
@@ -222,9 +199,7 @@ impl SchedulePolicy for PctPolicy {
 impl PctPolicy {
     /// The runnable task with the highest priority, ties broken by identifier.
     ///
-    /// A tie is broken without a draw on purpose: two tasks share a priority only when the tape
-    /// gave them one, and spending entropy to separate them again would change what a mutation
-    /// means.
+    /// Ties are broken without a draw, so mutations keep their meaning.
     fn highest(&self, runnable: &[TaskId], eligible: impl Fn(TaskId) -> bool) -> Option<TaskId> {
         runnable
             .iter()
@@ -237,9 +212,8 @@ impl PctPolicy {
 /// Uniform choice, with starvation bounded: with `n` tasks runnable, none is passed over more than
 /// `bound + n - 1` picks in a row.
 ///
-/// PCT runs one task in long stretches, which a liveness oracle would read as a hang the program
-/// does not have. A task passed over `bound` times joins the front of the line and runs without a
-/// draw.
+/// For liveness oracles, which would read PCT's long stretches as hangs. A task passed over `bound`
+/// times runs next without a draw.
 #[derive(Clone, Debug)]
 pub struct FairPolicy {
     bound: u32,
@@ -280,8 +254,7 @@ impl SchedulePolicy for FairPolicy {
         runnable: &[TaskId],
         cursor: &mut TapeCursor<'_>,
     ) -> Result<TaskId, KernelError> {
-        // The most starved task at or past the bound runs without a draw; ties go to the lower
-        // identifier, so the choice is a function of the books alone.
+        // The most starved task at the bound runs; ties go to the lower id.
         let starved = runnable
             .iter()
             .copied()
@@ -368,8 +341,7 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a task the policy never picks is a task never tested");
     }
 
-    /// PCT runs one task at a time in long stretches, which is what its guarantee is built on: a
-    /// policy that shuffled every step would explore orderings uniformly and prove nothing.
+    /// PCT runs one task in long stretches.
     #[test]
     fn pct_runs_one_task_until_it_demotes_it() {
         let tasks: Vec<TaskId> = (0..4).map(TaskId).collect();
@@ -386,12 +358,8 @@ mod tests {
         );
     }
 
-    /// The guarantee PCT is chosen for: a change point falls anywhere in the run with roughly equal
-    /// probability, so a bug that needs one particular ordering is reached at a rate that can be
-    /// stated in advance rather than hoped for.
-    ///
-    /// Checked against the bound from the paper rather than against another implementation of it: a
-    /// second implementation would have to be trusted, and the bound does not.
+    /// A change point falls anywhere in the window with roughly equal probability, checked against
+    /// the paper's bound.
     #[test]
     fn pct_spreads_its_change_points_across_the_run() {
         const STEPS: u64 = 20;
@@ -416,9 +384,8 @@ mod tests {
             }
         }
 
-        // A depth-2 policy places one change point, so each step should take about its share of the
-        // runs. The bound is loose because the sample is finite; what it rules out is a policy that
-        // switches always at the start, always at the end, or never.
+        // Depth 2 places one change point; the loose bound rules out always-early, always-late and
+        // never.
         let switched: u32 = switched_at.iter().sum();
         assert!(
             switched > SEEDS as u32 / 2,
@@ -432,23 +399,19 @@ mod tests {
         );
     }
 
-    /// Each demotion lands below the one before it, so demotion order -- not the identifier
-    /// tie-break -- decides who runs among demoted tasks.
-    ///
-    /// Driven through the change points, which are the only thing that demotes; a depth of one has
-    /// none and would exercise standing aside instead.
+    /// Each demotion lands below the previous one, so demotion order decides among demoted tasks.
     #[test]
     fn a_later_demotion_sits_below_an_earlier_one() {
         let tape = Tape::from_seed(Seed(2));
         let mut cursor = tape.cursor();
-        // Depth three arms two change points, and a short window puts them within reach.
+        // Depth 3 arms two change points in a short window.
         let mut policy = PctPolicy::new(3, 4);
         let runnable = [TaskId(0), TaskId(1), TaskId(2)];
 
         let mut demoted = Vec::new();
         for _ in 0..12 {
             let picked = policy.pick(&runnable, &mut cursor).expect("pick");
-            // A task whose priority has fallen below the priced band is one that was demoted.
+            // Below the priced band means demoted.
             for task in runnable {
                 let below = policy.priorities.get(&task).is_some_and(|p| *p < PRICED_FLOOR);
                 if below && !demoted.contains(&task) {

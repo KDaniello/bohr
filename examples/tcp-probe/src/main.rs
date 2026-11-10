@@ -1,14 +1,9 @@
 //! The smallest program that carries a request over a stream socket and reads the answer back.
 //!
-//! It exists to be surveyed rather than to be hunted. Every component of an OP Stack node talks
-//! over a stream: the engine API between the consensus client and the execution client, the JSON-RPC
-//! a user calls, the peer-to-peer transport, the batcher's calls to the settlement layer. A model
-//! that answers datagrams and nothing else reaches none of them, so the set this probe needs is the
-//! set that stands between the engine and every one of those programs.
+//! For surveys. Every OP Stack component talks over streams: the engine API, JSON-RPC, peer
+//! transport and the batcher.
 //!
-//! Both ends live in one process on purpose: a listener and a caller are two halves of one
-//! conversation, and putting them on separate nodes would measure the network model as well as the
-//! socket family, when only the second is in question here.
+//! Both ends are in one process, so only the socket family is exercised.
 
 use std::{net::SocketAddrV4, process::ExitCode};
 
@@ -17,8 +12,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-/// The port a consensus client calls its execution client on. Nothing here depends on the number;
-/// it is the real one so a reader recognises the shape.
+/// The engine API port, for recognisability.
 const ENGINE_PORT: u16 = 8551;
 
 /// One request, in the shape the engine API uses, kept to a single line so no framing is needed.
@@ -47,9 +41,7 @@ async fn converse() -> ExitCode {
         }
     };
 
-    // The caller is spawned rather than awaited in turn, because a connection is not established
-    // until both ends have acted: awaiting the connect before the accept would wedge the probe on
-    // a single-threaded runtime whatever the model underneath does.
+    // Spawned, since awaiting connect before accept would wedge a single-threaded runtime.
     let caller = tokio::spawn(async move {
         let mut stream = TcpStream::connect(address).await?;
         stream.write_all(REQUEST).await?;

@@ -1,8 +1,7 @@
-//! The digest projection is a tested contract, not a convention.
+//! The digest projection is a tested contract.
 //!
-//! It decides what "the same run" means, so both halves need proving: every field that carries
-//! behaviour must change the digest, and every field that carries only presentation or host detail
-//! must not. The exclusion list is `docs/API.md` §4.4.
+//! Behaviour fields change the digest; presentation and host fields do not. The exclusion list is
+//! `docs/API.md` §4.4.
 
 use bohr_trace::{
     AssertionKind, DiskOpKind, Event, EventKind, ExitStatus, FaultKind, NodeState, PacketFate,
@@ -63,8 +62,7 @@ fn every_syscall_field_carries_behaviour() {
     };
     let baseline = digest(base.clone());
 
-    // The clock this reads, which is the first of the two arguments `clock_gettime` takes. The
-    // registers after them are not read by the call and are no longer read by the digest either.
+    // `clock_gettime` reads two arguments; the rest are ignored.
     let mut other_args = [1, 2, 3, 4, 5, 6];
     other_args[0] = 99;
 
@@ -126,14 +124,7 @@ fn every_syscall_field_carries_behaviour() {
 
 /// Two runs that differ only in where memory landed are the same run.
 ///
-/// **The defect this closes was found by a measurement about something else.** Raising the coverage
-/// map moved the guest's mappings, and an execution client produced the same 36 735 events, in the
-/// same order, with the same returns, under two different digests. Every one of the 11 233
-/// differing lines was an argument register of a call that does not take one — `clock_gettime`
-/// takes two of six, `sched_yield` none — holding whatever the register held before.
-///
-/// A digest that fires on that is stricter than "the same run", and a differential compares runs
-/// for a living.
+/// Unread argument registers are ignored, so a moved memory layout does not change the digest.
 #[test]
 fn a_register_a_call_does_not_read_is_not_part_of_which_run_it_was() {
     let called = |args: [u64; 6]| {
@@ -145,8 +136,7 @@ fn a_register_a_call_does_not_read_is_not_part_of_which_run_it_was() {
         "sched_yield reads none of its six registers"
     );
 
-    // And the arguments a call does read still separate two runs, or the digest would have stopped
-    // meaning anything at all. `clock_gettime` reads a clock and a place to put the answer.
+    // Arguments a call reads still change the digest.
     let clock = |args: [u64; 6]| {
         digest(EventKind::Syscall { nr: 228, args, ret: 0, emulated: true, data_digest: None })
     };
@@ -157,8 +147,7 @@ fn a_register_a_call_does_not_read_is_not_part_of_which_run_it_was() {
         "somewhere against nowhere"
     );
 
-    // What an address equals is a fact about this run's memory; what it points at is carried by
-    // `data_digest`, which the case above proves is in the digest.
+    // An address value is ignored; `data_digest` carries what it points at.
     assert_eq!(clock([0, 0x1000, 0, 0, 0, 0]), clock([0, 0x7fff_0000, 0, 0, 0, 0]));
 }
 
@@ -249,10 +238,7 @@ fn the_written_log_digests_the_same_as_the_events_it_holds() {
 
 /// The nested discriminants, by the number each actually contributes.
 ///
-/// The comment above `EventKind::absorb` says discriminants are written explicitly rather than
-/// derived from declaration order, and for the outer tag bytes that is true. These six are not:
-/// each reaches the digest as `*x as u8`, so inserting a variant renumbers every one after it and
-/// re-reads every stored digest. Pinned by number, the way `bohr-tape` pins its draw sites.
+/// These six reach the digest as `*x as u8`, so they are pinned by number.
 #[test]
 fn nested_discriminants_are_the_frozen_ones() {
     assert_eq!(SwitchReason::SyscallBoundary as u8, 0);
@@ -304,9 +290,7 @@ fn nested_discriminants_are_the_frozen_ones() {
 
 /// Which word a task waited on is part of what the run did, and where that word lived is not.
 ///
-/// The address must not enter the digest whole: a run whose heap moved under a different
-/// coverage-map size would digest differently having behaved identically, which is the defect
-/// `absorb_args` exists to remove.
+/// The address is not hashed, as in `absorb_args`.
 #[test]
 fn waiting_is_told_apart_by_the_word_and_not_by_where_it_lived() {
     let first = digest(EventKind::Waited { on: SyncWordId(0) });
@@ -321,8 +305,7 @@ fn waiting_is_told_apart_by_the_word_and_not_by_where_it_lived() {
 
 /// Length prefixing, shown on a pair of fields the digest actually absorbs.
 ///
-/// The fields must be ones the digest absorbs: `Diagnostic`'s message is excluded from the
-/// projection, so "ab" against "a" there passes whether or not anything is length-prefixed.
+/// On fields the digest absorbs; `Diagnostic`'s message is excluded.
 #[test]
 fn adjacent_strings_cannot_be_re_split_to_collide() {
     let ab_c = digest(EventKind::Domain {

@@ -1,23 +1,20 @@
 #!/bin/sh
-# bohrup: installs bohr from a release, checked before anything of it runs.
+# bohrup: installs bohr from a release after checking it.
 #
 #   curl -sSf https://github.com/KDaniello/bohr/releases/latest/download/bohrup.sh | sh
 #
-# Fetches the static binary, the target packs and SHA256SUMS; checks the signature on SHA256SUMS,
-# then every file against it; installs to ~/.bohr/bin and ~/.bohr/packs, links ~/.local/bin/bohr,
-# and runs `bohr doctor`. Nothing is installed from a file that fails either check, and nothing
-# but that link is written outside ~/.bohr. A host other than Linux on x86-64 is refused with the
-# reason, before any download.
+# Downloads the static binary, the target packs and SHA256SUMS. Checks the signature on
+# SHA256SUMS, then every file against it. Installs to ~/.bohr/bin and ~/.bohr/packs, links
+# ~/.local/bin/bohr and runs `bohr doctor`. A file that fails a check is never installed.
+# Hosts other than Linux on x86-64 are refused before any download.
 #
 # Settings, all optional:
-#   BOHR_VERSION   a release tag, v1.0.0; the latest release where unset
-#   BOHR_HOME      where to install; ~/.bohr where unset
-#   BOHRUP_SOURCE  where releases are fetched from: a URL, or a local directory holding one
-#                  release's files, which is how the installer is tested without a network
-#   BOHRUP_SIGNER  the release key, as one allowed-signers line; the one written below where unset
+#   BOHR_VERSION   a release tag such as v1.0.0; defaults to the latest release
+#   BOHR_HOME      install directory; defaults to ~/.bohr
+#   BOHRUP_SOURCE  a URL, or a local directory with one release's files (used in tests)
+#   BOHRUP_SIGNER  the release key as one allowed-signers line; defaults to the one below
 #
-# What this does not do: edit a shell profile, install a Rust toolchain, or start anything but
-# `bohr doctor`. It says what to add to PATH and stops.
+# It does not edit shell profiles or install Rust.
 set -eu
 
 REPO_URL=https://github.com/KDaniello/bohr/releases
@@ -28,8 +25,7 @@ SIGNER_LINE='@BOHR_RELEASE_SIGNER@'
 say() { printf 'bohrup: %s\n' "$*" >&2; }
 fail() { say "$*"; exit 1; }
 
-# Everything runs from here, called on the last line: a download cut short defines a function
-# and runs nothing, rather than running the half of the script that arrived.
+# Called on the last line, so a truncated download runs nothing.
 main() {
 case "$(uname -s)" in
   Linux) ;;
@@ -70,8 +66,8 @@ fetch() {
   esac
 }
 
-# The tag, which every file name carries: the one asked for, the latest release's, or for a local
-# directory the one its SHA256SUMS names.
+# The release tag in every file name: the one asked for, the latest, or for a local directory the
+# one its SHA256SUMS names.
 version=${BOHR_VERSION:-}
 case "$source" in
   http://*|https://*)
@@ -95,8 +91,8 @@ for file in SHA256SUMS SHA256SUMS.sig "$binary" "$packs"; do
   fetch "$file"
 done
 
-# The signature first: a checksum file anybody could have written proves nothing about the files
-# it lists. Then every file against it, by name, so a file the release did not list is refused.
+# Checks the signature on SHA256SUMS first, then each file against it. A file the sums do not
+# list is refused.
 printf '%s\n' "$signer" > "$work/allowed_signers"
 ssh-keygen -Y verify -f "$work/allowed_signers" -I bohr-release -n bohr-release \
   -s "$work/SHA256SUMS.sig" < "$work/SHA256SUMS" >/dev/null 2>&1 \
@@ -110,7 +106,7 @@ done
 
 mkdir -p "$home/bin" "$home/packs"
 tar -xzf "$work/$binary" -C "$work"
-# Moved into place rather than written over, so a bohr already running keeps its own file.
+# Moved into place, so a running bohr keeps its own file.
 cp "$work/bohr" "$home/bin/bohr.new"
 chmod 755 "$home/bin/bohr.new"
 mv -f "$home/bin/bohr.new" "$home/bin/bohr"
@@ -122,8 +118,7 @@ mv "$home/packs.new" "$home/packs"
 say "installed bohr $version to $home/bin/bohr, its packs to $home/packs"
 
 "$home/bin/bohr" doctor < /dev/null || say "bohr doctor found something this host has to change; it says what above"
-# A link in ~/.local/bin, so the next command is `bohr` and not an export: Ubuntu's own profile
-# puts that directory on PATH for every login shell once it exists, and no profile is edited here.
+# Links ~/.local/bin/bohr. Ubuntu puts that directory on PATH in every login shell once it exists.
 mkdir -p "$HOME/.local/bin"
 ln -sf "$home/bin/bohr" "$HOME/.local/bin/bohr"
 case ":$PATH:" in

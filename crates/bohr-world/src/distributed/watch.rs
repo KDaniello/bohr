@@ -1,20 +1,12 @@
 //! Watching for the things a guest never says about itself.
 //!
-//! Every oracle before this one read either an assertion the guest wrote or the status it exited
-//! with. A blockchain client offers neither: it does not adopt an SDK, it does not exit, and when
-//! it is wrong it stays alive and keeps answering. What is left to judge it by is the boundary this
-//! crate already owns — the calls it made and the moments the world chose for it.
+//! A blockchain client neither asserts nor exits, so it is judged at the boundary: its calls and
+//! the moments the world chose.
 //!
-//! **The condition is watched here rather than read off the timeline afterwards, and that is a fact
-//! about the code rather than a preference.** A stalled `fsync` emits its `DiskOp` at the *start*
-//! of the stall and nothing at all when it completes, so "this node made something durable" is not
-//! a predicate over the event stream whenever `stall_probability > 0` — a reader of the log counts
-//! an interrupted sync as durability and misses the real one. Durability exists in exactly one
-//! place, which is the moment `NodeDisk::commit` runs. Fed there, a watcher is right by
-//! construction; reading the log is wrong on precisely the runs a durability search cares about.
+//! Durability is fed from `NodeDisk::commit`, since a stalled `fsync`'s `DiskOp` marks the stall's
+//! start.
 //!
-//! The division of labour, so it cannot blur: **this states a fact and gives it a code; the oracle
-//! decides the fact is a finding.** Nothing here says a run is a bug.
+//! This states a fact and gives it a code; the oracle decides whether it is a finding.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,45 +15,35 @@ use bohr_types::{NodeId, Tick};
 
 /// What counts as the cluster making progress.
 ///
-/// One definition, and the alternative is worth naming because it is the obvious one and it is
-/// wrong: a cluster that has stopped committing still gossips, so counting delivered packets as
-/// progress would read a dead cluster as a healthy one forever.
+/// Completed syncs; packets do not count, since a stalled cluster still gossips.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct LivenessConfig {
     /// How long a silence has to last, in ticks after the last cut lifts.
     pub after_heal_ticks: Tick,
     /// How long a node may make no call at all before it is reported. Zero watches for nothing.
     ///
-    /// **A server that is idle is not quiet.** It polls: an execution client with nothing to do
-    /// spends a million clock reads and half a million waits on saying so. A node that has stopped
-    /// making calls entirely has stopped, and the two are told apart by this and by nothing else —
-    /// a task blocked for ever and a task waiting on a timer look the same from the run loop,
-    /// which is why a horizon rescues both and why this is watched rather than inferred.
-    ///
-    /// The span belongs to the scenario because what counts as too long belongs to the guest.
+    /// An idle server still polls; a stopped one makes no calls. The run loop cannot tell them
+    /// apart, so this watches. The span is the scenario's.
     pub quiet_ticks: Tick,
 }
 
 /// Watches for a cluster that could talk to itself again and went on committing nothing.
 ///
-/// Armed by a heal and answered by a timer, because the finding is the *absence* of something and
-/// nothing in a stream of events marks an absence. The timer is what turns "nothing happened" into
-/// a moment, which is also what puts a positive event on the timeline for a reader.
+/// Armed by a heal and answered by a timer, since the finding is an absence.
 #[derive(Debug, Default)]
 pub(crate) struct Liveness {
     config: LivenessConfig,
     /// Completed syncs per node, counted for the life of the run.
     ///
-    /// A counter rather than a flag, so a window opened while an earlier one is still open reads
-    /// the progress made since *it* opened rather than since the run began.
+    /// A counter, so each window measures progress since it opened.
     commits: BTreeMap<NodeId, u64>,
     /// What each node had committed when the window opened, and when that was.
     open: Option<Window>,
     /// When each node was last seen doing anything at all.
     seen: BTreeMap<NodeId, Tick>,
-    /// Nodes the world has taken away, which are silent by our doing rather than their own.
+    /// Nodes the world has taken away, which are silent by our doing.
     down: BTreeSet<NodeId>,
-    /// Nodes already reported quiet, so a run says it once rather than at every check.
+    /// Nodes already reported quiet, so a run says it once.
     reported: BTreeMap<NodeId, ()>,
 }
 
@@ -98,8 +80,7 @@ impl Liveness {
 
     /// A node the cluster has, whether or not it has ever committed.
     ///
-    /// Called when a node is first seen, so a node that never syncs at all is counted as silent
-    /// rather than as absent — which is the case the whole oracle is about.
+    /// Called at first sight, so a node that never syncs counts as silent.
     pub(crate) fn knows(&mut self, node: NodeId) {
         self.commits.entry(node).or_default();
     }
@@ -116,12 +97,8 @@ impl Liveness {
 
     /// Records what the world did to a node.
     ///
-    /// **A node this world killed or froze makes no calls, and that is our doing.** From here it is
-    /// indistinguishable from a node that stopped on its own, so without this a campaign built on
-    /// crashes would report a stopped node at every fault whose outage outlasts the span — a false
-    /// finding on precisely the runs such a campaign exists to produce. Watching resumes when the
-    /// node does, timed from that moment, and a node reported before may be reported again: what it
-    /// did in an earlier life is not evidence about this one.
+    /// A node the world killed or froze is not watched. Watching resumes, timed afresh, when the
+    /// node does.
     pub(crate) fn node_became(&mut self, node: NodeId, state: NodeState, now: Tick) {
         match state {
             NodeState::Dead | NodeState::Frozen => {
@@ -137,19 +114,15 @@ impl Liveness {
 
     /// Records that a node's last task exited.
     ///
-    /// A program that finished is silent for the rest of the run and is not a program that stopped:
-    /// a caller that has asked everything it came to ask leaves, and accusing it of having gone
-    /// quiet would turn every scenario whose driver completes into a finding. Told apart from a
-    /// node the world killed only by who ended it, and both are answered the same way.
+    /// A finished program is not watched, like a killed one.
     pub(crate) fn ended(&mut self, node: NodeId) {
         self.down.insert(node);
     }
 
     /// The nodes that have made no call for the whole span, each named once.
     ///
-    /// A node never seen at all is not reported: it has not gone quiet, it has not started, and
-    /// accusing it would turn a cluster whose nodes come up in order into a finding. Nor is a node
-    /// the world is holding down — see [`Self::node_became`].
+    /// Never-seen nodes and nodes the world holds down are not reported; see
+    /// [`Self::node_became`].
     pub(crate) fn gone_quiet(&mut self, now: Tick) -> Vec<(NodeId, Tick)> {
         let Some(span) = self.quiet_span() else {
             return Vec::new();
@@ -170,9 +143,7 @@ impl Liveness {
 
     /// Opens a window at a heal, and says when the answer is due.
     ///
-    /// Called only when the *last* cut lifts: a partition that healed one direction while another
-    /// stays cut has not healed, and a window opened there would be measuring silence the cluster
-    /// has every reason to keep.
+    /// Called only when the last cut lifts.
     pub(crate) fn healed(&mut self, now: Tick) -> Tick {
         self.open = Some(Window { healed_at: now, was: self.commits.clone() });
         Tick(now.get().saturating_add(self.config.after_heal_ticks.get()))
@@ -180,8 +151,7 @@ impl Liveness {
 
     /// Closes the open window and says which nodes committed nothing while it was open.
     ///
-    /// Answers `None` where the window was already closed — a second heal within one span replaces
-    /// the first, so the timer the first armed fires into nothing.
+    /// `None` if already closed; a second heal replaces the first window.
     pub(crate) fn due(&mut self, now: Tick) -> Option<Silence> {
         let window = self.open.take()?;
         let nodes: Vec<NodeId> = self
@@ -201,48 +171,26 @@ impl Liveness {
 
 /// What a node telling somebody something means, where the world has no word for an answer.
 ///
-/// The hard part said plainly, so nobody mistakes it for a definition: this model has no notion of
-/// an acknowledgement, and the milestone forbids parsing the guest's protocol. What it has is the
-/// moment — **an outbound datagram sent while the node's disk is dirty**. The node told somebody
-/// something at an instant when what it had written was not yet durable, which is the same instant
-/// guided fault targeting already aims at, and is exactly the window `fsyncgate` names.
+/// The protocol is not parsed, so an answer is an outbound send while the disk is dirty: the
+/// `fsyncgate` window.
 ///
-/// It is an approximation in one direction only: a node that answers nothing is never accused, and
-/// a node that answers after syncing is never accused. What it can over-report is a node that sent
-/// an unrelated datagram in the window — which is why the finding also requires the data to be
-/// *missing afterwards*, and a node that lost nothing is not a finding however much it sent.
+/// It may over-mark an unrelated send, so a finding also needs the data missing afterwards.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DurabilityConfig;
 
 /// Watches for a node that answered before it synced and came back without the data.
 ///
-/// **What this can and cannot see.** A mark is a file *length*, so the loss it detects is a file
-/// that came back shorter than what was answered for. That is faithful for a store whose data file
-/// grows monotonically and is never rewritten in place — an append-structured log — and it is blind
-/// to a store that commits by writing into a region and updating a header, which is what a database
-/// does: such a store legitimately discards a partial transaction on recovery without the file
-/// changing length at all.
+/// A mark is a file length, so this catches files that came back shorter: right for append-only
+/// logs, blind to stores that rewrite pages in place.
 ///
-/// Comparing content instead would be worse, not better. A store recovering correctly rewrites its
-/// header and drops what it never promised, so a content comparison would report a difference on
-/// nearly every crash — and an oracle that fires on nearly every seed is a machine for false
-/// findings, by the same argument that governs projections (`docs/ARCHITECTURE.md` §5.20).
-///
-/// The property "an acknowledged write survived" is not expressible over the bytes of a file at
-/// all. It exists only through the store's own read path after the store's own recovery, which is
-/// where every crash-consistency tool for applications puts it and where a client puts it here.
-/// What this watcher contributes to such a hunt is not the verdict but [`Self::outstanding`]: what
-/// was at risk when the crash landed.
+/// Content comparison would fire on nearly every correct recovery (`docs/ARCHITECTURE.md` §5.20).
+/// Whether an acknowledged write survived is checked through the store's own read path; this
+/// watcher contributes [`Self::outstanding`].
 #[derive(Debug, Default)]
 pub(crate) struct Durability {
     /// The longest each file was when its node last answered somebody with it unsynced.
     ///
-    /// A high-water mark rather than a log of writes: what a restart has to be measured against is
-    /// the most the node ever implied it had, and marks only rise while the disk stays dirty.
-    ///
-    /// Nested by node rather than keyed by the pair, because what a restart asks for is one node's
-    /// whole set: a flat map answers that by walking every key and rebuilding the names it just
-    /// read, and a commit answers it by building a key per file at every `fsync`.
+    /// A high-water mark per file, nested by node since restarts and commits ask per node.
     marks: BTreeMap<NodeId, BTreeMap<String, u64>>,
 }
 
@@ -265,9 +213,7 @@ impl Durability {
 
     /// Records that a node answered somebody while these files were as long as this.
     ///
-    /// Called at a send made with the node's disk dirty. Every file is marked, not the one being
-    /// written: the node has told somebody something, and what stands behind that is whatever it
-    /// had written and not synced.
+    /// Called at a send with the disk dirty; every unsynced file is marked.
     pub(crate) fn answered(&mut self, node: NodeId, files: &[(String, u64)]) {
         let mine = self.marks.entry(node).or_default();
         for (name, len) in files {
@@ -282,8 +228,7 @@ impl Durability {
 
     /// Clears what a completed sync made good.
     ///
-    /// A mark at or below what is now durable is a promise the node kept, and keeping it around
-    /// would accuse a node of losing something it had synced.
+    /// Marks at or below the durable length are kept promises.
     pub(crate) fn committed(&mut self, node: NodeId, files: &[(String, u64)]) {
         let Some(mine) = self.marks.get_mut(&node) else {
             return;
@@ -297,10 +242,7 @@ impl Durability {
 
     /// What this node has answered for and not yet made durable: how many files, and how much.
     ///
-    /// The exposure at a moment, and never a verdict. A crash on a node with nothing outstanding
-    /// tests that the store survives being killed; a crash on a node with something outstanding
-    /// tests whether it keeps what it said. Only the second kind can cost anything, and a campaign
-    /// that cannot tell how often it landed the second kind cannot say what its clean runs mean.
+    /// Exposure: it shows whether a crash could cost anything.
     pub(crate) fn outstanding(&self, node: NodeId) -> (u32, u64) {
         let Some(mine) = self.marks.get(&node) else {
             return (0, 0);
@@ -310,8 +252,7 @@ impl Durability {
 
     /// What a node came back without, measured against what it had answered with.
     ///
-    /// Called once the restarted node's disk is in place. The marks are consumed either way: a node
-    /// that came back whole kept its promise, and one that did not has had it reported.
+    /// Called once the restarted disk is in place; the marks are consumed.
     pub(crate) fn restarted(&mut self, node: NodeId, files: &[(String, u64)]) -> Vec<Lost> {
         let mut lost = Vec::new();
         for (name, answered) in self.marks.remove(&node).unwrap_or_default() {
@@ -349,8 +290,7 @@ mod tests {
         assert_eq!(found.span, Tick(100));
     }
 
-    /// Progress is counted from the heal, not from the start of the run: a node that committed
-    /// heavily before the partition and nothing after it is silent.
+    /// Progress counts from the heal.
     #[test]
     fn what_happened_before_the_heal_does_not_count_as_progress_after_it() {
         let mut watch = watching(100);
@@ -363,7 +303,7 @@ mod tests {
         assert_eq!(found.nodes, vec![NodeId(0)]);
     }
 
-    /// A second heal replaces the first, so the timer the first armed finds nothing to answer.
+    /// A second heal replaces the first window.
     #[test]
     fn a_timer_whose_window_was_replaced_fires_into_nothing() {
         let mut watch = watching(100);
@@ -393,8 +333,7 @@ mod tests {
         Durability::new(Some(DurabilityConfig)).expect("configured")
     }
 
-    /// The defect this oracle exists for: the node told somebody it had eight records, died before
-    /// syncing them, and came back with four.
+    /// Eight records answered, four after the crash.
     #[test]
     fn what_a_node_answered_with_and_came_back_without_is_lost() {
         let mut watch = durability();
@@ -406,8 +345,7 @@ mod tests {
         assert_eq!((lost[0].answered, lost[0].came_back), (512, 256));
     }
 
-    /// A node that synced what it had answered with kept its promise, and a crash afterwards is
-    /// not this oracle's business however much it destroys.
+    /// A node that synced what it answered is clean.
     #[test]
     fn what_a_sync_made_good_is_not_lost() {
         let mut watch = durability();
@@ -427,8 +365,7 @@ mod tests {
         assert_eq!(watch.restarted(NodeId(0), &files(&[("/store.db", 256)])).len(), 1);
     }
 
-    /// The mark is the most the node ever implied it had, so a later answer about a shorter file
-    /// does not let it off.
+    /// A later, shorter answer does not lower the mark.
     #[test]
     fn a_mark_rises_and_does_not_fall() {
         let mut watch = durability();
@@ -438,8 +375,7 @@ mod tests {
         assert_eq!(watch.restarted(NodeId(0), &files(&[("/store.db", 256)])).len(), 1);
     }
 
-    /// A node that came back whole is not a finding, and its marks are spent either way: a second
-    /// restart must not report the first one's promises again.
+    /// A whole node is clean, and its marks are spent.
     #[test]
     fn a_node_that_came_back_whole_owes_nothing_afterwards() {
         let mut watch = durability();

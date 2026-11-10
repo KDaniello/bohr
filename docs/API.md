@@ -1711,6 +1711,14 @@ defect in one of them rather than a finding about a guest. A bundle that is refu
 bundles may be named at once; each is reported and the worst outcome is the exit code, because a
 glob is checked to learn whether they all still replay.
 
+`--binaries <dir>` looks up every recorded program in `<dir>` by its base name, checks it against
+the digest the bundle recorded, and executes that file for every node that ran it. The guest keeps
+the recorded `argv`. The executed path is padded with slashes to the recorded path's length, because
+the kernel copies it onto the new stack. A moved file therefore replays to the same digest. A path
+longer than the recorded one cannot be shortened, and that replay diverges: name `<dir>` relative
+to the current directory instead. A prepared state is still read from the path the configuration names, relative to the current
+directory.
+
 **A hand-over is inspection, not resumption, and the difference is not negotiable.** The guest is
 released from the supervisor and left stopped, so a debugger can attach and read it: backtraces,
 registers, memory, threads. It **cannot be continued.** The filter it was started under traces by
@@ -2032,6 +2040,39 @@ recorded paths are hashed, so replaying a redacted bundle of a program on disk n
 to say where those objects are now. A guest built into the tool keeps its name, which is not a path
 and discloses nothing.
 
+**`bohr confirm <bundle> [-o confirm.sh] [--runs N]`** writes a script that stages a stored
+finding on an ordinary Linux host, without bohr: the recorded programs as plain processes, each
+in a root of its own with `/dev` and `/proc` in a private mount namespace and in the working
+directory the scenario named, so a node's absolute paths are its own as they were in the world; the recorded kills as `kill -9`, freezes as
+`SIGSTOP` and `SIGCONT`, restarts where the run restarted a node, and the exit status the run
+recorded as the judgement. The programs must be static, as every program bohr runs is, and the
+script runs as root and needs `unshare --wd` (util-linux 2.38 or later). A start of a node that is
+still running restarts it, as in the world. Run from where the run was started, it repeats `N` times — `RUNS` overrides —
+and prints how many reproduced and the failing node's last three lines of output for each that did.
+**Not a replay but its complement**: a replay shows the failure under bohr's model, this whether it
+survives without the model.
+
+A crash on the model loses every write not yet synced, and a killed process on a real host loses
+none, so where the run killed a node each node's root is on a device-mapper `flakey` device of its
+own, as each node in the world has its own disk. At a node's kill its device drops every write and
+is remounted after it; the other nodes keep running. `POWER_LOSS=0` stages it as a plain kill
+instead, which tells a process-crash defect from a power-loss one. Each node's address,
+`10.66.0.(n+1)`, is put on the loopback device for the run and taken off after it.
+
+Every repetition starts on fresh filesystems, and one is void, and not counted, when the staging
+itself fails: a node that outlives its kill, a node that has already exited when its fault comes
+(in the recorded run it was up), an unmount that does not happen, or a filesystem `e2fsck -fn` finds
+damaged after the crash. A node that exits early with a status that makes the finding counts as a
+reproduction. Pids, statuses and logs stay off the devices.
+
+Virtual time counts syscalls and sleeps, not computation, so an early moment of a run comes later on
+a real host. The script keeps the recorded order of faults and draws each gap between none and
+twice the recorded one, and at least up to `SPREAD_NS` (2 s unless set); the rate is the share of
+that window that fails. After the last fault the script waits as long as the run went on after it,
+and at least `SPREAD_NS`. What it does not stage — partitions, lost or delayed packets, disk errors,
+tears and reordered writes, a disk rewound to a snapshot, clock faults, a probe's verdict — the
+script names in its first lines when the run had any.
+
 **`bohr note <bundle> "text"`** appends a line to the bundle's notes, in place, and prints them
 all. No timestamp and no author: two identical invocations produce identical bytes, which is the
 property every stored artefact here has.
@@ -2178,7 +2219,7 @@ to do.
 | `BOHR-4010` | replay of a redacted bundle needed a removed payload (§4.6) |
 | `BOHR-5001` | internal invariant violated — please file an issue with the bundle |
 | `BOHR-5002` | invalid draw request (`draw_range(0)`) |
-| `BOHR-5003` | the bundle handed to a reduction or a disclosure records nothing going wrong |
+| `BOHR-5003` | the bundle handed to a reduction, a disclosure or a confirmation records nothing going wrong, or for a confirmation no process that failed |
 | `BOHR-5004` | a differential run compared nothing: an implementation produced no projection (§5.8) |
 | `BOHR-5005` | this world showed the guest a state no machine could, so the run is not evidence about it (§5.1) |
 | `BOHR-5006` | a campaign armed adversity and none of it landed, so its clean runs are about a guest under no pressure |

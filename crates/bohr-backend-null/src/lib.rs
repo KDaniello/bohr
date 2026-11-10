@@ -1,10 +1,8 @@
 //! An in-process backend that executes a scripted guest.
 //!
-//! There is no operating system here and nothing is intercepted: a guest is a list of operations,
-//! and this crate hands them to the kernel through the same boundary a real one does. That makes
-//! the clock, the scheduler, the world and the trace testable in microseconds, on any operating
-//! system, with no privileges — which is what keeps work on those layers independent of work on
-//! interception.
+//! A guest is a list of operations, handed to the kernel through the same boundary a real backend
+//! uses. The clock, scheduler, world and trace can then be tested in microseconds, on any
+//! operating system, without privileges.
 
 #![forbid(unsafe_code)]
 
@@ -20,8 +18,7 @@ use bohr_types::{GuestAddr, NodeId, TaskId};
 
 /// First address of a scripted guest's memory.
 ///
-/// Every node's memory starts here: colliding addresses across nodes are the point, because that
-/// is what a second address space looks like.
+/// Every node's memory starts here, so nodes share addresses the way separate processes do.
 pub const MEMORY_BASE: u64 = 0x1000;
 
 /// Size of one node's memory.
@@ -41,16 +38,16 @@ pub enum GuestOp {
     Spawn,
     /// Continue the script at `pc` instead of the next operation.
     ///
-    /// Control flow only; no stop is produced. A cycle that reaches no stopping operation never
-    /// returns to the kernel, so a scripted spin goes through a syscall.
+    /// Produces no stop. A cycle without a stopping operation returns to the kernel only when its
+    /// budget runs out.
     Jump {
         /// Operation index to continue at.
         pc: usize,
     },
     /// Continue at `pc` when the eight bytes at `addr` equal `equals`; fall through otherwise.
     ///
-    /// The scripted form of a guest branching on shared state, which is what cluster fixtures
-    /// coordinate with. The same non-stopping caveat as [`GuestOp::Jump`] applies.
+    /// A branch on shared state, which cluster fixtures use to coordinate. Produces no stop, like
+    /// [`GuestOp::Jump`].
     JumpIfMem {
         /// Address of the eight bytes compared.
         addr: GuestAddr,
@@ -61,10 +58,8 @@ pub enum GuestOp {
     },
     /// Continue at `pc` when the given bit of the byte at `addr` is set.
     ///
-    /// One bit of state, which is what a coin flip is. [`GuestOp::JumpIfMem`] compares a whole
-    /// word, so a script branching on something it drew would take that branch once in every two
-    /// hundred and fifty-six runs — enough to test that branching works and far too rare to give a
-    /// search anything to follow.
+    /// A coin flip: a branch on one drawn bit is taken half the time. A branch on a whole drawn
+    /// byte, through [`GuestOp::JumpIfMem`], is taken once in 256 runs.
     JumpIfBit {
         /// Address of the byte examined.
         addr: GuestAddr,
@@ -75,10 +70,7 @@ pub enum GuestOp {
     },
     /// Read the timestamp counter, as a real guest's `rdtsc` does.
     ///
-    /// Here so the path the kernel takes for a trapped instruction is exercised on a machine with
-    /// no interceptor. Without it, `StopKind::TimestampCounter` is a variant of the boundary that
-    /// only Linux under `ptrace` can produce, and the layers above it are untested everywhere
-    /// else.
+    /// Lets the kernel's handling of a trapped instruction run on any host.
     ReadTimestamp {
         /// Whether the `rdtscp` form is used, which also reports a processor number.
         rdtscp: bool,
@@ -119,9 +111,8 @@ impl NullProgram {
 #[derive(Clone, Debug)]
 struct TaskState {
     node: NodeId,
-    /// Operations this task may still execute before it must stop, where it was resumed with a
-    /// budget. A scripted `Jump` cycle reaches no stopping operation, so without this the one
-    /// instrument the boundary offers against a spinning guest did nothing here.
+    /// Operations this task may still execute before it must stop, when resumed with a budget.
+    /// The budget is what stops a `Jump` cycle.
     budget: Option<u64>,
     ops: Vec<GuestOp>,
     pc: usize,
@@ -159,10 +150,8 @@ pub struct NullBackend {
     next_task: u32,
     /// Which transitions between operations this run took.
     ///
-    /// A scripted program has a control-flow graph like any other — `Jump` and `JumpIfMem` are its
-    /// branches — so the edges it walks are real coverage rather than a stand-in. That is what
-    /// lets the whole search be exercised on a machine with no interceptor at all, which is
-    /// §5.11 applied to the explorer.
+    /// `Jump` and `JumpIfMem` are a script's branches, so these edges are real coverage. The
+    /// search can be tested on a host with no interceptor (§5.11).
     covered: CoverageMap,
 }
 
@@ -192,15 +181,11 @@ impl NullBackend {
 
     /// Marks the transition from one operation to the next.
     ///
-    /// The index is AFL's: the previous location shifted and mixed with the current one, so that
-    /// the *pair* is what identifies an edge. Hashing the pair rather than the destination is what
-    /// tells a loop taken twice from two different callers apart, and that distinction is most of
-    /// what makes coverage worth following.
+    /// The index hashes the pair of locations, as AFL does, so the same destination reached from
+    /// two places counts as two edges.
     fn record_edge(&mut self, node: NodeId, from: usize, to: usize) {
-        // The node is mixed into the low bits. Shifted up instead, it vanished: the map size is a
-        // power of two, so the index keeps only the low bits and `node << 40` contributes none of
-        // them -- every node of a cluster of identical programs landed on the others' counters,
-        // and coverage stopped telling them apart at all.
+        // The node goes into the low bits: the map size is a power of two and the index keeps
+        // only the low bits, so nodes running the same program stay apart.
         let mixed = u64::from(node.get()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ ((from as u64) << 1)
             ^ (to as u64).wrapping_mul(31);
@@ -220,8 +205,7 @@ impl NullBackend {
     /// Whatever a node's guest has written into its memory.
     ///
     /// # Panics
-    /// For a node this backend was not built with: the caller scripted the cluster and knows its
-    /// size, so an unknown node is a bug in the test.
+    /// For a node this backend was not built with; that is a bug in the test.
     #[must_use]
     pub fn memory_of(&self, node: NodeId) -> &[u8] {
         &self.nodes.get(&node).expect("a node this backend was built with").memory
@@ -229,8 +213,8 @@ impl NullBackend {
 
     /// Places bytes in the first node's memory before it starts.
     ///
-    /// A scripted guest has no loader and no data section, so anything it passes by address — a
-    /// path, a buffer to compare against — has to be put there by whoever wrote the script.
+    /// A scripted guest has no loader, so data it passes by address, such as a path, is placed
+    /// here.
     pub fn preload(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), BackendError> {
         self.preload_on(NodeId::ZERO, addr, data)
     }
@@ -282,8 +266,7 @@ impl DeterminismBackend for NullBackend {
             // No real instruction stream exists, so there is nothing that could evade a trap.
             traps_rdrand: true,
             progress_unit: ProgressUnit::Operations,
-            // A scripted guest is a data structure in this process. There is nothing for a
-            // debugger to attach to, which is a different fact from a guest it could not reach.
+            // A scripted guest lives in this process; there is nothing for a debugger to attach to.
             hands_over_to_debugger: false,
             max_tasks: 1024,
             checkpoints: false,
@@ -303,10 +286,10 @@ impl DeterminismBackend for NullBackend {
                 reason: "no program for that node".to_owned(),
             })?;
             match &state.initial {
-                // First start: freeze the preloaded image so a restart can begin from it again.
+                // First start: keep the preloaded image for later restarts.
                 None => state.initial = Some(state.memory.clone()),
-                // Restart: fresh address space, fresh child budget, the way a re-executed binary
-                // gets its data section back.
+                // Restart: the preloaded image and a fresh child budget, as for a re-executed
+                // binary.
                 Some(initial) => {
                     state.memory = initial.clone();
                     state.children_used = 0;
@@ -334,10 +317,8 @@ impl DeterminismBackend for NullBackend {
 
     fn next_stop(&mut self) -> Result<Option<Stop>, BackendError> {
         let Some(task) = self.current.take() else {
-            // `None` means every task has ended and the run is over
-            // ([`DeterminismBackend::next_stop`]). Live tasks with none resumed is a caller that
-            // forgot to resume one, and answering `None` to it converted a half-finished run into
-            // a clean verdict.
+            // `None` means every task has ended ([`DeterminismBackend::next_stop`]). Live tasks
+            // with none resumed is a caller error and is reported as one.
             if self.tasks.values().any(|t| t.live) {
                 return Err(BackendError::Lost(
                     "asked for the next stop with tasks still live and none resumed".to_owned(),
@@ -347,8 +328,7 @@ impl DeterminismBackend for NullBackend {
         };
         let mut spent = 0u64;
         loop {
-            // Charged before the operation runs, so a cycle of non-stopping operations is bounded
-            // by the budget rather than by the guest reaching a syscall of its own accord.
+            // Charged before the operation runs, so the budget bounds a cycle without stops.
             if self.task_mut(task)?.budget.is_some_and(|budget| spent >= budget) {
                 self.current = None;
                 let kind = StopKind::BudgetExhausted { consumed: spent };
@@ -365,9 +345,7 @@ impl DeterminismBackend for NullBackend {
             };
             self.record_edge(node, from, to);
 
-            // Running off the end of a script is finishing, the same as exiting. Landing past it
-            // by a jump is not: that is an index nobody meant, and reading it as a clean exit
-            // turned a typo in a test into a passing run.
+            // Running off the end of a script is a clean exit. A jump past the end is a bad script.
             let Some(op) = op else {
                 if to > self.task_mut(task)?.ops.len() {
                     let reason = format!("a jump to operation {to} lands past the end of a script");
@@ -390,9 +368,7 @@ impl DeterminismBackend for NullBackend {
                 GuestOp::Spawn => {
                     let node = self.node_of(task)?;
                     let state = self.nodes.get_mut(&node).expect("a spawned task's node exists");
-                    // A spawn with no child program left is a script that asked for a task it
-                    // never wrote. Giving it an empty program made one that is born and dies
-                    // clean, which is a test passing for want of the thing it meant to run.
+                    // A spawn with no child program left is a bad script.
                     let Some(ops) = state.program.children.get(state.children_used).cloned() else {
                         let asked = state.children_used + 1;
                         let reason = format!("spawn number {asked} has no child program");
@@ -433,8 +409,7 @@ impl DeterminismBackend for NullBackend {
                     }
                 }
                 GuestOp::JumpIfBit { addr, bit, pc } => {
-                    // Masked into range, the ninth bit silently became the first and the script
-                    // branched on something nobody asked about.
+                    // A byte has eight bits; any other index is a bad script.
                     if bit >= 8 {
                         let reason = format!("bit {bit} is not one of the eight in a byte");
                         return Err(BackendError::BadProgram { reason });
@@ -479,8 +454,8 @@ impl DeterminismBackend for NullBackend {
                 state.live = false;
                 self.current = None;
             }
-            // A scripted guest has no handler to run, so the answer is delivered and the signal is
-            // counted rather than acted on; a test reads the count to see that it was sent.
+            // A scripted guest has no signal handler. The answer is delivered and the signal is
+            // counted, so a test can see it was sent.
             Resume::Emulate { ret } => {
                 state.regs.rax = ret as u64;
                 self.current = Some(task);
@@ -498,8 +473,7 @@ impl DeterminismBackend for NullBackend {
                 state.budget = Some(budget);
                 self.current = Some(task);
             }
-            // Refused for the same reason `Rewrite` is: a scripted guest has no handler to deliver
-            // a signal to, and accepting the request would answer a question this backend cannot.
+            // Refused, like `Rewrite`: a scripted guest has no handler to deliver a signal to.
             Resume::DeliverSignal { .. } => {
                 return Err(BackendError::InvalidResume { action: "DeliverSignal".to_owned() });
             }
@@ -572,9 +546,7 @@ impl DeterminismBackend for NullBackend {
 mod tests {
     use super::*;
 
-    /// A backend with nothing to hand over says so through the capability and answers with an
-    /// empty list — which are two different claims, and a caller that read only the second would
-    /// point somebody at a debugger session that cannot exist.
+    /// The capability says no hand-over, and a hand-over returns an empty list.
     #[test]
     fn a_scripted_guest_is_not_something_a_debugger_can_attach_to() {
         let mut backend = NullBackend::new(NullProgram::single(vec![GuestOp::Exit(0)]));
@@ -589,11 +561,9 @@ mod tests {
         ]))
     }
 
-    /// Nothing runs until it is resumed, and asking anyway is a mistake rather than an answer.
+    /// Nothing runs until it is resumed; asking for a stop before that is an error.
     ///
-    /// `None` from the boundary means every task has ended. Returning it for "you have not
-    /// resumed anybody" gave one word two meanings, and the kernel reads that word as a clean
-    /// finish: a half-finished run became a passing verdict with no error anywhere on the way.
+    /// `None` means every task has ended, so it cannot also mean "nothing resumed".
     #[test]
     fn a_task_only_advances_when_it_is_resumed() {
         let mut b = backend();
@@ -608,9 +578,7 @@ mod tests {
         assert!(matches!(stop.kind, StopKind::SyscallEntry { nr: 228, .. }));
     }
 
-    /// A budget that is accepted must be spent. The boundary offers it as the one bound on a guest
-    /// that will not stop by itself, and a scripted `Jump` cycle reaches no stopping operation --
-    /// so ignoring it meant the whole `BudgetExhausted` path was unreachable off Linux.
+    /// A budget stops a `Jump` cycle that would never stop by itself.
     #[test]
     fn a_progress_budget_stops_a_script_that_would_never_stop_itself() {
         let mut b = NullBackend::new(NullProgram::single(vec![GuestOp::Jump { pc: 0 }]));
@@ -623,15 +591,13 @@ mod tests {
         };
         assert_eq!(consumed, 32, "the budget was not the bound");
 
-        // A second budget starts again from nothing, rather than counting on from the first.
+        // A second budget starts from zero.
         b.resume(t, Resume::ContinueWithBudget { budget: 4 }).expect("resume");
         let stop = b.next_stop().expect("stop").expect("a stop");
         assert!(matches!(stop.kind, StopKind::BudgetExhausted { consumed: 4 }), "{:?}", stop.kind);
     }
 
-    /// Two nodes running the same program walk the same operations, and the edges must still be
-    /// told apart. Mixed into bits the map index throws away, the node vanished: a cluster of
-    /// identical programs covered one node's worth of counters however many nodes it had.
+    /// Two nodes running the same program cover different edges.
     #[test]
     fn the_same_edge_on_two_nodes_is_two_edges() {
         let program = || NullProgram::single(vec![GuestOp::Exit(0)]);
@@ -650,8 +616,7 @@ mod tests {
         );
     }
 
-    /// A script is written by whoever wrote the test, so a defect in one is a defect in the test.
-    /// Each of these was normalised into something that looked like a clean run.
+    /// A malformed script is an error: a jump past the end, a spawn with no child, a ninth bit.
     #[test]
     fn a_malformed_script_is_refused_rather_than_normalised() {
         let mut jumped = NullBackend::new(NullProgram::single(vec![GuestOp::Jump { pc: 99 }]));
@@ -686,9 +651,7 @@ mod tests {
         );
     }
 
-    /// The two resumptions a scripted guest cannot carry out are refused alike. One of them used
-    /// to be swallowed as an ordinary continuation, which answered a question this backend has no
-    /// way to answer.
+    /// `Rewrite` and `DeliverSignal` are refused.
     #[test]
     fn a_resumption_this_backend_cannot_perform_is_refused() {
         let mut b = backend();
@@ -702,8 +665,7 @@ mod tests {
         }
     }
 
-    /// The stops a scripted guest could not produce at all, which left the kernel's handling of
-    /// each reachable only on Linux under an interceptor.
+    /// A script produces timestamp, processor identification and signal stops.
     #[test]
     fn a_script_can_produce_the_stops_the_boundary_declares() {
         let mut b = NullBackend::new(NullProgram::single(vec![

@@ -1,14 +1,9 @@
 //! What the search has found worth keeping.
 //!
-//! An entry is a tape: a seed and the prefix bytes a run reads before the keystream takes over.
-//! Kilobytes, not gigabytes — the trace that a tape produces is a pure function of it, so keeping
-//! the trace as well would be keeping a cache of a deterministic computation. Anyone who wants to
-//! look at a run in the corpus replays it, which costs seconds and happens only when someone
-//! actually looks.
+//! An entry is a tape: a seed and the prefix a run reads before the keystream. The trace is a pure
+//! function of the tape, so only the tape is kept; a run is replayed to look at it.
 //!
-//! The corpus keeps an entry when it reached somewhere nothing before it had. That is the only
-//! question it asks, and asking a narrower one — "did it crash", "was it fast" — is how a search
-//! ends up exploring what it already understands.
+//! An entry is kept when it reaches coverage nothing before it reached.
 
 use bohr_backend::CoverageMap;
 use bohr_tape::Journal;
@@ -18,8 +13,7 @@ use crate::mutate::Operator;
 
 /// How an entry came to exist.
 ///
-/// Kept so a campaign can report which operators are earning their place, and so an entry that
-/// found something can be traced back to the one it came from.
+/// Used to credit operators and to trace a finding back to its parent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Origin {
     /// One of the tapes the campaign started from.
@@ -33,22 +27,15 @@ pub enum Origin {
     },
 }
 
-/// A corpus entry, named by something that does not move.
+/// A corpus entry's stable name, handed out in order and never reused.
 ///
-/// **A position was not that.** Eviction removes an entry and shifts every position after it, so
-/// the parent recorded in an [`Origin`] stopped naming the entry it came from — the traceback this
-/// crate's own documentation promises went quietly wrong after the first eviction, and `adopt`
-/// carried positions in from a previous campaign's corpus entirely. Handed out in order and never
-/// reused.
+/// Positions shift on eviction; a name does not.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct EntryId(pub u64);
 
 /// What a run offers the corpus: the tape that produced it, and what came back.
 ///
-/// The coverage map is borrowed rather than given. Answering "is this worth keeping" is all the
-/// corpus does with it, and that answer is reached before the entry exists — so keeping the map
-/// afterwards would be four thousand entries holding sixty-four kilobytes each of counters nothing
-/// reads again.
+/// The coverage map is borrowed: it is only needed to decide whether to keep the entry.
 #[derive(Clone, Copy, Debug)]
 pub struct Offer<'a> {
     /// The seed the tape extends from.
@@ -76,15 +63,11 @@ pub struct Entry {
     pub origin: Origin,
     /// How often it has been chosen to mutate from.
     ///
-    /// The search prefers what it has visited least, which is what stops a campaign from spending
-    /// itself on the first entry that happened to look promising.
+    /// The search prefers the least visited entry.
     pub visits: u64,
     /// How many edges the coverage held.
     ///
-    /// Counted once, when the entry is made, and never again. Counting it on demand means walking
-    /// sixty-four kilobytes, and the two places that want it — choosing what to mutate and
-    /// choosing what to drop — both want it inside a sort, where a linear scan per comparison
-    /// turns a campaign into a program that spends its time counting rather than running guests.
+    /// Counted once at creation, since both sorts that use it would otherwise scan the map.
     pub(crate) edges: usize,
     /// The draws this entry's run made inside the prefix, for the mutation that aims at one site.
     pub(crate) draws: Journal,
@@ -92,18 +75,13 @@ pub struct Entry {
 
 /// Draws an entry remembers, at most.
 ///
-/// A run makes one draw per decision — hundreds of thousands of them for a traced cluster — and a
-/// corpus holds thousands of entries, so the whole journal is not something a campaign can carry.
-/// What a mutation can use is far smaller, and the earliest draws are the ones the rest of the run
-/// follows from.
+/// A traced cluster makes hundreds of thousands of draws; the earliest ones matter most.
 const REMEMBERED_DRAWS: usize = 256;
 
 impl Entry {
     /// The entry an offer becomes, once the corpus has decided to keep it.
     fn from(offer: Offer<'_>, id: EntryId) -> Self {
-        // Only the draws a mutation could reach: one that read past the end of the prefix took its
-        // bytes from the keystream, where there is nothing to overwrite, and one that consumed
-        // nothing names an empty range.
+        // Only draws inside the prefix that consumed bytes.
         let draws: Vec<_> = offer
             .draws
             .records()
@@ -140,7 +118,7 @@ impl Entry {
 #[derive(Clone, Debug)]
 pub struct Corpus {
     pub(crate) entries: Vec<Entry>,
-    /// Every bucket any run has reached. The question "is this new" is one comparison against it.
+    /// Every bucket any run has reached.
     pub(crate) seen: CoverageMap,
     /// Entries dropped because the corpus was full.
     pub(crate) evicted: u64,
@@ -152,8 +130,7 @@ pub struct Corpus {
 
 /// Entries a corpus holds before it starts dropping the least useful.
 ///
-/// A bound rather than a preference: a campaign that runs overnight will offer millions of inputs,
-/// and a corpus that kept every one of them would spend the morning choosing between them.
+/// A long campaign offers millions of inputs, so the corpus is bounded.
 pub const DEFAULT_CAPACITY: usize = 4096;
 
 impl Corpus {
@@ -207,9 +184,7 @@ impl Corpus {
 
     /// Offers a run to the corpus, and says whether it was kept.
     ///
-    /// Kept when it reached a bucket nothing before it reached. Note the order: the entry is
-    /// compared against what was seen *before* it, then folded in — comparing after folding would
-    /// mean every run had already been seen, and the corpus would never grow.
+    /// Kept when it reached a new bucket. It is compared against `seen` before being folded in.
     pub fn consider(&mut self, offer: Offer<'_>) -> bool {
         if !offer.coverage.has_new_bits(&self.seen) {
             return false;
@@ -226,8 +201,7 @@ impl Corpus {
 
     /// Marks an entry as having been mutated from.
     ///
-    /// By name rather than by position: a visit noted between two folds is credited to the entry
-    /// that earned it, not to whichever entry has since taken its place.
+    /// By name, so the visit reaches the right entry after evictions.
     pub fn note_visit(&mut self, id: EntryId) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
             entry.visits += 1;
@@ -242,11 +216,7 @@ impl Corpus {
 
     /// The order the search returns to entries in.
     ///
-    /// Least-visited first, and among equals the one that covered most: a broad entry has more
-    /// neighbours worth reaching. Handed out whole rather than one position at a time, because
-    /// planning a generation asks for dozens of positions from one unchanged corpus, and sorting
-    /// four thousand entries for each of them is a campaign that spends its time ordering a list
-    /// it already ordered.
+    /// Least visited first, then widest coverage. Returned whole, so a generation sorts once.
     #[must_use]
     pub fn order(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.entries.len()).collect();
@@ -257,15 +227,10 @@ impl Corpus {
         order
     }
 
-    /// Drops the entry that reached least, which is the cheapest sound answer to "which one is the
-    /// rest of the corpus most nearly a copy of".
+    /// Drops the entry with the least coverage, an approximation that keeps no maps.
     ///
-    /// Cheapest and not exact: knowing which entry contributes coverage no other entry holds would
-    /// mean keeping every entry's map, and four thousand of those is a quarter of a gigabyte held
-    /// to answer one question about eviction.
-    ///
-    /// Ties are broken towards the longer prefix and then the later position, so the choice is a
-    /// function of the corpus and never of the order two equal entries were offered in.
+    /// Ties go to the longer prefix, then the later position, so the choice depends only on the
+    /// corpus.
     fn evict(&mut self) {
         let Some(worst) = (0..self.entries.len()).min_by_key(|i| {
             let entry = &self.entries[*i];
@@ -275,9 +240,7 @@ impl Corpus {
         };
         self.entries.remove(worst);
         self.evicted += 1;
-        // `seen` is deliberately not recomputed. It records what the campaign has covered, which
-        // does not become untrue because the tape that covered it is no longer kept — and a corpus
-        // that forgot would re-admit the same input every time it was offered again.
+        // `seen` keeps what was covered, so a dropped input is not re-admitted.
     }
 }
 
@@ -319,8 +282,7 @@ mod tests {
         assert_eq!(corpus.len(), 2);
     }
 
-    /// A journal is kept so a mutation can aim at one draw site — and kept bounded, because a run
-    /// makes more draws than a corpus can hold and only those inside the prefix can be aimed at.
+    /// An entry keeps only the bounded draws inside its prefix.
     #[test]
     fn an_entry_remembers_the_draws_a_mutation_could_reach_and_no_others() {
         let mut journal = Journal::new();
@@ -338,8 +300,7 @@ mod tests {
         assert_eq!(kept[0].offset, 0);
     }
 
-    /// What a campaign has covered is a fact about the campaign, not about which tapes it still
-    /// holds. A corpus that forgot on eviction would keep re-admitting the input it just dropped.
+    /// Coverage survives eviction, so a dropped input is not re-admitted.
     #[test]
     fn what_was_covered_survives_the_tape_that_covered_it() {
         let mut corpus = Corpus::with_capacity(2);
@@ -352,8 +313,7 @@ mod tests {
         assert!(!consider(&mut corpus, &[1], 8), "the dropped path was admitted again");
     }
 
-    /// Eviction has to be a function of the corpus. If it depended on the order two equal entries
-    /// arrived in, two campaigns with one master seed could end up holding different tapes.
+    /// Eviction ignores the order equal entries arrived in.
     #[test]
     fn eviction_drops_the_same_entry_whatever_order_equals_arrived_in() {
         let build = |order: [usize; 3]| {
@@ -379,9 +339,7 @@ mod tests {
         assert_ne!(first, second, "a visited entry stayed at the front of the queue");
     }
 
-    /// An entry keeps its name while the corpus drops others around it. A position did not: the
-    /// parent recorded in an `Origin` stopped naming the entry it came from at the first eviction,
-    /// and a visit noted afterwards was credited to whoever had moved into that slot.
+    /// An entry keeps its name while others are dropped.
     #[test]
     fn an_entry_keeps_its_name_while_the_corpus_moves_under_it() {
         let mut corpus = Corpus::with_capacity(2);
@@ -392,8 +350,7 @@ mod tests {
         consider(&mut corpus, &[1, 2, 3, 4, 5], 8);
         assert_eq!(corpus.evicted(), 1, "nothing was dropped, so nothing moved");
 
-        // The narrowest entry was the one dropped, so the one asked about is still held -- at a
-        // different position, under the same name.
+        // The narrowest entry was dropped; this one moved but kept its name.
         let held = corpus.entry(wanted);
         assert!(held.is_none() || held.expect("held").id == wanted);
 

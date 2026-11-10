@@ -1,13 +1,10 @@
 //! A disclosure draft: one finding as the Markdown a maintainer receives.
 //!
-//! Not a report of the run but a letter about it. The page answers "what happened in this run";
-//! a maintainer reading an issue asks something else first — is this my program, can I make it
-//! happen, and how far can I believe it — so the draft is ordered by those three questions, and
-//! the evidence of the run comes after them.
+//! The draft answers a maintainer's questions in order: is this my program, can I reproduce it, how
+//! far can I trust it. The run's evidence follows.
 //!
-//! What this does not do: send anything, judge severity, or say why the program failed. The
-//! steps are what came before the violation, gathered by rule, and the draft says so where a
-//! reader would otherwise take them for a diagnosis.
+//! It sends nothing, judges no severity and gives no cause. The steps are what came before the
+//! violation, and the draft says so.
 
 use std::fmt::Write as _;
 
@@ -20,8 +17,7 @@ use crate::{
 
 /// Where the program under test came from, where something on the host says so.
 ///
-/// The bundle names its programs by path and digest and nothing else: a commit is a fact about
-/// how a binary was built, and only the target pack that built it knows it.
+/// Only the target pack knows the commit; the bundle has paths and digests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
     /// The pack's name.

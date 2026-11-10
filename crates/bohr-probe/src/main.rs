@@ -1,12 +1,10 @@
 //! Asks the nodes of a cluster what they did, over their own JSON-RPC, and writes down the answers.
 //!
-//! **A guest, not a part of the supervisor.** It is started by the world as one more node, so its
-//! sockets are the virtual network's, its clock is the run's and its randomness is the tape's: a
-//! probe that asked from outside would see a cluster at moments the run never chose, and two runs
-//! of one seed would be asked different questions. See `docs/ARCHITECTURE.md` §5.17.
+//! The probe is a guest: the world starts it as one more node, so its network, clock and randomness
+//! are the run's and one seed asks the same questions. See `docs/ARCHITECTURE.md` §5.17.
 //!
-//! It judges nothing. Each round it takes the replies to what it asked last round, asks again,
-//! and writes one SDK event with what came back or why nothing did. The world compares.
+//! It judges nothing. Each round it collects last round's replies, asks again, and writes one SDK
+//! event with the answers or why there were none. The world compares.
 //!
 //! The plan is the one argument, a JSON document the tool derives from the scenario's probes:
 //! `{"requests":[{"node":0,"port":8545,"method":"…","params":[…],"fields":["number"],"every":N}]}`.
@@ -31,7 +29,7 @@ const PROBE_EVENT: &str = "bohr_probe";
 /// Longest a node may take to answer: three beats, and never more than a second.
 const MOST_WAIT: Duration = Duration::from_secs(1);
 
-/// Largest reply read; a larger one is reported as too large rather than held.
+/// Largest reply read; a larger one is reported as too large.
 const MOST_BODY: usize = 1 << 20;
 
 /// One call, as the plan names it.
@@ -63,9 +61,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Rounds on one beat, the shortest interval any request asked for; a request with a longer one
-    // is asked every so many rounds. Counted in rounds rather than read off the clock, so a round
-    // costs the calls that ask and nothing else.
+    // One beat is the shortest requested interval; longer ones are counted in rounds.
     let beat = requests.iter().map(|r| r.every).min().unwrap_or(MOST_WAIT);
     let rounds_in = |span: Duration| span.as_nanos() / beat.as_nanos().max(1);
     let period: Vec<u128> = requests.iter().map(|r| rounds_in(r.every).max(1)).collect();
@@ -159,8 +155,7 @@ fn read_plan(text: &str) -> Result<Vec<Request>, String> {
 
 /// The run's randomness, drawn once from the tape and stretched.
 ///
-/// One draw at start rather than one a round: the seed is the tape's, so every moment the probe
-/// chooses is still the run's, and a round is spared a call.
+/// Drawn once at start; the seed is the tape's, so every chosen moment is still the run's.
 struct Draws(u64);
 
 impl Draws {
@@ -172,7 +167,7 @@ impl Draws {
         Self(seed | 1)
     }
 
-    /// xorshift64*: small, and enough to spread moments, which is all it is asked to do.
+    /// xorshift64*, enough to spread moments.
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -182,8 +177,7 @@ impl Draws {
 
     /// An interval moved by up to a quarter either way.
     ///
-    /// Moved so that two seeds ask at different moments: a probe on a fixed beat would only ever
-    /// see the cluster at one phase of whatever rhythm it keeps.
+    /// Jitter lets different seeds sample different phases of the cluster's rhythm.
     fn jittered(&mut self, every: Duration) -> Duration {
         let draw = u128::from(self.next() >> 48);
         let nanos = every.as_nanos();
@@ -237,8 +231,8 @@ impl Endpoint {
 
     /// Takes the reply to the batch owed, where it has arrived whole.
     ///
-    /// Gives up after `patience` rounds and drops the connection then: a reply that came later
-    /// would be read as the answer to the next batch.
+    /// Gives up after `patience` rounds and drops the connection, so a late reply is never read
+    /// as the next batch's.
     fn collect(&mut self, patience: u128, answered: &mut Answers) {
         if self.owed.is_empty() {
             return;
@@ -281,7 +275,7 @@ impl Endpoint {
 
 /// The body of one node's batch: the calls, each with its request's index as its id.
 ///
-/// A single call goes alone rather than as a batch of one, which every JSON-RPC server answers.
+/// A single call is sent unbatched, which every JSON-RPC server accepts.
 fn batch_body(requests: &[Request], members: &[usize]) -> String {
     let call = |index: usize| {
         let request = &requests[index];
@@ -342,7 +336,7 @@ fn read_available(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(), Strin
                 if buf.len() > MOST_BODY {
                     return Err("reply too large".to_owned());
                 }
-                // A short read is everything there was; only a full one may have more behind it.
+                // A short read drained the socket.
                 if n < chunk.len() {
                     return Ok(());
                 }

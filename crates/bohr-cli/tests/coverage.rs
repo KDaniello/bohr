@@ -1,16 +1,11 @@
 //! The coverage channel, against a guest that was really built with it.
 //!
-//! The synthetic half of this claim is checked everywhere by `bohr-testkit`; what can only be
-//! checked here is that the descriptor survives the six namespaces and the `execve` a guest is put
-//! through, that an instrumented binary finds it, and that what it writes is the same on every run
-//! of a seed.
+//! `bohr-testkit` checks the synthetic half. These check that the descriptor survives the
+//! namespaces and `execve`, that an instrumented binary finds it, and that a seed writes the same
+//! map every run.
 //!
-//! Driven through the command line and read back out of the bundle, which is both the path a user
-//! takes and the only way to run two traced guests at once: a traced guest is a per-process affair,
-//! and two of them inside one test binary would wait on each other's children.
-//!
-//! Skipped where no guest can be intercepted or the guests have not been built. A check that
-//! cannot run must not look like a check that passed, so it says which it was.
+//! Each test runs the CLI and reads the bundle, since two traced guests in one test process would
+//! wait on each other's children. A test with no built guest says so and returns.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -27,8 +22,7 @@ fn guest(name: &str) -> Option<String> {
 
 /// Runs a guest under a seed and returns what its bundle recorded as covered.
 ///
-/// `None` means the bundle carries no coverage section, which is what a guest built without the
-/// runtime leaves behind.
+/// `None` means no coverage section, as for a guest built without the runtime.
 fn covered(tag: &str, path: &str, seed: u64) -> Option<Vec<u8>> {
     covered_with(tag, path, seed, None)
 }
@@ -40,8 +34,7 @@ fn covered_with(tag: &str, path: &str, seed: u64, cells: Option<usize>) -> Optio
 
 /// The same, answering what the run covered and which run it was.
 fn run_under(tag: &str, path: &str, seed: u64, cells: Option<usize>) -> (Option<Vec<u8>>, String) {
-    // Named after the test as well as the seed: these run in parallel, and two of them clearing
-    // one directory would fail on each other's evidence rather than on the thing under test.
+    // Named by test and seed, since tests run in parallel.
     let dir = std::env::temp_dir().join(format!("bohr-cov-{tag}-{seed}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a directory of this test's own");
@@ -95,8 +88,7 @@ shm_size = {cells}
     (parsed.section(SectionId::Coverage).map(<[u8]>::to_vec), digest)
 }
 
-/// The descriptor has to cross the isolation to be of any use, and a guest that found nothing to
-/// write to leaves exactly the bytes of a guest that covered nothing.
+/// The descriptor crosses the isolation and the guest writes into it.
 #[test]
 fn an_instrumented_guest_fills_the_map_through_its_isolation() {
     let Some(path) = guest("covered_branches") else {
@@ -107,8 +99,7 @@ fn an_instrumented_guest_fills_the_map_through_its_isolation() {
     assert!(map.iter().any(|c| *c != 0), "the channel did not reach the guest");
 }
 
-/// The gate: coverage is as reproducible as the run that produced it. Anything else would make a
-/// search irreproducible while every run inside it reproduced perfectly.
+/// Coverage is as reproducible as the run, so a search is too.
 #[test]
 fn the_same_seed_covers_the_same_edges() {
     let Some(path) = guest("covered_branches") else {
@@ -122,7 +113,7 @@ fn the_same_seed_covers_the_same_edges() {
     }
 }
 
-/// And it still has to move, or there is nothing for a search to follow.
+/// Different seeds cover differently, which gives a search something to follow.
 #[test]
 fn a_guest_that_branches_on_the_tape_covers_differently_under_different_seeds() {
     let Some(path) = guest("covered_branches") else {
@@ -134,8 +125,7 @@ fn a_guest_that_branches_on_the_tape_covers_differently_under_different_seeds() 
     assert!(seen.len() >= 2, "eight seeds walked one path through a guest with four");
 }
 
-/// A guest built without the runtime is a guest searched without coverage. Recording that as "it
-/// covered nothing" would tell a campaign the program does nothing, which is the opposite fact.
+/// A guest without the runtime records no section; an empty one would mean it covered nothing.
 #[test]
 fn a_guest_without_the_runtime_records_no_coverage_rather_than_empty_coverage() {
     let Some(path) = guest("clock_and_random") else {
@@ -148,17 +138,10 @@ fn a_guest_without_the_runtime_records_no_coverage_rather_than_empty_coverage() 
     );
 }
 
-/// The claim: the map is the size the scenario says, and the guest fills that size.
+/// The map is the size the scenario asks for, and the guest fills that size.
 ///
-/// **A map smaller than the guest has edges stops telling paths apart**, and against a real
-/// execution client the default is smaller — measured, thirty-two thousand of sixty-five thousand
-/// counters from one startup, after which nearly every run looks novel and the corpus keeps them
-/// all. The remedy is a number, so the number has to reach both sides: the supervisor maps it and
-/// the guest folds into it, and a guest folding into a width nobody mapped would write past the
-/// end of the region.
-///
-/// Stated as a pair of sizes rather than one, because a section of the default length would
-/// satisfy any claim made about a scenario that asked for the default.
+/// A real execution client sets 32 768 of the default 65 536 counters in one startup, so large
+/// targets need a wider map. Two non-default sizes are checked.
 #[test]
 fn the_map_is_the_size_the_scenario_asked_for() {
     let Some(path) = guest("covered_branches") else {
@@ -174,21 +157,12 @@ fn the_map_is_the_size_the_scenario_asked_for() {
     assert!(wide.iter().any(|c| *c != 0), "a wider map was never written into");
 }
 
-/// The claim: how large the map is is not part of which run this was.
+/// The map size does not change the digest.
 ///
-/// **Coverage is what a search reads, never what a run does.** The size therefore travels in the
-/// shared region's own header and not in the guest's environment — in the environment it is part of
-/// what the program was started with, and the same seed under two map sizes digests as two
-/// different runs. Which would mean a bundle recorded by one campaign could not be replayed by a
-/// campaign searching with a different map, and `docs/API.md` §5.1 does not exempt the explorer.
-///
-/// It was in the environment for about an hour of one afternoon, which is why it is a test.
-///
-/// **What this does not claim** is that no guest can tell: against a real execution client the two
-/// sizes produce the same events in the same order with the same returns and still digest apart,
-/// because a syscall event records six argument registers whatever the call takes and a different
-/// memory footprint moves the pointers left in them. That is a defect in what a digest is made of
-/// rather than in this channel, and it is recorded in `benches/baseline.toml`.
+/// The size travels in the shared region's header, outside the guest's environment, so one seed
+/// digests the same under any map. A large guest can still digest apart: syscall events record
+/// all six argument registers, and a different footprint moves pointers left in them. That is
+/// recorded in `benches/baseline.toml`.
 #[test]
 fn the_size_of_the_map_is_not_part_of_which_run_it_was() {
     let Some(path) = guest("covered_branches") else {

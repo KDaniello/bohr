@@ -1,5 +1,4 @@
-//! The JSON Lines projection, which is a promise rather than a rendering: `bohr trace` writes it
-//! and a windowed report points at it, so anything that reads one has to keep reading the other.
+//! The JSON Lines projection is a contract: `bohr trace` writes it and windowed reports link to it.
 
 use bohr_report::jsonl;
 use bohr_trace::{
@@ -12,8 +11,7 @@ fn at(id: u64, kind: EventKind) -> Event {
     Event { id: EventId(id), tick: Tick(id * 1000), node: NodeId(1), task: TaskId(2), kind }
 }
 
-/// One of every kind, so a variant added without a projection is caught by a test as well as by
-/// the compiler.
+/// One of every kind, so a new variant without a projection fails here too.
 fn one_of_each() -> Vec<Event> {
     vec![
         at(
@@ -115,9 +113,7 @@ fn every_line_is_json_and_carries_the_envelope() {
     }
 }
 
-/// Numbers wide enough to lose precision as doubles are strings, and the ones a reader sorts by
-/// are not. A syscall argument silently rounded by being read is a value the reader cannot know
-/// was changed.
+/// Wide numbers are strings; counts and ids are numbers.
 #[test]
 fn what_would_not_survive_being_read_as_a_double_is_a_string() {
     let written = jsonl::write_log(&one_of_each());
@@ -131,8 +127,7 @@ fn what_would_not_survive_being_read_as_a_double_is_a_string() {
     assert_eq!(syscall["syscall"]["name"].as_str(), Some("write"), "the call was not named");
 }
 
-/// Everything in a string field came out of a guest, which has no interest in producing valid
-/// JSON. This is the field a hostile one aims at.
+/// Guest strings with quotes and control characters stay valid JSON.
 #[test]
 fn a_guest_cannot_break_the_line_it_is_written_on() {
     let hostile = "\"}\n{\"id\":999,\"kind\":\"forged\",\"x\":\"\u{202e}\u{0}";
@@ -152,8 +147,7 @@ fn a_guest_cannot_break_the_line_it_is_written_on() {
     assert_eq!(value["assertion"]["name"].as_str(), Some(hostile), "the text did not survive");
 }
 
-/// The same events written twice are the same bytes: a report and its sidecar are compared, and a
-/// projection that reordered anything would make that comparison meaningless.
+/// The same events always write the same bytes.
 #[test]
 fn the_projection_is_the_same_bytes_every_time() {
     assert_eq!(jsonl::write_log(&one_of_each()), jsonl::write_log(&one_of_each()));

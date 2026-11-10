@@ -1,9 +1,8 @@
-//! The backend boundary: guest execution, stated in terms of what a guest does.
+//! The backend boundary: guest execution in terms of guest operations.
 //!
-//! The whole vocabulary is guest operations — a task stopped at a syscall, a task resumed with a
-//! substituted return value, memory read at a guest address. No host mechanism appears in it, and
-//! no layer above may branch on which implementation is in use. That is what allows the mechanism
-//! to be replaced without touching the layers that give the tool its value.
+//! A task stopped at a syscall, a task resumed with a substituted return value, memory read at a
+//! guest address. No host mechanism appears here, and no layer above branches on the
+//! implementation, so the mechanism can be replaced without touching them.
 //! See `docs/ARCHITECTURE.md` §5.2 and `docs/API.md` §3.
 
 #![forbid(unsafe_code)]
@@ -29,8 +28,7 @@ pub trait DeterminismBackend {
 
     /// Runs until exactly one task stops, or reports that none remain.
     ///
-    /// At most one task is ever executing. `None` means every task has ended, which is a normal
-    /// end of run rather than a failure.
+    /// At most one task executes at a time. `None` means every task has ended, a normal end.
     fn next_stop(&mut self) -> Result<Option<Stop>, BackendError>;
 
     /// Lets a stopped task continue.
@@ -59,61 +57,49 @@ pub trait DeterminismBackend {
 
     /// Ends a task without letting it run again.
     ///
-    /// Nothing more is reported about the task afterwards, its exit included: it is forgotten
-    /// here, and the caller takes it off its own books when it asks.
+    /// Nothing more is reported about the task afterwards, including its exit.
     fn kill(&mut self, task: TaskId) -> Result<(), BackendError>;
 
     /// What the guest executed, where this implementation can observe it.
     ///
-    /// Coverage is a fact about guest execution, which is what this boundary is for, so it is
-    /// reported here rather than gathered by whoever wanted it. `None` means this build has no way
-    /// to observe execution at all; a map that is present and empty means the guest ran without
-    /// the runtime that fills one — see [`CoverageMap::is_empty`].
+    /// `None` means this build cannot observe execution. An empty map means the guest ran without
+    /// the coverage runtime; see [`CoverageMap::is_empty`].
     ///
-    /// Read after a run rather than during it, because a search that sampled mid-run would depend
-    /// on when it sampled. See `docs/API.md` §5.5.
-    ///
-    /// Takes the backend by mutable reference because reading is an act: the counters live in
-    /// memory the guest writes, and this is where they are copied out of it.
+    /// Read after a run, so a search never depends on when it sampled. See `docs/API.md` §5.5.
+    /// Takes `&mut self` because it copies the counters out of guest-written memory.
     fn coverage(&mut self) -> Option<&CoverageMap> {
         None
     }
 
     /// How many edges the guest was instrumented with, where the guest says.
     ///
-    /// **The number that decides whether the map is big enough**, and the guest is the only side
-    /// that knows it: a map with fewer counters than the guest has edges puts two edges on one
-    /// counter, and two paths that differ only there are one path to everything downstream. Left
-    /// unsaid, a map too small looks exactly like a guest with a great many paths, and the search
-    /// degrades without saying so.
+    /// Shows whether the map is big enough: with fewer counters than edges, two edges share a
+    /// counter and their paths merge.
     ///
-    /// Nought where nothing said, which is every guest without the coverage runtime.
+    /// Zero for a guest without the coverage runtime.
     fn coverage_edges(&self) -> u64 {
         0
     }
 
     /// Releases every stopped guest to an external debugger, and says how to reach each one.
     ///
-    /// Guarded by [`BackendCapabilities::hands_over_to_debugger`]. The default is that there is
-    /// nothing to hand over: a backend that executes a synthetic guest has no process for a
-    /// debugger to attach to, and an empty list is not the same claim as being unable to.
+    /// Guarded by [`BackendCapabilities::hands_over_to_debugger`]. The default returns an empty
+    /// list: a synthetic guest has no process to attach to.
     ///
-    /// **This ends the run.** Afterwards the guest is no longer under this backend's control —
-    /// nothing may be resumed, read, written or stopped through it — and dropping the backend is
-    /// what ends the guest. Whoever calls this is the last thing that knows how to.
+    /// This ends the run. Nothing may be resumed, read, written or stopped afterwards, and dropping
+    /// the backend ends the guest.
     ///
     /// # Errors
     ///
-    /// Reports what stopped the hand-over. A backend that fails part-way has released whichever
-    /// guests it got to, which is why the failure names one rather than being silent.
+    /// What stopped the hand-over. Guests released before the failure stay released.
     fn hand_over(&mut self) -> Result<Vec<DebuggerTarget>, BackendError> {
         Ok(Vec::new())
     }
 
     /// Holds every guest as it stands, so the run can later go on from here more than once.
     ///
-    /// Taken with every task stopped, between two picks. `Ok(None)` from a backend that cannot,
-    /// which [`BackendCapabilities::checkpoints`] says in advance.
+    /// Taken with every task stopped, between two picks. `Ok(None)` from a backend that cannot;
+    /// [`BackendCapabilities::checkpoints`] says so in advance.
     fn checkpoint(&mut self) -> Result<Option<CheckpointId>, BackendError> {
         Ok(None)
     }
@@ -128,10 +114,8 @@ pub trait DeterminismBackend {
 
 /// Where an external debugger is told to look, and what it will not be able to do there.
 ///
-/// Opaque by construction. What identifies a stopped guest to a debugger is the backend's own
-/// business, and a process identifier here would be a host mechanism sitting above a boundary that
-/// exists to keep host mechanisms below it. What crosses is a command a person can run and a list
-/// of the things that will not work once they do.
+/// Opaque: it carries a command a person can run and the limits of the session, never a host
+/// process identifier.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DebuggerTarget {
     node: NodeId,
@@ -142,8 +126,7 @@ pub struct DebuggerTarget {
 impl DebuggerTarget {
     /// A target a debugger can be pointed at.
     ///
-    /// The command must be runnable exactly as written: whoever reads it is looking at a frozen
-    /// process and a terminal, and is in no position to work out what was meant.
+    /// The command must run exactly as written.
     #[must_use]
     pub fn new(node: NodeId, command: String, limits: Vec<String>) -> Self {
         Self { node, command, limits }
@@ -175,13 +158,12 @@ pub struct GuestSpec {
     pub argv: Vec<String>,
     /// Environment, in the order it is presented to the guest.
     ///
-    /// Built from configuration rather than inherited: an inherited environment carries host
-    /// details such as `PWD` and `HOSTNAME` straight into the run.
+    /// Built from configuration, so host values such as `PWD` and `HOSTNAME` stay out.
     pub env: Vec<(String, String)>,
     /// The file executed, where it is not `argv[0]`.
     ///
-    /// For a program the tool supplies: the guest is shown a fixed `argv[0]`, and where this host
-    /// keeps the file stays out of the run.
+    /// Used for a program the tool supplies, so the guest sees a fixed `argv[0]` and not the host
+    /// path.
     pub executable: Option<String>,
 }
 
@@ -271,16 +253,16 @@ pub enum Resume {
     },
     /// Do not execute the syscall; return `ret` to the guest.
     ///
-    /// The normal path. A syscall reaching the host kernel is an exception that has to be
-    /// justified per syscall, because the guest is meant to be talking to the world, not to Linux.
+    /// The normal path: the guest talks to the world, and a syscall reaches the host kernel only
+    /// by a per-syscall exception.
     Emulate {
         /// What the guest receives.
         ret: i64,
     },
     /// As [`Resume::Emulate`], and the kernel then delivers `signal` as the task returns.
     ///
-    /// The kernel applies the task's own disposition — its handler, the default action, or
-    /// nothing — so a signal is handled exactly as the guest arranged, at a moment the run chose.
+    /// The kernel applies the task's own disposition (handler, default action or ignore), at a
+    /// moment the run chose.
     EmulateAndSignal {
         /// What the guest receives.
         ret: i64,
@@ -301,12 +283,10 @@ pub enum Resume {
     },
     /// End the task.
     Terminate {
-        /// The signal it died of, where it died of one rather than reaching an exit.
+        /// The signal it died of, if any.
         ///
-        /// Carried because only the world knows: a task that stops *on* a signal is one the kernel
-        /// can see for itself, and a task that asks to die — `abort`, a failed assertion, a panic
-        /// that aborts — stops on nothing at all. Without this it is recorded as having exited
-        /// cleanly, and a guest that killed itself reads as a run that passed.
+        /// Only the world knows it for a task that asked to die (`abort`, an aborting panic);
+        /// without it the task would be recorded as a clean exit.
         signal: Option<u32>,
     },
 }
@@ -324,8 +304,8 @@ pub enum ProgressUnit {
 
 /// What an implementation can and cannot do.
 ///
-/// Read once at startup and recorded in the bundle. A `false` where the run needed `true` marks
-/// the run degraded rather than failing it; what is never done is reporting a degraded run clean.
+/// Read once at startup and recorded in the bundle. A missing capability the run needed marks the
+/// run degraded; a degraded run is never reported clean.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BackendCapabilities {
     /// Short stable name, recorded in the bundle.
@@ -375,8 +355,7 @@ pub struct Mapping {
     pub start: GuestAddr,
     /// One past the last address.
     pub end: GuestAddr,
-    /// Whether the region is executable, and therefore worth scanning for untrappable
-    /// instructions.
+    /// Whether the region is executable, and so scanned for untrappable instructions.
     pub executable: bool,
     /// Whether the region is writable.
     pub writable: bool,
@@ -386,9 +365,8 @@ pub struct Mapping {
 
 /// Failures that originate in a backend.
 ///
-/// One code to one condition. `BOHR-3005` means the guest died in a way the backend cannot
-/// describe -- our bug or a hostile guest -- so an ordinary mistake (a task that already exited, a
-/// read off the end of a mapping, a host descriptor running out) never wears it.
+/// One code per condition. `BOHR-3005` is reserved for a guest state the backend cannot describe;
+/// ordinary mistakes have their own codes.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// `BOHR-1001` — the program cannot be executed.
@@ -429,10 +407,8 @@ pub enum BackendError {
 
     /// `BOHR-3011` — the guest a caller supplied is not one that can be executed.
     ///
-    /// A scripted guest is written by whoever wrote the test, so a jump past the end of it or a
-    /// bit index outside a byte is a mistake in the test rather than anything the guest did.
-    /// Normalising it — treating the jump as the end of the program, masking the bit into range —
-    /// turns a broken test into a passing one.
+    /// A scripted guest with a jump past its end or a bit index outside a byte is a broken test,
+    /// and is reported instead of normalised.
     #[error("BOHR-3011: the guest given to this backend is malformed: {reason}")]
     BadProgram {
         /// What about it cannot be executed.
@@ -441,10 +417,8 @@ pub enum BackendError {
 
     /// `BOHR-3010` — the host refused something the backend needed to do its work.
     ///
-    /// Not a `#[from]`: a conversion that happens by writing `?` is one nobody decided on, and it
-    /// turned every host failure — a descriptor limit, a full disk, a read that came up short —
-    /// into whichever error the surrounding function happened to return. What the backend was
-    /// doing when the host refused is the useful half, so the caller states it.
+    /// Built with [`BackendError::host`], which makes the caller state what it was doing; there is
+    /// no `#[from]` conversion.
     #[error("BOHR-3010: {doing}: {source}")]
     Host {
         /// What the backend was attempting.

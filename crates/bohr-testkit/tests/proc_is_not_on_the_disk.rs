@@ -1,14 +1,7 @@
 //! What the kernel says about a process survives a crash, because it was never on the platter.
 //!
-//! A guest asks the system about itself through files under `/proc`, and this world answers by
-//! making one. Held on the modelled disk they would be snapshotted, rolled back and torn like
-//! anything else — so a crash would take away the process's own entry, and a guest that came back
-//! and asked who it was would be told it does not exist.
-//!
-//! That is not a state any machine reaches, and a real client walked into it: an execution client
-//! panics on `expect("own process")` after a crash, which looked like its defect and was this
-//! world's. Recorded as a pair, because a run that read `/proc` and never crashed would pass either
-//! way.
+//! Generated `/proc` files are kept off the modelled disk, so a crash cannot roll them back. An
+//! execution client panics on `expect("own process")` if its entry vanishes after a crash.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -47,13 +40,8 @@ const RESTART_AT: Tick = Tick(12 * Tick::MILLISECOND.get());
 
 /// Ask who it is, then make an ordinary file durable, then wait to be killed.
 ///
-/// **The order is the whole test.** A namespace goes into the durable image whole at every sync,
-/// so the sync after the `/proc` open is what puts that *name* on the disk — while its content
-/// never goes there, because nothing ever syncs `/proc`. A crash then restores a name with nothing
-/// behind it, and the guest that comes back and asks again reads nought.
-///
-/// A restarted node runs its program from the beginning, so the second asking is the same two
-/// calls reached a second time rather than two more written here.
+/// The order matters: a sync after the `/proc` open would put the name on the disk without its
+/// content. A restarted node asks again from the start.
 fn asks_who_it_is() -> NullProgram {
     let mut ops = vec![
         GuestOp::Syscall { nr: OPENAT, args: [u64::MAX, PROC_PATH_AT, 0, 0, 0, 0] },
@@ -62,7 +50,7 @@ fn asks_who_it_is() -> NullProgram {
         GuestOp::Syscall { nr: WRITE, args: [DATA_FD, PAYLOAD_AT, 64, 0, 0, 0] },
         GuestOp::Syscall { nr: FSYNC, args: [DATA_FD, 0, 0, 0, 0, 0] },
     ];
-    // Long enough to still be here when the kill and the restart arrive.
+    // Long enough for the kill and restart.
     ops.extend((0..40).map(|_| GuestOp::Syscall { nr: SLEEP, args: [TIMESPEC_AT, 0, 0, 0, 0, 0] }));
     NullProgram::single(ops)
 }
@@ -99,8 +87,7 @@ fn proc_reads(judged: &Judged) -> Vec<i64> {
         .events
         .iter()
         .filter_map(|e| match e.kind {
-            // The disk row rather than the syscall row: it says what the model actually handed
-            // over, which is the thing under test.
+            // The disk row shows what the model handed over.
             EventKind::DiskOp { op: DiskOpKind::Read, ret, .. } if e.node == NodeId::ZERO => {
                 Some(ret)
             }
@@ -109,7 +96,7 @@ fn proc_reads(judged: &Judged) -> Vec<i64> {
         .collect()
 }
 
-/// The claim: a crash does not take away what the disk never held.
+/// A crash keeps `/proc` content.
 #[test]
 fn a_crash_leaves_what_the_kernel_says_about_the_process() {
     let crashed = judge(vec![
@@ -127,7 +114,7 @@ fn a_crash_leaves_what_the_kernel_says_about_the_process() {
     );
 }
 
-/// And without the crash, so the pair means something.
+/// The same without a crash.
 #[test]
 fn the_same_run_without_a_crash_reads_it_too() {
     let reads = proc_reads(&judge(Vec::new()));

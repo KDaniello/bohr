@@ -1,22 +1,13 @@
 //! What a byte stream promises, and the two things that can take it away.
 //!
-//! A datagram socket says nothing about whether anybody is at the other end; a stream says exactly
-//! that, and every program built on one depends on being told. Two claims here, each stated as a
-//! pair, because a run that ends the same way with and without the fault shows nothing.
+//! Each claim is checked with and without its fault.
 //!
-//! **A stream ends when the node behind it dies.** A client waiting on a server that was killed has
-//! to find out, and the only way it can is the read it is already parked in coming back with
-//! nothing. A model that let the connection go quiet instead would leave the client waiting for the
-//! rest of the run — and worse, would let a guest that mishandles a dead peer look correct, because
-//! it would never reach the code that handles one.
+//! A stream ends when the node behind it dies: the parked read returns end-of-file.
 //!
-//! **A partition stops the bytes and a heal carries them on.** What the transport hides from the
-//! program above it is loss, duplication and reordering; what it cannot hide is that the other end
-//! is unreachable. So a write into a cut link is neither refused nor lost: it waits, and the reader
-//! on the far side hears nothing until the cut lifts.
+//! A partition holds the bytes and a heal delivers them; a write into a cut link is neither refused
+//! nor lost.
 //!
-//! **A stream carries an answer written in pieces.** A server puts its headers and its body on the
-//! wire in one vectored call, and that is the shape of nearly every reply a real one sends.
+//! A stream carries a vectored answer, as servers send headers and body.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -36,7 +27,7 @@ const WRITEV: u32 = 20;
 const CLOSE: u32 = 3;
 /// `nanosleep`.
 const SLEEP: u32 = 35;
-/// `getpid`: what a script says when it has got past the call before it.
+/// `getpid`, a marker that the previous call returned.
 const MARKER: u32 = 39;
 /// `socket`.
 const SOCKET: u32 = 41;
@@ -63,18 +54,16 @@ const INBOX_AT: u64 = MEMORY_BASE + 0x400;
 
 /// The descriptors the network model hands out, in the order these scripts ask for them.
 ///
-/// Written down rather than read back, because a scripted guest has nowhere to keep a return
-/// value. The allocator counts up from a base of its own per node, so the listener is the first
-/// socket the server opens and the connection it accepts is the second.
+/// Scripts cannot keep return values. The listener is the server's first socket and the accepted
+/// connection its second.
 const LISTEN_FD: u64 = 4096;
 const ACCEPTED_FD: u64 = 4097;
 const CLIENT_FD: u64 = 4096;
-/// The descriptors a second conversation gets. Numbers are never reused, so a server that has
-/// closed one connection accepts the next on a fresh one.
+/// A second conversation's descriptors; numbers are never reused.
 const SECOND_ACCEPTED_FD: u64 = 4098;
 const SECOND_CLIENT_FD: u64 = 4097;
 
-/// One scripted sleep, which is what every wait below is counted in.
+/// One scripted sleep, the unit of every wait below.
 const STEP: Tick = Tick::MILLISECOND;
 
 /// The server is killed here, well after the connection is established.
@@ -94,8 +83,7 @@ fn server() -> NullProgram {
         GuestOp::Syscall { nr: SOCKET, args: INET_STREAM },
         GuestOp::Syscall { nr: BIND, args: [LISTEN_FD, SOCKADDR_AT, 16, 0, 0, 0] },
         GuestOp::Syscall { nr: LISTEN, args: [LISTEN_FD, 128, 0, 0, 0, 0] },
-        // No address wanted: `accept4` is documented to take a null pointer for one, and a script
-        // that asked for the caller's address would be testing the write rather than the accept.
+        // A null address, which `accept4` accepts.
         GuestOp::Syscall { nr: ACCEPT4, args: [LISTEN_FD, 0, 0, 0, 0, 0] },
         GuestOp::Syscall { nr: READ, args: [ACCEPTED_FD, PAYLOAD_AT, 64, 0, 0, 0] },
         GuestOp::Syscall { nr: MARKER, args: [0; 6] },
@@ -115,8 +103,7 @@ fn client(before_write: usize) -> NullProgram {
     NullProgram::single(ops)
 }
 
-/// A client that connects and then says nothing at all, so only the server's death can end the
-/// read.
+/// A client that connects and says nothing, so only the server's death ends the read.
 fn silent_client() -> NullProgram {
     let mut ops = sleeps(2);
     ops.push(GuestOp::Syscall { nr: SOCKET, args: INET_STREAM });
@@ -145,8 +132,7 @@ fn asking_client() -> NullProgram {
     ops.push(GuestOp::Syscall { nr: SOCKET, args: INET_STREAM });
     ops.push(GuestOp::Syscall { nr: CONNECT, args: [CLIENT_FD, SOCKADDR_AT, 16, 0, 0, 0] });
     ops.push(GuestOp::Syscall { nr: WRITE, args: [CLIENT_FD, PAYLOAD_AT, 5, 0, 0, 0] });
-    // Read once the answer is there: a read that parks is recorded with what it answered when it
-    // parked, and the length it came back with is not on its event.
+    // Read after the answer arrives, since a parked read's event lacks the final length.
     ops.extend(sleeps(2));
     ops.push(GuestOp::Syscall { nr: READ, args: [CLIENT_FD, INBOX_AT, 64, 0, 0, 0] });
     ops.extend(sleeps(30));
@@ -172,8 +158,7 @@ fn twice_serving_server() -> NullProgram {
 
 /// Ask once, hang up, and come back on a connection of its own.
 ///
-/// The sleeps put the second call after the server has finished with the first, which is the order
-/// that matters: what broke the listener was the close, not the connection.
+/// The second call comes after the server closed the first.
 fn twice_asking_client() -> NullProgram {
     let mut ops = sleeps(2);
     ops.push(GuestOp::Syscall { nr: SOCKET, args: INET_STREAM });
@@ -261,13 +246,7 @@ fn client_read(judged: &Judged) -> Option<i64> {
 
 /// A server answers with a vectored write, and the whole answer arrives.
 ///
-/// `writev` is how a server puts its headers and its body on the wire in one call, and a socket
-/// that recognised only the flat spelling refused it: the call fell past the network to a
-/// filesystem that had never heard of the descriptor, and the answer came back `EBADF`. Found
-/// against an execution client, whose every reply goes out this way.
-///
-/// Both halves are asserted by the length, which is what makes this about gathering rather than
-/// about dispatch: a model that carried the first entry and dropped the second would answer five.
+/// `writev` on a socket reaches the network. The length checks both halves arrived.
 #[test]
 fn a_stream_carries_an_answer_written_in_pieces() {
     let judged = judge(vec![answering_server(), asking_client()], two_nodes());
@@ -276,13 +255,7 @@ fn a_stream_carries_an_answer_written_in_pieces() {
 
 /// A listener serves more than one caller.
 ///
-/// An accepted connection is given the listening port so `getsockname` can answer on it, and
-/// closing it must not give that port up: a server would then be bound to nothing after its first
-/// caller, and an execution client -- asked a question, hung up on, asked the next -- refuses every
-/// connection after the first.
-///
-/// Asserted on both connects rather than on the second alone: a pair where the first also failed
-/// would be a different defect wearing the same result.
+/// Closing an accepted connection keeps the listener's port. Both connects are checked.
 #[test]
 fn a_listener_serves_more_than_one_caller() {
     let judged = judge(vec![twice_serving_server(), twice_asking_client()], two_nodes());
@@ -292,9 +265,7 @@ fn a_listener_serves_more_than_one_caller() {
 
 /// A stream ends when the node behind it dies, and stays open while it lives.
 ///
-/// The pair is the whole test: the same server, the same silent client, and the only difference is
-/// whether anything killed the server. A model that ended the stream on its own would pass the
-/// first half and fail the second.
+/// The same server and silent client, with and without a kill.
 #[test]
 fn a_stream_ends_when_the_node_behind_it_dies() {
     let killed = Scenario {
@@ -310,8 +281,7 @@ fn a_stream_ends_when_the_node_behind_it_dies() {
         "the server is the node that died, so it is the client that has to hear about it"
     );
 
-    // The client is the survivor, so the claim is stated from its side: it connected, it was told
-    // the connection was open, and the run ends with it having got past the wait it was in.
+    // From the client's side: it connected and got past its wait.
     let killed = Scenario {
         node_faults: vec![ScheduledNodeFault {
             at_tick: KILL_AT,
@@ -335,9 +305,7 @@ fn a_stream_ends_when_the_node_behind_it_dies() {
 
 /// A partition stops the bytes; a heal carries them on.
 ///
-/// Stated as a pair on the same schedule: with the cut, the write reaches the server only once the
-/// cut lifts; without it, the same write arrives as it is made. A model that ignored the partition
-/// would give the same answer twice, and a model that lost the write would give none.
+/// With the cut, the write arrives when it lifts; without it, at once.
 #[test]
 fn a_partition_holds_a_write_until_the_cut_lifts() {
     let cut = Scenario {

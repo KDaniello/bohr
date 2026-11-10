@@ -1,9 +1,7 @@
 //! Guests built into the binary, used by `bohr selftest`.
 //!
-//! They exercise the paths a real guest reaches the outside world through — the clock, randomness
-//! and thread creation — without needing a program on disk or the privileges to trace one. The
-//! programs themselves are the fixtures the test suite runs, so what a user can invoke and what
-//! continuous integration checks are the same guests.
+//! They exercise the clock, randomness and thread creation without a program on disk or tracing
+//! privileges. They are the same fixtures the test suite runs.
 
 use bohr_backend_null::NullProgram;
 use bohr_testkit::Fixture;
@@ -19,9 +17,7 @@ pub(crate) enum Demo {
     LargeRandom,
     /// Branches eight times on what it drew, so it has two hundred and fifty-six paths.
     ///
-    /// The guest a search has something to do with. The others walk one path whatever they draw,
-    /// which makes them good determinism checks and useless as targets: a campaign against one
-    /// covers everything it will ever cover in its first run.
+    /// The only built-in guest worth searching; the others take one path whatever they draw.
     ManyFlips,
 }
 

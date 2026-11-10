@@ -1,19 +1,13 @@
 //! The memory the guest writes its edge counters into.
 //!
-//! An anonymous file, mapped by both sides and handed to the guest as a descriptor. A descriptor
-//! rather than a named segment because the guest lives in its own IPC and mount namespaces, where a
-//! System V identifier or a `/dev/shm` path means nothing — the `__AFL_SHM_ID` convention every
-//! other fuzzer uses cannot reach a guest that has been isolated properly. A descriptor is neither
-//! a name nor an identifier, so it crosses both the namespaces and the `execve`.
+//! An anonymous file, mapped by both sides and passed to the guest as a descriptor. The guest has
+//! its own IPC and mount namespaces, where a System V identifier or a `/dev/shm` path does not
+//! reach it; a descriptor survives both the namespaces and `execve`.
 //!
-//! **The region carries a header and the counters after it, and both sides write to it.** The
-//! supervisor puts the number of counters there, because the guest cannot be told it any other way:
-//! an environment variable holding it would make the size part of what the guest was started with,
-//! and a run under one size would digest differently from the same run under another — a search
-//! setting deciding what "the same run" means, which is exactly what `docs/API.md` §5.1 forbids.
-//! The guest puts its own edge count there, which is the one number that says whether the map is
-//! big enough and the one number only the guest knows. Without it, a map too small to tell paths
-//! apart looks exactly like a guest with a great many paths, and a search degrades quietly.
+//! The region holds a header followed by the counters. The supervisor writes the counter count
+//! into the header; passing it through the environment would change the run's digest with the map
+//! size (`docs/API.md` §5.1). The guest writes its own edge count there, which shows whether the
+//! map is big enough.
 //!
 //! See `docs/API.md` §5.5.
 
@@ -26,9 +20,8 @@ pub(super) const COVERAGE_FD_VAR: &str = "BOHR_COV_FD";
 /// Bytes before the counters. Four little-endian `u64`s, the last reserved.
 const HEADER_BYTES: usize = 32;
 
-/// What the guest checks before believing the rest of the header, so that a guest linked against a
-/// runtime of a different age falls back to its own buffer rather than indexing off the end of a
-/// region it has misread. Shared with `sdk/c/bohr-cov-rt.c`.
+/// The value the guest checks before reading the header. A guest with a mismatched runtime falls
+/// back to its own buffer. Shared with `sdk/c/bohr-cov-rt.c`.
 const HEADER_MAGIC: u64 = 0x0042_4F48_5243_5601;
 
 /// The shared counters, open for as long as the backend is.
@@ -41,10 +34,9 @@ pub(super) struct CoverageChannel {
 }
 
 impl CoverageChannel {
-    /// Opens a channel of `cells` counters, or reports that this kernel offers no way to.
+    /// Opens a channel of `cells` counters, or `None` where the kernel has no anonymous files.
     ///
-    /// Absence is not an error: a host too old for anonymous files still runs guests, it just
-    /// cannot say what they executed, and that is a search without coverage rather than a failure.
+    /// Guests still run on such a host; the search just has no coverage.
     pub(super) fn open(cells: usize) -> Option<Self> {
         let cells = cells.max(1);
         let bytes = HEADER_BYTES + cells;
@@ -96,9 +88,8 @@ impl CoverageChannel {
 
     /// How many edges the guest was instrumented with, as the guest reported.
     ///
-    /// Nought from a guest that carries no coverage runtime, which is a different fact from a guest
-    /// with no edges and must not be reported as one — the caller has the map's emptiness to tell
-    /// them apart.
+    /// Zero from a guest without the coverage runtime. The caller tells that apart from a guest
+    /// with no edges by the map being empty.
     pub(super) fn guards(&self) -> u64 {
         let mut word = [0u8; 8];
         // SAFETY: the word is within the header, mapped readable for this channel's lifetime.
@@ -108,14 +99,11 @@ impl CoverageChannel {
 
     /// Copies the counters out.
     ///
-    /// Called once the run loop has ended, never during it: what the search does next must not
-    /// depend on when it looked, which is the explorer's own version of §5.1.
+    /// Called after the run loop ends, so the search never depends on when it looked (§5.1).
     ///
-    /// **That is a statement about when it is called, not about who else can be writing.** A guest
-    /// killed on the way out of a run has not necessarily been reaped, so a counter may be
-    /// incremented while this reads it; the value that comes back is then one increment stale.
-    /// Bucketing was chosen to tolerate exactly that, and coverage is outside the trace digest
-    /// (§5.10), so a stale count cannot move what a run is.
+    /// A guest killed at the end may not be reaped yet and can still increment a counter, which
+    /// then reads one increment stale. Bucketing absorbs that, and coverage is outside the trace
+    /// digest (§5.10).
     pub(super) fn read_into(&self, out: &mut [u8]) {
         let len = out.len().min(self.cells);
         // SAFETY: the counters begin HEADER_BYTES into a mapping of HEADER_BYTES + cells readable

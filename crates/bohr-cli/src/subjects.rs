@@ -1,23 +1,21 @@
 //! Subjects: what `bohr check` checks, and the checks each one declares.
 //!
-//! **A subject is not a test, but a declaration.** A target pack carries a `[check]` table in its
-//! `target.toml`; a seeded defect carries a `bug.toml` beside its scenarios. Each names checks from
-//! one fixed set and the bounds they are held to, so a new target or defect is a file and never a
-//! script. The checks themselves live in [`crate::check`] and are the same for every subject.
+//! A subject is a declaration. A target pack has a `[check]` table in its `target.toml`; a seeded
+//! defect has a `bug.toml` beside its scenarios. Each names checks from one fixed set with their
+//! bounds, so a new target or defect is a file. The checks live in [`crate::check`].
 //!
-//! A scenario a check names is found beside the file that names it. The program is the pack's
-//! verified binary, or the first word of the scenario's own argv; runs start where the scenario's
-//! argv is meant to be read from — the pack's repository, or the directory `bohr check` was run in.
+//! A scenario is found beside the file that names it. The program is the pack's verified binary,
+//! or the first word of the scenario's argv. Runs start in the pack's repository, or in the
+//! directory `bohr check` was run from.
 //!
-//! What this does not do: choose a bound. `at_least = 30` is written by whoever writes the subject,
-//! before the run, and an unknown check or parameter is refused rather than skipped.
+//! Bounds are written by the subject's author before the run. An unknown check or parameter is
+//! refused.
 
 use std::path::{Path, PathBuf};
 
 use crate::{CliError, hunt::parse_seeds, targets};
 
-/// Checks in the order they are reported: whether the program ran at all comes first, because
-/// every other answer about a program that did not run is about nothing.
+/// Checks in report order; whether the program runs at all comes first.
 pub(crate) const CHECKS: [&str; 12] = [
     "works",
     "repeats",
@@ -35,9 +33,7 @@ pub(crate) const CHECKS: [&str; 12] = [
 
 /// A number written in a subject file, held in thousandths.
 ///
-/// **Read from the number's text, never multiplied in floating point.** A bound is compared once a
-/// run is over, and a `0.9` that became `0.8999…` would fail a check that met it exactly; the
-/// workspace bans float arithmetic for the same reason in every other place.
+/// Parsed from the text, never through floating point, so `0.9` stays exactly 900.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Milli(pub(crate) u64);
 
@@ -134,7 +130,7 @@ pub(crate) struct Check {
     pub(crate) name: &'static str,
     /// The scenario it runs.
     pub(crate) scenario: PathBuf,
-    /// The scenario's text, where the subject generates it rather than naming a file.
+    /// The scenario's text, where the subject generates it.
     pub(crate) generated: Option<String>,
     pub(crate) kind: Kind,
 }
@@ -341,8 +337,7 @@ struct Workload {
     ops: u64,
 }
 
-/// Virtual time a golden workload may take: far past what any of them needs, since each ends
-/// itself, and there only so a workload that hangs ends too.
+/// Virtual time a golden workload may take; far more than any needs, so only a hang reaches it.
 const GOLDEN_HORIZON_TICKS: i64 = 600_000_000_000;
 
 /// The scenario a golden workload runs in: `nodes` nodes, each running the golden program with the
@@ -727,8 +722,7 @@ finds = { seeds = "1..60", code = "GuestCrashed", at_least = 20 }
         );
     }
 
-    /// Whatever the file says that no check reads is refused: a misspelt bound that was skipped
-    /// would hold every time.
+    /// A key no check reads is refused, so a misspelt bound cannot pass silently.
     #[test]
     fn an_unknown_check_or_parameter_is_refused() {
         let err = |text: &str| checks(text, false).unwrap_err().to_string();

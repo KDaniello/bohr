@@ -1,19 +1,7 @@
 //! What the filesystem a guest starts on will and will not do.
 //!
-//! Two claims, and they pull against each other on purpose.
-//!
-//! **A file cannot be made where its directory is not.** Waving that through would let a guest that
-//! skipped its own `mkdir` open a file the real filesystem would have refused it, and then be
-//! judged on a path it could never have taken. A model that produces states the real thing cannot
-//! does not miss defects — it invents them.
-//!
-//! **And yet the ordinary thing must work.** Every filesystem a program is ever started on already
-//! has `/tmp`, so a program writing there without making it first is not skipping anything. A world
-//! that refused *that* would refuse an open which succeeds everywhere, and a correct program would
-//! look broken for a reason belonging entirely to this model.
-//!
-//! Between them sits the rule: the hierarchy standard's directories are there from the start, and
-//! nothing else is until somebody makes it.
+//! A file cannot be made where its directory is not. The hierarchy standard's directories, such as
+//! `/tmp`, exist from the start; nothing else does until made.
 
 use bohr_backend::GuestSpec;
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
@@ -115,8 +103,7 @@ fn stat(index: u64) -> GuestOp {
 
 /// A file cannot be made where its directory is not, and can be once it is.
 ///
-/// The pair is the test. Only the first half would also pass on a model that refused everything,
-/// and only the second on the flat namespace this replaced.
+/// Both halves are checked.
 #[test]
 fn a_file_needs_the_directory_over_it() {
     let answered = answers(
@@ -187,7 +174,6 @@ fn the_filesystem_reports_its_own_numbers() {
 
     assert!(answered[0].1 >= 0, "the file opens: {:?}", answered[0]);
     assert_eq!(answered[1], (FSTATFS, 0), "and the filesystem under it answers");
-    // `EBADF`, not `ENOENT`: the caller gave a descriptor, not a path, so a missing name is not
-    // an answer to what it asked. The wrong one was pinned here.
+    // `EBADF`, since the caller gave a descriptor.
     assert_eq!(answered[2], (FSTATFS, EBADF), "a descriptor nobody holds is a bad descriptor");
 }

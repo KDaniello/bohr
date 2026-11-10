@@ -1,7 +1,7 @@
 //! Starting a guest with every host-derived variable already removed.
 //!
-//! Everything here happens between `fork` and `execve`, or at the exec stop immediately after, so
-//! the guest never executes an instruction in a state we did not choose.
+//! Everything here happens between `fork` and `execve`, or at the exec stop right after, so the
+//! guest's first instruction runs in a chosen state.
 
 use std::{
     ffi::{CString, OsStr},
@@ -27,13 +27,11 @@ const AT_NULL: u64 = 0;
 /// The variable a campaign names a worker's core in; without it, core nought.
 pub const CORE_VARIABLE: &str = "BOHR_CORE";
 
-/// The core this supervisor and its guests run on: the worker's position, as `BOHR_CORE` names it,
-/// among the cores this process may use, in the order [`spread`] puts them; the first of them where
-/// no position is named.
+/// The core this supervisor and its guests run on: position `BOHR_CORE` (default 0) among the
+/// allowed cores, in the order [`spread`] gives.
 ///
-/// A guest can read which core it is on without a syscall — `RDPID`, the per-CPU segment limit —
-/// and nothing traps either, so a guest that does sees its worker's position. `docs/DETERMINISM.md`
-/// says so.
+/// A guest can read its core without a syscall (`RDPID`, the per-CPU segment limit), and neither is
+/// trapped; `docs/DETERMINISM.md` lists this.
 fn guest_core() -> usize {
     // SAFETY: the set is ours and sized for the call; pid 0 is this thread.
     let allowed: Vec<usize> = unsafe {
@@ -44,8 +42,7 @@ fn guest_core() -> usize {
         (0..libc::CPU_SETSIZE as usize).filter(|c| libc::CPU_ISSET(*c, &set)).collect()
     };
     let nth = std::env::var(CORE_VARIABLE).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-    // Read once per process: the topology does not change while a campaign runs, and a worker
-    // spawns thousands of guests.
+    // Read once per process: the topology is fixed and a worker spawns thousands of guests.
     static ORDER: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
     let order = ORDER.get_or_init(|| {
         spread(&allowed, |cpu| {
@@ -63,9 +60,8 @@ fn guest_core() -> usize {
 /// The cores in the order workers take them: one hardware thread of every physical core before a
 /// second thread of any.
 ///
-/// Linux numbers a core's two threads next to each other on common parts, so position by number
-/// alone would put two workers on one core while other cores sat idle. A CPU whose core this
-/// cannot read keeps its place among the first, as a core of its own.
+/// Linux often numbers a core's two threads next to each other, so ordering by number would put
+/// two workers on one core. A CPU whose core cannot be read counts as its own core.
 pub(super) fn spread(
     allowed: &[usize],
     core_of: impl Fn(usize) -> Option<(usize, usize)>,
@@ -93,11 +89,11 @@ mod spread_tests {
 
     #[test]
     fn every_physical_core_is_taken_before_a_second_thread_of_any() {
-        // Six cores, two threads each, numbered as this kind of part numbers them.
+        // Six cores, two threads each, with sibling threads numbered next to each other.
         let allowed: Vec<usize> = (0..12).collect();
         let order = spread(&allowed, |cpu| Some((0, cpu / 2)));
         assert_eq!(order, [0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11]);
-        // Numbered the other common way, threads a socket apart, the order is unchanged.
+        // Sibling threads numbered six apart give the same first six cores.
         let order = spread(&allowed, |cpu| Some((0, cpu % 6)));
         assert_eq!(order[..6], [0, 1, 2, 3, 4, 5]);
     }
@@ -108,37 +104,26 @@ mod spread_tests {
     }
 }
 
-/// Namespaces the guest is placed in, so that what it can observe of the machine is ours to define
-/// rather than the host's to leak.
+/// Namespaces the guest is placed in, so it sees the machine bohr defines instead of the host.
 ///
-/// The identifier namespace is what makes thread numbering reproducible: glibc stores a thread's
-/// own identifier in memory and waits on it, so a guest that inherited host numbering would differ
-/// from itself on the second run.
+/// The pid namespace makes thread numbers reproducible: glibc stores a thread's id in memory and
+/// waits on it.
 ///
-/// **There is no network namespace here, and the omission is deliberate.** What confines the guest
-/// to the modelled network is the filter, not an empty interface list: the filter's default action
-/// is to trace, the admitted list holds only calls that shape the guest's own address space or
-/// signal mask, and so every network call either reaches the model or is refused by name. A guest
-/// cannot open a socket the host would honour whether or not it has interfaces to try.
-///
-/// The namespace was therefore protecting against nothing that can occur, and it is not free: it
-/// costs about 180 KB of kernel memory that cannot be reclaimed against 4 KB for all the others
-/// together, the kernel releases it on a lagging schedule, and a campaign starts hundreds of
-/// guests. Consecutive campaigns ran their host out of it and could no longer place a guest at all.
+/// There is no network namespace. The seccomp filter already sends every network call to the model
+/// or refuses it. A network namespace also costs about 180 KB of unreclaimable kernel memory, freed
+/// late, and campaigns that start hundreds of guests ran the host out of it.
 pub(super) const GUEST_NAMESPACES: libc::c_int = libc::CLONE_NEWUSER
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWNS
     | libc::CLONE_NEWUTS
     | libc::CLONE_NEWIPC;
 
-/// Machine name the guest sees, in place of whichever host it happens to be on.
+/// Host name the guest sees.
 const GUEST_HOSTNAME: &[u8] = b"bohr";
 
 /// Exit codes the child uses when a step of its own setup fails.
 ///
-/// Between `fork` and `execve` there is nothing to report through — no allocation, no channel, and
-/// a signal would be indistinguishable from the guest crashing. The exit code is the only channel,
-/// and each step gets its own so a failure names the step rather than a wait status.
+/// Between `fork` and `execve` the exit code is the only way to report, so each step has its own.
 mod failed {
     pub(super) const PERSONALITY: i32 = 101;
     pub(super) const AFFINITY: i32 = 102;
@@ -171,11 +156,9 @@ pub(super) fn setup_failure(code: i32) -> Option<&'static str> {
 
 /// Starts the guest and returns the pid the supervisor traces.
 ///
-/// A guest that is to see its own process numbering must be *inside* a new identifier namespace,
-/// and a process only ever enters one by being created after it exists. So the guest is a
-/// grandchild: the intermediate creates the namespace and the guest in it, then leaves. The
-/// supervisor attaches to the grandchild rather than being handed it by `PTRACE_TRACEME`, since
-/// that names the immediate parent, which is the intermediate and not us.
+/// The guest is a grandchild: a process enters a new pid namespace only by being created in it, so
+/// an intermediate creates the namespace and the guest, then exits. The supervisor attaches to
+/// the grandchild, since `PTRACE_TRACEME` would name the intermediate.
 pub(super) fn spawn_traced(
     spec: &GuestSpec,
     isolate: bool,
@@ -195,12 +178,9 @@ pub(super) fn spawn_traced(
         .iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")).unwrap_or_default())
         .collect();
-    // Where the guest's coverage runtime will find its counters. Added here rather than by the
-    // caller because the number is this module's to choose: it is the one the descriptor is moved
-    // to below, and the two must not be able to disagree.
-    // How large the map is is *not* here, and that is the point: the guest reads it out of the
-    // region's own header. In the environment it would be part of what the guest was started with,
-    // and one run would digest differently from the same run searched with a different map.
+    // The descriptor number of the coverage counters, the same one it is moved to below. The map
+    // size stays out of the environment, so it cannot change the run's digest; the guest reads it
+    // from the region's header.
     if coverage.is_some() {
         let named = format!("{}={}", coverage::COVERAGE_FD_VAR, coverage::COVERAGE_FD);
         envp.push(CString::new(named).unwrap_or_default());
@@ -215,10 +195,9 @@ pub(super) fn spawn_traced(
         reason: format!("cannot build the syscall filter: {e}"),
     })?;
 
-    // **The supervisor runs on the guest's core.** Every intercepted call is two stops, and with
-    // tracer and guest on different cores each is a cross-core wake-up; on one core it is a plain
-    // context switch. Measured on 200,000 `getpid` calls: 12.5 s apart, 1.55 s together. Best
-    // effort: a supervisor that cannot pin itself is slower, not wrong, so a refusal is ignored.
+    // The supervisor runs on the guest's core: each intercepted call is two stops, and on one core
+    // they are plain context switches. 200,000 `getpid` calls took 12.5 s on two cores and 1.55 s
+    // on one. A refusal is ignored; the run is only slower.
     let core = guest_core();
     // SAFETY: the set is ours and sized for the call; pid 0 is this thread.
     unsafe {
@@ -227,16 +206,13 @@ pub(super) fn spawn_traced(
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
 
-    // Two pipes: one carries the guest's pid outwards, the other tells the guest it is being
-    // traced. Without the second, the guest could reach its filter before the supervisor is
-    // watching, and a filter that traces with no tracer attached fails the syscall instead.
+    // Two pipes: one carries the guest's pid out, the other tells the guest it is traced. Without
+    // the second, the guest could reach its filter before the tracer attaches, and the filter
+    // would fail the syscall.
     let mut report = [0; 2];
     let mut go = [0; 2];
-    // Close-on-exec, so the ends the guest does not use do not follow it through `execve`: a guest
-    // reading `/proc/self/fd` would otherwise see descriptor numbers taken from this process's
-    // allocation state, which is host state reaching a guest by the back door. The ends the guest
-    // is meant to inherit clear the flag where they are dup'd into place, as the coverage channel's
-    // do.
+    // Close-on-exec, so unused ends do not reach the guest's `/proc/self/fd`. Ends the guest needs
+    // clear the flag when they are moved into place.
     // SAFETY: both arrays are ours and large enough for a pipe pair.
     if unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(BackendError::CannotStart { program: program.clone(), reason: last_error() });
@@ -252,9 +228,8 @@ pub(super) fn spawn_traced(
         return Err(BackendError::CannotStart { program: program.clone(), reason });
     }
 
-    // The guest is a grandchild, and its parent exits before it is attached to. Orphaned, it would
-    // pass to init and stop being this process's descendant, which is all `ptrace_scope = 1` —
-    // Ubuntu's default — lets a process attach to. As a subreaper this process takes it instead.
+    // The guest's parent exits before the attach. As a subreaper this process adopts the guest,
+    // which `ptrace_scope = 1` (Ubuntu's default) requires for attaching.
     // SAFETY: a flag on this process, with no pointer passed.
     unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
 
@@ -263,8 +238,7 @@ pub(super) fn spawn_traced(
     let intermediate = unsafe { libc::fork() };
     if intermediate < 0 {
         let reason = last_error();
-        // Closed on every failure: a campaign that meets a descriptor ceiling would otherwise leak
-        // four per attempt and never get back under it.
+        // Closed on every failure, so a campaign at the descriptor limit does not leak four a try.
         // SAFETY: descriptors this call opened and nothing else holds.
         unsafe {
             libc::close(report[0]);
@@ -282,8 +256,8 @@ pub(super) fn spawn_traced(
         }
     }
 
-    // SAFETY: descriptors this process owns; the ends the guest uses are closed here so a read
-    // blocks until the writer is gone rather than forever.
+    // SAFETY: descriptors this process owns. Closing the guest's ends lets the read below end when
+    // the writer exits.
     unsafe {
         libc::close(report[1]);
         libc::close(go[0]);
@@ -309,10 +283,10 @@ pub(super) fn spawn_traced(
     let guest = libc::pid_t::from_le_bytes(buf);
 
     let options = trace_options();
-    // SAFETY: `guest` is our own descendant, which is what makes attaching to it permitted.
+    // SAFETY: `guest` is our descendant, so attaching is permitted.
     let seized = unsafe { libc::ptrace(libc::PTRACE_SEIZE, guest, 0, options) };
-    // Releasing the guest is what lets it install its filter, and it must not happen before the
-    // line above: a filter that traces with no tracer attached turns every syscall into ENOSYS.
+    // Release the guest to install its filter only after the attach: with no tracer, a tracing
+    // filter turns every syscall into ENOSYS.
     // SAFETY: our own descriptor, written once and then closed.
     unsafe {
         libc::write(go[1], b"g".as_ptr().cast(), 1);
@@ -327,7 +301,7 @@ pub(super) fn spawn_traced(
     Ok(guest)
 }
 
-/// Trace options every task carries, named here because the guest is attached to before it runs.
+/// Trace options every task carries, set when the guest is attached before it runs.
 pub(super) const fn trace_options() -> libc::c_int {
     libc::PTRACE_O_TRACESECCOMP
         | libc::PTRACE_O_TRACESYSGOOD
@@ -367,13 +341,12 @@ unsafe fn intermediate_setup(
     // SAFETY: every call below is made under this function's own contract (`# Safety` above),
     // which its caller upholds.
     unsafe {
-        // Whether this host allows it is settled before the fork, so reaching here and failing is a
-        // condition the run cannot be honest about and must not continue under.
+        // Support was checked before the fork, so a failure here stops the launch.
         if isolate && !enter_namespaces() {
             libc::_exit(failed::NAMESPACES);
         }
 
-        // The guest, and only the guest, is inside the identifier namespace created above.
+        // Only the guest is inside the new pid namespace.
         let guest = libc::fork();
         if guest < 0 {
             libc::_exit(failed::HANDOVER);
@@ -383,8 +356,7 @@ unsafe fn intermediate_setup(
             child_setup(path, argv, envp, filter, go, coverage)
         }
 
-        // The pid here is the one the supervisor can see, which is the outer numbering; inside its
-        // own namespace the guest is number one.
+        // The outer pid, which the supervisor sees; inside its namespace the guest is pid 1.
         let bytes = guest.to_le_bytes();
         if libc::write(report, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
             libc::_exit(failed::HANDOVER);
@@ -410,9 +382,9 @@ unsafe fn child_setup(
     // SAFETY: every call below is made under this function's own contract (`# Safety` above),
     // which its caller upholds.
     unsafe {
-        // The counters, moved to the number the environment names. `dup2` is what carries them
-        // across the `execve`: it clears close-on-exec on the descriptor it creates, and
-        // the original was opened with it set so that no other spawn inherits one.
+        // Moves the counters to the descriptor the environment names. `dup2` clears close-on-exec
+        // on the copy, so it survives `execve`; the original keeps it, so other spawns do not
+        // inherit it.
         if let Some(fd) = coverage
             && libc::dup2(fd, coverage::COVERAGE_FD) < 0
         {
@@ -423,9 +395,8 @@ unsafe fn child_setup(
             libc::_exit(failed::PERSONALITY);
         }
 
-        // One core: migration between cores changes timing and what the processor reports. The
-        // supervisor pinned itself before the fork, so the first core this process may run on is
-        // the one chosen for it; a supervisor that could not pin itself leaves core nought.
+        // One core: migration changes timing and what the processor reports. The supervisor pinned
+        // itself before the fork, so the first allowed core is the chosen one (core 0 otherwise).
         let mut inherited: libc::cpu_set_t = std::mem::zeroed();
         libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut inherited);
         let core =
@@ -436,35 +407,30 @@ unsafe fn child_setup(
             libc::_exit(failed::AFFINITY);
         }
 
-        // No core file. A guest dying of a signal is a finding the trace records; a core written
-        // on the host is the host's business, and some hosts hand every one to a crash collector
-        // that a campaign of crashing guests overwhelms.
+        // No core file: the trace records the crash, and a campaign of crashing guests would flood
+        // the host's crash collector.
         let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         libc::setrlimit(libc::RLIMIT_CORE, &none);
 
-        // A filter may only be installed by a process that cannot gain privileges, and the
-        // guarantee must outlive the exec.
+        // Installing a filter requires no-new-privileges, which persists across the exec.
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
             libc::_exit(failed::NO_NEW_PRIVS);
         }
-        // Reading the timestamp counter becomes a fault the supervisor answers from logical time.
-        // Set before the filter, because `prctl` is itself filtered and would otherwise be refused.
+        // Timestamp reads fault, and the supervisor answers them from logical time. Set before the
+        // filter, which also filters `prctl`.
         if libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) == -1 {
             libc::_exit(failed::TSC);
         }
 
-        // Wait until the supervisor is watching. The order is load-bearing: a filter returning
-        // SECCOMP_RET_TRACE while no tracer is attached produces no event at all and fails the
-        // syscall with ENOSYS instead, which surfaces much later as a segfault in the
-        // loader.
+        // Wait for the tracer. With none attached, `SECCOMP_RET_TRACE` fails the syscall with
+        // ENOSYS, which shows up later as a segfault in the loader.
         let mut ready = [0u8; 1];
         if libc::read(go, ready.as_mut_ptr().cast(), 1) != 1 {
             libc::_exit(failed::HANDOVER);
         }
         libc::close(go);
 
-        // Both crates describe the kernel's `struct sock_filter`, so the cast is between two
-        // spellings of one ABI type.
+        // Both crates define the kernel's `struct sock_filter`, so the cast is between equal types.
         let prog = libc::sock_fprog {
             len: u16::try_from(filter.len()).unwrap_or(u16::MAX),
             filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
@@ -504,9 +470,8 @@ pub(super) unsafe fn enter_namespaces() -> bool {
             return false;
         }
 
-        // A fresh user namespace starts with no mapping, which leaves every identifier unresolvable
-        // until one is written. Group mapping is refused outright unless `setgroups` is denied
-        // first.
+        // A new user namespace has no identifier mapping. The group map can only be written after
+        // `setgroups` is denied.
         let mut line = [0u8; 32];
         if !write_proc(c"/proc/self/setgroups", b"deny")
             || !write_proc(c"/proc/self/uid_map", identity_map(&mut line, uid))
@@ -562,16 +527,13 @@ unsafe fn write_proc(path: &std::ffi::CStr, line: &[u8]) -> bool {
 
 /// Rewrites the auxiliary vector on the guest's stack.
 ///
-/// Called once, at the stop that follows `execve`, when the stack pointer still points at
-/// `argc`. Walks past the arguments and the environment to reach the vector, then neutralises the
-/// two entries that would otherwise carry host state into the guest.
+/// Called at the stop after `execve`, when the stack pointer points at `argc`. Walks past the
+/// arguments and environment to the vector and neutralises the two entries that carry host state.
 pub(super) fn neutralise_auxv(pid: libc::pid_t, rsp: u64) -> Result<AuxvReport, BackendError> {
     let mut addr = rsp;
     let argc = read_word(pid, addr)?;
-    // Checked, because `argc` comes out of the guest's memory and everything after it is address
-    // arithmetic. The kernel builds this stack and bounds `argc` by `ARG_MAX`, so nothing here is
-    // expected to overflow -- but "expected" is the word that makes a release build wrap silently
-    // where a debug build would have panicked, and this walk runs again at every later `execve`.
+    // Checked arithmetic: `argc` comes from guest memory. The kernel bounds it by `ARG_MAX`, but a
+    // release build would wrap silently, and the walk runs again at every `execve`.
     let bad = || BackendError::BadAddress { addr: GuestAddr(rsp), len: 8 };
     addr = argc
         .checked_add(1)
@@ -612,7 +574,7 @@ pub(super) fn neutralise_auxv(pid: libc::pid_t, rsp: u64) -> Result<AuxvReport, 
     Ok(report)
 }
 
-/// What the auxiliary vector rewrite actually managed to do.
+/// What the auxiliary vector rewrite did.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct AuxvReport {
     /// Whether a VDSO entry was present and cleared.

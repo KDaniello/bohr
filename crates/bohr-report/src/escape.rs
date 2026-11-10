@@ -1,13 +1,10 @@
 //! Putting a guest's own words into a page without letting them become part of it.
 //!
-//! Every string a report shows came out of somewhere with no interest in producing valid markup:
-//! an assertion's message, a diagnostic, a path, a configuration file. A report is also the
-//! artefact that circulates — attached to an issue, opened by a maintainer — so a page that could
-//! be made to execute something by the run it describes is the one defect here that matters.
+//! Every string on a page comes from the guest, and reports circulate, so the run must never inject
+//! markup.
 //!
-//! Three escapes rather than one, because the three places a string can land have different ways
-//! of ending: an element's text ends at `<`, an attribute ends at its quote, and a string inside a
-//! script block ends at `</script>` no matter what the JSON rules say about it.
+//! Three escapes for three contexts: element text ends at `<`, an attribute at its quote, and a
+//! script block at `</script>`.
 
 /// Text between tags.
 #[must_use]
@@ -26,8 +23,7 @@ pub(crate) fn text(raw: &str) -> String {
 
 /// The value of an attribute.
 ///
-/// Quotes as well, both kinds: an attribute written with one and closed by the other is a mistake
-/// somebody will make, and escaping both costs nothing.
+/// Both quote kinds are escaped.
 #[must_use]
 pub(crate) fn attr(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -46,11 +42,8 @@ pub(crate) fn attr(raw: &str) -> String {
 
 /// A JSON document that will sit inside a script element.
 ///
-/// The real hazard of a single-file report. Inside a script block the parser is looking for
-/// `</script` and nothing else — not quotes, not backslashes — so a guest that names an assertion
-/// `</script><img onerror=…>` closes the block and everything after it is markup. JSON permits
-/// `<` and `/` to be written as escapes, and writing them that way means the sequence never
-/// appears however the guest spells it.
+/// A script block ends at `</script` regardless of JSON quoting, so `<` and `/` are written as JSON
+/// escapes and the sequence never appears.
 #[must_use]
 pub(crate) fn json_in_script(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
@@ -59,7 +52,7 @@ pub(crate) fn json_in_script(json: &str) -> String {
             '<' => out.push_str("\\u003c"),
             '>' => out.push_str("\\u003e"),
             '/' => out.push_str("\\u002f"),
-            // Not valid raw in a script block and not something a reader gains by seeing.
+            // Invalid raw in a script block.
             '\u{2028}' => out.push_str("\\u2028"),
             '\u{2029}' => out.push_str("\\u2029"),
             _ => out.push(character),
@@ -84,8 +77,7 @@ mod tests {
         assert_eq!(attr("' onload='x"), "&#39; onload=&#39;x");
     }
 
-    /// The one that matters: a script block ends at a literal `</script`, whatever JSON thinks
-    /// about escaping, so the sequence must be impossible to write.
+    /// `</script` cannot appear in the output.
     #[test]
     fn a_script_block_cannot_be_closed_from_inside_its_data() {
         let hostile = r#"{"name":"</script><img onerror=alert(1)>"}"#;
@@ -95,8 +87,7 @@ mod tests {
         assert!(escaped.contains("\\u003c"), "{escaped}");
     }
 
-    /// What comes out is still JSON: the escapes used are ones the format defines, so a reader
-    /// parses the same values back.
+    /// The output is still JSON and parses to the same values.
     #[test]
     fn escaping_for_a_script_block_leaves_it_parseable() {
         let json = r#"{"a":"</script>","b":"1/2","c":" "}"#;

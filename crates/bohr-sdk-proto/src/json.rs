@@ -1,20 +1,15 @@
 //! The JSON this project writes and reads, and nothing more.
 //!
-//! Hand-rolled because an SDK carries no third-party dependency (`docs/ARCHITECTURE.md` S3): a
-//! customer links our SDK into their process, and a serialisation library in that position is a
-//! version conflict waiting for them. The supervisor parses with the same code, so the two halves
-//! of the contract cannot drift apart.
+//! Hand-rolled, since an SDK has no third-party dependencies (`docs/ARCHITECTURE.md` S3). The
+//! supervisor parses with the same code.
 //!
-//! Numbers are integers only. A record that fed a decision back into a run would have to be
-//! integral anyway (`docs/API.md` §1 rule 2), and a float that round-trips differently between two
-//! libc versions is precisely the class of bug this tool exists to catch.
+//! Numbers are integers only (`docs/API.md` §1 rule 2).
 
 use std::collections::BTreeMap;
 
 /// Deepest nesting a parser will follow.
 ///
-/// A bound rather than recursion to exhaustion: the parser reads records written by somebody
-/// else's build, and a deeply nested document is a stack overflow rather than an error message.
+/// Bounded, so a deeply nested record is an error.
 const MAX_DEPTH: usize = 32;
 
 /// A JSON value, as far as records need one.
@@ -123,8 +118,7 @@ fn write_string(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            // Everything below a space has to be escaped; \u is the only form that works for
-            // all of them, and these are rare enough that a general path costs nothing.
+            // Control characters are written as `\u` escapes.
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
@@ -134,8 +128,7 @@ fn write_string(s: &str, out: &mut String) {
 
 /// Parses one JSON document.
 ///
-/// Trailing content is an error rather than ignored: a record is one line, and text after the
-/// value is a line that means something other than what it appears to.
+/// Trailing content is an error.
 pub fn parse(text: &str) -> Result<Json, String> {
     let bytes = text.as_bytes();
     let mut at = 0;
@@ -268,22 +261,18 @@ fn parse_string(b: &[u8], at: &mut usize) -> Result<String, String> {
 
 /// Reads what follows a `\u`, joining a surrogate pair into the one character it stands for.
 ///
-/// **A pair is the only way JSON can escape a character outside the basic plane**, and every
-/// serialiser that escapes non-ASCII emits them — Python's `json.dumps` does it by default, which
-/// is what every Python guest writes its records with. Decoding the two halves separately turns
-/// one emoji into two replacement characters, and `to_line` then writes the damage back into the
-/// bundle as though the guest had produced it.
+/// Characters outside the basic plane arrive as surrogate pairs, as Python's `json.dumps` writes
+/// them by default.
 ///
-/// A half with no partner is not a character in any encoding; it becomes the replacement
-/// character, which keeps a malformed record readable rather than refusing the line.
+/// An unpaired half becomes the replacement character, so the record stays readable.
 fn parse_escaped_char(b: &[u8], at: &mut usize) -> Result<char, String> {
     let first = parse_hex4(b, at)?;
-    // Not a leading surrogate: whatever it is stands alone.
+    // Not a leading surrogate: it stands alone.
     if !(0xD800..=0xDBFF).contains(&first) {
         return Ok(char::from_u32(first).unwrap_or('\u{fffd}'));
     }
-    // A trailing half completes it; anything else leaves the leading half orphaned, and the
-    // position must not move so that what follows is read as itself.
+    // A trailing half completes it; otherwise the position stays so what follows is read
+    // normally.
     let mut lookahead = *at;
     if b.get(lookahead) == Some(&b'\\') && b.get(lookahead + 1) == Some(&b'u') {
         lookahead += 2;
@@ -300,8 +289,7 @@ fn parse_escaped_char(b: &[u8], at: &mut usize) -> Result<char, String> {
 
 /// The four hexadecimal digits of one `\u` escape, advancing past them.
 ///
-/// Each digit is checked rather than handed to `from_str_radix`, which accepts a leading sign and
-/// would read `\u+12f` as a character nobody wrote.
+/// Each digit is checked, since `from_str_radix` accepts a sign such as `\u+12f`.
 fn parse_hex4(b: &[u8], at: &mut usize) -> Result<u32, String> {
     let digits = b.get(*at..*at + 4).ok_or_else(|| format!("bad \\u escape at byte {at}"))?;
     let mut value = 0u32;
@@ -335,8 +323,7 @@ fn parse_int(b: &[u8], at: &mut usize) -> Result<Json, String> {
     if *at == start {
         return Err(format!("not a value at byte {start}"));
     }
-    // A fractional or exponent part is refused rather than truncated: silently reading 1.5 as 1
-    // would put a number in a record that nobody wrote.
+    // A fraction or exponent is refused, never truncated.
     if matches!(b.get(*at), Some(b'.' | b'e' | b'E')) {
         return Err(format!("fractional numbers are not part of this format, at byte {start}"));
     }
@@ -388,24 +375,18 @@ mod tests {
         assert_eq!(back.get("emoji").and_then(Json::as_str), Some("ok ✓ 🎯"));
     }
 
-    /// The form every serialiser that escapes non-ASCII produces, and the only form JSON has for
-    /// a character outside the basic plane. Python's `json.dumps` writes it by default, so this is
-    /// what arrives from a Python guest whose assertion message carries one.
+    /// A surrogate pair decodes to one character, as Python guests write them.
     #[test]
     fn an_escaped_surrogate_pair_is_one_character_again() {
-        // Written as the escape rather than as the character: the escape is the form a writer
-        // that avoids non-ASCII emits, and it is the only form this test exists for. Python's
-        // `json.dumps` writes every non-ASCII character this way by default.
+        // Written as the escape a non-ASCII-avoiding writer emits.
         let back = parse(r#"{"m":"ok \ud83c\udfaf"}"#).expect("parses");
         assert_eq!(back.get("m").and_then(Json::as_str), Some("ok \u{1f3af}"));
 
-        // And a round trip out of this crate keeps it, rather than writing the damage back.
+        // A round trip keeps it.
         assert_eq!(parse(&back.to_json()).expect("parses"), back);
     }
 
-    /// Half a pair is not a character in any encoding. It is replaced rather than refused, so one
-    /// damaged message does not cost the whole record — and the halves must not swallow what
-    /// follows them.
+    /// An unpaired half is replaced and does not swallow what follows.
     #[test]
     fn a_lone_surrogate_becomes_one_replacement_and_eats_nothing() {
         let leading = parse(r#"{"m":"\ud83cX"}"#).expect("parses");
@@ -414,7 +395,7 @@ mod tests {
         let trailing = parse(r#"{"m":"\udfafX"}"#).expect("parses");
         assert_eq!(trailing.get("m").and_then(Json::as_str), Some("\u{fffd}X"));
 
-        // A leading half followed by an escape that is not its partner keeps both meanings.
+        // A leading half followed by a non-partner escape keeps both.
         let mismatched = parse(r#"{"m":"\ud83cA"}"#).expect("parses");
         assert_eq!(mismatched.get("m").and_then(Json::as_str), Some("\u{fffd}A"));
     }

@@ -1,13 +1,9 @@
 //! Turning a stored bundle into something a person reads.
 //!
-//! Sans-io like the layers below it: nothing here opens a file, spawns anything or reads a clock.
-//! A renderer is handed a parsed bundle and answers with text — which is what lets a report be
-//! byte-for-byte the same twice, and what makes the output testable without a filesystem.
+//! Sans-io: a renderer takes a parsed bundle and returns text, so a report is the same bytes every
+//! time and is tested without a filesystem.
 //!
-//! The audience is the reason the crate exists. A bundle is complete and unreadable: sixteen kinds
-//! of event, eighteen draw sites, a manifest of contract numbers. Somebody arriving from a bug
-//! report has none of that vocabulary and one question — what went wrong, and what should I do
-//! next. Every decision here is answerable from that sentence.
+//! Written for someone arriving from a bug report who asks what went wrong and what to do next.
 
 #![forbid(unsafe_code)]
 
@@ -23,19 +19,15 @@ pub mod sarif;
 pub mod text;
 mod window;
 
-/// Naming a syscall, from the one table this workspace holds. Re-exported rather than copied:
-/// the crate below already carries it, because a digest has to know what a call is called
-/// with.
+/// Syscall names, re-exported from the workspace's one table.
 pub use bohr_trace::{named_syscalls, syscall_name};
 pub use model::{Location, RunModel, Violation};
 pub use text::summary;
 
 /// The largest page this crate will produce.
 ///
-/// A bound rather than a preference: a report exists to be attached to an issue and opened by
-/// somebody who did not ask for it, and a file too large for either has stopped being a report.
-/// A run too long to draw is windowed rather than truncated, and what is left out is written
-/// beside it — see [`Rendered::sidecar`].
+/// Small enough to attach to an issue. A longer run is windowed and the rest goes in
+/// [`Rendered::sidecar`].
 pub const MOST_BYTES: usize = 4 * 1024 * 1024;
 
 /// A rendered report, and whatever has to travel with it.
@@ -45,16 +37,13 @@ pub struct Rendered {
     pub html: String,
     /// Every event of the run, one per line, where the page did not draw them all.
     ///
-    /// Present exactly when the page is partial. A reader who has to reconcile a page with a file
-    /// in a different shape has been given two problems, so this is the same projection
-    /// `bohr trace --format json` writes.
+    /// Present exactly when the page is partial, in the format `bohr trace --format json` writes.
     pub sidecar: Option<String>,
 }
 
 /// Renders a report for a stored run.
 ///
-/// `sidecar_name` is what the page calls the file beside it. Naming rather than writing: this
-/// crate does not open files, and what a caller does with the two strings is the caller's.
+/// `sidecar_name` is what the page calls the file beside it; the caller writes both.
 ///
 /// # Errors
 ///
@@ -68,12 +57,7 @@ pub fn render(
 
 /// The same, told what the bundle it was made from is called.
 ///
-/// **The page prints a command a maintainer is meant to copy, and it named a file nobody writes.**
-/// It was built out of the run identifier -- `bohr replay 4f2a1b8c9d0e.bohr` -- while findings are
-/// saved as `finding-…`, and a saved run or a reduction takes whatever name its caller chose. So
-/// the one line the page exists to hand somebody answered "cannot read". Where the caller knows
-/// the name, it says it; where it does not, the line asks for the bundle rather than inventing
-/// one.
+/// The reproduction command names this bundle; without a name it shows a placeholder.
 ///
 /// # Errors
 ///
@@ -84,9 +68,7 @@ pub fn render_from(
     bundle_name: Option<&str>,
 ) -> Result<Rendered, ReportError> {
     let model = RunModel::of(bundle)?;
-    // One criterion, read once. The sidecar was written on the event count and the page said so on
-    // whether the window elided anything, so a run whose keep-set covered everything got a file
-    // the page never mentioned.
+    // One criterion decides both the sidecar and the page's mention of it.
     let rendered = html::render_with(&model, sidecar_name, bundle_name, &[]);
     let sidecar = rendered.partial.then(|| jsonl::write_log(&model.events));
     Ok(Rendered { html: rendered.html, sidecar })
@@ -94,9 +76,7 @@ pub fn render_from(
 
 /// The same, with the lanes the chain's timeline is drawn from.
 ///
-/// The lanes are the scenario's — which node each probe request asks, and which fields of its
-/// answer are the key and the value — and the caller derives them, because this crate reads the
-/// bundle and not the world model that knows what a probe is.
+/// The caller derives the lanes from the scenario, which this crate does not read.
 ///
 /// # Errors
 ///
@@ -115,7 +95,7 @@ pub fn render_chain(
 
 /// Renders a report for a model somebody already has.
 ///
-/// The seam a test uses to put a hostile guest's own words into a page and check they stay words.
+/// Lets a test render hostile guest strings and check they stay text.
 #[must_use]
 pub fn render_model(model: &RunModel, sidecar_name: Option<&str>) -> String {
     html::render(model, sidecar_name)

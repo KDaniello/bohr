@@ -1,11 +1,8 @@
-//! `bohr explore`, and the promise that the worker count cannot be seen from the outside.
+//! `bohr explore`: the worker count never changes the result.
 //!
-//! The campaign's own reproducibility is settled in `bohr-explorer` and proven against the
-//! scripted backend by `bohr-testkit`; what is left to check here is the plumbing — that splitting
-//! a generation across processes, handing work over and reading results back does not smuggle the
-//! machine into the answer.
-//!
-//! Searched against a guest built into the binary, so this runs wherever the tool builds.
+//! `bohr-explorer` and `bohr-testkit` check the campaign itself. These check the process plumbing:
+//! splitting a generation, handing work over, reading results back. A built-in guest is searched,
+//! so these run anywhere.
 
 use std::{path::PathBuf, process::Command};
 
@@ -27,7 +24,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Runs a campaign and returns its summary, which is everything two campaigns must agree on.
+/// Runs a campaign and returns its summary, which two equal campaigns agree on byte for byte.
 fn campaign(tag: &str, jobs: &str, runs: &str, seed: &str) -> String {
     let dir = scratch(tag);
     let summary = dir.join("summary.json");
@@ -50,7 +47,7 @@ fn campaign(tag: &str, jobs: &str, runs: &str, seed: &str) -> String {
     std::fs::read_to_string(&summary).expect("a campaign writes the summary it was asked for")
 }
 
-/// The milestone gate. One master seed, one run budget, any number of workers — one campaign.
+/// One master seed and one budget give one campaign with any number of workers.
 #[test]
 fn one_worker_and_eight_search_the_same_thing() {
     let alone = campaign("j1", "1", "128", "11");
@@ -58,20 +55,19 @@ fn one_worker_and_eight_search_the_same_thing() {
     assert_eq!(alone, crowd, "the worker count reached the result");
 }
 
-/// And a campaign is repeatable at all, which is the weaker claim the stronger one rests on.
+/// One master seed repeats as one campaign.
 #[test]
 fn one_master_seed_is_one_campaign() {
     assert_eq!(campaign("again-a", "4", "96", "3"), campaign("again-b", "4", "96", "3"));
 }
 
-/// A different seed has to search somewhere else, or the master seed is decoration.
+/// A different master seed searches differently.
 #[test]
 fn a_different_master_seed_searches_differently() {
     assert_ne!(campaign("seed-a", "2", "96", "1"), campaign("seed-b", "2", "96", "2"));
 }
 
-/// A budget nobody gave is a campaign that would never end. Refused at the door rather than
-/// defaulted to something the caller did not choose.
+/// A campaign without a budget is refused; there is no default.
 #[test]
 fn a_campaign_without_a_budget_is_refused() {
     let (code, report) = bohr(&["explore", "--guest", "many-flips"]);
@@ -80,21 +76,16 @@ fn a_campaign_without_a_budget_is_refused() {
     assert!(report.contains("--runs"), "and say what to type: {report}");
 }
 
-/// The run budget is exact. A campaign asked for ninety-six runs that did a hundred and twenty
-/// would be a campaign nobody could repeat by asking for the same thing.
+/// The run budget is met exactly, even when it cuts a generation short.
 #[test]
 fn a_run_budget_is_met_exactly() {
     let summary = campaign("exact", "3", "50", "5");
     assert!(summary.contains(r#""runs": 50"#), "the budget was not met exactly: {summary}");
 }
 
-/// A campaign that armed adversity and landed none has measured a guest under no pressure.
+/// A campaign that armed faults and landed none exits 3 with `BOHR-5006`.
 ///
-/// **The failure this catches is silent and it happened.** An execution client's campaign armed a
-/// kill three hundred milliseconds in and ended with its caller at forty-four; twenty seeds fired
-/// nothing, built their blocks, and reported twenty clean runs. A horizon does not bound the end of
-/// a run that `run.ends_with_node` decides, so no check at load could have known — only the runs
-/// can say, and this is them saying it.
+/// A run that `run.ends_with_node` ends can finish before faults arm, so only the runs can tell.
 #[test]
 fn a_campaign_that_armed_adversity_and_landed_none_is_not_clean() {
     let dir = scratch("landed-nothing");
@@ -123,8 +114,7 @@ fn a_campaign_that_armed_adversity_and_landed_none_is_not_clean() {
     assert!(report.contains("ends_with_node"), "and where to look: {report}");
 }
 
-/// Naming both a built-in guest and a program is a question with no answer, and guessing at one
-/// would search something the caller did not ask about.
+/// Naming both a built-in guest and a program is refused.
 #[test]
 fn naming_two_subjects_is_refused() {
     let (code, report) =
@@ -156,9 +146,8 @@ fn resumable(dir: &std::path::Path, runs: &str, seed: &str, jobs: &str) -> (i32,
     (code, std::fs::read_to_string(&summary).unwrap_or(report))
 }
 
-/// Stopped at a run budget that cuts a generation short and resumed to a larger one, a
-/// campaign is the campaign that ran the larger budget at once, byte for byte, whatever the
-/// worker count on either side of the stop.
+/// A campaign stopped mid-generation and resumed to a larger budget equals one run straight
+/// through, with any worker counts.
 #[test]
 fn a_resumed_campaign_is_the_same_campaign() {
     let whole = campaign("whole", "1", "100", "21");
@@ -170,7 +159,7 @@ fn a_resumed_campaign_is_the_same_campaign() {
     assert_eq!(whole, resumed, "the stop reached the result");
 }
 
-/// A directory holding another campaign is refused rather than continued as this one.
+/// A directory holding another campaign is refused.
 #[test]
 fn a_resume_of_another_campaign_is_refused() {
     let dir = scratch("other");

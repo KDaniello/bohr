@@ -1,8 +1,7 @@
 name: release
 
-# Two ways in, one build. A dispatch builds, compares and signs everything a release ships and
-# keeps it as workflow artefacts; a `v*` tag does the same and then publishes it. Nothing reaches
-# a release page or a registry from a dispatch.
+# Builds, compares and signs everything a release ships. A dispatch keeps the result as workflow
+# artefacts. A pushed `v*` tag also publishes it.
 on:
   push:
     tags: ["v*"]
@@ -69,12 +68,10 @@ jobs:
       - uses: ./.github/actions/deterministic-build-env
       - run: cargo build --profile dist --locked --target "$TARGET" --bin bohr
       - name: Package the binary and the packs
-        # Pinned as hard as the binary: without a fixed time, ownership and order an archive
-        # differs on every run and its checksum says nothing about its contents. The packs are
-        # what `bohr hunt <name>` needs off a checkout: the pack files, the examples they build,
-        # the script that builds them, the C runtime an instrumented example compiles in, and the
-        # toolchain they are pinned to. A pushed tag names the release; anything else is a build
-        # of the workspace version, marked as one.
+        # Archives use a fixed time, owner and file order, so they reproduce like the binary. The
+        # packs archive holds what `bohr hunt <name>` needs off a checkout: pack files, examples,
+        # their build script, the C coverage runtime and the toolchain file. A pushed tag names
+        # the release; any other run is named after the workspace version with `-dev`.
         run: |
           set -e
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -94,16 +91,15 @@ jobs:
           (cd dist && sha256sum "bohr-$version-$TARGET.tar.gz" "bohr-packs-$version.tar.gz" > SHA256SUMS)
       - name: Sign
         id: sign
-        # The key signs SHA256SUMS and nothing else; every file is checked against the sums.
-        # `ssh-keygen -Y` because every host bohrup runs on already has it. A repository without
-        # the key builds and checks everything and publishes nothing signed.
+        # Signs SHA256SUMS with `ssh-keygen -Y`, which every host bohrup runs on has. Without the
+        # key, a dispatch builds and checks everything and signs nothing.
         env:
           KEY: ${{ secrets.BOHR_RELEASE_KEY }}
           SIGNER: ${{ vars.BOHR_RELEASE_SIGNER }}
         run: |
           set -e
           if [ -z "$KEY" ] || [ -z "$SIGNER" ]; then
-            # A tag publishes, and an unsigned release is one bohrup refuses to install.
+            # bohrup refuses an unsigned release, so a tag without the key fails here.
             if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
               echo "::error::a release needs its key"; exit 1
             fi
@@ -111,7 +107,7 @@ jobs:
             cp scripts/bohrup.sh dist/bohrup.sh
             exit 0
           fi
-          # The line is written into a single-quoted shell string, so a quote in it would end it.
+          # The line goes into a single-quoted shell string and must not contain a quote.
           case "$SIGNER" in *"'"*) echo "::error::the signer line holds a quote"; exit 1 ;; esac
           umask 077
           printf '%s\n' "$KEY" > "$RUNNER_TEMP/key"
@@ -120,13 +116,13 @@ jobs:
           printf '%s\n' "$SIGNER" > "$RUNNER_TEMP/allowed"
           ssh-keygen -Y verify -f "$RUNNER_TEMP/allowed" -I bohr-release -n bohr-release \
             -s dist/SHA256SUMS.sig < dist/SHA256SUMS
-          # Spliced in as text: a replacement string in awk reads `&` and `\` as its own.
+          # Spliced in as plain text; an awk replacement string would interpret `&` and `\`.
           awk '{ i = index($0, "@BOHR_RELEASE_SIGNER@")
                  if (i) $0 = substr($0, 1, i - 1) ENVIRON["SIGNER"] substr($0, i + 21) } 1' \
             scripts/bohrup.sh > dist/bohrup.sh
           echo "signed=true" >> "$GITHUB_OUTPUT"
       - name: Install from what was just built
-        # The installer is tested against the very files it would fetch, from a directory.
+        # Installs the files just built, from a directory, to test the installer on them.
         if: steps.sign.outputs.signed == 'true'
         run: BOHRUP_SOURCE=dist BOHR_HOME="$RUNNER_TEMP/home" sh dist/bohrup.sh < /dev/null
       - uses: actions/upload-artifact@v7
@@ -153,8 +149,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with: { name: image, path: image.tar.gz }
 
-  # Only a pushed tag publishes, and the release page before the image: a registry tag nothing
-  # links to is the one artefact here nobody would know to look for.
+  # Runs only for a pushed tag. Publishes the release page first and pushes the image after it.
   publish:
     needs: [build, image]
     if: github.event_name == 'push' && github.ref_type == 'tag'

@@ -6,6 +6,92 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.0 — the hunt
+
+Bohr ran campaigns on four targets and had no way to keep what it found, to check it outside its own
+model, or to say which of its claims hold. v0.9 adds all three: a private bank that replays every
+stored finding on every commit, `bohr confirm`, which stages a finding on a real Linux host without
+bohr, and a table of the nine claims with the figure that decides each. It also adds a pack for a
+four-validator CometBFT network driven by real transactions. What the campaigns found stays private
+until its maintainers have it.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.0` |
+| `tape_abi` | `2` |
+| `bundle_format` | `2` |
+| `sdk_schema` | `1` |
+
+Every bundle of v0.8 replays to its digest. Figures are under `[v0_9.*]` in
+[`benches/baseline.toml`](./benches/baseline.toml). `make pr` is green on Ubuntu 24.04, with 728 tests in
+`test-fast` and 60 in `test-linux`. Three of the nine claims hold; the rest are listed below.
+
+### Campaigns
+
+- **Four targets, master seed 0, on a 4 GB host with two cores**: geth and CometBFT for an hour
+  each (3,072 and 3,232 runs), redb and reth for thirty minutes (98,784 and 24,640 runs).
+- **`targets/cometbft-net`**: four `cometbft` validators at the addresses the world gives nodes
+  0–3, with `examples/comet-driver`, a static client that sends transactions in rotation, waits for
+  each to commit and then asks every validator for every committed key. A key that a validator lost
+  ends the driver with an abort, so a lost transaction is a finding with no oracle of its own.
+  `build-state.sh` rebuilds the network's state from the pack's binary.
+
+### Confirmation on a real host
+
+- **`bohr confirm <bundle> [-o confirm.sh] [--runs N]`** writes a script that stages a stored
+  finding without bohr ([`docs/API.md`](./docs/API.md) §7.11). The script runs the recorded
+  programs as plain processes, each in a root and a working directory of its own. It delivers the
+  recorded kills, freezes and restarts in order and judges each repetition by the recorded exit
+  status. Its last line is the rate.
+- **A crash loses unsynced writes, on the node it kills.** Each node's root sits on a device-mapper
+  `flakey` device of its own that drops writes from the node's kill onward; `POWER_LOSS=0` stages a
+  plain kill instead.
+- **A repetition that cannot be staged is void and is not counted**: a node that outlives its kill,
+  a node that has already exited when its fault comes, an unmount that does not happen, a filesystem
+  `e2fsck` finds damaged. Each repetition starts on fresh filesystems, and each node's address goes
+  on the loopback device for the run.
+- **Real time is not virtual time.** Each gap between faults is drawn up to twice the recorded one
+  and at least up to `SPREAD_NS`, 2 s by default, because an early moment of a run comes later on a
+  real host.
+
+### The bank and the claims
+
+- **`make bank`** replays every finding kept in `findings/bank/` to its digest and fails on one
+  that does not. An entry keeps its bundles, the binaries it was found on and the prepared state it
+  began from, and is replayed from its own directory. The bank is private and is not part of a
+  published tree.
+- **`make claims`** prints each claim with the figure that decides it, read from
+  `benches/baseline.toml`: held, failed, or not measured. A claim without a figure is never
+  reported as held.
+
+### Fixed
+
+- **`bohr replay --binaries` ran a file other than the one it checked.** When the scenario named
+  its programs, the replay checked the file under `--binaries` and executed the path the scenario
+  named. When the scenario named none, it put the new path into `argv[0]`, which moved the guest's
+  stack. Now every node executes the checked file and keeps the recorded `argv`. The executed path is
+  padded with slashes to the recorded length, because the kernel copies it onto the stack. A moved
+  program replays to its digest; under v0.8 it could not start.
+- **Every doc comment and code comment was rewritten** to state its contract directly, and several
+  that had been merged into the wrong item were split.
+
+### What it does not do
+
+- **Hold claim 4.** Nothing is disclosed, so no maintainer has confirmed a finding (G9.4).
+- **Count refusals.** A campaign does not record the runs the model refused, and the 60-seed sweep
+  G9.1 asks for was not run, so claim 1 is not measured.
+- **Confirm the two findings held since v0.1 (G9.12).** Their bundles record no binaries to stage.
+- **Hold P9.1.** The supervisor and workers together used 102 MB on average over minutes 1–5 of the
+  geth campaign and 126 MB over minutes 26–30, against a bound of 10%. The figure is a sum over a
+  changing set of workers sampled once a minute: three adjacent samples read 81, 155 and 109 MB.
+  P9.2 holds: 48 runs a minute over minutes 8–12 and 55.8 over minutes 26–30.
+- **Hunt op-reth, Lighthouse or Solana.** They had no campaign.
+- **Hunt a network for long.** Four validators produce about 400,000 events per virtual second, so
+  the event budget and the 1 GiB bundle section end a run at about 20 virtual seconds, and saving a
+  finding of a network needs 1–3 GB, more than a 4 GB host has left beside the campaign.
+- **Stage partitions, packet faults, disk errors, torn or reordered writes, or clock faults** on a
+  real host. `bohr confirm` names the ones a run had and leaves them out.
+
 ## v0.8.0 — where it runs
 
 Bohr was built from source by someone who had this repository, and read by a person at a terminal.

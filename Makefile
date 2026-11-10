@@ -107,6 +107,14 @@ test-mutation: ## Assert every chaos injection breaks the determinism suite (doc
 gate: build guests ## Every milestone gate, measured on this host
 	scripts/gate.sh
 
+.PHONY: bank
+bank: build ## Replay every banked finding to its digest (findings/bank, private)
+	scripts/bank.sh
+
+.PHONY: claims
+claims: ## Every claim the tool makes, held or failed, with its number (docs/EVIDENCE.md)
+	scripts/claims.sh
+
 .PHONY: policy-comparison
 policy-comparison: build guests ## Which scheduler reaches the seeded defects (docs/TESTING.md 8)
 	scripts/policy-comparison.sh

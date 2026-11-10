@@ -2,8 +2,7 @@
 //!
 //! Nothing here performs I/O or knows anything about a domain.
 //!
-//! Every identifier is a newtype rather than a bare integer: two `u64` parameters that can be
-//! swapped eventually are, and a swapped identifier yields a plausible but wrong trace. See
+//! Every identifier is a newtype, so swapped arguments fail to compile. See
 //! `docs/ARCHITECTURE.md` §8 rule 2.
 
 #![forbid(unsafe_code)]
@@ -15,16 +14,8 @@ use serde::{Deserialize, Serialize};
 
 /// Declares a transparent newtype over an integer with the traits every identifier needs.
 ///
-/// A macro rather than repeated derives: hand-written variants drift apart.
-///
-/// `Default` is deliberately not among them. Zero is a real inhabitant of most of these types —
-/// the first node, the first task — so a derived default is a value that reads as "unset" and
-/// compares equal to something that exists. `unwrap_or_default()` on a missing identifier is then
-/// a plausible wrong answer rather than an error, which is the failure this crate's whole reason
-/// for existing is meant to exclude. Where zero genuinely is an origin, the type says so itself.
-///
-/// Each type states what its own zero means: a constant every type shares and no type explains is
-/// a constant every reader guesses at.
+/// No `Default`: zero is usually a real node or task. Types whose zero is an origin implement it
+/// themselves.
 macro_rules! id_newtype {
     ($(#[$meta:meta])* $name:ident($inner:ty), $prefix:literal, $zero:literal) => {
         $(#[$meta])*
@@ -69,8 +60,7 @@ macro_rules! id_newtype {
 id_newtype! {
     /// Virtual time, in nanoseconds, with no relationship to any host clock.
     ///
-    /// Advanced only at defined points — a syscall boundary, a scheduler switch, a timer expiry.
-    /// A guest that sleeps for an hour wakes instantly having advanced this by 3.6e12.
+    /// Advanced only at syscall boundaries, switches and timer expiries.
     Tick(u64), "t", "The origin of virtual time: the tick a run starts at."
 }
 
@@ -87,8 +77,8 @@ id_newtype! {
 id_newtype! {
     /// One guest thread, as the scheduler sees it.
     ///
-    /// Virtual and assigned by us in creation order. The host tid is host-specific and must never
-    /// reach a trace — see `docs/ARCHITECTURE.md` §4.3.
+    /// Assigned in creation order; the host tid never reaches a trace (`docs/ARCHITECTURE.md`
+    /// §4.3).
     TaskId(u32), "task", "The first task created in a run. Not a spelling of \"no task\"."
 }
 
@@ -100,12 +90,8 @@ id_newtype! {
 id_newtype! {
     /// A word a guest synchronises on, numbered in the order the run first touched it.
     ///
-    /// **An ordinal rather than the address itself.** A futex word is a guest virtual address, and
-    /// an address moves when the memory around it moves — a heap-allocated lock sits somewhere
-    /// else the moment an earlier mapping changes size. Numbering the words in first-touch order
-    /// keeps what a trace needs (this is a different word from that one) and drops what it must
-    /// not have (where the word happened to live on this machine), so two runs that behaved alike
-    /// digest alike. See `docs/API.md` §4.4.
+    /// An ordinal in first-touch order, so memory layout never reaches the digest. See
+    /// `docs/API.md` §4.4.
     SyncWordId(u32), "sync", "The first word the run synchronised on."
 }
 
@@ -114,12 +100,8 @@ id_newtype! {
     TapeOffset(u64), "@", "The first byte of the tape."
 }
 
-// `Default` belongs to the three types whose zero is an origin rather than an inhabitant: a run
-// starts at tick nought, records its first event at nought and reads its tape from nought, so
-// defaulting to those is defaulting to the beginning. `NodeId`, `TaskId` and `Seed` are left
-// without one on purpose — their zero is a particular node, a particular task and a particular
-// run, and a default that silently names one of them is the plausible wrong answer §8 rule 2
-// exists to prevent. Written out rather than generated, because each line is that decision.
+// `Default` only where zero is an origin: tick, event and tape offset. `NodeId`, `TaskId` and
+// `Seed` have none (§8 rule 2).
 impl Default for Tick {
     #[inline]
     fn default() -> Self {
@@ -143,7 +125,7 @@ impl Default for TapeOffset {
 
 /// A guest file descriptor, virtualised at the interception boundary.
 ///
-/// Signed because the guest's own numbering is, and because syscall returns use `-1`.
+/// Signed, as syscall returns use `-1`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
@@ -163,9 +145,7 @@ impl fmt::Debug for Fd {
 
 /// An address inside a guest's address space.
 ///
-/// No [`Default`]: the address it would produce is the null pointer, and a defaulted null is how
-/// a buffer nobody supplied comes to be read as a buffer at address zero. Where an address is
-/// genuinely absent, `Option<GuestAddr>` says so.
+/// No [`Default`]; an absent address is `Option<GuestAddr>`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
@@ -193,8 +173,7 @@ impl Tick {
 
     /// Advances by `delta`.
     ///
-    /// Saturates rather than wraps: a wrapped clock runs time backwards and breaks the delivery
-    /// queue's ordering invariant.
+    /// Saturates, since a wrapped clock would run backwards.
     #[inline]
     #[must_use]
     pub const fn saturating_add(self, delta: Self) -> Self {
@@ -210,9 +189,7 @@ impl Tick {
 
     /// This span repeated `times` over.
     ///
-    /// Here rather than at the call sites: scaling a unit is what every horizon, budget and
-    /// timeout is written as, and doing it on the wrapped integer drops the saturation the two
-    /// operations above are careful to keep. A wrapped product is a horizon in the past.
+    /// Saturates, so a large horizon never wraps into the past.
     #[inline]
     #[must_use]
     pub const fn saturating_mul(self, times: u64) -> Self {
@@ -260,9 +237,7 @@ impl Digest {
     #[must_use]
     pub fn to_hex(&self) -> String {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        // Indexed rather than converted, so there is no failure path to substitute a character
-        // for: a digest that could render a placeholder mid-string would hide the corruption a
-        // digest exists to reveal.
+        // Indexed, so there is no failure path.
         let mut s = String::with_capacity(64);
         for b in self.0 {
             s.push(DIGITS[usize::from(b >> 4)] as char);
@@ -311,8 +286,7 @@ impl WorldModelId {
     ///
     /// # Panics
     ///
-    /// Panics on an empty name. The name is half of the key a replay refuses on, and a nameless
-    /// model would make every bundle it wrote refusable against every other nameless one.
+    /// Panics on an empty name.
     #[must_use]
     pub const fn new(name: &'static str, version: u16) -> Self {
         assert!(!name.is_empty(), "a world model's name must not be empty");
@@ -322,10 +296,8 @@ impl WorldModelId {
 
 /// Characters [`OracleId::composed`] builds a panel's name out of.
 ///
-/// Banned from a declared name so that the composed form cannot be spelled by hand: the name is
-/// the key a replay refuses on, and a key two different panels could share is a refusal that can
-/// be argued with. `+` is deliberately absent — `properties+crash` is one oracle that does two
-/// things, and renaming it would refuse every bundle already written under it.
+/// Banned in declared names, so no oracle can be named like a panel. `+` is allowed, as in
+/// `properties+crash`.
 const PANEL_SYNTAX: [u8; 4] = *b"(),@";
 
 impl OracleId {
@@ -333,10 +305,8 @@ impl OracleId {
     ///
     /// # Panics
     ///
-    /// Panics on an empty name, or on one containing any of `(`, `)`, `,` or `@` — the syntax
-    /// [`Self::composed`] builds a panel's name from. Both are programming errors in wiring
-    /// rather than anything a user can cause, and the name is a `&'static str`, so one written in
-    /// a `const` context fails to compile rather than at run time.
+    /// Panics on an empty name or one containing `(`, `)`, `,` or `@`; in a `const` context this
+    /// fails to compile.
     #[must_use]
     pub const fn new(name: &'static str, version: u16) -> Self {
         assert!(!name.is_empty(), "an oracle's name must not be empty");
@@ -358,22 +328,14 @@ impl OracleId {
 
     /// Names a panel of oracles by its members, in the order they are asked.
     ///
-    /// Derived rather than declared, so what a bundle records is what actually judged it. A name
-    /// written by hand beside a list that grew is a bundle claiming a judgement nobody made — and
-    /// this is the field a replay refuses on, so the lie would be enforced.
+    /// Derived, so the bundle records what actually judged it.
     ///
-    /// One member gives exactly that member's identity, which is what keeps every bundle written
-    /// before panels existed replaying against a panel of one.
-    ///
-    /// Several give `panel(first@1,second@5)`: each member carries its own version, because a
-    /// panel whose members are the same but at different versions judged the run differently and
-    /// must not share a key. The surrounding syntax is banned from a declared name by
-    /// [`Self::new`], so no single oracle can be spelled to collide with a panel.
+    /// One member gives that member's identity. Several give `panel(first@1,second@5)`, with
+    /// each member's version.
     ///
     /// # Panics
     ///
-    /// Panics on an empty panel. Nothing judged the run, so there is no identity to record, and a
-    /// nameless one would be refusable against every other empty panel.
+    /// Panics on an empty panel.
     #[must_use]
     pub fn composed(members: &[Self]) -> Self {
         assert!(!members.is_empty(), "a panel with no members judged nothing");
@@ -387,8 +349,7 @@ impl OracleId {
             }
             name.push_str(&member.name);
             name.push('@');
-            // The member's own version, decimal, because a panel of the same names at different
-            // versions is a different panel and a `max` over them would hide that.
+            // Each member's own version.
             name.push_str(&member.version.to_string());
         }
         name.push(')');
@@ -439,10 +400,8 @@ mod tests {
         assert_eq!(task.to_string(), "task3");
     }
 
-    /// The algorithm is a bundle-format promise, not an implementation detail: every stored
-    /// digest was produced by it. The vector is BLAKE3's own published one for the empty input,
-    /// taken from the specification rather than from this crate, so a switch to a keyed or
-    /// derived mode fails here instead of silently invalidating every bundle ever written.
+    /// The digest matches BLAKE3's published empty-input vector; the algorithm is part of the
+    /// bundle format.
     #[test]
     fn digest_is_unkeyed_blake3_and_pinned_to_its_published_vector() {
         assert_eq!(
@@ -451,9 +410,7 @@ mod tests {
         );
     }
 
-    /// `#[serde(transparent)]` on every identifier is what makes a manifest readable by anything
-    /// other than this build. A lost attribute would wrap each one in an object and change the
-    /// bundle format without changing a version.
+    /// Identifiers serialise as bare numbers.
     #[test]
     fn identifiers_are_written_as_bare_integers() {
         assert_eq!(serde_json::to_string(&NodeId(7)).expect("json"), "7");
@@ -466,17 +423,14 @@ mod tests {
         assert_eq!(back, NodeId(7));
     }
 
-    /// A panel of one is the member itself, which is what lets a bundle written before panels
-    /// existed replay against a panel of one.
+    /// A panel of one has the member's identity.
     #[test]
     fn a_panel_of_one_is_that_one() {
         let alone = OracleId::new("properties+crash", 1);
         assert_eq!(OracleId::composed(std::slice::from_ref(&alone)), alone);
     }
 
-    /// The refusal key has to tell two different judgements apart. `properties+crash` is a real
-    /// oracle that does two things, so the plain join this replaced gave a panel of `properties`
-    /// and `crash` the identity of an oracle that already exists.
+    /// A panel of `properties` and `crash` differs from the oracle `properties+crash`.
     #[test]
     fn a_panel_is_never_spelled_like_a_single_oracle() {
         let panel =
@@ -485,8 +439,7 @@ mod tests {
         assert_ne!(panel, OracleId::new("properties+crash", 1));
     }
 
-    /// Members at different versions judged the run differently, so the two orderings must not
-    /// share a key. Taking a maximum over the versions alone gave both the same one.
+    /// Members at different versions give different keys.
     #[test]
     fn a_panel_carries_the_version_of_each_member() {
         let (a1, a5) = (OracleId::new("a", 1), OracleId::new("a", 5));
@@ -513,8 +466,7 @@ mod tests {
         let _ = OracleId::new("", 1);
     }
 
-    /// Every horizon and timeout in the tool is a unit scaled by a number, and the scaling used
-    /// to happen on the wrapped integer. A horizon that wrapped would sit in the past.
+    /// Scaling saturates.
     #[test]
     fn scaling_a_span_saturates_rather_than_wrapping() {
         assert_eq!(Tick::from_secs(2), Tick(2_000_000_000));

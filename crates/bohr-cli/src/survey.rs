@@ -1,16 +1,11 @@
 //! What a program asks for that this build cannot answer.
 //!
-//! An ordinary run refuses the first unmodelled syscall and ends, which is §5.7 and is the
-//! right thing for a run: a call that reached the host unnoticed is a hole nothing downstream would
-//! find. It also means that learning a real program's surface one call at a time costs a run per
-//! call, and `docs/ARCHITECTURE.md` §5.7 promises the opposite — the whole set, up front. This is
-//! that promise.
+//! A run stops at the first unmodelled syscall (§5.7), so learning a program's surface that way
+//! takes a run per call. A survey reports the whole set in one run.
 //!
-//! A survey is not a run and must never be mistaken for one, which is arranged rather than asked
-//! for: the worlds it uses carry an identity of their own so a bundle claiming one is refused
-//! before it replays, nothing is written to disk, and a survey that found anything exits non-zero.
-//! There is no flag on `bohr run` that does this, and there must never be — the moment there is,
-//! somebody's continuous integration has it switched on.
+//! A survey is never a run: its worlds have their own identity, so a bundle claiming one is
+//! refused; nothing is written to disk; and a survey that found anything exits non-zero. It is a
+//! separate command, with no flag on `bohr run`.
 
 use bohr_tape::Tape;
 use bohr_trace::Outcome;
@@ -36,8 +31,7 @@ pub(crate) fn run(
         Some(_) => Some(bohr_world::config::load(&config_toml)?),
         None => None,
     };
-    // The libraries a dynamic target loads ask the processor too, so they are trapped as its own
-    // binary is: a survey of a program prepared differently from its run surveys another program.
+    // A dynamic target's libraries are trapped like its binary, as in a run.
     if patch_cpuid
         && let Some(scenario) = loaded.as_mut()
         && let Some(state) = scenario.state.take()
@@ -72,9 +66,8 @@ pub(crate) fn run(
     } else {
         report(&completed, seed);
     }
-    // Never zero with something to report, and never one: a survey found nothing about the guest,
-    // it found something about this build. A guest that did not run to completion is something to
-    // report -- see `report` for why it cannot be allowed to read as a clean surface.
+    // Exit 4, since the result is about this build. An incomplete guest also
+    // counts as something to report; see `report`.
     let ran = completed.report.outcome == Outcome::Clean;
     Ok(if completed.surveyed.is_empty() && ran { exit::CLEAN } else { exit::DEGRADED })
 }
@@ -89,8 +82,7 @@ pub(crate) fn surface(
     record: execute::Record,
 ) -> Result<execute::Completed, CliError> {
     let tape = Tape::from_seed(Seed(seed));
-    // The scenario's horizon and its node to end with reach a survey as they reach a run: a survey
-    // that ignored them ran a different, longer program than the one it was asked about.
+    // The scenario's horizon and ending node apply as in a run.
     let run_config = crate::run_config_for(loaded, max_events);
     let target = target_for(program, loaded)?;
     execute::survey_with(execute::Execution {
@@ -127,18 +119,12 @@ fn target_for(
 
 /// Prints the set, and what it is not evidence of.
 ///
-/// The second half is not decoration. A survey answers `ENOSYS` and lets the guest carry on, so a
-/// program refused `io_uring_setup` takes its fallback path and never issues `io_uring_enter` at
-/// all — which means a survey naming a mechanism is reporting less than it appears to, and a survey
-/// silent about one is reporting nothing about it either way. A reader who takes this list for the
-/// program's whole surface will build against the wrong list.
+/// A survey answers `ENOSYS` and the guest takes its fallback, so calls behind a refused one never
+/// appear: a program refused `io_uring_setup` never calls `io_uring_enter`. The list is a lower
+/// bound, and the output says so.
 ///
-/// How the guest ended is printed for the same reason, and is the sharper case. A dynamically
-/// linked program whose loader finds none of its libraries asks a dozen calls, is answered
-/// every one of them, and exits 127 without reaching its own first instruction — and "every
-/// call it made was answered" is then true and worthless, indistinguishable from the survey of
-/// a program that genuinely asks for nothing. The surface of a guest that did not run is not a
-/// small surface; it is no measurement at all, and it says so here.
+/// How the guest ended is printed too. A dynamic program whose loader finds no libraries exits 127
+/// before its first instruction; its short list measures nothing.
 fn report(completed: &execute::Completed, seed: u64) {
     println!(
         "survey  seed {seed}  {} events  {}",
@@ -210,11 +196,8 @@ pub(crate) fn walls_json(surveyed: &[(u32, u64)]) -> Vec<serde_json::Value> {
 
 /// A syscall's name, and which kind of wall the guest met at it.
 ///
-/// The two are not the same work and must not read as though they were. *nothing models it* is a
-/// table entry that does not exist and a run that would have been refused; *answered ENOSYS* is a
-/// table entry that does exist and a model that deliberately says it cannot, so the caller takes
-/// its own fallback. Told apart here because the fix differs: the first wants a row, the second
-/// wants a model.
+/// *nothing models it* has no table row; a run would be refused. *answered ENOSYS* has a row whose
+/// model deliberately refuses. The fixes differ: the first needs a row, the second a model.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn describe(nr: u32) -> (&'static str, &'static str) {
     if let Some(name) = bohr_backend_ptrace::unmodelled_syscall_name(nr) {
@@ -235,8 +218,7 @@ pub(crate) fn describe(_nr: u32) -> (&'static str, &'static str) {
 mod tests {
     use super::*;
 
-    /// A survey's object carries each wall as a row and says whether the guest ran to completion,
-    /// because walls of a guest that did not are no measurement.
+    /// A survey's object lists each wall and whether the guest ran to completion.
     #[test]
     fn a_survey_object_names_its_walls_and_whether_the_guest_ran() {
         let clean = bohr_report::narrate::verdict(&Outcome::Clean);

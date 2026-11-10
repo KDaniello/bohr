@@ -12,7 +12,7 @@ pub(super) fn read(pid: libc::pid_t, addr: u64, out: &mut [u8]) -> Result<(), Ba
     let remote = libc::iovec { iov_base: addr as *mut libc::c_void, iov_len: out.len() };
 
     // SAFETY: `local` describes a buffer we own for the whole call; `remote` is interpreted by the
-    // kernel, which reports a bad address rather than touching it.
+    // kernel, which reports a bad address with an error.
     let n = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
     if n < 0 || n as usize != out.len() {
         return Err(BackendError::BadAddress { addr: GuestAddr(addr), len: out.len() });

@@ -1,9 +1,8 @@
 //! Finding the probe a scenario with `[[probe]]` or `[chain]` starts as its last node.
 //!
-//! The probe is a guest, so it is a file the world executes and not code in this binary: it has to
-//! be a static executable, because a world holds no dynamic loader. It is looked for in one order —
-//! the variable, then beside this binary, then where `scripts/build-probe.sh` puts it — and a
-//! dynamic one is passed over, since the workspace build leaves one beside a development binary.
+//! The probe is a guest, so it must be a static executable: a world has no dynamic loader. Looked
+//! for in order: the variable, beside this binary, then where `scripts/build-probe.sh` puts it. A
+//! dynamic one, such as the workspace build leaves, is skipped.
 
 use std::path::{Path, PathBuf};
 
@@ -15,12 +14,9 @@ pub(crate) const PROBE_VARIABLE: &str = "BOHR_PROBE";
 /// The file the probe is executed from: a copy at `/tmp/bohr-probe-` and its digest's first 16
 /// hex digits, made where it is not there yet.
 ///
-/// A path of one length on every host, because the kernel copies the executed path onto the
-/// guest's stack, and a stack laid out by where a host keeps its files is a run that replays only
-/// on that host.
+/// The path has the same length on every host, since the kernel copies it onto the guest's stack.
 pub(crate) fn program() -> Result<String, CliError> {
-    // Once per process: a campaign builds every run's guests from here, and the probe does not
-    // move while one runs.
+    // Once per process; the probe does not change during a campaign.
     static PLACED: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
     PLACED.get_or_init(|| place().map_err(|e| e.to_string())).clone().map_err(CliError::Usage)
 }
@@ -35,8 +31,7 @@ fn place() -> Result<String, CliError> {
     if std::fs::read(&fixed).is_ok_and(|held| held == bytes) {
         return Ok(fixed);
     }
-    // Written beside and renamed into place, so two runs making the copy at once never execute a
-    // half-written file.
+    // Renamed into place, so a concurrent run never executes a half-written copy.
     let part = format!("{fixed}.{}", std::process::id());
     let cannot = |e: std::io::Error| {
         CliError::Usage(format!("BOHR-1002: cannot place the probe at {fixed}: {e}"))

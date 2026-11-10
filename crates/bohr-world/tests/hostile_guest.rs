@@ -1,10 +1,8 @@
 //! A guest that names sizes no machine could serve.
 //!
-//! The supervisor is the single component whose failure destroys the evidence a run exists to
-//! produce, so a guest must never be able to bring it down by asking for something absurd — and a
-//! guest that asks is usually not a hostile one, but a program in the middle of going wrong, which
-//! is exactly when the evidence matters. The rule is the same in every case here: a request past
-//! what can be held is answered, never obeyed. See `docs/ARCHITECTURE.md` §5.7.
+//! A supervisor failure destroys the evidence, and such requests usually come from a failing
+//! program. A request past what can be held is answered, never obeyed. See
+//! `docs/ARCHITECTURE.md` §5.7.
 
 use bohr_backend::{BackendError, GuestSpec};
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullBackend, NullProgram};
@@ -97,9 +95,7 @@ fn opening(mut rest: Vec<GuestOp>) -> Vec<GuestOp> {
 /// A request for more randomness than any machine has is cut to the transfer bound before
 /// anything is drawn for it.
 ///
-/// The scripted guest has sixty-four kilobytes to its name, so a bounded request still lands
-/// outside it — and the size named in that refusal is the evidence: it is the bound, not the
-/// number the guest asked for.
+/// The guest's 64 KB memory is smaller than the bound, so the refusal names the bound.
 #[test]
 fn randomness_beyond_any_buffer_is_cut_to_the_bound() {
     let err = outcome(vec![
@@ -126,7 +122,7 @@ fn a_write_past_what_may_be_held_is_refused() {
     assert_eq!(rets.get(1).copied(), Some(-27), "the write must be EFBIG: {rets:?}");
 }
 
-/// The same rule reached the other way: setting a length rather than writing at one.
+/// The same rule reached the other way: by setting a length.
 #[test]
 fn a_length_past_what_may_be_held_is_refused() {
     let rets =
@@ -134,8 +130,7 @@ fn a_length_past_what_may_be_held_is_refused() {
     assert_eq!(rets.get(1).copied(), Some(-27), "the truncation must be EFBIG: {rets:?}");
 }
 
-/// An address that wraps the address space is not an address, and walking an array from one must
-/// not be arrived at by arithmetic.
+/// An address that wraps the address space is refused.
 #[test]
 fn an_array_that_wraps_the_address_space_is_refused() {
     let rets = answers(vec![
@@ -145,7 +140,7 @@ fn an_array_that_wraps_the_address_space_is_refused() {
     assert_eq!(rets.first().copied(), Some(-14), "the walk must be EFAULT: {rets:?}");
 }
 
-/// What is refused must still be reachable: the bound is a ceiling, not a closed door.
+/// Requests within the bound succeed.
 #[test]
 fn a_write_within_the_bound_is_carried_out() {
     let rets = answers(opening(vec![

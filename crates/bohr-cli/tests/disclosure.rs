@@ -1,9 +1,8 @@
 //! `bohr report --disclosure` and `--sarif`: what a maintainer receives, and that it can be acted
 //! on.
 //!
-//! The finding is a real program's: `lease_clock`, which is found on every seed because the clock
-//! step is written down. Linux only for that half, and skipped where the guest is not built, like
-//! the other tests of real guests.
+//! The finding comes from `lease_clock`, which fails on every seed because its clock step is
+//! scheduled. That half is Linux only and skips when the guest is not built.
 
 use std::{path::PathBuf, process::Command};
 
@@ -31,7 +30,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// A run that found nothing has nothing to disclose, and a draft saying so would be sent anyway.
+/// A clean run has nothing to disclose and is refused.
 #[test]
 fn a_clean_run_is_refused_with_the_reason() {
     let out = scratch("clean").join("report.md");
@@ -53,7 +52,7 @@ mod real {
 
     const GUEST: &str = "testdata/guests/build/lease_clock";
 
-    /// Saves the finding of one seed, or nothing where the guest is not built.
+    /// Saves one seed's finding, or nothing if the guest is not built.
     fn found(dir: &std::path::Path, seed: &str) -> Option<String> {
         if !root().join(GUEST).is_file() {
             return None;
@@ -100,7 +99,6 @@ mod real {
         }
         assert!(draft.contains("## What this cannot claim"), "no limits:\n{draft}");
 
-        // The command the draft gives, as it gives it.
         let (code, said, err) = bohr(&["replay", &bundle]);
         assert!(said.contains(&digest), "the replay did not reach the digest: {said}{err}");
         assert_ne!(code, 2, "the command in the draft was refused: {err}");

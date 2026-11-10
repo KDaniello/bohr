@@ -1,12 +1,9 @@
 //! The world configuration file: `bohr run --config cluster.toml`.
 //!
 //! The shape is normative in `docs/API.md` §5. Everything is validated at load, and every refusal
-//! names the key it refuses: a configuration mistake found at tick four billion is a configuration
-//! mistake this parser should have caught.
+//! names its key.
 //!
-//! Beside the models it configures rather than in the tool that reads the file: the text names
-//! this crate's own types, and two callers now need it — the binary that runs a scenario, and the
-//! harness that reduces one. A parser in the binary would have been copied rather than shared.
+//! It lives beside the models it configures, shared by the binary and the reduction harness.
 
 use bohr_types::{NodeId, Tick};
 use serde::Deserialize;
@@ -20,16 +17,12 @@ use crate::{
 
 /// The largest file a prepared state may hold.
 ///
-/// The same bound the world puts on a file a guest writes, and for the same reason: every byte
-/// here is held in supervisor memory, cloned into a snapshot ring at each `fsync`, once per node,
-/// in every worker a campaign runs.
+/// The same bound as for guest files, since every byte lives in supervisor memory per node.
 const MAX_STATE_FILE_BYTES: u64 = 1 << 26;
 
 /// Why a configuration was refused.
 ///
-/// One variant on purpose: every refusal is the same kind of thing — a key this build will not
-/// accept the value of — and the message names the key. Splitting it would give callers a choice
-/// they have no different reaction to.
+/// One variant, since callers react to every refusal the same way.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The key named in the message cannot be accepted as written.
@@ -49,8 +42,8 @@ const MAX_DENOMINATOR: u32 = 65_536;
 /// Everything a configuration file can ask a run to be.
 #[derive(Debug)]
 pub struct LoadedConfig {
-    /// The cluster shape, when one is configured. Consumed where a program can actually be
-    /// traced; a build with no syscall backend still parses and validates it, then refuses.
+    /// The cluster shape, when one is configured. Builds without a backend validate it, then
+    /// refuse.
     #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub cluster: Option<Cluster>,
     /// What the distributed world is wired with.
@@ -96,10 +89,8 @@ pub struct LinuxConfig {
 
 /// What `io_uring_setup` is answered.
 ///
-/// `Absent` is the default and not a fallback: a kernel built without the option, or one with
-/// `kernel.io_uring_disabled=2`, answers `ENOSYS`, and every program that opens a ring keeps a path
-/// for that reply. `Ring` opens one whose file operations are carried through the same model as the
-/// plain calls, and whose other operations end the run by name.
+/// `Absent`, the default, answers `ENOSYS` like a kernel without io_uring; programs keep a path for
+/// it. `Ring` carries file operations through the same model as plain calls and refuses the rest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum IoUring {
     /// `ENOSYS` at setup; entering or registering a ring ends the run under `BOHR-2004`.
@@ -125,15 +116,11 @@ pub struct Implementation {
     pub name: String,
     /// How it is started, with `{node}` substituted as the cluster's argv is.
     ///
-    /// Empty where the scenario names none, and then the node runs whatever it would have run
-    /// without a comparison — its cluster program, or the command line where there is no cluster.
+    /// Empty means the node's usual program.
     pub argv: Vec<String>,
     /// Which node's program this stands in for.
     ///
-    /// A cluster of unlike nodes is how a real client is driven at all: one node is the thing
-    /// under comparison and another is the caller that makes it do anything. Only one of them
-    /// is the implementation, and this says which — without it the caller would be replaced
-    /// too, and two implementations would be compared by a value neither of them produced.
+    /// A real client is driven by a caller on another node; only this node is replaced.
     pub node: u32,
 }
 
@@ -157,11 +144,7 @@ impl LoadedConfig {
 
     /// Whether this scenario asks for anything to go wrong.
     ///
-    /// Read against what actually landed, because the two come apart and nothing else says so. A
-    /// fault is drawn, a packet is lost or not, and a moment written down may fall after the run
-    /// has ended — so a scenario can arm plenty and a run can meet none of it. Measured: an
-    /// execution client's campaign armed a kill three hundred milliseconds in, ended with its
-    /// caller at forty-four, and reported twenty clean runs having pressed on the client not once.
+    /// Compared with what landed: a run can end before any armed fault fires.
     #[must_use]
     pub fn asks_for_adversity(&self) -> bool {
         let drawn = self.fault_policy.kill.0 > 0
@@ -182,9 +165,7 @@ impl LoadedConfig {
 
 /// What a scenario says about how long its run is.
 ///
-/// Plain values rather than a `RunConfig`: this crate parses the file because the text names its
-/// own types, and a run bound names none of them. It travels as data, and the crate that owns
-/// wiring is what turns it into a bound.
+/// Plain values; the wiring crate turns them into a `RunConfig`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RunLimits {
     /// Virtual time at which a guest that was never going to end on its own is done.
@@ -193,10 +174,7 @@ pub struct RunLimits {
     pub max_ticks: Option<Tick>,
     /// The node whose ending is the run's ending, where the scenario names one.
     ///
-    /// A cluster of a service and the thing that drives it has no ending of its own, and a horizon
-    /// has to be guessed at generously enough to cover whatever the driver does. This says it
-    /// exactly, and what it saves is every tick the run would spend watching a server talk to
-    /// nobody — most of one, against a client that goes on polling.
+    /// Ends the run with the driver instead of a guessed horizon.
     pub ends_with_node: Option<u32>,
 }
 
@@ -210,10 +188,7 @@ pub struct Cluster {
     pub argv: Vec<String>,
     /// One argument vector per node, where the nodes are not alike.
     ///
-    /// A cluster of like nodes is one command line with an index substituted, which is most of
-    /// them. A cluster of unlike ones — a service and the thing that drives it, a client and the
-    /// server it holds to its word — has as many command lines as it has nodes, and there is
-    /// nowhere in one list to put the second. This is that place.
+    /// For clusters of unlike nodes, such as a service and its driver.
     pub programs: Vec<Vec<String>>,
     /// Environment presented to every node.
     pub env: Vec<(String, String)>,
@@ -222,9 +197,7 @@ pub struct Cluster {
 impl Cluster {
     /// The argument vector node `index` runs, with the `{node}` token substituted.
     ///
-    /// Its own where the scenario gave it one, and the shared template otherwise. The token is
-    /// substituted either way: a node that knows its own number needs it whether or not it shares
-    /// a command line with anybody.
+    /// Its own argv if given, else the shared template; `{node}` is substituted in both.
     #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     #[must_use]
     pub fn argv_for(&self, index: u32) -> Vec<String> {
@@ -243,8 +216,7 @@ impl Implementation {
 
 /// Substitutes `{node}` for the number of the node a command line belongs to.
 ///
-/// One rule for both callers: a node that knows its own number needs it whether it shares a command
-/// line with the rest of its cluster or stands in for one node of it.
+/// Shared by cluster and differential command lines.
 #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 fn with_node(argv: &[String], index: u32) -> Vec<String> {
     argv.iter().map(|a| a.replace("{node}", &index.to_string())).collect()
@@ -278,9 +250,7 @@ struct RawConfig {
 
 /// The `[run]` section, for the two keys this build can honour.
 ///
-/// The rest of what `docs/API.md` §5.1 shows under `[run]` is named here rather than left to
-/// serde's "unknown field", because that message would tell a reader the key does not exist when
-/// what it actually needs to say is which flag does the job instead.
+/// Other `[run]` keys in `docs/API.md` §5.1 are refused with the flag that replaces them.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRun {
@@ -490,12 +460,10 @@ struct RawFault {
 }
 
 /// Parses and validates a configuration file's text.
-/// Parses and validates a configuration file's text.
 ///
 /// # Errors
 ///
-/// Returns the key it refuses and why, so a mistake is fixed by reading the message rather than
-/// by bisecting the file.
+/// Returns the key it refuses and why.
 pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| {
         ConfigError::Refused(format!("BOHR-1002: configuration does not parse: {e}"))
@@ -525,8 +493,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         network.corrupt_probability =
             probability(net.corrupt_probability.as_deref(), "network.corrupt_probability")?;
         if let Some(bytes) = net.corrupt_bytes {
-            // Bounded, because every armed datagram draws eight bytes per flip whether or not it
-            // is altered.
+            // Bounded: every armed datagram draws eight bytes per flip.
             if bytes == 0 || bytes > 64 {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: network.corrupt_bytes is {bytes}; an altered datagram has 1 to 64 \
@@ -574,8 +541,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     if let Some(raw_disk) = &raw.disk {
         match raw_disk.sync_semantics.as_deref() {
             None | Some("strict") => {}
-            // Named in the format but deliberately refused: answering "lenient" with strict
-            // behaviour would be a config that lies.
+            // Refused; strict behaviour under "lenient" would mislead.
             Some(other) => {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: disk.sync_semantics {other:?} is not available; \
@@ -603,7 +569,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     let mut fault_point_odds = (1, 2);
     if let Some(raw_faults) = &raw.faults {
         if let Some(names) = &raw_faults.fault_points {
-            // A name with a comma in it could never be armed: the SDKs read the list split on them.
+            // The SDKs split the list on commas.
             if let Some(bad) = names.iter().find(|n| n.is_empty() || n.contains(',')) {
                 return Err(ConfigError::Refused(format!(
                     "BOHR-1002: faults.fault_points {bad:?} is not a name a fault point can have"
@@ -643,9 +609,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
             fault_policy.budget_per_run = Some(budget);
         }
         if let Some(named) = &raw_faults.draw {
-            // Named rather than defaulted to everything: a campaign that drew a freeze it never
-            // asked for would be searching something its scenario does not describe, and the
-            // kinds it can search are what its bundle has to be read against.
+            // Kinds must be named, so a campaign searches only what its scenario says.
             let mut kinds = crate::DrawnFaults {
                 kill: false,
                 freeze: false,
@@ -661,8 +625,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     "node_freeze" => kinds.freeze = true,
                     "node_isolate" => kinds.isolate = true,
                     "node_degrade" => kinds.degrade = true,
-                    // Named as a recovery rather than as a kind, because that is what it is: the
-                    // fault is still the kill and what changes is the disk the node comes back on.
+                    // A recovery mode of the kill.
                     "recover_from_snapshot" => kinds.recover_from_snapshot = true,
                     "clock_step" => kinds.clock_step = true,
                     "clock_drift" => kinds.clock_drift = true,
@@ -707,9 +670,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     )
                 })?,
             },
-            // In the existing `[[fault]]` table with the existing `at_tick` key, deliberately: a
-            // table of its own would be invisible to reduction, and nobody would notice until the
-            // first real finding refused to shrink.
+            // In `[[fault]]` with `at_tick`, so reduction can move it.
             "chain_reorg" => NodeFaultKind::ChainReorg {
                 back: fault.snapshot_back.ok_or_else(|| {
                     ConfigError::Refused(
@@ -731,8 +692,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 let ppm = fault.drift_ppm.ok_or_else(|| {
                     ConfigError::Refused("BOHR-1002: clock_drift needs drift_ppm".to_owned())
                 })?;
-                // Refused here rather than by the clock's own assertion: a scenario with a typo
-                // in it is a refusal at load, not a run that panics at the fault.
+                // Refused at load, before the clock would panic.
                 if ppm.unsigned_abs() > bohr_kernel::MAX_DRIFT_PPM {
                     return Err(ConfigError::Refused(format!(
                         "BOHR-1002: clock_drift's drift_ppm is {ppm}, and a clock may drift at \
@@ -748,7 +708,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 )));
             }
         };
-        // A clock's key on another kind would be read as meaning something, and it means nothing.
+        // A clock key on another kind is refused.
         let stray = match kind {
             NodeFaultKind::ClockStep { .. } => fault.drift_ppm.map(|_| "drift_ppm"),
             NodeFaultKind::ClockDrift { .. } => fault.step_ticks.map(|_| "step_ticks"),
@@ -760,8 +720,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                 fault.kind
             )));
         }
-        // A cluster-wide fault names no node, and a node fault must: a `node` on a reorg would be
-        // read as meaning something, and it means nothing.
+        // A cluster-wide fault names no node; a node fault must.
         let cluster_wide = matches!(kind, NodeFaultKind::ChainReorg { .. });
         let node = match (cluster_wide, fault.node) {
             (false, Some(node)) => NodeId(node),
@@ -777,10 +736,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     .to_owned(),
             )),
         };
-        // **A node the cluster does not have is a typo.** The world creates a node it is asked
-        // about, so `node = 5` in a cluster of three would produce a fourth to kill and restart --
-        // a scenario that runs, reports nothing and tests nothing anybody meant. §8 rule 6:
-        // refused where it is read.
+        // A node outside the cluster is refused (§8 rule 6); the world would create it.
         let known = network.nodes;
         let named: Vec<u32> = match &kind {
             NodeFaultKind::ChainReorg { nodes, .. } => {
@@ -799,11 +755,8 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     let cluster = match raw.cluster {
         None => None,
         Some(c) => {
-            // Neither is required: a scenario that names no program at all takes the one given on
-            // the command line, which is how every single-program scenario here is written. What
-            // is refused is naming both, which leaves a reader to work out which won, and naming
-            // fewer programs than there are nodes, which would quietly give a node its
-            // neighbour's command line.
+            // Neither is required; without one the command line's program runs. Both together, or
+            // fewer programs than nodes, are refused.
             if !c.argv.is_empty() && !c.programs.is_empty() {
                 return Err(ConfigError::Refused(
                     "BOHR-1002: [cluster] takes argv or programs, not both".to_owned(),
@@ -833,9 +786,7 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
     let durability = durability(raw.durability.as_ref(), raw.faults.as_ref(), &raw.fault)?;
     let probes = probes(raw.chain.as_ref(), &raw.probe, cluster.as_ref())?;
 
-    // A policy armed after the run is over is a policy that never fires, and a configuration that
-    // is read and does nothing is a configuration that lies. Both numbers are named, because the
-    // reader is about to change one of them and needs to know which.
+    // A policy armed after the run ends never fires, so it is refused with both numbers.
     if let Some(horizon) = run.horizon
         && fault_policy.arm_after >= horizon
     {
@@ -872,11 +823,10 @@ const DEFAULT_RPC_PORT: u16 = 8545;
 
 /// Reads `[chain]` and every `[[probe]]` into the probes they amount to.
 ///
-/// **Each oracle is a probe written out in advance**, so there is one judging path: `finality` is
-/// `never-reverts` on the finalised block's hash by its number, `agreement` is `agrees` on the
-/// same, `liveness` is `advances` on its number, and `double-sign` is `unique` on each signed vote
-/// by signer and height. A node the cluster does not have, a probe without a cluster, and a span
-/// on a property that has no use for one are refused where they are read.
+/// Each oracle is a predefined probe: `finality` is `never-reverts` on the finalised hash by
+/// number, `agreement` is `agrees` on the same, `liveness` is `advances` on the number, and
+/// `double-sign` is `unique` on votes by signer and height. Unknown nodes, probes without a cluster
+/// and stray spans are refused.
 fn probes(
     chain: Option<&RawChain>,
     raw: &[RawProbe],
@@ -1067,8 +1017,7 @@ fn probes(
                 "BOHR-1002: {what}: rpc, value and every key field are named, never empty"
             )));
         }
-        // An array is positional parameters and a table named ones; JSON-RPC servers take one or
-        // the other, and CometBFT's only the second.
+        // An array is positional parameters, a table named ones; CometBFT takes only named.
         let params = match &probe.params {
             None => bohr_sdk_proto::json::Json::Array(Vec::new()),
             Some(value @ (toml::Value::Array(_) | toml::Value::Table(_))) => json_of(value)
@@ -1124,10 +1073,8 @@ fn json_of(value: &toml::Value) -> Option<bohr_sdk_proto::json::Json> {
 
 /// Reads `[linux]`, refusing a ring the disk model could not keep its promises through.
 ///
-/// **A stalled sync inside a ring has no moment to finish.** A plain `fsync` that stalls parks its
-/// task and is released by a timer; a submission is carried out inside one `io_uring_enter` that
-/// returns with every completion posted, so a drawn stall there would have to be dropped or turned
-/// into a refusal at a seed nobody chose. Refused here instead, once, before anything runs.
+/// A stall cannot happen inside one `io_uring_enter`, so a ring with drawn disk stalls is refused
+/// at load.
 fn linux(raw: Option<&RawLinux>, disk: &DiskConfig) -> Result<LinuxConfig, ConfigError> {
     let io_uring = match raw.and_then(|l| l.io_uring.as_deref()) {
         None | Some("absent") => IoUring::Absent,
@@ -1150,9 +1097,7 @@ fn linux(raw: Option<&RawLinux>, disk: &DiskConfig) -> Result<LinuxConfig, Confi
 
 /// Reads `[coverage]`, refusing a map that could not tell anything apart or could not be held.
 ///
-/// **A map is copied out of shared memory once per run and held once per worker**, so its size is
-/// a cost a campaign pays continuously rather than a number to set generously. The upper bound is
-/// where that cost stops being small; the lower one is where the map stops being a map.
+/// The map is copied once per run and held per worker, so its size is a continuous cost.
 fn coverage(raw: Option<&RawCoverage>) -> Result<Option<usize>, ConfigError> {
     let Some(size) = raw.and_then(|c| c.shm_size) else {
         return Ok(None);
@@ -1176,9 +1121,7 @@ fn liveness(
         return Ok(None);
     };
 
-    // Named rather than accepted and ignored. A cluster that has stopped committing still gossips,
-    // so counting delivered packets as progress would read a dead cluster as a healthy one for as
-    // long as anybody cared to watch.
+    // Refused: a stalled cluster still gossips, so packets are not progress.
     match raw.progress.as_deref() {
         None | Some("fsync") => {}
         Some(other) => {
@@ -1205,9 +1148,8 @@ fn liveness(
             )));
         }
     }
-    // A watch armed by a heal, in a scenario where nothing is ever cut, never fires — and a
-    // configuration that is read and does nothing is a configuration that lies. Only that half of
-    // the section is refused: watching for a node that stopped needs nothing to have been cut.
+    // A heal-armed watch with nothing ever cut never fires and is refused; the stopped-node watch
+    // needs no cut.
     if raw.after_heal_ticks.is_some() && partitions.is_empty() {
         return Err(ConfigError::Refused(
             "BOHR-1002: liveness.after_heal_ticks watches for a silence after a heal, and this \
@@ -1224,9 +1166,8 @@ fn liveness(
 
 /// Splits a leading node number off the rest of a projection source.
 ///
-/// `file:1:/head` is node one's; `file:/head` is node zero's, which is what every source written
-/// before a node could be named meant and goes on meaning. A path this world can hold is absolute,
-/// so what precedes the first colon is a number or it is not there.
+/// `file:1:/head` is node one's; `file:/head` is node zero's. Paths are absolute, so a prefix
+/// before the colon is a node number.
 fn node_prefix(source: &str) -> (u32, &str) {
     match source.split_once(':') {
         Some((head, rest)) => head.parse().map_or((0, source), |node| (node, rest)),
@@ -1258,10 +1199,8 @@ fn differential(
                 .to_owned(),
         ));
     }
-    // Drawn faults draw at every syscall, deliberately, so byte consumption cannot depend on disk
-    // state — and two implementations make a different number of syscalls in a different order, so
-    // a drawn schedule cannot line up across them under any construction. Scheduled faults can and
-    // do. See `docs/ARCHITECTURE.md` §5.20.
+    // Drawn faults draw per syscall, which differs between implementations; scheduled faults line
+    // up. See `docs/ARCHITECTURE.md` §5.20.
     if faults.and_then(|f| f.kill_probability.as_deref()).is_some() {
         return Err(ConfigError::Refused(
             "BOHR-1002: faults.kill_probability draws per syscall, and two implementations make \
@@ -1271,10 +1210,7 @@ fn differential(
         ));
     }
 
-    // **Which node an implementation is.** A cluster of unlike nodes puts the thing under
-    // comparison beside the caller that drives it, and only one of the two is the implementation.
-    // Naming a node the cluster has not got would replace nobody, and naming different ones would
-    // compare a client against a caller.
+    // Every implementation must name the same node, inside the cluster.
     let nodes = cluster.map_or(1, |c| c.nodes.max(1));
     let mut stands_in_for: Option<(&str, u32)> = None;
     for implementation in &raw.implementation {
@@ -1349,9 +1285,7 @@ fn state(raw: Option<&RawState>) -> Result<(Option<StateImage>, Option<String>),
     let image = StateImage::from_dir(std::path::Path::new(&raw.dir), MAX_STATE_FILE_BYTES)
         .map_err(|e| ConfigError::Refused(e.to_string()))?;
 
-    // A pin is what makes a scenario file say which state it means rather than which directory it
-    // happened to find. Checked here, at load, because everything after this point would be a run
-    // against a state nobody chose.
+    // The pin names the exact state; it is checked at load.
     if let Some(pinned) = raw.digest.as_deref() {
         let actual = image.digest().to_hex();
         if pinned.trim_start_matches("blake3:") != actual {
@@ -1375,9 +1309,7 @@ fn durability(
         return Ok(None);
     };
 
-    // Named rather than accepted and ignored, because it is an approximation and the reader has to
-    // know which one: this model has no word for an acknowledgement, so what stands in for one is
-    // the moment a node reached outward with unsynced writes behind it.
+    // An answer is approximated as reaching outward with unsynced writes.
     match raw.ack.as_deref() {
         None | Some("send_while_dirty") => {}
         Some(other) => {
@@ -1388,8 +1320,7 @@ fn durability(
             )));
         }
     }
-    // The finding needs a node to come back without something, so a scenario where nothing can
-    // kill one can never produce it — and a configuration that is read and does nothing lies.
+    // Refused without kills, since the finding needs a crash.
     let can_kill = faults.and_then(|f| f.kill_probability.as_deref()).is_some()
         || scheduled.iter().any(|f| f.kind == "node_kill");
     if !can_kill {
@@ -1433,9 +1364,7 @@ fn run_limits(raw: Option<&RawRun>, nodes: Option<u32>) -> Result<RunLimits, Con
             "BOHR-1002: run.horizon_ticks is zero, which completes a run that never ran".to_owned(),
         ));
     }
-    // A horizon the budget reaches first never fires, and a configuration that is read and does
-    // nothing is a configuration that lies. Refused with both numbers, because the reader is about
-    // to change one of them and needs to know which.
+    // A horizon past the budget never fires; refused with both numbers.
     if let (Some(at), Some(budget)) = (horizon, max_ticks)
         && at >= budget
     {
@@ -1447,8 +1376,7 @@ fn run_limits(raw: Option<&RawRun>, nodes: Option<u32>) -> Result<RunLimits, Con
         )));
     }
 
-    // Refused rather than clamped, because a node that is not in the cluster never ends and the
-    // run would quietly wait out its horizon instead — a key that is read and does nothing.
+    // A node outside the cluster never ends, so it is refused.
     if let Some(node) = raw.ends_with_node
         && nodes.is_some_and(|count| node >= count)
     {
@@ -1476,15 +1404,13 @@ fn probability(text: Option<&str>, key: &str) -> Result<(u32, u32), ConfigError>
         )));
     };
     if den == 0 || den > MAX_DENOMINATOR {
-        // The nearest expressible value is part of the refusal so the fix is a copy-paste.
+        // The refusal includes the nearest expressible value.
         return Err(ConfigError::Refused(format!(
             "BOHR-1003: {key} denominator {den} is outside 1..={MAX_DENOMINATOR}; \
              nearest expressible: {num}/{MAX_DENOMINATOR}"
         )));
     }
-    // **A probability above one is not a probability.** Accepted, it read as certainty -- and a
-    // certainty costs no tape, so a typed `1000/100` silently changed how every later draw in the
-    // run was laid out as well as making the thing it named inevitable.
+    // A probability above one is refused.
     if num > den {
         return Err(ConfigError::Refused(format!(
             "BOHR-1003: {key} is {num}/{den}, which is more than certain"
@@ -1554,9 +1480,7 @@ mod tests {
 
     /// A map has to be big enough to tell paths apart and small enough to copy once per run.
     ///
-    /// Both bounds are refusals rather than clamps, for the reason every other value here is: a
-    /// campaign that asked for a size and silently got another would report coverage numbers
-    /// against a map nobody chose.
+    /// Both bounds refuse, never clamp.
     #[test]
     fn a_coverage_map_too_small_to_read_or_too_large_to_hold_is_refused() {
         let sized = |bytes: &str| {
@@ -1613,7 +1537,7 @@ mode = \"shm\"
         assert!(err.to_string().contains("BOHR-1002"), "{err}");
     }
 
-    /// A stalled sync inside a ring has no moment to finish, so the pair is refused before the run.
+    /// A ring with drawn disk stalls is refused.
     #[test]
     fn a_ring_with_stalling_syncs_is_refused() {
         let err = load("[linux]\nio_uring = \"ring\"\n[disk]\nstall_probability = \"1/10\"\n")
@@ -1622,9 +1546,7 @@ mode = \"shm\"
         assert!(load("[disk]\nstall_probability = \"1/10\"\n").is_ok(), "without a ring it runs");
     }
 
-    /// An implementation stands in for one node of the cluster, and which one is part of the
-    /// comparison rather than a detail: a client and the caller that drives it are not two
-    /// implementations of one thing.
+    /// An implementation names the node it replaces.
     #[test]
     fn an_implementation_stands_in_for_a_node_the_cluster_has() {
         let compared = |first: &str, second: &str| {
@@ -1668,8 +1590,7 @@ mode = \"shm\"
         assert!(unlike.to_string().contains("unlike programs"), "got: {unlike}");
     }
 
-    /// A source says which node holds the value, and a source written before it could says node
-    /// zero — which is what it always meant.
+    /// A source names its node; without one it is node zero.
     #[test]
     fn a_projection_source_carries_the_node_that_holds_it() {
         let read = |source: &str| {
@@ -1708,8 +1629,7 @@ mode = \"shm\"
         assert!(absent.to_string().contains("BOHR-1002"), "got: {absent}");
     }
 
-    /// Each chain oracle is a probe written out in advance, and every node is asked unless the
-    /// section narrows it.
+    /// Each chain oracle is a predefined probe asking every node unless narrowed.
     #[test]
     fn the_chain_oracles_are_probes_of_every_node() {
         let loaded = load(

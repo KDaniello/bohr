@@ -29,8 +29,7 @@ fn a_stored_run_prints_one_line_per_event() {
     assert!(out.contains("syscall"), "no syscall was named: {out}");
 }
 
-/// The json form is what a report points at for the events it did not show, so every line of it
-/// has to be readable on its own.
+/// Every line of the JSON form parses on its own; reports link to it for omitted events.
 #[test]
 fn the_json_form_is_one_object_per_line() {
     let bundle = stored("clock-and-random-seed0.bohr");
@@ -45,7 +44,7 @@ fn the_json_form_is_one_object_per_line() {
     }
 }
 
-/// A format nobody implements is refused by name rather than silently answered with another one.
+/// An unknown format is refused by name.
 #[test]
 fn an_unknown_format_is_refused_and_says_what_there_is() {
     let (code, _, err) = bohr(&["trace", &stored("two-tasks-seed0.bohr"), "--format", "yaml"]);

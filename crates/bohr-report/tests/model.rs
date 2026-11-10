@@ -1,8 +1,6 @@
 //! Reading stored bundles the way a reader will: the ones in the repository, unchanged.
 //!
-//! Fixtures rather than bundles built in the test, because what is under test is whether a bundle
-//! *somebody else wrote* can be understood. A model exercised only against its own idea of a
-//! bundle would keep working while every real one stopped opening.
+//! Stored fixtures, so the model is tested against bundles it did not build.
 
 use std::path::PathBuf;
 
@@ -52,8 +50,7 @@ fn draws_land_on_events_that_exist() {
     }
 }
 
-/// A guest that kept every promise has no violation to point at, and the model must say so rather
-/// than pointing at whatever event happened to be last.
+/// A guest that kept every promise has no violation.
 #[test]
 fn a_clean_run_has_no_point_of_violation() {
     let model = model("two-tasks-seed0.bohr");

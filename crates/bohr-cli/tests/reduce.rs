@@ -26,8 +26,7 @@ fn stored(name: &str) -> String {
     format!("{}/../../testdata/bundles/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// A bundle that records nothing going wrong has nothing to reduce, and saying so is more useful
-/// than spending two thousand replays discovering it.
+/// A clean bundle is refused before any replay.
 #[test]
 fn a_clean_bundle_is_refused_with_the_reason() {
     let out = scratch("clean").join("smaller.bohr");
@@ -77,12 +76,9 @@ fn a_bundle_that_is_not_there_is_a_usage_error() {
     assert!(err.contains("BOHR-1002"), "{err}");
 }
 
-/// The one that matters: a finding reduces, and what comes out is a bundle the tool still accepts.
-/// A reduction that produced something unreplayable would have made the finding harder to hand on
-/// rather than easier.
+/// A finding reduces to a bundle the tool still replays.
 ///
-/// A real program's finding, found on every seed: a finding that a campaign may or may not make
-/// would leave this test checking nothing on the runs where it made none.
+/// The guest fails on every seed, so the test always has a finding to reduce.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn a_finding_reduces_to_a_bundle_that_still_replays() {
@@ -127,11 +123,9 @@ fn a_finding_reduces_to_a_bundle_that_still_replays() {
     assert_eq!(code, 0, "the reduced bundle no longer replays: {err}");
 }
 
-/// A bundle judged by an oracle this build does not wire is refused, naming both sides.
+/// A bundle judged by an oracle this build does not wire is refused, naming both.
 ///
-/// Before the check existed, such a bundle replayed clean — the oracle that found the violation was
-/// not there to find it again — and the reduction reported `BOHR-5003: nothing to reduce`. That
-/// message is true about what happened and points a reader at the bundle, which is the wrong place.
+/// Without the oracle the bundle would replay clean and report `BOHR-5003: nothing to reduce`.
 #[test]
 fn a_bundle_judged_by_another_oracle_is_refused_before_replaying() {
     use bohr_trace::{Bundle, SectionId};
@@ -143,8 +137,7 @@ fn a_bundle_judged_by_another_oracle_is_refused_before_replaying() {
     )
     .expect("the manifest is text");
 
-    // The one field under test, changed where it is written rather than by rebuilding a run: what
-    // is being checked is the refusal, and a hand-built bundle would be checking the builder.
+    // Only the oracle field changes; the rest of the bundle is the real run's.
     let foreign =
         manifest.replace(r#""name": "properties+crash""#, r#""name": "properties+boundary""#);
     assert_ne!(

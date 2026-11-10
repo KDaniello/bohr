@@ -1,27 +1,18 @@
 //! The passes that work on the tape, and what "plainest" means for each kind of decision.
 //!
-//! All are the same shape: a set of decisions the run made, where keeping one means leaving its
-//! bytes alone and removing it means overwriting them with the bytes that make the decision go the
-//! dull way. They differ only in which decisions they are allowed to touch and what dull means.
-//! The fault pass has one more move, [`sooner`]: the same fault, fired at an earlier chance.
+//! Each pass removes a decision by overwriting its bytes with the value that makes it go the dull
+//! way. Passes differ in which decisions they touch and what dull means. The fault pass can also
+//! fire a fault at an earlier chance, with [`sooner`].
 //!
-//! # Why this is a tape edit and not an edit to a list of events
+//! # Tape edits
 //!
-//! There is no stored list of deliveries to strike a line out of. A delivery happened because two
-//! bytes on the tape said so, and the event log is a record of that having happened. So "do not
-//! deliver this message" is written by putting different bytes at the offset the decision was
-//! drawn from — which the draw ABI makes safe, because what a draw consumes is a function of the
-//! request and never of the value, so one rewritten decision leaves every later one reading from
-//! the same place.
+//! A decision is the bytes at the offset it was drawn from, and the event log only records it. A
+//! draw consumes a fixed width, so rewriting one leaves every later draw at its offset.
 //!
-//! # Why offsets are resolved again after every success
+//! # Offsets after a success
 //!
-//! A decision that goes differently changes what happens next: an undelivered message arms no
-//! timer, wakes no receive, and the syscalls that would have followed are not made. The run
-//! therefore makes a different *number* of draws, and every offset after the change belongs to
-//! something else. The pass consequently addresses decisions by their position among the sites it
-//! cares about in the journal of the run that is currently best, and re-reads that journal each
-//! time one is accepted.
+//! A changed decision changes the number of later draws, so later offsets shift. Decisions are
+//! addressed by position in the current best run's journal, re-read after each accepted step.
 
 use bohr_tape::{DrawRecord, DrawSite, Journal};
 
@@ -40,9 +31,7 @@ pub(crate) enum Target {
 
 /// The decisions of interest in a journal, in the order they were drawn.
 ///
-/// Only those a rewrite can reach: a draw that consumed nothing decided something structural
-/// rather than something drawn, and a draw past the end of the prefix took its bytes from the
-/// keystream, where there is nothing to write.
+/// Only draws inside the prefix that consumed bytes can be rewritten.
 #[must_use]
 pub(crate) fn decisions(journal: &Journal, prefix_len: usize, target: Target) -> Vec<Decision> {
     let mut found = Vec::new();
@@ -62,8 +51,7 @@ pub(crate) fn decisions(journal: &Journal, prefix_len: usize, target: Target) ->
             Target::Faults => {
                 site.is_some_and(|site| is_odds(site, record.len)) && journal.fired(index)
             }
-            // Two draws are made per send — whether to drop, then whether to duplicate — in that
-            // order. Only the first decides whether the message arrives at all.
+            // A send draws drop, then duplicate; only the first decides arrival.
             Target::Deliveries => is_delivery && deliveries % 2 == 1,
             Target::Everything => site.is_some(),
         };
@@ -74,10 +62,10 @@ pub(crate) fn decisions(journal: &Journal, prefix_len: usize, target: Target) ->
     found
 }
 
-/// Whether a draw is a fixed-width odds draw: a fault that either happens here or does not.
+/// Whether a draw is a two-byte odds draw, which decides whether a fault happens here.
 ///
-/// Read off the site and the width, because a record does not say which primitive drew it. At
-/// these sites every two-byte draw is one: a node fault's kind is narrower, a stall's length wider.
+/// A record does not say which primitive drew it, so this reads the site and the width. At these
+/// sites a node fault's kind is narrower and a stall's length is wider.
 fn is_odds(site: DrawSite, len: u32) -> bool {
     len == 2
         && matches!(
@@ -94,13 +82,13 @@ fn is_odds(site: DrawSite, len: u32) -> bool {
 
 /// Where a fired node fault could have fired instead, earliest first.
 ///
-/// Only node faults are moved: a kill decides how long everything after it takes, so firing it at
-/// an earlier chance is what shortens a run, while an earlier dropped packet is a different packet.
+/// Only node faults are moved. A kill decides how long the rest of the run takes, so firing it
+/// earlier shortens the run. An earlier dropped packet would be a different packet.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Movable {
-    /// The node-fault odds draws that did not fire before this one, after the fault before it.
+    /// Offsets of the unfired node-fault odds draws between the previous fault and this one.
     pub(crate) chances: Vec<u64>,
-    /// The bytes the fault drew after deciding to fire — which kind, how bad — at its own event.
+    /// The bytes the fault drew at its own event after firing: its kind and severity.
     pub(crate) body: Vec<u8>,
 }
 
@@ -128,8 +116,8 @@ pub(crate) fn fired_at(journal: &Journal, offset: u64) -> bool {
 
 /// The `nth` fired node fault of a journal, and the chances it had before it.
 ///
-/// The chances stop at the fault before it, so a move keeps the order the faults fired in and the
-/// run up to the new chance is the run that was.
+/// The chances start after the previous fault, so a move keeps the faults in order and leaves the
+/// run unchanged up to the new chance.
 #[must_use]
 pub(crate) fn movable(journal: &Journal, prefix: &[u8], nth: usize) -> Option<Movable> {
     let reachable = |record: &DrawRecord| {
@@ -156,10 +144,8 @@ pub(crate) fn movable(journal: &Journal, prefix: &[u8], nth: usize) -> Option<Mo
         if !reachable(record) {
             return None;
         }
-        // What the fault drew next to say what it is: the kind, and for a degradation or a clock
-        // fault how much. Nothing else at its event belongs to it — a fault that leaves the call
-        // standing goes on to draw the call's own decisions — so the body stops at another site.
-        // A one-option kind draws nothing and is passed over.
+        // The body is the fault's next draws (kind, severity), up to the first other site. A
+        // one-option kind draws nothing.
         let mut body = Vec::new();
         let mut end = record.offset + u64::from(record.len);
         for next in &records[at + 1..] {
@@ -185,12 +171,11 @@ pub(crate) fn movable(journal: &Journal, prefix: &[u8], nth: usize) -> Option<Mo
     None
 }
 
-/// The edits that fire a node fault at the chance at `offset`, as what it fired as before.
+/// The edits that fire a node fault at the chance at `offset`, as the same kind as before.
 ///
-/// Zero is below every threshold a non-zero probability makes, so the draw fires; the body follows
-/// it because a fired fault reads its kind from the bytes straight after. What the original fault
-/// drew is left alone: the run has already gone another way by then, and those bytes belong to
-/// whatever reads them now.
+/// Zero is below every threshold a non-zero probability makes, so the draw fires. The body follows
+/// it because a fired fault reads its kind from the next bytes. The original fault's bytes are left
+/// alone, since other draws read them in the changed run.
 #[must_use]
 pub(crate) fn sooner(offset: u64, body: &[u8]) -> Vec<Edit> {
     let mut bytes = vec![0u8, 0u8];
@@ -212,7 +197,7 @@ pub(crate) struct Decision {
 impl Decision {
     /// Whether this decision already reads the way a pass would rewrite it.
     ///
-    /// Asked so a probe is never spent proposing a scenario identical to the one it came from.
+    /// Such a decision is never proposed, since the probe would change nothing.
     #[must_use]
     pub(crate) fn is_already_dull(&self, prefix: &[u8], target: Target) -> bool {
         let at = self.offset as usize;
@@ -228,20 +213,16 @@ impl Decision {
 
     /// The bytes that make it dull.
     ///
-    /// Dull is not always zero. A boolean draw fires when the drawn value is *below* a threshold,
-    /// so all-zero bytes make a fault certain rather than impossible — which is the opposite of a
-    /// reduction for everything except a delivery, where "the packet did not arrive" is the thing
-    /// being kept. All-ones make a delay the longest rather than the shortest. So each kind of
-    /// decision says for itself which end of its range is the quiet one.
+    /// Odds draws fire below a threshold, so all-ones is quiet for faults and zero is quiet for
+    /// delays and choices. A delivery's zero drops the packet, which is what the event pass keeps.
     fn dull(&self, target: Target) -> Vec<u8> {
         let quiet = match (target, self.site) {
             // Zero is below every threshold, so the packet is dropped: what the event pass keeps.
             (Target::Deliveries, _) => 0x00,
-            // Any odds draw — a kill, a stall, a refused allocation — is quiet at all-ones, which
-            // is above every threshold a probability can produce. Decided by width as well as
-            // site, because a stall's *length* is drawn at the same site and is quiet at zero.
+            // An odds draw is quiet at all-ones. A stall's length shares the site but not the
+            // width, and is quiet at zero.
             (_, site) if is_odds(site, self.len) => 0xFF,
-            // Bytes that decide a fault by comparison rather than by odds: all-ones loses it too.
+            // These sites decide a fault by comparison, and all-ones loses it too.
             (
                 _,
                 DrawSite::NetPartition
@@ -249,8 +230,7 @@ impl Decision {
                 | DrawSite::DiskReorder
                 | DrawSite::SdkFaultPoint,
             ) => 0xFF,
-            // A delay, a priority, a choice among waiting tasks, bytes a guest was handed: zero is
-            // the shortest, the first and the plainest.
+            // Delays, priorities, choices and guest bytes are plainest at zero.
             _ => 0x00,
         };
         vec![quiet; self.len as usize]
@@ -271,8 +251,7 @@ mod tests {
         journal
     }
 
-    /// Two draws are made per send and only the first decides whether the message arrives. Aiming
-    /// at the second would rewrite whether it was duplicated, which is not the same question.
+    /// Only a send's first draw, the drop decision, is offered.
     #[test]
     fn a_delivery_pass_aims_at_the_first_draw_of_each_send() {
         let journal = journal_of(&[
@@ -286,8 +265,7 @@ mod tests {
         assert_eq!(found.iter().map(|d| d.offset).collect::<Vec<_>>(), vec![0, 8]);
     }
 
-    /// A draw that consumed nothing decided something structural, and one past the prefix took its
-    /// bytes from the keystream. Neither can be rewritten, so neither is offered.
+    /// Empty draws and draws past the prefix are not offered.
     #[test]
     fn a_decision_a_rewrite_cannot_reach_is_not_offered() {
         let journal = journal_of(&[
@@ -299,8 +277,7 @@ mod tests {
         assert_eq!(found.iter().map(|d| d.offset).collect::<Vec<_>>(), vec![8]);
     }
 
-    /// A fault fires when what it drew is below a threshold, so zeroing its bytes makes it certain.
-    /// A reduction that wrote zeroes everywhere would inject faults rather than remove them.
+    /// A fault is quieted with all-ones, since zero would make it certain.
     #[test]
     fn quiet_is_not_the_same_end_of_the_range_for_every_decision() {
         let fault = Decision { site: DrawSite::NodeFault, offset: 0, len: 2 };
@@ -313,8 +290,8 @@ mod tests {
         assert_eq!(delivery.edit(Target::Deliveries).bytes, vec![0, 0]);
     }
 
-    /// Draws as `(site, offset, len, event, fired)`; a two-byte draw at an odds site is an odds
-    /// draw, journalled as the world journals one.
+    /// A journal of draws given as `(site, offset, len, event, fired)`. A two-byte draw at an odds
+    /// site is journalled as an odds draw, the way the world journals one.
     fn journal_with_values(draws: &[(DrawSite, u64, u32, u64, u64)]) -> Journal {
         let mut journal = Journal::new();
         for (site, offset, len, event, fired) in draws {
@@ -327,8 +304,8 @@ mod tests {
         journal
     }
 
-    /// The fault pass sees the faults that fired and nothing else: an odds draw journals whether it
-    /// fired, and a draw at a fault site of another width decided something else.
+    /// The fault pass sees only the faults that fired. An odds draw journals whether it fired, and
+    /// a draw of another width at a fault site decided something else.
     #[test]
     fn the_fault_pass_aims_at_faults_that_fired() {
         let journal = journal_with_values(&[
@@ -345,8 +322,8 @@ mod tests {
         }
     }
 
-    /// A stall's odds and its length are drawn at one site. All-ones makes the first not happen
-    /// and zero makes the second the shortest; one rule for the site would get one of them wrong.
+    /// A stall's odds and its length are drawn at one site. All-ones stops the stall and zero makes
+    /// the length shortest, so the quiet value depends on the width.
     #[test]
     fn one_site_can_hold_an_odds_draw_and_a_length() {
         let odds = Decision { site: DrawSite::DiskLatency, offset: 0, len: 2 };
@@ -357,8 +334,8 @@ mod tests {
         assert_eq!(refused.edit(Target::Everything).bytes, vec![0xFF, 0xFF]);
     }
 
-    /// A node fault's earlier chances stop at the fault before it, and what it drew next at its own
-    /// event travels with it so it fires as the same kind.
+    /// A node fault's earlier chances stop at the fault before it, and its body moves with it, so
+    /// it fires as the same kind.
     #[test]
     fn a_node_fault_moves_with_its_kind_and_never_past_the_fault_before_it() {
         let journal = journal_with_values(&[
@@ -384,8 +361,8 @@ mod tests {
         assert!(fired_at(&journal, 13) && !fired_at(&journal, 11));
     }
 
-    /// A fault's body is what says what it is, and nothing the call went on to draw: a kind of one
-    /// option is passed over, a degradation's severity is kept, the call's own draws are not.
+    /// A fault's body holds only the fault's own draws. A one-option kind is skipped, a
+    /// degradation's severity is kept, and the call's later draws are left out.
     #[test]
     fn a_fault_carries_what_it_is_and_not_what_the_call_drew_next() {
         let journal = journal_with_values(&[

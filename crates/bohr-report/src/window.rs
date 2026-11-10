@@ -1,24 +1,18 @@
 //! Which events a page shows when a run recorded more than a page can hold.
 //!
-//! A single slice around the violation would be the obvious answer and the wrong one: what a
-//! reader needs is the neighbourhood of the failure *and* everything that was done to the run,
-//! and the faults are usually nowhere near the end. So the window is a dense range around the
-//! point of interest merged with a keep-set of the events that are worth showing wherever they
-//! fall — and what is left out is counted and named rather than quietly dropped.
+//! A dense range around the point of interest, merged with a keep-set of events worth showing
+//! wherever they fall, such as faults far from the end. What is left out is counted.
 
 use bohr_trace::{Event, EventKind};
 
 /// Events a page draws before it starts leaving some out.
 ///
-/// A bound on the page rather than on the run: past a couple of thousand chips the timeline stops
-/// being something a person reads and becomes something they scroll past, and the file stops being
-/// something anybody attaches to an issue.
+/// Past a couple of thousand chips the timeline stops being readable.
 pub(crate) const MOST_SHOWN: usize = 2000;
 
 /// Events kept before the point of interest, and after it.
 ///
-/// Weighted backwards on purpose: what led to a failure is the question, and what the guest did
-/// afterwards is rarely part of the answer.
+/// Weighted backwards, toward what led to the failure.
 const BEFORE: usize = 1200;
 const AFTER: usize = 300;
 
@@ -45,11 +39,8 @@ impl Window {
         let to = (centre + AFTER).min(events.len());
 
         let mut shown: Vec<usize> = (from..to).collect();
-        // **The keep-set is bounded too.** Keeping everything worth showing wherever it falls is
-        // right until a guest asserts in a loop: a hundred thousand assertions are a hundred
-        // thousand kept slots, each costing a cell on every node's lane, and the page would pass
-        // the size `MOST_BYTES` documents as the largest this crate produces.
-        // What does not fit is counted as elided like anything else, so the page still says so.
+        // The keep-set is bounded too, so an assertion in a loop cannot push the page past
+        // `MOST_BYTES`. What does not fit is counted as elided.
         let mut kept: Vec<usize> = events
             .iter()
             .enumerate()
@@ -57,8 +48,7 @@ impl Window {
             .map(|(at, _)| at)
             .collect();
         if kept.len() > MOST_KEPT {
-            // The earliest of them, because what a reader is looking for is where a run first
-            // went wrong rather than the last of a repeating tail.
+            // The earliest, where the run first went wrong.
             kept.truncate(MOST_KEPT);
         }
         shown.extend(kept);
@@ -84,9 +74,7 @@ impl Window {
 
     /// How many events are missing immediately before each shown one, and after the last.
     ///
-    /// One entry longer than the shown list, so the run's beginning and end are counted as well as
-    /// its middle: a timeline that started at the eight-thousandth event with nothing said about
-    /// the ones before it would read as a run that began there.
+    /// One entry longer than the shown list, so gaps at both ends are counted.
     pub(crate) fn gaps(&self) -> Vec<usize> {
         let mut missing = Vec::with_capacity(self.shown.len() + 1);
         let mut previous: Option<usize> = None;
@@ -101,16 +89,12 @@ impl Window {
 
 /// The most events the keep-set may add on top of the slice around the failure.
 ///
-/// A bound rather than a preference: every kept slot is drawn on every node's lane, so the page
-/// grows with the product of the two, and a guest that asserts inside a loop is not unusual. Wide
-/// enough that no ordinary run reaches it, and the page says how many it left out either way.
+/// Every kept slot is drawn on every lane. No ordinary run reaches the bound.
 const MOST_KEPT: usize = 2_000;
 
 /// Whether an event is shown wherever it falls.
 ///
-/// Everything the world did to the run, and everything the guest said about itself. These are the
-/// events a reader is looking for, and they are the ones a slice around a failure misses: a
-/// partition raised at the start of a long run is nowhere near the end of it.
+/// Everything the world did to the run and everything the guest said about itself.
 const fn always_worth_showing(kind: &EventKind) -> bool {
     matches!(
         kind,
@@ -150,9 +134,7 @@ mod tests {
         assert!(window.gaps().iter().all(|missing| *missing == 0), "a whole run has no holes");
     }
 
-    /// The reason the keep-set exists: a fault at the start of a long run is nowhere near the
-    /// failure at the end, and a slice would show a reader neither the cause nor that there was
-    /// one.
+    /// A fault at the start of a long run is shown with the failure at its end.
     #[test]
     fn what_the_world_did_is_shown_wherever_it_happened() {
         let mut events: Vec<Event> = (0..10_000).map(syscall).collect();
@@ -180,8 +162,7 @@ mod tests {
         assert!(window.shown().len() <= MOST_SHOWN + 64, "shown {}", window.shown().len());
     }
 
-    /// What is left out is counted and locatable, because a hole drawn as nothing reads as a run
-    /// in which nothing happened.
+    /// What is left out is counted and located.
     #[test]
     fn what_is_left_out_is_counted_and_placed() {
         let events: Vec<Event> = (0..10_000).map(syscall).collect();
@@ -195,8 +176,7 @@ mod tests {
         assert!(gaps[0] > 0, "the events before the first one shown were not counted");
     }
 
-    /// With nothing to centre on, the end of the run is what a reader wants: that is where a
-    /// crash or a hang left off.
+    /// With nothing to centre on, the window shows the end of the run.
     #[test]
     fn a_run_with_no_point_of_interest_shows_its_end() {
         let events: Vec<Event> = (0..10_000).map(syscall).collect();

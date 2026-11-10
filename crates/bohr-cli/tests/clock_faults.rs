@@ -1,6 +1,6 @@
 //! Clock faults against a real program: a wall clock set back is reached, and nothing else is.
 //!
-//! Linux only, and skipped where the guest has not been built, like the other tests of real guests.
+//! Linux only; skips when the guest is not built.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -26,7 +26,7 @@ fn built() -> bool {
     root().join(GUEST).is_file()
 }
 
-/// A step back during the lease is the finding, on every seed: the moment is written down.
+/// A step back during the lease is found on every seed, since its moment is scheduled.
 #[test]
 fn a_wall_clock_set_back_outlives_a_lease() {
     if !built() {
@@ -66,7 +66,7 @@ fn a_steady_clock_keeps_the_lease_honest() {
     }
 }
 
-/// An absolute wall-clock deadline set after a step is reached a second later, not thirty-one.
+/// An absolute wall-clock deadline set after a step is reached one second later.
 #[test]
 fn a_wall_deadline_is_measured_on_the_wall_clock() {
     const DEADLINE: &str = "testdata/guests/build/wall_deadline";

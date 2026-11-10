@@ -1,9 +1,7 @@
 //! What `bohr doctor` must say, and must never do.
 //!
-//! Runs on any host: what varies is the verdict, and what these check is that a verdict is
-//! reached, named, and never acted on. A host that fails is as valid an outcome as one that
-//! passes — the gate is that the answer is correct on every runner, including the ones that
-//! cannot run guests at all.
+//! Runs on any host. The verdict varies; these check that it is reached, named and never acted
+//! on, including on hosts that cannot run guests.
 
 use std::process::Command;
 
@@ -20,7 +18,7 @@ fn bohr(args: &[&str]) -> (i32, String) {
 #[test]
 fn a_diagnosis_reaches_a_verdict_and_names_what_it_checked() {
     let (code, out) = bohr(&["doctor"]);
-    // Zero where the host is usable, four where it is not; nothing else is a diagnosis.
+    // 0 for a usable host, 4 for an unusable one.
     assert!(code == 0 || code == 4, "doctor exited {code}:\n{out}");
     assert!(
         out.contains("pass") || out.contains("skip") || out.contains("FAIL"),
@@ -32,8 +30,7 @@ fn a_diagnosis_reaches_a_verdict_and_names_what_it_checked() {
     );
 }
 
-/// A failure has to say what to type. A diagnosis that names a problem and not a next step is
-/// where somebody gives up.
+/// A failure says what to type next.
 #[test]
 fn every_failure_carries_something_to_type() {
     let (_, out) = bohr(&["doctor"]);
@@ -48,7 +45,7 @@ fn every_failure_carries_something_to_type() {
     }
 }
 
-/// The support table is what a target is compared against, so it must be printable.
+/// The support table prints.
 #[test]
 fn the_syscall_table_can_be_printed() {
     let (code, out) = bohr(&["doctor", "--syscalls"]);
@@ -61,7 +58,7 @@ fn the_syscall_table_can_be_printed() {
     }
 }
 
-/// A target that cannot be read is a usage error, not a verdict about the host.
+/// A target that cannot be read is a usage error.
 #[test]
 fn a_missing_target_is_refused_rather_than_judged() {
     let (code, out) = bohr(&["doctor", "--target", "no/such/program"]);
@@ -84,16 +81,10 @@ fn a_target_is_inspected_where_one_can_be() {
     assert!(out.contains("io_uring"), "{out}");
 }
 
-/// The instruction is reported where it is there, and not where it only looks like it.
+/// The instruction is reported where it is, and not where its bytes appear inside another one.
 ///
-/// Two guests, because either half alone is a scan that could be right by accident. One carries a
-/// single `RDRAND`; the other carries none and carries, like every large object, byte pairs that
-/// spell one inside the displacements of ordinary instructions.
-///
-/// The strict half is the one that was wrong. A rule that dropped every candidate it had not
-/// placed on an instruction boundary reported `libstdc++` clean — five real sites, the path
-/// `std::random_device` takes — and a hole reported as solid ground is worse than a warning that
-/// wastes an afternoon.
+/// One guest has a single `RDRAND`; the other has none but contains its byte pattern inside
+/// ordinary instructions' displacements. A real `libstdc++` has five sites.
 #[test]
 fn hardware_randomness_is_reported_where_it_is_and_only_there() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {

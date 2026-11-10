@@ -1,12 +1,9 @@
 //! Every subject in this repository, held to the checks it declares.
 //!
-//! The test does not list subjects: it reads them, as `bohr check --all` does, so a pack or a
-//! seeded defect added as files is checked here without a line of Rust. What it asserts is that
-//! the declarations parse and that every defect with a scenario has one; the quick checks run in
-//! `make test`, and the full ones — sixty-seed sweeps, a thousand repeats — in `make test-hunting`.
+//! Subjects are discovered as `bohr check --all` does, so a new pack or defect needs no Rust. Quick
+//! checks run in `make test`; full ones (60-seed sweeps, 1000 repeats) in `make test-hunting`.
 //!
-//! Packs are declared here and checked in the VM gate, not in this file: their binaries are built
-//! by their own pack, take minutes to build, and are not in a checkout.
+//! Pack checks run in the VM gate, since pack binaries take minutes to build.
 
 use std::{path::PathBuf, process::Command};
 
@@ -39,7 +36,7 @@ fn every_subject_declares_its_checks() {
     }
 }
 
-/// A seeded defect with a scenario is a subject: a scenario nobody checks is a gate nobody runs.
+/// Every seeded defect with a scenario declares checks.
 #[test]
 fn every_seeded_defect_with_a_scenario_has_a_bug_toml() {
     let bugs = root().join("testdata/bugs");
@@ -75,7 +72,7 @@ fn built_defects() -> Vec<&'static str> {
     .collect()
 }
 
-/// The quick checks — that each program works, repeats and replays — hold on every built defect.
+/// The quick checks (runs, repeats, replays) hold on every built defect.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn quick_checks_hold_on_every_built_defect() {
@@ -87,8 +84,7 @@ fn quick_checks_hold_on_every_built_defect() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
-/// Every check every built defect declares holds: the seeded defects are found at their bounds, and
-/// their correct twins are not.
+/// Every declared check holds: defects are found at their bounds and their correct twins are not.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 #[ignore = "sweeps of sixty seeds and a thousand repeats; run by `make test-hunting`"]

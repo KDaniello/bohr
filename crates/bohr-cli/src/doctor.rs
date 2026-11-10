@@ -1,9 +1,8 @@
 //! What this host can do, what it cannot, and what to type about it.
 //!
-//! Every check reports pass, warn or fail, and every failure carries the command that would show
-//! the setting behind it. **Nothing here changes a host setting.** A tool that quietly relaxed
-//! `ptrace_scope` on somebody's machine would be a worse neighbour than one that cannot run, and
-//! the person who owns the machine is the one who should decide. See `docs/API.md` §7.5.
+//! Every check reports pass, warn or fail, and every failure carries the command that shows the
+//! setting behind it. Nothing here changes a host setting; the machine's owner decides. See
+//! `docs/API.md` §7.5.
 
 use crate::CliError;
 
@@ -12,14 +11,11 @@ use crate::CliError;
 pub(crate) enum Verdict {
     /// The capability is there.
     Pass,
-    /// Runs work, but something is lost — speed, or a guarantee that can be reported as lost.
+    /// Runs work but lose speed or a guarantee, which is reported.
     Warn,
     /// Runs cannot be trusted here.
     Fail,
-    /// Nothing could be established, usually because this build has no interceptor.
-    ///
-    /// Only a build without one reaches for this, so a build that can intercept never constructs
-    /// it and would otherwise report it as dead.
+    /// Nothing could be checked, usually because this build has no interceptor.
     #[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
     Skip,
 }
@@ -34,7 +30,7 @@ impl Verdict {
         }
     }
 
-    /// The verdict as a `--json` reader matches it: lower case, so a failure is `fail`.
+    /// The verdict in lower case, as `--json` writes it.
     const fn status(self) -> &'static str {
         match self {
             Self::Pass => "pass",
@@ -70,8 +66,8 @@ impl Check {
 
 /// Runs every check and prints what it found.
 ///
-/// Exit codes are part of the contract: 0 where every check passed, 4 where one failed — the same
-/// code a run uses for "determinism could not be guaranteed", because that is what it means.
+/// Exits 0 when every check passed and 4 when one failed, the code a run uses for "determinism
+/// could not be guaranteed".
 pub(crate) fn run(target: Option<&str>, list_syscalls: bool) -> Result<u8, CliError> {
     if list_syscalls {
         return Ok(print_syscalls());
@@ -91,8 +87,7 @@ pub(crate) fn run(target: Option<&str>, list_syscalls: bool) -> Result<u8, CliEr
     let width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
     for check in &checks {
         println!("{:width$}  {}  {}", check.name, check.verdict.mark(), check.detail);
-        // Only where something is wrong: a remedy printed under a passing check reads as an
-        // instruction to follow rather than as the way to look into a problem.
+        // Printed only for a problem, so a passing check shows no instructions.
         if check.verdict != Verdict::Pass
             && let Some(remedy) = &check.remedy
         {
@@ -132,8 +127,7 @@ fn worst_of(checks: &[Check]) -> Verdict {
 
 /// Every check as a row, and the worst of them as the host's verdict.
 ///
-/// A remedy is carried whatever the status: a program decides for itself what to show, and the
-/// rule that hides it under a pass is about what a person reads.
+/// Every row carries its remedy; hiding it under a pass applies only to the text.
 fn checks_json(checks: &[Check], worst: Verdict) -> serde_json::Value {
     let rows: Vec<serde_json::Value> = checks
         .iter()
@@ -178,7 +172,7 @@ fn syscalls_json() -> serde_json::Value {
     serde_json::json!({ "backend": backend, "syscalls": rows })
 }
 
-/// What a build without an interceptor can say about a host: that it is not one.
+/// What a build without an interceptor reports: that it cannot check this host.
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn host_checks() -> Vec<Check> {
     vec![
@@ -237,8 +231,8 @@ fn host_checks() -> Vec<Check> {
         describe(seccomp, "a filter can be installed", "filters are unavailable"),
     ));
 
-    // A failure, not a warning: without its own identifier namespace a guest's threads carry the
-    // host's numbers, the kernel writes them into guest memory, and two runs of one seed differ.
+    // A failure: without its own pid namespace a guest's threads get host numbers, the kernel
+    // writes them into guest memory, and two runs of one seed differ.
     let namespaces = probe::can_use_namespaces();
     checks.push(
         Check::new(
@@ -301,10 +295,8 @@ fn host_checks() -> Vec<Check> {
         describe(affinity, "a guest can be pinned to one core", "a guest cannot be pinned"),
     ));
 
-    // **What the guest is shown is a promise this host has to be able to keep.** A guest told it
-    // has a feature will execute it, and it executes on the real processor whatever the world said
-    // -- so a machine that cannot do what the presented profile advertises is a machine where a
-    // guest dies on an instruction nobody could have predicted from the run.
+    // The host must support every feature the guest is told it has: the guest executes them on
+    // the real processor and would crash on a missing one.
     let promised =
         probe::supports(bohr_world::cpu::identify(1, 0)[2], bohr_world::cpu::identify(7, 0)[1]);
     checks.push(
@@ -351,8 +343,8 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
         Some(loader) => checks.push(
             Check::new(
                 "target loader",
-                // A dynamic program needs its loader inside the guest's own filesystem, which
-                // the world does not populate: it is a run that will fail, said now instead.
+                // A dynamic program needs its loader in the guest's filesystem, which the world
+                // does not provide, so the run would fail.
                 Verdict::Warn,
                 format!("needs {loader}, which the virtual filesystem does not provide"),
             )
@@ -378,10 +370,8 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
         );
     }
 
-    // A warning and not a failure, because what this looks at cannot answer the question. The scan
-    // finds the string anywhere in the binary, so a program that links a library offering a ring
-    // and never opens one is reported here exactly like a program that depends on it. What settles
-    // it is running the thing: `bohr survey` reports the calls a program actually made.
+    // A warning: the scan finds the string anywhere in the binary, including a linked library the
+    // program never uses. `bohr survey` reports the calls the program actually makes.
     checks.push(if report.uses_io_uring {
         Check::new("io_uring", Verdict::Warn, "the program mentions io_uring somewhere in itself")
             .with_remedy("bohr survey -- <program>, to see whether it calls one")
@@ -394,8 +384,7 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
 
 /// The same, where nothing can inspect a program for this host.
 ///
-/// The file is still read: whether it is there is a fact about the file, and a build that
-/// answered "skipped" for a path that does not exist would be hiding a typo.
+/// The file is still read, so a mistyped path is reported.
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
     std::fs::read(path)
@@ -409,9 +398,8 @@ fn target_checks(path: &str) -> Result<Vec<Check>, CliError> {
 
 /// What to type where namespaces are refused, which depends on who refuses them.
 ///
-/// Ubuntu from 24.04 refuses them to unprivileged programs through AppArmor unless a profile names
-/// the program; the answer there is a profile for this binary, not a host-wide switch. Elsewhere
-/// the count of namespaces a user may hold is the setting.
+/// Ubuntu 24.04 refuses them through AppArmor unless a profile names the program, so the remedy is
+/// a profile for this binary. Elsewhere it is the per-user namespace limit.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn namespace_remedy() -> String {
     let restricted =
@@ -450,7 +438,7 @@ mod tests {
         assert_eq!(worst_of(&checks[..2]), Verdict::Warn);
     }
 
-    /// The host checks this build runs come out as rows whatever the host is.
+    /// This host's checks come out as rows on any host.
     #[test]
     fn this_hosts_checks_are_rows() {
         let checks = host_checks();

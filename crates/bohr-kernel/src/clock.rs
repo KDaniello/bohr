@@ -7,16 +7,13 @@ use bohr_types::{NodeId, Tick};
 
 /// Parts per million a node's clock may run fast or slow by.
 ///
-/// Wall clocks on separate machines never agree, and software that assumes they do fails in ways
-/// that only appear in production. The rate is bounded so a run stays comprehensible: a node an
-/// hour ahead is a different test from a node a microsecond ahead, and both are reachable.
+/// Real machines' clocks disagree; the bound keeps a run's skew realistic.
 pub const MAX_DRIFT_PPM: u32 = 200;
 
 /// Where every wall clock starts: 2025-01-01 00:00:00 UTC, in ticks since 1970.
 ///
-/// **A date, not zero.** A clock stepped back in a run's first minute moves back from here rather
-/// than standing at 1970, and a program that checks the date it is shown against a certificate or a
-/// genesis sees a year it can believe. Fixed, so every run on every host reads the same dates.
+/// A plausible date, so certificate and genesis checks pass and an early step back has room.
+/// Fixed, so every host reads the same dates.
 pub const WALL_EPOCH: Tick = Tick(1_735_689_600 * 1_000_000_000);
 
 /// How one node sees the world clock, as two readings: monotonic, and wall.
@@ -38,8 +35,7 @@ impl NodeClock {
     ///
     /// # Panics
     ///
-    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`]. Below -1 000 000 a node's clock would read
-    /// earlier as the world moves on, so the bound is checked here rather than trusted to callers.
+    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`].
     #[must_use]
     pub const fn new(offset: u64, drift_ppm: i32) -> Self {
         assert_drift_in_bounds(drift_ppm);
@@ -48,14 +44,12 @@ impl NodeClock {
 
     /// The same reading at `at`, drifting at `drift_ppm` from there on.
     ///
-    /// Folding the accumulated part into the offset is what keeps a rate change from rewriting the
-    /// past: readings before `at` stay exactly what they were, which a replayed trace depends on.
-    /// Where the fold would need a negative offset the clock reads the drifted value instead —
-    /// forward, never back.
+    /// The accumulated drift folds into the offset, so readings before `at` are unchanged. The
+    /// clock never reads backwards.
     ///
     /// # Panics
     ///
-    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`], for the reason [`Self::new`] does.
+    /// Panics on a rate outside ±[`MAX_DRIFT_PPM`].
     #[must_use]
     pub fn rebased(self, at: Tick, drift_ppm: i32) -> Self {
         assert_drift_in_bounds(drift_ppm);
@@ -90,8 +84,7 @@ impl NodeClock {
 
     /// What this node's monotonic clock reads when the world clock says `now`.
     ///
-    /// Drift accumulates with elapsed time, which is what makes two nodes diverge the longer a run
-    /// goes on rather than sitting at a fixed distance apart.
+    /// Drift accumulates with elapsed time, so nodes diverge as the run goes on.
     #[must_use]
     pub const fn read(self, now: Tick) -> Tick {
         let elapsed = now.get() as i128;
@@ -117,9 +110,8 @@ const fn assert_drift_in_bounds(drift_ppm: i32) {
 
 /// Virtual time for a run.
 ///
-/// Advances only when something in the run says it should. No host clock is ever consulted, so a
-/// guest that sleeps for an hour wakes instantly and a run takes the same virtual time on a busy
-/// machine as on an idle one.
+/// Advances only when the run says so. A guest sleeping an hour wakes at once, and load on the
+/// host never changes virtual time.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Clock {
     now: Tick,
@@ -143,8 +135,7 @@ impl Clock {
 
     /// What `node` reads.
     ///
-    /// Ordering inside the run always uses the world clock; this is only what a guest is told, so
-    /// two nodes disagreeing about the time cannot make the run itself ambiguous.
+    /// Only what the guest is told; the run is ordered by the world clock.
     #[must_use]
     pub fn now_on(&self, node: NodeId) -> Tick {
         self.nodes.get(&node).map_or(self.now, |clock| clock.read(self.now))

@@ -1,20 +1,12 @@
 //! A cluster that promises something about itself, and a world that can break the promise.
 //!
-//! Everything else in this crate is scripted to test *reproduction*: the fixtures run clean and
-//! what is measured is whether two runs agree. Reduction asks the opposite question — what is the
-//! smallest scenario that still goes wrong — so it needs a guest that genuinely goes wrong, judged
-//! by the oracle the tool ships rather than by one with no opinion.
+//! A guest that really fails, judged by the shipped oracle, for testing reduction.
 //!
-//! # Why the scripts are shaped as they are
+//! # Script shape
 //!
-//! A script cannot be shortened. Reduction removes what the *world* did — a partition, a fault, a
-//! delivery — and the program it was done to is whatever it was compiled as. So a guest that keeps
-//! polling after the answer stops coming would record its remaining rounds whatever a reducer took
-//! away, and the run could never become small. Both guests therefore stop as soon as the world
-//! stops behaving: the asserter says its promise was broken and exits, and the responder is
-//! blocked on a receive that a scheduled fault ends. That is what makes the difference between the
-//! long run and the short one a matter of *when* the world acts rather than of how much guest is
-//! left to execute.
+//! Reduction changes only what the world did, so both guests stop as soon as the world misbehaves:
+//! the asserter reports the broken promise and exits, and the responder blocks until a scheduled
+//! fault ends it. The run's length then depends on when the world acts.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_types::{GuestAddr, NodeId, Tick};
@@ -27,12 +19,11 @@ pub const ASKER: NodeId = NodeId(0);
 /// The node that keeps it, until the world stops letting it.
 pub const ANSWERER: NodeId = NodeId(1);
 
-/// `FIONBIO`: what makes an empty receive answer rather than park.
+/// `FIONBIO`: what makes an empty receive return at once.
 const FIONBIO: u64 = 0x5421;
 /// `O_CREAT`, as an ordinary guest passes it.
 const O_CREAT: u64 = 0o100;
-/// The first socket a node opens, and the first descriptor `openat` hands out. Both deterministic,
-/// which is what lets a script name them without having read a return value.
+/// The first socket and the first `openat` descriptor, both deterministic.
 const SOCK: u64 = 4096;
 const RECORDS_FD: u64 = 3;
 
@@ -43,11 +34,9 @@ const NONBLOCKING: u64 = MEMORY_BASE + 96;
 const SLEEP: u64 = MEMORY_BASE + 128;
 const PATH: u64 = MEMORY_BASE + 256;
 const RECORD: u64 = MEMORY_BASE + 512;
-/// The responder reads into one slot: a blocking receive only returns when something filled it,
-/// so there is no stale answer to tell apart from a fresh one.
+/// The responder's one slot; a blocking receive returns only once it is filled.
 const ANSWER_SLOT: u64 = MEMORY_BASE + 1024;
-/// The asserter needs one slot per round. Nothing in a script can clear memory, so a reused slot
-/// would still hold the answer to the round before and every later round would look answered.
+/// One slot per round, since a script cannot clear memory.
 const INBOX: u64 = MEMORY_BASE + 4096;
 
 /// Eight bytes each way, so a script can branch on what arrived.
@@ -68,8 +57,7 @@ const PATIENCE_TICKS: u64 = 2_000_000;
 
 /// A two-node exchange, and the two moments the world can break it at.
 ///
-/// The rounds decide how long the run is; the ticks decide how early it goes wrong. A reduction
-/// works on the second pair and never on the first, which is the whole point of the fixture.
+/// Rounds set the run's length; ticks set how early it fails. Reduction moves only the ticks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PingPong {
     rounds: usize,
@@ -80,8 +68,7 @@ pub struct PingPong {
 impl PingPong {
     /// An exchange of `rounds` rounds that the world never interferes with.
     ///
-    /// On its own this runs clean: every ping is answered and the guest exits without complaining.
-    /// A caller breaks it with [`Self::cut_at`] and ends the responder with [`Self::kill_at`].
+    /// Runs clean on its own; [`Self::cut_at`] breaks it and [`Self::kill_at`] ends the responder.
     #[must_use]
     pub const fn new(rounds: usize) -> Self {
         Self { rounds, cut_at: Tick(u64::MAX), kill_at: Tick(u64::MAX) }
@@ -96,9 +83,7 @@ impl PingPong {
 
     /// Ends the responder at this tick.
     ///
-    /// Needed rather than tidy: the responder waits on a receive, and a task waiting with nothing
-    /// left to release it is a deadlock — which the kernel reports as a hang, not as the broken
-    /// promise the fixture is about. The fault is what lets the run end on the verdict it earned.
+    /// Without it the blocked responder is a deadlock, which would hide the broken promise.
     #[must_use]
     pub const fn kill_at(mut self, at: Tick) -> Self {
         self.kill_at = at;
@@ -183,8 +168,7 @@ impl PingPong {
             let base = HEAD + round * PER_ROUND;
             ops.push(GuestOp::Syscall { nr: sys::CLOCK_NANOSLEEP, args: [0, 0, SLEEP, 0, 0, 0] });
             ops.push(GuestOp::Syscall { nr: sys::RECVFROM, args: [SOCK, slot, 8, 0, 0, 0] });
-            // An answer carries on; an empty queue answers `EAGAIN` and leaves the slot as it
-            // was, which falls through to the complaint.
+            // `EAGAIN` leaves the slot empty and falls through to the complaint.
             ops.push(GuestOp::JumpIfMem { addr: GuestAddr(slot), equals: PONG, pc: base + 4 });
             ops.push(GuestOp::Jump { pc: complain_at + 1 });
             ops.push(GuestOp::Syscall {
@@ -198,9 +182,7 @@ impl PingPong {
             "the rounds do not end where the complaint begins"
         );
 
-        // Running out of rounds with every one answered is a guest that kept its promise: it
-        // arrives here by falling through and steps over the complaint, which is reached only by
-        // the jump above.
+        // Every round answered: skip the complaint.
         ops.push(GuestOp::Jump { pc: complain_at + 3 });
         ops.push(GuestOp::Syscall { nr: sys::OPENAT, args: [0, PATH, O_CREAT, 0, 0, 0] });
         ops.push(GuestOp::Syscall {
@@ -213,9 +195,7 @@ impl PingPong {
 
     /// Answer whatever arrives, and wait when nothing has.
     ///
-    /// The receive blocks rather than polling: a poll would need a sleep to be bearable, and every
-    /// sleep is a round the responder records whether or not anything is happening. Blocking makes
-    /// the responder cost nothing at all once the answers stop.
+    /// Blocking, so the responder records nothing once answers stop.
     fn answers(&self) -> NullProgram {
         let mut ops = vec![
             GuestOp::Syscall { nr: sys::SOCKET, args: [2, 2, 0, 0, 0, 0] },

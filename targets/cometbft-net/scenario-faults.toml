@@ -1,0 +1,69 @@
+# Four CometBFT validators with the kvstore application and a client committing transactions, under
+# crashes, freezes, isolation and bad links once the network is up.
+#
+# Judged four ways: every validator answers the same hash for a height, a hash a validator gave
+# for a height never changes, the height moves, and every transaction the client saw committed is
+# held by every validator that has applied its height.
+[run]
+horizon_ticks = 25_000_000_000
+ends_with_node = 4
+
+[state]
+dir = "targets/cometbft-net/state"
+cwd = "/"
+
+[cluster]
+nodes = 5
+programs = [
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node0", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node1", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node2", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node3", "--proxy_app", "kvstore"],
+  ["examples/comet-driver/build/comet-driver"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[disk]
+sync_semantics = "strict"
+reorder_unsynced = true
+
+[faults]
+kill_probability = "1/65536"
+targeting = "guided"
+restart_after_ticks = 1_000_000_000
+arm_after_ticks = 3_000_000_000
+budget_per_run = 3
+draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade"]
+
+[[probe]]
+name = "finality"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 1_000_000_000
+key = "block.header.height"
+value = "block_id.hash"
+property = "never-reverts"
+
+[[probe]]
+name = "agreement"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 1_000_000_000
+key = "block.header.height"
+value = "block_id.hash"
+property = "agrees"
+
+[[probe]]
+name = "liveness"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 1_000_000_000
+value = "block.header.height"
+property = "advances"
+within_ticks = 10_000_000_000

@@ -1,11 +1,9 @@
 //! The draw journal: what was decided, where on the tape, and by whom.
 //!
-//! Produced during a run and never consumed as input. The tape stays a flat byte string so that
-//! byte-level mutators apply to it directly; the journal supplies the decision boundaries the
-//! reducer and the report need. See `docs/ARCHITECTURE.md` §5.3.
+//! Produced by a run, never read as input. The tape stays flat bytes for mutators; the journal
+//! gives the reducer and the report the decision boundaries. See `docs/ARCHITECTURE.md` §5.3.
 //!
-//! Being derived, it is regenerated on replay and compared. A mismatch means the draw ABI changed
-//! under a stored bundle.
+//! Replay regenerates and compares it; a mismatch means the draw ABI changed.
 
 use bohr_types::{EventId, TapeOffset};
 use serde::{Deserialize, Serialize};
@@ -70,9 +68,7 @@ pub enum DrawSite {
 impl DrawSite {
     /// The name a report or a reduction shows for this site.
     ///
-    /// Beside the enum rather than in whoever prints it: two readers naming one site differently
-    /// is how a reduction that says it aimed at the network and a report that says a packet
-    /// decision was made stop looking like the same fact.
+    /// Defined here, so every reader names a site the same way.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -101,8 +97,7 @@ impl DrawSite {
 
     /// The site a stored code names, where this build knows it.
     ///
-    /// A journal written by a newer build carries codes this one has no name for, and a reader
-    /// that refused the whole journal over one of them would lose every draw it did understand.
+    /// `None` for codes from a newer build, which do not invalidate the journal.
     #[must_use]
     pub const fn from_code(code: u16) -> Option<Self> {
         Some(match code {
@@ -169,10 +164,7 @@ impl DrawRecord {
     ///
     /// # Errors
     ///
-    /// Refuses a record whose reserved field is not zero. The journal is regenerated on replay and
-    /// compared, and a mismatch is read as "the draw ABI changed under a stored bundle" — a verdict
-    /// about the tool. Damage in a file must not be able to produce it, so the damage is named
-    /// where it is read.
+    /// Refuses a non-zero reserved field, so file damage is reported as damage.
     pub fn from_bytes(b: &[u8; DRAW_RECORD_BYTES]) -> Result<Self, TapeError> {
         let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap_or_default());
         let pad = u16::from_le_bytes([b[26], b[27]]);
@@ -192,8 +184,7 @@ impl DrawRecord {
 
 /// Append-only list of draws made during one run.
 ///
-/// Equal by its records alone: which odds draws fired is known to the run that made them and is
-/// never stored, so a journal read back from a bundle equals the one its run produced.
+/// Equal by records alone; which odds draws fired is not stored.
 #[derive(Clone, Default, Debug)]
 pub struct Journal {
     records: Vec<DrawRecord>,
@@ -218,9 +209,7 @@ impl Journal {
 
     /// A journal of records that were written down somewhere and read back.
     ///
-    /// Takes records rather than draws, because a stored record carries a site code this build may
-    /// have no name for: a journal written by a newer version names sites this one does not, and
-    /// refusing to reconstruct it would lose the draws it does understand along with them.
+    /// Takes records, which may carry site codes unknown to this build.
     #[must_use]
     pub fn from_records(records: Vec<DrawRecord>) -> Self {
         Self { records, fired: Vec::new() }
@@ -247,8 +236,7 @@ impl Journal {
 
     /// Records an odds draw: the bytes it read, as any draw, and whether it fired.
     ///
-    /// The bytes and not the outcome go into the record, so the stored section is what it always
-    /// was; the outcome is kept beside it for a reduction, which needs to know which faults landed.
+    /// The record holds the bytes; the outcome is kept beside it for the reducer.
     pub fn push_odds(
         &mut self,
         offset: TapeOffset,
@@ -322,9 +310,7 @@ mod tests {
         assert_eq!(DrawRecord::from_bytes(&bytes).expect("a record we wrote"), r);
     }
 
-    /// "Reserved; must be zero" that nothing checked was a promise the format did not keep. A
-    /// stored journal with rubbish there replays as a digest mismatch, which the module doc says
-    /// to read as the draw ABI having moved under the bundle — the tool blamed for a damaged file.
+    /// A non-zero reserved field is refused.
     #[test]
     fn a_reserved_field_that_is_not_zero_is_named_rather_than_carried() {
         let mut bytes = DrawRecord {
@@ -340,8 +326,7 @@ mod tests {
         assert_eq!(DrawRecord::from_bytes(&bytes), Err(TapeError::ReservedNotZero));
     }
 
-    /// What fired is kept beside the records and never in them: the bytes are what they were, and
-    /// a journal read back equals the one written.
+    /// What fired is kept beside the records, so a read-back journal equals the written one.
     #[test]
     fn an_odds_draw_keeps_its_bytes_and_says_whether_it_fired() {
         let mut j = Journal::new();
@@ -364,8 +349,7 @@ mod tests {
         assert_eq!(j.to_bytes().len(), 2 * DRAW_RECORD_BYTES);
     }
 
-    /// Every site a stored journal can name is a site this build can name back, and by the number
-    /// the record actually carries.
+    /// Every site code round-trips.
     #[test]
     fn a_stored_code_reads_back_as_the_site_that_wrote_it() {
         let sites = [
@@ -399,7 +383,7 @@ mod tests {
 
     #[test]
     fn site_values_are_the_frozen_ones() {
-        // These values appear in stored journals; renumbering would relabel existing records.
+        // Stored journals carry these values.
         assert_eq!(DrawSite::SchedPick as u16, 1);
         assert_eq!(DrawSite::SyncWake as u16, 4);
         assert_eq!(DrawSite::NetDeliver as u16, 10);

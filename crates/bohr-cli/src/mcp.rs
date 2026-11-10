@@ -1,19 +1,14 @@
-//! `bohr mcp`: the commands as tools a coding agent calls, over the Model Context Protocol.
+//! `bohr mcp`: serves the commands as Model Context Protocol tools over standard input and output.
 //!
-//! Not a second implementation of the commands but a way of starting them. Every tool runs this
-//! same binary with `--json` and hands back what it wrote, so what an agent is told and what a
-//! pipeline reads are one object by construction, never by a promise kept in two places. The
-//! cost is a process per call, which is nothing beside a run.
+//! Each tool runs this binary with `--json` and returns the object it wrote, so an agent gets
+//! exactly what a pipeline reads. A call costs one process.
 //!
-//! A campaign or a reduction takes minutes, longer than an agent should hold a call open, so
-//! `explore` and `reduce` answer at once with a handle; `status` says how far it got — the last
-//! progress line the command wrote — and, once it ends, the object it came to. `cancel` ends it.
-//! Every request is answered on a thread of its own, so a run an agent asked for does not hold up
-//! its question about a campaign; a job is a process group, so ending it ends what it started.
+//! `explore` and `reduce` take minutes, so they return a handle at once. `status` reports the
+//! command's last progress line and, when it ends, its object; `cancel` kills its process group.
+//! Each request runs on its own thread, so a long `run` does not delay a `status`.
 //!
-//! What this does not do: run anything the command line could not, read a bundle itself, or keep
-//! a job past the server's own life. The transport is standard input and output, one JSON-RPC
-//! message a line.
+//! The server runs only what the command line can run, and its jobs end with it. Messages are
+//! JSON-RPC, one per line.
 
 use std::{
     collections::BTreeMap,
@@ -320,10 +315,9 @@ fn tools() -> Vec<Value> {
     ]
 }
 
-/// The command line a tool call stands for.
+/// The command line for a tool call.
 ///
-/// Every value is joined to its flag and every positional comes after `--`, so a bundle named
-/// `-x.bohr` is a bundle and not an option.
+/// Values are joined to their flags and positionals follow `--`, so `-x.bohr` stays a file name.
 fn command_line(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
     let mut args = vec![name.to_owned()];
     let mut option = |flag: &str, key: &str| match &arguments[key] {
@@ -403,8 +397,7 @@ fn required(arguments: &Value, key: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    /// A call becomes the command line a person would have typed, `--json` aside, and a value or a
-    /// name that starts with a dash is never read as an option.
+    /// A call maps to the command line a person would type, and a leading dash stays data.
     #[test]
     fn a_call_is_the_command_it_stands_for() {
         let args =
@@ -418,7 +411,7 @@ mod tests {
         assert!(command_line("sudo", &json!({})).is_err());
     }
 
-    /// Every tool named in the list is one a call reaches.
+    /// Every listed tool is callable.
     #[test]
     fn every_listed_tool_is_callable() {
         for tool in tools() {
@@ -431,7 +424,7 @@ mod tests {
         }
     }
 
-    /// The handshake names the protocol and the server, and an unknown method is refused.
+    /// The handshake names the protocol and the server; an unknown method gets -32601.
     #[test]
     fn the_handshake_and_a_wrong_method() {
         let jobs: Jobs = Arc::default();

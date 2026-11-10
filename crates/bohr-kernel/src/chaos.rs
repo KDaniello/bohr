@@ -1,10 +1,9 @@
 //! Deliberate defects: two ways a scheduling decision can stop coming from the tape.
 //!
-//! Present so the tests that are supposed to catch them can be shown to catch them. Reachable only
-//! through the features that name them, which no ordinary build enables.
+//! They show the tests catch them. Only the features of the same names enable them.
 
-// This whole module is the deliberate violation the mutation harness enables one at a time; the
-// compile-time bans hold everywhere else. See docs/TESTING.md 7.4.
+// The mutation harness enables these one at a time; the bans hold everywhere else. See
+// docs/TESTING.md 7.4.
 #![allow(clippy::disallowed_methods)]
 
 use bohr_types::TaskId;
@@ -17,12 +16,11 @@ pub(crate) fn in_hash_order(runnable: &[TaskId]) -> Vec<TaskId> {
     set.into_iter().collect()
 }
 
-/// Resolves the choice by which task the host got round to first, rather than by a draw.
+/// Resolves the choice by host timing instead of a draw.
 #[cfg(feature = "chaos-delivery-tie")]
 pub(crate) fn first_to_arrive(runnable: &[TaskId]) -> TaskId {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let arrived = START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as usize;
-    // Divided by the coarsest clock granularity in use, because the low digits are constant where
-    // the host counts in hundreds of nanoseconds and the arrival order would not move.
+    // Divided by the coarsest host clock granularity, whose low digits never change.
     runnable[(arrived / 100) % runnable.len()]
 }

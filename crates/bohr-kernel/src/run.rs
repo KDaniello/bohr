@@ -27,37 +27,24 @@ pub struct RunConfig {
     pub max_events: u64,
     /// How far ahead of the world clock a node's clock may be drawn, in ticks.
     ///
-    /// One direction only: the offset is drawn non-negative ([`crate::NodeClock`]), because a
-    /// clock reading before the run began would have to be clamped and would then stand still
-    /// at the start instead of running.
+    /// Ahead only: the offset is non-negative ([`crate::NodeClock`]).
     pub max_clock_skew: Tick,
     /// An event to stop the world before, where a caller asked for one.
     ///
     /// The run stops at the first scheduling point at or after this event, with every task
-    /// stopped — never inside a stop the world is still half-answering, where a return value has
-    /// been decided and not yet applied and the registers do not mean what they say. Overshooting
-    /// is therefore possible and is reported rather than hidden. See `docs/API.md` §7.3.
+    /// stopped and no stop half-answered. It can overshoot, and says so. See `docs/API.md` §7.3.
     pub break_at: Option<EventId>,
     /// Virtual time at which a run that was never going to end on its own is complete.
     ///
-    /// `None` for a guest expected to finish, which is every guest until a scenario says otherwise
-    /// — and with `None` this changes nothing about how a run proceeds, which is what keeps every
-    /// stored bundle replaying to the digest it recorded.
+    /// `None` for a guest expected to finish; `None` leaves the run unchanged.
     ///
-    /// Distinct from `max_ticks` because the two answer opposite questions. `max_ticks` is "this
-    /// guest is stuck"; a horizon is "this guest is a server, and we have seen enough". A guest
-    /// that stops making progress before the horizon is still a deadlock, and one that runs past
-    /// its budget without a horizon is still hung.
+    /// Reaching `max_ticks` means the guest hung; reaching the horizon means a server ran long
+    /// enough. A deadlock before the horizon is still a deadlock.
     pub horizon: Option<Tick>,
     /// The node whose ending is the run's ending, where a scenario names one.
     ///
-    /// A cluster of a service and the thing that drives it has no ending of its own: the service
-    /// goes on serving, and a horizon has to be guessed at generously enough to cover whatever the
-    /// driver does. This says it exactly — the run is over when that node is — and what it buys is
-    /// every tick the run would otherwise have spent watching a server talk to nobody.
-    ///
-    /// `None` for every scenario that does not name one, which is what keeps stored bundles
-    /// replaying to the digest they recorded.
+    /// A service never ends, so the run ends with the node that drives it, without guessing a
+    /// horizon. `None` leaves the run unchanged.
     pub ends_with: Option<NodeId>,
     /// Virtual time one unit of the guest's own computation costs, where the backend counts it.
     ///
@@ -107,12 +94,9 @@ impl Default for RunConfig {
 
 /// Whether `name` is armed on `node`, from the run's arming draw.
 ///
-/// A hash of the draw, the node and the name rather than a draw each: the tape then spends the same
-/// eight bytes whatever a scenario lists, so adding a fault point to a scenario moves no other
-/// decision of the run.
+/// A hash of the draw, node and name, so the tape spends eight bytes whatever the scenario lists.
 ///
-/// All-ones arms nothing: it is what a reduction writes over a decision to make it quiet, and a
-/// hashed draw would otherwise turn a reduction's quietest tape into an arbitrary set.
+/// All-ones arms nothing, since the reducer writes all-ones to quiet a decision.
 fn armed(seed: u64, node: u32, name: &str, (num, den): (u32, u32)) -> bool {
     if num == 0 || den == 0 || seed == u64::MAX {
         return false;
@@ -128,10 +112,8 @@ fn armed(seed: u64, node: u32, name: &str, (num, den): (u32, u32)) -> bool {
 
 /// Virtual hours a run may reach before it is called hung.
 ///
-/// A day and an hour, because a guest that sleeps for a day is a test that is supposed to finish
-/// and a budget below it would refuse the very thing virtual time exists for. It catches sleeping
-/// without end; a guest spinning without syscalls advances no virtual time at all and is caught by
-/// the event budget instead.
+/// A day and an hour, so a guest sleeping a day finishes. A guest spinning without syscalls
+/// advances no time and is caught by the event budget.
 const DEFAULT_MAX_HOURS: u64 = 25;
 
 /// Events between two progress reports to an [`Observer`].
@@ -156,8 +138,7 @@ pub struct RunInputs<'a, 't> {
     pub observer: Option<&'a mut dyn Observer>,
     /// What to run: one spec per node, `NodeId(i)` running `specs[i]`.
     ///
-    /// A slice rather than a map: node identity is dense and ordered by construction, which is
-    /// what keeps the clock draws at the same tape offsets however many nodes there are.
+    /// Node ids are dense and ordered, so clock draws keep their tape offsets.
     pub specs: &'a [GuestSpec],
     /// Bounds on the run.
     pub config: RunConfig,
@@ -180,16 +161,13 @@ pub struct RunReport {
     pub outcome: Outcome,
     /// Where a promise the guest made about itself first did not hold.
     ///
-    /// The event a report points a reader at, and it is not the same as the last event of a run
-    /// that ended badly: a guest goes on running after an assertion fails, so the last event is
-    /// wherever it happened to stop rather than where the answer is.
+    /// A report points here, since the guest keeps running after a failed assertion.
     pub violation_event: Option<EventId>,
     /// Draws made, in order.
     pub journal: Journal,
     /// How many faults actually landed on the guest.
     ///
-    /// Reported because a campaign that injected nothing is indistinguishable from one that
-    /// injected plenty and found nothing, and only this number separates them.
+    /// Shows whether a clean campaign injected anything.
     pub adversity: u32,
     /// What the loop did, counted. Read for progress and comparison, never for a verdict.
     pub metrics: RunMetrics,
@@ -210,8 +188,7 @@ pub struct RunMetrics {
 
 /// Whether a node's tasks may be offered to the scheduler.
 ///
-/// The kernel's own mirror of the lifecycle: the world decides transitions and narrates them; this
-/// is only what the run loop needs to act on them.
+/// The kernel's mirror of the lifecycle the world decides and narrates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NodeLifecycle {
     Running,
@@ -225,8 +202,7 @@ enum NodeLifecycle {
 enum Slot {
     /// Stopped, holding the action it resumes with when the scheduler next picks it.
     Pending(Resume),
-    /// Waiting on the world. Not a scheduling candidate; every task here with nothing armed is a
-    /// deadlock rather than a finish.
+    /// Waiting on the world. All tasks here with nothing armed is a deadlock.
     Blocked,
     /// Neither: executing, or killed and awaiting the exit the backend still reports.
     Out,
@@ -238,11 +214,9 @@ struct TaskEntry {
     /// The node it belongs to; `None` once it was retired with its node.
     node: Option<NodeId>,
     slot: Slot,
-    /// The signal it last stopped on. A task the world ends after a fault is killed by us, so the
-    /// status the host reports names our signal rather than the one the guest died of.
+    /// The signal it last stopped on, since the host reports our kill signal instead.
     faulted_on: Option<u32>,
-    /// Taken off the books when its node ended. The backend still reports its exit afterwards, and
-    /// that exit is expected rather than refused.
+    /// Taken off the books when its node ended; the later backend exit is expected.
     retired: bool,
 }
 
@@ -266,8 +240,7 @@ impl Tasks {
 
     /// The node a task belongs to, where this run still knows.
     ///
-    /// **An option rather than node nought**: a task whose node this run has forgotten is a task
-    /// nothing should be filed under (§8 rule 2).
+    /// `None` for a forgotten node, never node 0 (§8 rule 2).
     fn node_for(&self, task: TaskId) -> Option<NodeId> {
         self.entries.get(&task).and_then(|e| e.node)
     }
@@ -278,9 +251,8 @@ impl Tasks {
 
     /// Hands each released task the value its blocking call returns.
     ///
-    /// Only a task that is actually blocked is released. A wake naming a pending task would
-    /// overwrite the answer the world already decided for its syscall, and one naming a task that
-    /// has ended would put back a task the backend no longer has.
+    /// Only blocked tasks are released, so a pending task keeps its answer and an ended one stays
+    /// gone.
     fn release(&mut self, wakes: impl IntoIterator<Item = Wake>) {
         for released in wakes {
             if let Some(entry) = self.entries.get_mut(&released.task)
@@ -332,15 +304,13 @@ impl Tasks {
 
     /// Whether a task the host is executing still owes the loop its next stop.
     ///
-    /// A retired task is not one: its node ended, and whatever the backend reports about it is
-    /// dropped on arrival.
+    /// A retired task does not; its reports are dropped.
     fn in_flight(&self) -> bool {
         self.entries.values().any(|e| matches!(e.slot, Slot::Out) && !e.retired)
     }
 
     fn schedulable(&self, task: TaskId) -> bool {
-        // A task whose node is gone is not a task to run, and the state of node nought is not an
-        // answer about it.
+        // A task whose node is gone is not runnable.
         let Some(node) = self.node_for(task) else {
             return false;
         };
@@ -452,8 +422,7 @@ struct Run<'a, 't> {
     killed_by: Option<u32>,
     /// Why the previous running task's turn ended; stamped on the next switch event.
     last_reason: SwitchReason,
-    /// Rebuilt from the books each iteration and kept across them: a fresh allocation per stop is
-    /// a per-syscall cost.
+    /// Rebuilt each iteration in a kept buffer, avoiding an allocation per syscall.
     runnable: Vec<TaskId>,
     metrics: RunMetrics,
     /// The event count at the last progress report.
@@ -477,9 +446,7 @@ enum Idle {
 impl Run<'_, '_> {
     /// Refuses a run that cannot be carried out, then gives every node its clock and first task.
     fn start(&mut self) -> Result<(), KernelError> {
-        // Refused here rather than never satisfied: a run told to end with node five in a cluster
-        // of three would otherwise fall back to the horizon, and a scenario with a typo in it would
-        // look like one whose node never finished. §8 rule 6: the boundary is where this is caught.
+        // An ending node outside the cluster is refused here (§8 rule 6).
         if let Some(node) = self.config.ends_with
             && node.get() as usize >= self.specs.len()
         {
@@ -488,9 +455,8 @@ impl Run<'_, '_> {
         if self.specs.is_empty() {
             return Err(KernelError::Invariant("a run needs at least one node"));
         }
-        // **Which fault points are armed is drawn first, and always.** Eight bytes before the first
-        // node clock, whatever the scenario lists, so the tape's layout is one thing for every run
-        // and a scenario that names a fault point moves no other decision. See `docs/API.md` §5.4.
+        // The arming draw comes first, always eight bytes, so the tape layout is the same for every
+        // scenario. See `docs/API.md` §5.4.
         let mut drawn = [0u8; 8];
         self.cursor.draw_into(&mut drawn, DrawSite::SdkFaultPoint);
         let seed = u64::from_le_bytes(drawn);
@@ -507,9 +473,7 @@ impl Run<'_, '_> {
                     .collect()
             })
             .collect();
-        // Every node gets a clock of its own before anything runs. Two machines never agree on the
-        // time, and a run where they did would never reach the bugs that depend on them
-        // disagreeing.
+        // Every node gets its own skewed clock before anything runs.
         for index in 0..self.specs.len() {
             let node = NodeId(index as u32);
             let node_clock = draw_node_clock(&mut self.cursor, self.config.max_clock_skew)?;
@@ -525,8 +489,7 @@ impl Run<'_, '_> {
 
     /// A node's program as it is started: its spec, with the fault points armed on it.
     ///
-    /// The same at every start of the node, a restart included: what a node was armed with is
-    /// drawn once for the run, and a restarted node that came back unarmed would be another test.
+    /// The same at every start, restarts included; arming is drawn once per run.
     fn spec_for(&self, node: NodeId) -> Result<GuestSpec, KernelError> {
         let mut spec = self
             .specs
@@ -552,12 +515,8 @@ impl Run<'_, '_> {
     /// The loop: fire what is due, check every ending, pick, run, and answer the stop.
     fn drive(&mut self) -> Result<StopReason, KernelError> {
         loop {
-            // **A task the host is running is waited for before anything else is decided.** The
-            // backend reports stops in the order the host delivers them, and a thread group that
-            // ends reports each thread's death in an order no tape decides. Choosing another task,
-            // moving time or ending the run while one is still in flight let that order through:
-            // a process that failed from a thread other than its first ended the run before its own
-            // exit arrived, and its status was lost on some runs and kept on others.
+            // A task in flight is waited for before anything else is decided, so host delivery
+            // order (such as a thread group's exits) never reaches the run.
             if self.tasks.in_flight() {
                 let stop = self.backend.next_stop()?;
                 if !self.take(stop)? {
@@ -586,8 +545,7 @@ impl Run<'_, '_> {
     /// Answers a stop the backend reported; `false` where it reported that nothing is left.
     fn take(&mut self, stop: Option<Stop>) -> Result<bool, KernelError> {
         let Some(stop) = stop else {
-            // A backend answering `None` with work still outstanding turns a half-finished run
-            // into a clean verdict, and the oracle then judges a prefix as the whole execution.
+            // `None` with work outstanding is an invariant failure.
             if self.tasks.anything_outstanding() || self.tasks.in_flight() {
                 return Err(KernelError::Invariant(
                     "the backend reported every task finished while tasks were still to run",
@@ -602,9 +560,7 @@ impl Run<'_, '_> {
         Ok(true)
     }
 
-    /// Fires every deadline at or before now: what was armed for this tick happens before anything
-    /// at this tick is scheduled, which is the only order a replay can reconstruct without
-    /// guessing.
+    /// Fires every deadline at or before now, before anything at this tick is scheduled.
     fn fire_due(&mut self) -> Result<(), KernelError> {
         if !self.world.next_deadline().is_some_and(|t| t <= self.clock.now()) {
             return Ok(());
@@ -621,8 +577,7 @@ impl Run<'_, '_> {
             self.world.on_deadline(&mut ctx)?
         };
         self.apply_due(due)?;
-        // The contract is "fire everything due"; a due entry surviving the call would spin this
-        // loop forever, so it is an invariant rather than a retry.
+        // A due entry surviving the call would spin forever, so it is an invariant failure.
         if self.world.next_deadline().is_some_and(|t| t <= self.clock.now()) {
             return Err(KernelError::Invariant("a due deadline survived on_deadline"));
         }
@@ -632,14 +587,13 @@ impl Run<'_, '_> {
     /// The ending the run has reached, checked in order: a named node, the horizon, the budgets,
     /// then a requested break.
     fn ending(&self) -> Option<StopReason> {
-        // Before the horizon, so a scenario that named the ending it wanted is answered with that
-        // ending. A node with no tasks left is done whether it ended or was ended.
+        // Before the horizon. A node with no tasks is done however it ended.
         if self.config.ends_with.is_some_and(|node| {
             matches!(self.tasks.node_state.get(&node), Some(NodeLifecycle::Dead))
         }) {
             return Some(StopReason::NodeFinished);
         }
-        // Before the budget, so a horizon can never be shadowed by a bound it sits under.
+        // Before the budget, so the budget never shadows the horizon.
         if self.config.horizon.is_some_and(|at| self.clock.now() >= at) {
             return Some(StopReason::HorizonReached);
         }
@@ -649,8 +603,7 @@ impl Run<'_, '_> {
         if self.next_event.get() >= self.config.max_events {
             return Some(StopReason::EventBudget);
         }
-        // After the deadlines and before the scheduler picks: the one place in the loop where
-        // every task is stopped and none is part-way through being answered.
+        // Here every task is stopped and none is half-answered.
         if self.config.break_at.is_some_and(|at| self.next_event >= at) {
             return Some(StopReason::BreakRequested);
         }
@@ -659,10 +612,7 @@ impl Run<'_, '_> {
 
     /// Nothing is runnable: move time to the next deadline, or end the run.
     fn when_idle(&mut self) -> Idle {
-        // An armed deadline outranks both endings: blocked and frozen tasks are waiting for it, and
-        // even an empty cluster may owe a restart to a timer. A deadline at or past the tick budget
-        // is one the run will never live to see, and chasing it would make every far-future timer
-        // a hang.
+        // An armed deadline outranks both endings, unless it lies at or past the tick budget.
         let ceiling =
             self.config.horizon.unwrap_or(self.config.max_ticks).min(self.config.max_ticks);
         match self.world.next_deadline() {
@@ -670,12 +620,8 @@ impl Run<'_, '_> {
                 self.clock.advance(Tick(due.get().saturating_sub(self.clock.now().get())));
                 Idle::Advanced
             }
-            // A cluster whose next timer is past the horizon has reached the horizon. Advancing to
-            // it first makes the recorded tick count the span the scenario asked for, which is
-            // what an oracle reasoning about a span of silence measures against.
-            //
-            // With **nothing** armed, no horizon saves it: nothing can ever happen again, and a
-            // clean ending there would hide exactly the defect the deadlock check exists to find.
+            // A next timer past the horizon ends the run at the horizon, with the clock advanced
+            // to it. With nothing armed it is a deadlock, horizon or not.
             Some(_) if self.config.horizon.is_some_and(|at| at <= self.config.max_ticks) => {
                 let at = self.config.horizon.unwrap_or(self.clock.now());
                 self.clock.advance(Tick(at.get().saturating_sub(self.clock.now().get())));
@@ -708,8 +654,7 @@ impl Run<'_, '_> {
             .ok_or(KernelError::Invariant("scheduler chose a task that is not stopped"))?;
 
         if self.tasks.last_run != Some(chosen) {
-            // The first dispatch of a run moves execution from nowhere and is not a switch; every
-            // later change of the running task is one, including the change after an exit.
+            // The first dispatch is not a switch; every later change is, including after an exit.
             if let Some(from) = self.tasks.last_run {
                 let node = self
                     .tasks
@@ -777,12 +722,10 @@ impl Run<'_, '_> {
         }
         self.tasks.release(effects.wake);
         match effects.state {
-            // Ending a task is carried out here rather than left for the scheduler: the task is
-            // gone once the backend has been told, and how it ended is written while still known.
+            // Ended here, while how it ended is still known.
             TaskState::Runnable(Resume::Terminate { signal }) => {
                 self.backend.resume(stop.task, Resume::Terminate { signal })?;
-                // A task that asked to die stops on no signal, so only the world can say what
-                // took it.
+                // No signal stopped it, so the world names the cause.
                 let died_of = signal.or_else(|| self.tasks.take_faulted(stop.task));
                 let status = match died_of {
                     Some(signal) => {
@@ -817,9 +760,7 @@ impl Run<'_, '_> {
         self.apply_node_ops(&effects.node_ops)
     }
 
-    /// A task appeared: it belongs to the node that created it, and so does the event announcing
-    /// it — reading the node from a task that does not exist yet would file every spawn under node
-    /// zero.
+    /// A task appeared; it and its event belong to the creator's node.
     fn on_created(&mut self, task: TaskId, parent: TaskId) -> Result<(), KernelError> {
         let node = self
             .tasks
@@ -836,9 +777,7 @@ impl Run<'_, '_> {
     fn on_exited(&mut self, task: TaskId, status: &GuestExit) -> Result<(), KernelError> {
         self.tasks.unblock(task);
         self.tasks.release(self.world.task_exited(task));
-        // A task retired with its node was accounted for there, deliberately without an exit
-        // event; its own exit still arrives from the backend, and filing it would report a task the
-        // run has finished with twice over.
+        // A task retired with its node was accounted for then; its backend exit is dropped.
         if self.tasks.is_retired(task) {
             self.tasks.note_task_gone(task);
             self.policy.forget(task);
@@ -847,17 +786,14 @@ impl Run<'_, '_> {
         let node = self.tasks.node_for(task);
         let converted = match status {
             GuestExit::Exited(c) => {
-                // A guest that failed is a finding whoever exits after it: a cluster's caller
-                // routinely outlives the node it drove, and keeping the last status would let it
-                // report its success as the run's.
+                // The first failure is kept, since a caller often outlives the node it drove.
                 if *c != 0 || self.last_exit.is_none() {
                     self.last_exit = Some(*c);
                 }
                 ExitStatus::Exited(*c)
             }
             GuestExit::Signalled(s) => {
-                // Never a task this loop killed: those leave the books when they are killed, and a
-                // backend reports nothing more about them.
+                // Killed tasks left the books already.
                 let signal = self.tasks.take_faulted(task).unwrap_or(*s);
                 self.killed_by = Some(signal);
                 ExitStatus::Signalled(signal)
@@ -885,14 +821,12 @@ impl Run<'_, '_> {
     fn apply_node_ops(&mut self, ops: &[NodeOp]) -> Result<(), KernelError> {
         for op in ops {
             match *op {
-                // The host has already ended them; what is left is to stop expecting them. Nothing
-                // is killed or narrated: the program said it was done.
+                // The host ended them; nothing is killed or narrated.
                 NodeOp::Ended { node, by } => {
                     let gone: Vec<TaskId> =
                         self.tasks.of_node(node).map(|(t, _)| t).filter(|t| *t != by).collect();
                     for task in gone {
-                        // Off the node's books, so "does this node still have tasks" can answer
-                        // no and the node reaches `Dead` once the spared task goes.
+                        // Off the books, so the node is `Dead` once the spared task goes.
                         self.tasks.retire(task);
                         self.policy.forget(task);
                     }
@@ -910,20 +844,15 @@ impl Run<'_, '_> {
                     let doomed: Vec<TaskId> = self.tasks.of_node(node).map(|(t, _)| t).collect();
                     for task in doomed {
                         self.backend.kill(task)?;
-                        // Off the books now: a backend reports nothing more about a task it was
-                        // told to kill, so a record kept for its exit would count against the node
-                        // for ever and a restarted node could never end.
+                        // Off the books now, since no exit will be reported for it.
                         self.tasks.note_task_gone(task);
                         self.policy.forget(task);
-                        // No switch event follows a kill: the world's NodeState narration already
-                        // explains why execution moved, and the killed task is not a `from`.
+                        // No switch event: the world's NodeState already explains it.
                         if self.tasks.last_run == Some(task) {
                             self.tasks.last_run = None;
                         }
                     }
-                    // Not recorded as the guest being killed: the signal came from the fault
-                    // injector, and what the node was killed by is on the timeline as
-                    // `NodeState::Dead`.
+                    // Recorded as `NodeState::Dead`.
                     self.tasks.node_state.insert(node, NodeLifecycle::Dead);
                 }
                 NodeOp::Freeze(node) => {
@@ -998,8 +927,8 @@ impl Run<'_, '_> {
 
     /// Turns the oracle's verdict into the outcome recorded in a bundle.
     ///
-    /// A run cut short by a budget is a hang whatever the oracle thought: it only ever saw a
-    /// prefix. A run that reached its horizon or its named node is judged in full.
+    /// A budget stop is a hang whatever the oracle says. A horizon or ending node is judged in
+    /// full.
     fn judge(&mut self, digest: Digest, stop_reason: StopReason) -> Outcome {
         let now = self.clock.now().get();
         let events = self.next_event.get();
@@ -1007,8 +936,7 @@ impl Run<'_, '_> {
             StopReason::TickBudget => {
                 return Outcome::GuestHung(format!("no progress by tick {now}"));
             }
-            // The budget names the horizon when there was one: ten million events go by long
-            // before twenty-five virtual hours, and the message should send a reader to the budget.
+            // Names the horizon, if any, alongside the budget that was reached.
             StopReason::EventBudget => {
                 return Outcome::GuestHung(match self.config.horizon {
                     Some(at) => format!(
@@ -1018,12 +946,11 @@ impl Run<'_, '_> {
                     None => format!("event budget reached at {events}"),
                 });
             }
-            // Every task waiting with nothing left to release any of them is the guest's own
-            // defect, and one the oracle never gets to see.
+            // A deadlock is the guest's defect; the oracle never sees it.
             StopReason::Deadlock => {
                 return Outcome::GuestHung(format!("every task is waiting at tick {now}"));
             }
-            // Asked to stop is neither a hang nor a clean finish.
+            // A requested stop is neither a hang nor a clean finish.
             StopReason::BreakRequested => {
                 return Outcome::StoppedOnRequest(format!("stopped at event {events}"));
             }
@@ -1036,7 +963,7 @@ impl Run<'_, '_> {
             exit: self.last_exit,
             killed_by: self.killed_by,
             diagnostics: self.recorded.diagnostics().to_vec(),
-            // Read after the run, by whoever holds the world; the kernel never sees one.
+            // Filled after the run by whoever holds the world.
             projections: Vec::new(),
         };
         match self.oracle.judge(&outcome) {
@@ -1062,8 +989,7 @@ impl Run<'_, '_> {
 
 /// Draws the offset and drift one node's clock runs at.
 ///
-/// Both come from the tape, so a seed selects how far apart the machines in a run are, and a
-/// mutation of those bytes moves them without disturbing any other decision.
+/// Both come from the tape, so mutating them moves no other decision.
 fn draw_node_clock(cursor: &mut TapeCursor<'_>, max_skew: Tick) -> Result<NodeClock, KernelError> {
     let offset = cursor.draw_range(max_skew.get().saturating_add(1), DrawSite::ClockSkew)?;
 

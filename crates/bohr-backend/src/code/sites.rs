@@ -1,15 +1,11 @@
-//! Where an instruction begins, and how sure of that anyone is.
+//! Where an instruction begins, and whether that was established.
 //!
-//! One question, asked the same way whatever instruction is being looked for. A search for an
-//! opcode is a couple of bytes wide and finds every real one and some displacements besides; what
-//! separates them is measuring the code from a place known to be a boundary and seeing where the
-//! steps land.
+//! A search for an opcode's bytes finds every real instruction and some displacements too. Decoding
+//! the code from a known instruction boundary and seeing where the steps land tells them apart.
 //!
-//! **Reporting and rewriting are not the same question.** A diagnosis says everything it found,
-//! the unestablished included, because a site real and unreported is a hole described as solid
-//! ground. A rewrite touches only what was established, because bytes written over the middle of
-//! another instruction corrupt it silently and nowhere near where the mistake was made.
-//! [`Site::confirmed`] is that difference, and both callers exist.
+//! A diagnosis reports every candidate, confirmed or not. A rewrite touches only confirmed ones,
+//! because overwriting the middle of another instruction corrupts it silently. [`Site::confirmed`]
+//! carries the difference.
 
 use super::{insn, symbols};
 
@@ -20,31 +16,25 @@ pub struct Site {
     pub at: usize,
     /// Bytes, prefixes included.
     pub len: usize,
-    /// Whether a sweep measured an instruction beginning here.
-    ///
-    /// A diagnosis reports the unconfirmed as well. A rewrite must not touch them: see the note at
-    /// the head of this module for why the two callers are given different answers.
+    /// Whether a sweep measured an instruction beginning here. Rewrites touch only confirmed
+    /// sites.
     pub confirmed: bool,
 }
 
-/// Every candidate that survives being measured, and whether each was established.
+/// The candidates that survive measurement, each marked confirmed or not.
 ///
-/// Two ways of establishing one, in order of strength. From a function symbol, where the object
-/// keeps one covering the site: the sweep runs from the symbol and the site is a boundary or it is
-/// not. Where no symbol covers it — a stripped shared object exports little, and `libstdc++` keeps
-/// the five sites `std::random_device` reaches somewhere unexported — by agreement between sweeps
-/// begun at several different bytes before it.
+/// A site is confirmed from a function symbol covering it, by sweeping from the symbol. Without a
+/// symbol (a stripped library, or `libstdc++`'s unexported `std::random_device` code), sweeps
+/// started at several bytes before it must agree.
 ///
-/// A candidate inside a swept function that is not one of its boundaries is dropped: it has been
-/// shown to be the middle of something longer. A candidate nothing reached is kept, unconfirmed.
+/// A candidate inside a swept function that is not a boundary is dropped. A candidate no sweep
+/// reached is kept, unconfirmed.
 #[must_use]
 pub fn confirm(object: &[u8], candidates: Vec<Site>) -> Vec<Site> {
     if candidates.is_empty() {
         return Vec::new();
     }
-    // No early answer where there are no symbols. An object with none still has code, and the
-    // agreement below is what reads it -- returning the raw candidates there would hand a rewrite
-    // exactly the bytes it must not touch.
+    // An object without symbols still goes through the agreement check below.
     let functions = symbols::functions(object);
 
     let mut starts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
@@ -67,10 +57,8 @@ pub fn confirm(object: &[u8], candidates: Vec<Site>) -> Vec<Site> {
     candidates
         .into_iter()
         .filter_map(|site| {
-            // The opcode may sit one byte into the instruction, behind a `REX` prefix. Which of the
-            // two it is is read off the measurement rather than guessed from the byte before:
-            // plenty of bytes look like that prefix without being one, and a site placed a byte
-            // early is a site the check then answers about the wrong address.
+            // The opcode may follow a `REX` prefix. The measurement decides, since many bytes look
+            // like a prefix without being one.
             if let Some(len) = starts.get(&site.at) {
                 return Some(Site { at: site.at, len: *len, confirmed: true });
             }
@@ -91,16 +79,14 @@ pub fn confirm(object: &[u8], candidates: Vec<Site>) -> Vec<Site> {
 
 /// Whether sweeps begun at several different bytes all agree that an instruction begins here.
 ///
-/// Weaker than a symbol and much stronger than a guess. A sweep started in the middle of an
-/// instruction produces nonsense for a step or two and then falls back into step with the real
-/// boundaries, so starts that disagree are starts still inside their own nonsense. What is required
-/// is that every start reaching this far lands on it, and that enough of them do to be worth
-/// calling agreement.
+/// A sweep started mid-instruction decodes garbage for a step or two, then falls into step with the
+/// real boundaries. Every start that reaches the address must land on it, and at least `ENOUGH`
+/// of them must.
 fn agreed(object: &[u8], at: usize) -> bool {
-    /// How far back each attempt begins. Spread rather than consecutive: two starts one byte apart
-    /// resynchronise into the same nonsense as often as into the same truth.
+    /// How far back each sweep starts. Spread out, since starts one byte apart often resynchronise
+    /// on the same wrong boundaries.
     const BACK: [usize; 5] = [16, 24, 32, 48, 64];
-    /// Below this many usable starts there is no agreement to speak of, only a small sample.
+    /// The minimum number of starts that must land on the address.
     const ENOUGH: usize = 3;
 
     let mut reached = 0;
@@ -115,8 +101,7 @@ fn agreed(object: &[u8], at: usize) -> bool {
             };
             walk += step.len;
         }
-        // Past it means this start stepped over the address: an instruction it measured covered the
-        // byte, so from where it stood nothing begins here.
+        // This sweep stepped over the address, so no instruction begins there.
         if walk > at {
             return false;
         }
@@ -129,10 +114,8 @@ fn agreed(object: &[u8], at: usize) -> bool {
 
 /// The ranges of a file that become instructions once it is mapped.
 ///
-/// Only those. An opcode spelled inside a string table or a relocation is not an instruction and
-/// never will be, and counting it makes a diagnosis louder without making it truer. A file that is
-/// not an object this can read is scanned whole, because nothing said where its code is and silence
-/// is not the same as absence.
+/// Bytes in string tables or relocations are skipped. A file that is not a readable ELF object is
+/// scanned whole, since its code could be anywhere.
 #[must_use]
 pub fn executable(object: &[u8]) -> Vec<(usize, usize)> {
     let header = |at: usize, len: usize| -> u64 {

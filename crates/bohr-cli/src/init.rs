@@ -1,14 +1,11 @@
 //! `bohr init -- ./node`: a first scenario, written from what a survey of the program finds.
 //!
-//! **A starting point, not a campaign design.** It writes the cluster shape asked for, a horizon,
-//! the faults the program's own calls can meet — the disk where it syncs, the network where it
-//! talks, crashes where it keeps state — and one comment per wall the survey found, so the first
-//! thing a reader learns is what this build cannot yet answer for this program. A dynamically
-//! linked program gets the libraries its loader asks for copied into a prepared state, pinned by
-//! digest, so the scenario runs the libraries it was written against and no others.
+//! A starting point. It writes the cluster shape, a horizon, the faults the program's calls can
+//! meet (disk faults if it syncs, network faults if it talks, crashes if it keeps state) and one
+//! comment per wall the survey found. A dynamic program gets its loader's libraries copied into a
+//! prepared state, pinned by digest.
 //!
-//! What it does not do: judge anything beyond what every run already judges, or choose numbers
-//! better than a guess. The probabilities are a first setting, and they say so.
+//! The probabilities are first guesses and are marked as such.
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +29,7 @@ pub(crate) fn interpreter(bytes: &[u8]) -> Option<String> {
     }
     let (phoff, phentsize, phnum) =
         (word(0x20, 8)? as usize, word(0x36, 2)? as usize, word(0x38, 2)? as usize);
-    // Checked throughout: a header that points past the file is a file this does not read.
+    // Bounds-checked throughout; a header pointing past the file gives `None`.
     (0..phnum).find_map(|n| {
         let header = phoff.checked_add(n.checked_mul(phentsize)?)?;
         // `PT_INTERP`.
@@ -52,7 +49,7 @@ fn libraries_into(binary: &str, state: &Path) -> Result<usize, CliError> {
         .map_err(|e| refused(format!("cannot ask ldd about {binary}: {e}")))?;
     let mut copied = 0;
     for line in String::from_utf8_lossy(&listed.stdout).lines() {
-        // A library the loader cannot find is a scenario that cannot start, said now.
+        // A library the loader cannot find is reported now; the scenario could not start.
         if line.contains("not found") {
             return Err(refused(format!(
                 "{binary} needs a library this host does not have: {}",

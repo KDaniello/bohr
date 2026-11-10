@@ -1,21 +1,12 @@
 //! The value a run is compared by.
 //!
-//! Two implementations of one specification, driven by one tape, do not produce the same event
-//! stream — different languages, different syscalls, different internals — so their digests cannot
-//! be compared and something else has to be. That something is a **projection**: a value the
-//! specification requires to be equal, extracted from the world after the run.
+//! Implementations produce different event streams, so they are compared by a projection: a value
+//! the specification requires to be equal, read from the world after the run.
 //!
-//! **The guest does nothing.** A projection is a rule in the configuration, not a channel a program
-//! opts into, which is the whole reason it works against a client that will never adopt an SDK. The
-//! world already holds a filesystem and already sees what a guest writes to its output; a
-//! projection names which of that to read.
+//! A projection is configuration, so the guest needs no SDK; it names a file or the output.
 //!
-//! What may be compared is bounded by an argument rather than by taste, and it is the argument that
-//! makes the comparison sound at all: **the value must be one the specification requires to be
-//! equal under any legal schedule.** A state root after N blocks is such a value. An event digest,
-//! a log ordering, anything timing-sensitive is not — and comparing one of those would report a
-//! disagreement on nearly every seed, which is a machine for producing false findings. See
-//! `docs/ARCHITECTURE.md` §5.20.
+//! The value must be equal under any legal schedule, such as a state root after N blocks. Event
+//! digests and orderings are not. See `docs/ARCHITECTURE.md` §5.20.
 
 use std::collections::BTreeMap;
 
@@ -35,11 +26,7 @@ pub struct ProjectionSpec {
     pub label: String,
     /// Which node produced it.
     ///
-    /// **Not always the implementation's own.** A client that has to be driven leaves the record
-    /// of what it did with the caller that drove it, so the value under comparison is on a
-    /// node other than the one being compared — and reading it off node zero by convention
-    /// finds nothing at all, which is a comparison that did not happen rather than one that
-    /// failed.
+    /// Often the caller's node.
     pub node: u32,
     /// Where its bytes come from, within that node.
     pub source: Source,
@@ -47,9 +34,7 @@ pub struct ProjectionSpec {
 
 /// The most a projection may hold.
 ///
-/// Past it the value is marked truncated and is **not** compared: two cut-off values that match
-/// agree about nothing, and calling that agreement is worse than reporting that the question went
-/// unanswered.
+/// Past it the value is marked truncated and not compared.
 pub const MAX_PROJECTION_BYTES: usize = 1 << 20;
 
 /// What one execution produced, by label.

@@ -1,8 +1,7 @@
 //! Stopping a run at a named event, which is what handing a frozen world to a debugger rests on.
 //!
-//! Against the scripted backend, so it runs everywhere. What cannot be checked here is the other
-//! half — a real process, actually detached, actually attachable — because that needs a terminal
-//! and a debugger on the machine. `docs/TESTING.md` says so rather than pretending otherwise.
+//! Against the scripted backend, so it runs everywhere. Detaching a real process needs a terminal
+//! and a debugger and is untested; `docs/TESTING.md` says so.
 
 use bohr_kernel::{RunConfig, StopReason};
 use bohr_tape::Tape;
@@ -23,8 +22,7 @@ fn run_to(break_at: Option<EventId>) -> bohr_kernel::RunReport {
     .report
 }
 
-/// The run stops where it was asked to, and everything before that happened exactly as it would
-/// have — the point of a break is to look at a run that was going to happen anyway.
+/// The run stops where asked, and everything before matches an unbroken run.
 #[test]
 fn a_run_stops_at_the_event_it_was_asked_to() {
     let whole = run_to(None);
@@ -36,8 +34,7 @@ fn a_run_stops_at_the_event_it_was_asked_to() {
     assert!(broken.events < whole.events, "the break did not stop anything");
 }
 
-/// Overshooting is possible and must be small: the loop breaks between stops, and one stop can
-/// record several events. What it must never be is silent, which is the caller's half.
+/// Overshoot is small: the loop breaks between stops, and one stop can record several events.
 #[test]
 fn a_break_lands_at_or_after_the_event_and_close_to_it() {
     for at in [1u64, 5, 17, 33] {
@@ -51,8 +48,7 @@ fn a_break_lands_at_or_after_the_event_and_close_to_it() {
     }
 }
 
-/// A run somebody stopped is not a run that went wrong. Reporting it as a hang would put a finding
-/// in the log of a command that was run to look at something.
+/// A requested stop is not a hang.
 #[test]
 fn a_run_that_was_asked_to_stop_is_not_reported_as_a_hang() {
     let broken = run_to(Some(EventId(20)));
@@ -62,8 +58,7 @@ fn a_run_that_was_asked_to_stop_is_not_reported_as_a_hang() {
     assert!(detail.contains("stopped at event"), "{detail}");
 }
 
-/// Breaking before the first event stops before anything is scheduled, which is what "before the
-/// first instruction" means from the world's side.
+/// Breaking at event 0 stops before anything is scheduled.
 #[test]
 fn breaking_at_the_first_event_stops_before_anything_runs() {
     let broken = run_to(Some(EventId(0)));

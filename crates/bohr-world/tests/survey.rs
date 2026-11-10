@@ -1,10 +1,7 @@
 //! A survey collects what a program needs and this build does not have.
 //!
-//! An ordinary run refuses the first unmodelled call and ends, which is §5.7 and is right:
-//! a call that reached the host unnoticed is a hole nothing downstream would find. But it means
-//! learning a real program's surface costs one run per syscall, and `ARCHITECTURE.md` §5.7 promises
-//! the opposite — the whole set, up front. This is that mode, and these are the properties that
-//! keep it from ever being mistaken for a run.
+//! A run stops at the first unmodelled call (§5.7); a survey collects them all. These tests also
+//! keep a survey from passing as a run.
 
 use bohr_backend::GuestSpec;
 use bohr_backend_null::{GuestOp, NullBackend, NullProgram};
@@ -16,7 +13,7 @@ use bohr_trace::{EventKind, TraceWriter, read_events};
 use bohr_types::{OracleId, Seed};
 use bohr_world::MinimalWorld;
 
-/// Judges nothing: what is under test is what the world did, not what a verdict made of it.
+/// Judges nothing: what is under test is what the world did.
 struct AcceptEverything;
 
 impl Oracle for AcceptEverything {
@@ -31,12 +28,11 @@ impl Oracle for AcceptEverything {
 
 /// `io_uring_enter`, which no build here models: opening a ring is answered, entering one is not.
 const IO_URING_ENTER: u32 = 426;
-/// `epoll_create1`, an ordinary unmodelled call rather than a specially named one.
+/// `epoll_create1`, an ordinary unmodelled call.
 const EPOLL_CREATE1: u32 = 291;
 /// `getpid`, which every build models.
 const GETPID: u32 = 39;
-/// `inotify_init1`, which this build has a row for and deliberately answers "not implemented" — so
-/// a caller falls back to polling, which needs nothing modelled.
+/// `inotify_init1`, answered `ENOSYS` on purpose so callers poll.
 const INOTIFY_INIT1: u32 = 294;
 
 fn call(nr: u32) -> GuestOp {
@@ -78,10 +74,7 @@ fn drive(
         .collect())
 }
 
-/// The property the whole mode rests on: a survey reaches the second unmodelled call.
-///
-/// An ordinary run cannot, by design, so a survey that stopped at the first would be a slower way
-/// of learning exactly what a run already tells you.
+/// A survey reaches the second unmodelled call.
 #[test]
 fn a_survey_gets_past_the_first_call_it_cannot_model() {
     let mut world = MinimalWorld::new().surveying();
@@ -103,9 +96,7 @@ fn a_survey_gets_past_the_first_call_it_cannot_model() {
 
 /// A survey says what it faked, on the timeline, under the same code the refusal would have used.
 ///
-/// Reading the report is not the only way anyone will meet these runs — the log is, and a log that
-/// showed `io_uring_setup` returning an error like any other call would be describing a run that
-/// never happened.
+/// The log says so too.
 #[test]
 fn every_faked_answer_is_named_where_the_run_is_read() {
     let mut world = MinimalWorld::new().surveying();
@@ -120,9 +111,7 @@ fn every_faked_answer_is_named_where_the_run_is_read() {
     }
 }
 
-/// The lock. A survey's world has an identity of its own, so nothing it produces can be replayed
-/// as a run: `Manifest::check_provenance` refuses a bundle claiming it, and every answer a survey
-/// gave was invented.
+/// A survey world has its own identity, which `Manifest::check_provenance` refuses.
 #[test]
 fn a_survey_is_a_different_world_and_says_so() {
     let ordinary = MinimalWorld::new();
@@ -143,8 +132,7 @@ fn an_ordinary_world_still_refuses_the_first_one() {
     assert!(world.surveyed().is_empty(), "a world that is not surveying records nothing");
 }
 
-/// A call the world does model is answered by the model, surveying or not. A survey that stubbed
-/// everything would report a surface no program has.
+/// Modelled calls are answered by the model, surveying or not.
 #[test]
 fn a_survey_only_answers_what_nothing_else_would() {
     let mut world = MinimalWorld::new().surveying();
@@ -156,9 +144,7 @@ fn a_survey_only_answers_what_nothing_else_would() {
 
 /// A wall is a wall: a call answered `ENOSYS` on purpose is collected like one nothing models.
 ///
-/// The two are different work and the report says which is which, but from the guest's side they
-/// stop it in the same place. A survey naming only the second kind lets a program that got nowhere
-/// look surveyed clean, which is the one thing this mode exists to prevent.
+/// The report says which kind each is.
 #[test]
 fn a_call_answered_on_purpose_is_still_a_wall() {
     let mut world = MinimalWorld::new().surveying();
@@ -172,8 +158,7 @@ fn a_call_answered_on_purpose_is_still_a_wall() {
     );
     assert_eq!(diagnostics.len(), 1, "once per number, not per call: {diagnostics:?}");
 
-    // An ordinary run is untouched. The fallback is the point of answering rather than refusing,
-    // and a run that started narrating it would be a run whose behaviour changed.
+    // An ordinary run answers silently.
     let mut ordinary = MinimalWorld::new();
     let quiet =
         drive(&mut ordinary, vec![call(INOTIFY_INIT1)]).expect("still answered, and still quietly");

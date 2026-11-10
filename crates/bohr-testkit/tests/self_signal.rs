@@ -1,13 +1,7 @@
-//! A guest that kills itself is a crash, not a clean exit.
+//! A guest that kills itself is a crash.
 //!
-//! `abort`, a failed assertion in C, a panic configured to abort — all of them end a task by
-//! sending it a fatal signal rather than by reaching an exit. The task never *stops on* a signal,
-//! so nothing the kernel observes distinguishes it from a task that returned zero; only the world,
-//! which answered the call, knows what took it.
-//!
-//! Recorded as its own test because the failure is silent in the worst way: the run reports clean,
-//! the exit status reads zero, and a campaign of a million of them says a guest that aborted every
-//! time never once misbehaved.
+//! `abort`, a failed C assertion or an aborting panic sends the task a fatal signal. The task never
+//! stops on it, so only the world, which answered the call, knows the cause.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -49,7 +43,7 @@ fn judge(program: NullProgram) -> Outcome {
     .outcome
 }
 
-/// The claim. A fatal signal a task sends itself ends the run as a crash.
+/// A fatal signal a task sends itself ends the run as a crash.
 #[test]
 fn a_task_that_aborts_itself_is_a_crash() {
     match judge(signals_itself(SIGABRT)) {
@@ -60,7 +54,7 @@ fn a_task_that_aborts_itself_is_a_crash() {
     }
 }
 
-/// And a signal this world does not treat as fatal changes nothing, so the pair means something.
+/// A non-fatal signal changes nothing.
 #[test]
 fn a_signal_that_is_not_fatal_leaves_the_run_alone() {
     assert_eq!(judge(signals_itself(SIGTERM)), Outcome::Clean);

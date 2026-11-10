@@ -46,8 +46,7 @@ fn a_stored_run_becomes_a_page_that_opens_on_its_own() {
     assert!(page.contains("This run found"), "no verdict: the page opens with machinery");
 }
 
-/// A short run is one file. The sidecar exists for runs a page cannot draw whole, and offering it
-/// where it is not needed would make every report two files to carry.
+/// A short run is one file; the sidecar appears only for runs too long to draw.
 #[test]
 fn a_short_run_is_one_file() {
     let dir = scratch("single");
@@ -72,8 +71,7 @@ fn a_bundle_that_is_not_there_is_a_usage_error() {
     assert!(err.contains("BOHR-1002"), "{err}");
 }
 
-/// The page is what a maintainer receives, so it has to be readable by whatever they open it in:
-/// valid text, in the encoding it declares.
+/// The page is valid text in the encoding it declares.
 #[test]
 fn the_page_is_the_encoding_it_says_it_is() {
     let out = scratch("encoding").join("run.html");
@@ -86,8 +84,7 @@ fn the_page_is_the_encoding_it_says_it_is() {
     assert!(page.contains("charset=\"utf-8\""), "the page does not declare its encoding");
 }
 
-/// The promise §4.6 makes, and the reason redaction is a bundle rather than a filter over a page:
-/// what comes out is still a bundle the tool accepts, so a maintainer can be handed both.
+/// A redacted bundle still replays (§4.6).
 #[test]
 fn a_redacted_bundle_is_still_one_the_tool_accepts() {
     let dir = scratch("redact");
@@ -106,7 +103,7 @@ fn a_redacted_bundle_is_still_one_the_tool_accepts() {
     assert_eq!(code, 0, "the redacted bundle no longer replays: {err}");
 }
 
-/// It says so about itself, so nobody has to remember which of two files is which.
+/// A redacted bundle says it is redacted.
 #[test]
 fn a_redacted_bundle_says_that_it_is_one() {
     let dir = scratch("redact-note");
@@ -131,8 +128,7 @@ fn a_redacted_bundle_says_that_it_is_one() {
     assert!(notes.contains("redacted:"), "the bundle does not say what was taken out: {notes}");
 }
 
-/// A note is what somebody wants the next reader to see, and it survives being written and read
-/// back — including a second one, which must not replace the first.
+/// Notes survive a write and read back, and a second note does not replace the first.
 #[test]
 fn a_note_is_kept_on_the_bundle_and_added_to() {
     let dir = scratch("note");
@@ -153,8 +149,7 @@ fn a_note_is_kept_on_the_bundle_and_added_to() {
     assert_eq!(code, 0, "a bundle with a note on it no longer replays: {err}");
 }
 
-/// Written twice, the same note produces the same bytes: nothing in it is a fact about when it
-/// was written.
+/// The same note written twice gives the same bytes; it holds no timestamp.
 #[test]
 fn a_note_carries_nothing_about_when_it_was_made() {
     let dir = scratch("note-twice");

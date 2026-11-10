@@ -1,11 +1,8 @@
 //! Fixed-point evaluation of the exponential inverse CDF.
 //!
-//! `f64::ln` is libm-backed and may differ between platforms and libc versions, and a delay that
-//! differs in one low bit is a cross-machine reproduction failure. So the mapping from a uniform
-//! draw to an exponentially distributed value is integer arithmetic over a frozen table, and the
-//! table is as much a part of the tape ABI as the draw widths are: the committed golden vectors in
-//! `testdata/tape/exponential.golden` pin it, interpolation error and all. Normative text:
-//! `docs/API.md` §2.4. Regenerate both artifacts with
+//! `f64::ln` may differ across libm versions, so the mapping is integer arithmetic over a frozen
+//! table. The table is part of the tape ABI, pinned by `testdata/tape/exponential.golden`.
+//! Normative text: `docs/API.md` §2.4. Regenerate both with
 //! `scripts/experiments/exponential-table.py`.
 
 /// `ln(1 + k/256) · 2^32` for `k` in `0..=256`, rounded to nearest.
@@ -90,15 +87,13 @@ mod tests {
 
     #[test]
     fn the_median_lands_at_mean_times_ln_two() {
-        // At u = 2^31 the survival is exactly one half, so the value is mean·ln 2 with no
-        // interpolation involved — an anchor the whole table hangs from.
+        // At u = 2^31 the survival is one half: exactly mean·ln 2.
         let median = exp_inverse_cdf(1 << 32, 1 << 31);
         assert_eq!(median, 2_977_044_472);
     }
 
-    /// The committed vectors are derived independently by
-    /// `scripts/experiments/exponential-table.py`; a mismatch here is a tape ABI break, not a
-    /// tuning opportunity.
+    /// The vectors come from `scripts/experiments/exponential-table.py`; a mismatch is a tape ABI
+    /// break.
     #[test]
     fn golden_vectors_match_the_frozen_evaluation() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tape/exponential.golden");

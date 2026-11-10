@@ -1,11 +1,9 @@
 //! Makes the calls a conformance case asks for, in Rust.
 //!
-//! A driver knows how to call its own SDK and nothing else: the case says what to call, the
-//! checker says whether the records were right, and this file is the only language-specific part.
+//! The case says what to call and the checker judges the records; this file is the
+//! language-specific part.
 //!
-//! The case is parsed with the SDK's own JSON, which is the only parser available to something
-//! that carries no dependencies — and parsing the case with the code under test is fine, because
-//! what is under test is the records, and a case that failed to parse fails loudly.
+//! The case is parsed with the SDK's own JSON, the only parser available without dependencies.
 
 use bohr_sdk::Value;
 use bohr_sdk_proto::json;

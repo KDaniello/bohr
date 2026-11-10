@@ -1,14 +1,9 @@
 //! How a campaign hands work to a worker, and takes results back.
 //!
-//! Between two processes of ours, so the format answers to nobody: it is length-prefixed binary
-//! because a coverage map is sixty-four kilobytes and a generation carries one per run. Encoding
-//! those as text would cost more than the runs they describe.
+//! Length-prefixed binary: a coverage map is 64 KB and a generation carries one per run.
 //!
-//! Nothing here is a stored format. A bundle is read years later by a different build and is
-//! versioned and hashed accordingly; this is read seconds later by the same binary that wrote it,
-//! and a mismatch means a defect rather than an old file. The one thing it must do is refuse
-//! damage rather than misread it, because a truncated result would otherwise be folded into the
-//! corpus as a run that covered nothing.
+//! Not a stored format: the same binary reads it seconds later, so a mismatch is a defect. It
+//! refuses damaged input, so a truncated result is never folded in as a run that covered nothing.
 
 use bohr_backend::CoverageMap;
 use bohr_explorer::{Origin, RunResult, WorkItem};
@@ -17,7 +12,7 @@ use bohr_types::{Digest, Seed};
 
 use crate::CliError;
 
-/// What a file of work or results begins with, so a stale one is refused rather than read.
+/// What a file of work or results begins with, so a stale one is refused.
 const MAGIC: &[u8; 8] = b"BOHRWIRE";
 
 fn broken(what: &str) -> CliError {
@@ -95,9 +90,7 @@ pub(crate) fn decode_work(bytes: &[u8]) -> Result<Vec<WorkItem>, CliError> {
         let index = cursor.u32()?;
         let seed = Seed(cursor.u64()?);
         let prefix = cursor.bytes()?;
-        // The origin is the campaign's own bookkeeping and never leaves it: a worker is told what
-        // to run, not where the tape came from, and inventing an origin here would put a guess
-        // into the corpus.
+        // The origin stays with the campaign; a worker only learns what to run.
         items.push(WorkItem { index, seed, prefix, origin: Origin::Seeded });
     }
     Ok(items)
@@ -111,9 +104,7 @@ pub(crate) fn results_header() -> Vec<u8> {
 
 /// Encodes one result, in the form a file of them is a sequence of.
 ///
-/// One at a time rather than a list, because a worker writes each result as it earns it: a slice
-/// written only at the end is a slice lost entirely when the worker is killed, and the runs that
-/// did complete are exactly the ones the campaign would otherwise have to do again.
+/// One at a time, so a worker killed mid-generation has already reported the runs it finished.
 #[must_use]
 pub(crate) fn encode_result(result: &RunResult) -> Vec<u8> {
     let mut out = Vec::new();
@@ -249,10 +240,8 @@ mod tests {
         assert_eq!(back[0].journal.records()[0].value, 0x1234);
     }
 
-    /// The campaign-scoped properties have to survive the handover, and only a worker can have
-    /// seen them: they are what a run says about promises no single run can answer, and a campaign
-    /// that took them back empty would report every `sometimes` as never satisfied — a map of the
-    /// untested that is untrue in the one direction nobody would question.
+    /// Campaign-scoped properties survive the round trip; losing them would report every
+    /// `sometimes` as never satisfied.
     #[test]
     fn what_the_guest_promised_survives_the_handover() {
         let back = decode_results(&encode_results(&[a_result(0)])).expect("readable");
@@ -266,13 +255,8 @@ mod tests {
         );
     }
 
-    /// A worker killed mid-write leaves a partial file. Read as if it were whole, a half-written
-    /// result would be folded into the corpus as a run that covered less than it did.
-    ///
-    /// A file that ends exactly where a record ends is a different matter: it is a short list, and
-    /// short is legitimate — a worker that ran two of its four items wrote two results. Noticing
-    /// that two are missing is the campaign's job, because only the campaign knows how many it
-    /// asked for.
+    /// A file cut mid-record is refused. A file ending on a record boundary is a short list, which
+    /// is valid; the campaign notices missing results.
     #[test]
     fn a_handover_cut_mid_record_is_refused_rather_than_half_read() {
         let whole = encode_results(&[a_result(0), a_result(1)]);

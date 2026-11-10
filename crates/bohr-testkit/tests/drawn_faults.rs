@@ -1,18 +1,11 @@
 //! A campaign can search more than one kind of node fault.
 //!
-//! A fault that exists only where somebody wrote a tick down is a fault a campaign never searches:
-//! it appears only where a person already guessed the moment.
+//! A scheduled fault fires only where a person chose the tick; drawn faults are searched.
 //!
-//! Two claims:
+//! A scenario gets exactly the kinds it enables, chosen by a draw over that set.
 //!
-//! **The kinds a scenario enables are the kinds it gets**, chosen by a draw over the enabled set —
-//! so a mutation of the tape moves which kind fires, and a scenario that enabled one never meets
-//! another.
-//!
-//! **Enabling one costs exactly what it cost before.** An index into a set of one is a choice with
-//! one option and consumes no tape, so every scenario that draws only kills lays its tape out
-//! exactly as it did. That is asserted here rather than left to the determinism suite to notice,
-//! because it is the property that decides whether stored bundles survive this change.
+//! A one-kind set costs no tape, so kill-only scenarios keep their tape layout and stored bundles
+//! replay.
 
 use std::collections::BTreeSet;
 
@@ -42,7 +35,7 @@ const PAYLOAD_AT: u64 = MEMORY_BASE + 0x200;
 
 const DATA_FD: u64 = 3;
 
-/// Writes and syncs for a long time, so there are plenty of moments to draw at.
+/// Writes and syncs for a long time, giving many moments to draw at.
 fn works() -> NullProgram {
     let mut ops =
         vec![GuestOp::Syscall { nr: OPENAT, args: [u64::MAX, PATH_AT, OPEN_FLAGS, 0o644, 0, 0] }];
@@ -132,7 +125,7 @@ fn run_two(kinds: DrawnFaults, seed: u64) -> Judged {
     )
 }
 
-/// The claim: a scenario that enables a lifecycle kind meets it.
+/// A scenario that enables a lifecycle kind meets it.
 #[test]
 fn a_campaign_draws_the_kinds_it_was_given() {
     let everything = DrawnFaults {
@@ -153,7 +146,7 @@ fn a_campaign_draws_the_kinds_it_was_given() {
     }
 }
 
-/// And a scenario that enables only the kill never meets another kind.
+/// A kill-only scenario meets no other kind.
 #[test]
 fn a_scenario_that_asked_for_one_kind_gets_one_kind() {
     let seen: BTreeSet<String> =
@@ -195,10 +188,7 @@ fn only(kind: fn(&mut DrawnFaults)) -> DrawnFaults {
     kinds
 }
 
-/// The claim: a drawn isolation cuts the node off, and heals it again.
-///
-/// Stated over both directions of the pair, because a cut that only stopped what the node sent
-/// would be a half-isolation, and a node that can still hear the cluster is not cut off from it.
+/// A drawn isolation cuts both directions and heals.
 #[test]
 fn a_campaign_draws_the_cut_it_was_given() {
     let isolating = only(|k| k.isolate = true);
@@ -211,8 +201,8 @@ fn a_campaign_draws_the_cut_it_was_given() {
         raised.contains(&(to, from)),
         "{from} was cut from {to} and {to} was left able to reach it: {raised:?}"
     );
-    // Each cut is narrated where it is raised and again where it heals, so a link a policy gives
-    // a recovery to is named an even number of times. An odd count is a partition left standing.
+    // A cut is narrated when raised and when healed, so a healed link appears an even number of
+    // times.
     let outward = raised.iter().filter(|link| **link == (from, to)).count();
     assert_eq!(
         outward % 2,
@@ -226,7 +216,7 @@ fn a_campaign_draws_the_cut_it_was_given() {
     );
 }
 
-/// And a scenario that did not ask for one never gets one.
+/// A scenario without isolation never gets one.
 #[test]
 fn a_scenario_that_asked_for_no_cut_gets_none() {
     for seed in 1..=8 {
@@ -236,10 +226,7 @@ fn a_scenario_that_asked_for_no_cut_gets_none() {
     }
 }
 
-/// The claim: a drawn degradation spoils the node's links without cutting one.
-///
-/// The distinction is the whole point of the kind: a cut a guest can detect against a link that
-/// merely stopped being good, which is what it handles worst.
+/// A drawn degradation spoils the node's links without cutting any.
 #[test]
 fn a_campaign_draws_the_degradation_it_was_given() {
     let degrading = only(|k| k.degrade = true);
@@ -281,8 +268,7 @@ fn cuts(judged: &Judged) -> Vec<(u32, u32)> {
 
 /// Enabling one kind lays the tape out exactly as it did before there was a choice.
 ///
-/// The property stored bundles depend on: an index into a set of one is not a decision, so the
-/// default policy draws what it always drew and a run of it is the run it always was.
+/// A one-kind set draws nothing for the kind, so stored bundles replay.
 #[test]
 fn one_kind_costs_no_tape() {
     let only_kills = run(DrawnFaults::default(), 5);
@@ -296,10 +282,7 @@ fn one_kind_costs_no_tape() {
 
     assert!(!drawn.is_empty(), "the policy never drew at all");
 
-    // Two records per fire and only one of them costs anything: the odds are a fixed two bytes,
-    // and the choice of kind is a choice with one option, which the journal records at nought.
-    // A record is written either way — that is what makes the journal a full account of the run —
-    // and what a stored bundle depends on is the width, not the count.
+    // Two records per fire: the two-byte odds, and the zero-width kind choice.
     let free = drawn.iter().filter(|r| r.len == 0).count();
     assert!(free > 0, "the kind was never drawn at all");
     for record in &drawn {

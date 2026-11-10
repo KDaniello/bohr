@@ -1,13 +1,9 @@
 //! Writes the JSON Schema for the record format to standard output.
 //!
-//! What keeps the schema and the code from drifting: a job regenerates this and fails on a diff,
-//! so a field added to a record without a thought for the schema stops a change rather than
-//! shipping a document that quietly describes the version before it.
+//! A job regenerates the schema and fails on a diff, so the schema follows the code.
 //!
-//! Written with the crate's own JSON rather than with a schema library, for the same reason the
-//! crate has no dependencies at all: it is linked into a customer's process through the Rust SDK,
-//! and a library in that position is a version conflict waiting for them. The document is small
-//! and its shape is stable, so hand-writing it costs a page and saves that.
+//! Written with the crate's own JSON: the crate has no dependencies, since the Rust SDK links it
+//! into customer processes.
 
 use std::collections::BTreeMap;
 
@@ -31,9 +27,7 @@ fn schema() -> Json {
             ),
         ),
         ("type", string("object")),
-        // A record written by a newer SDK carries keys this version has no name for, and the tool
-        // preserves them verbatim rather than refusing the line. A schema that forbade them would
-        // describe a stricter format than the one implemented.
+        // Unknown keys are allowed, since the tool preserves them.
         ("additionalProperties", Json::Bool(true)),
         (
             "properties",
@@ -117,8 +111,7 @@ fn assert_record() -> Json {
 
 /// Every kind of promise, named as the wire names them.
 ///
-/// Taken from the type rather than written out again: the list is what the code accepts, and a
-/// schema that listed anything else would be describing a format nothing implements.
+/// Taken from the type, so the list matches what the code accepts.
 fn assert_types() -> Json {
     Json::Array(
         [

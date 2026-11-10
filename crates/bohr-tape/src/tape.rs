@@ -20,21 +20,13 @@ const EXTENSION_CONTEXT: &[u8] = b"bohr/tape/extension/v1";
 
 /// How far one keying of the extension cipher is used for.
 ///
-/// **The cipher has a ceiling and the tape claimed not to.** ChaCha8 with a 96-bit nonce counts
-/// blocks in 32 bits, so one keying reaches `2^32` blocks of 64 bytes — 256 GiB — and the crate
-/// panics rather than erring past it. A tape documented as endless that panics inside the
-/// supervisor destroys the run it exists to record.
+/// ChaCha8 with a 96-bit nonce reaches 256 GiB per keying and panics past it, so the extension is
+/// re-keyed per segment.
 ///
-/// Half the ceiling rather than all of it, because the last block of a keying is not dependable
-/// here: measured against `cipher` 0.4.4, seeking to `2^38 - 64` and applying a whole block
-/// panics, while seeking to `2^38 - 8` and applying eight bytes does not. Staying an entire
-/// keying away from that block costs nothing — 128 GiB is beyond any run that will ever exist —
-/// and buys not having to reason about which side of the quirk a read lands on.
+/// A segment is half the ceiling: `cipher` 0.4.4 panics applying the last whole block of a keying.
 ///
-/// Past a segment the nonce carries its number, so the extension goes on being a pure function of
-/// the seed. Segment nought takes the all-zero nonce, which is exactly what the single keying
-/// used, so every byte any stored run has ever read is unchanged and [`crate::TAPE_ABI`] is
-/// untouched.
+/// The nonce carries the segment number. Segment 0 uses the all-zero nonce, so stored runs read
+/// the same bytes.
 const EXTENSION_SEGMENT_BYTES: u64 = 1 << 37;
 
 /// The nonce a segment of the extension is keyed with.
@@ -48,9 +40,8 @@ fn segment_nonce(segment: u64) -> [u8; 12] {
 
 /// A finite prefix followed by a deterministic keystream that does not run out.
 ///
-/// Past the end of the prefix the tape keeps producing bytes, still as a pure function of the
-/// seed, for as far as an offset can be counted — the cipher is re-keyed per
-/// `EXTENSION_SEGMENT_BYTES` rather than asked for more than one keying can give.
+/// Past the prefix, bytes are a pure function of the seed at any offset, re-keyed per
+/// `EXTENSION_SEGMENT_BYTES`.
 #[derive(Clone)]
 pub struct Tape {
     seed: Seed,
@@ -133,9 +124,7 @@ impl Tape {
     /// Parses a container, verifying the magic, both versions, the reserved bytes, the exact
     /// length and the prefix hash.
     ///
-    /// Every check is fatal: a silently misread tape produces a plausible, wrong run. That
-    /// includes bytes past the declared prefix — nothing would ever read them, so a container
-    /// carrying them was not written by this tool.
+    /// Every check is fatal, including bytes past the declared prefix.
     pub fn from_container(bytes: &[u8]) -> Result<Self, TapeError> {
         if bytes.len() < TAPE_HEADER_BYTES {
             return Err(TapeError::HeaderTooShort { actual: bytes.len() });
@@ -151,9 +140,7 @@ impl Tape {
                 supported: TAPE_FORMAT_VERSION,
             });
         }
-        // Any other ABI, not merely a newer one. The same bytes read under another draw ABI are
-        // another run, and an older interpretation is no more this build's than a newer one is:
-        // accepting it would produce a run that is self-consistent and not the one recorded.
+        // Any other ABI, older or newer, is refused.
         let abi = u16::from_le_bytes([bytes[6], bytes[7]]);
         if abi != TAPE_ABI {
             return Err(TapeError::UnsupportedAbi { found: abi, supported: TAPE_ABI });
@@ -185,9 +172,7 @@ impl Tape {
 
 /// Reads tape bytes while holding on to the extension cipher between calls.
 ///
-/// The cipher is a stream: advancing it costs nothing, seeking it costs a block computation, and
-/// building it costs a key schedule. A run draws a few bytes at a time and always moves forward, so
-/// keeping one reader turns what would be one cipher setup per draw into one per run.
+/// A run reads forward a few bytes at a time, so one kept cipher costs one key schedule per run.
 pub struct TapeReader<'a> {
     tape: &'a Tape,
     /// Positioned at `next_ext` within `segment`, once anything has been read from the extension.
@@ -200,8 +185,7 @@ pub struct TapeReader<'a> {
 impl TapeReader<'_> {
     /// Fills `out` with the tape bytes starting at absolute offset `from`.
     ///
-    /// Reads spanning the prefix boundary are stitched here rather than by callers: an off-by-one
-    /// in the split changes how the tape decodes at exactly one length.
+    /// Reads spanning the prefix boundary are stitched here.
     pub fn read_at(&mut self, from: u64, out: &mut [u8]) {
         if out.is_empty() {
             return;
@@ -220,16 +204,14 @@ impl TapeReader<'_> {
             return;
         }
 
-        // Extension offsets are counted from the end of the prefix, not from the start of the
-        // tape, so a corpus entry keeps its meaning when the prefix is extended by a mutator.
+        // Extension offsets count from the end of the prefix.
         let ext_from = (from + written as u64).saturating_sub(prefix_len);
         self.fill_extension(ext_from, &mut out[written..]);
     }
 
     /// ChaCha8 keystream at `from`, counted from the start of the extension.
     ///
-    /// Split across segments where the read crosses one, because a segment is as far as one
-    /// keying of the cipher reaches ([`EXTENSION_SEGMENT_BYTES`]).
+    /// Split where a read crosses an [`EXTENSION_SEGMENT_BYTES`] boundary.
     fn fill_extension(&mut self, from: u64, out: &mut [u8]) {
         let mut written = 0usize;
         let mut at = from;
@@ -237,12 +219,10 @@ impl TapeReader<'_> {
             let segment = at / EXTENSION_SEGMENT_BYTES;
             let within = at % EXTENSION_SEGMENT_BYTES;
             let room = (EXTENSION_SEGMENT_BYTES - within).min((out.len() - written) as u64);
-            // The cast is bounded by `out.len()`, which the line above took the minimum against.
+            // Bounded by `out.len()`.
             let take = room as usize;
 
-            // A cipher keyed for another segment answers about another part of the tape, so it is
-            // rebuilt rather than sought. Within one segment, seeking is what the kept reader is
-            // for: a run draws forward and pays one key schedule instead of one per draw.
+            // Another segment needs a new cipher; within one, the kept cipher seeks.
             if self.cipher.is_none() || self.segment != segment {
                 self.cipher = Some(ChaCha8::new(
                     &self.tape.extension_key.into(),
@@ -329,7 +309,7 @@ mod tests {
         let tape = Tape::with_prefix(Seed(11), vec![7; 9]);
         let mut reader = tape.reader();
 
-        // Forward in small steps, the way a run draws, then backwards, which forces a seek.
+        // Forward in small steps, then backwards to force a seek.
         for pos in (0..64u64).chain((0..64u64).rev()) {
             let mut kept = [0u8; 5];
             reader.read_at(pos, &mut kept);
@@ -378,9 +358,7 @@ mod tests {
         ));
     }
 
-    /// A tape written under another reading of its bytes is another tape, whichever direction the
-    /// difference points. An older ABI is not a subset of this one: it is a different mapping, and
-    /// reading it here would produce a run that looks self-consistent and is not the one recorded.
+    /// A tape under an older or newer ABI is refused.
     #[test]
     fn a_tape_under_any_other_abi_is_refused_in_both_directions() {
         let bytes = Tape::with_prefix(Seed(3), vec![1, 2, 3]).to_container();
@@ -396,9 +374,7 @@ mod tests {
         assert!(Tape::from_container(&bytes).is_ok(), "the ABI this build writes still reads");
     }
 
-    /// The extension is a pure function of the seed at any offset, including past the point one
-    /// keying of the cipher reaches. Before this was split into segments, reading here panicked
-    /// inside the cipher crate — a panic in the supervisor, which destroys the run it was keeping.
+    /// The extension is readable past one keying's reach.
     #[test]
     fn the_extension_goes_on_past_one_keying_of_the_cipher() {
         let tape = Tape::from_seed(Seed(17));
@@ -416,9 +392,7 @@ mod tests {
         }
     }
 
-    /// A read that straddles the boundary between two keyings must be the two pieces it is made
-    /// of, or the split is a place where the tape means one thing read whole and another read in
-    /// parts.
+    /// A read across a segment boundary equals its two halves.
     #[test]
     fn a_read_across_a_segment_boundary_is_stitched() {
         let tape = Tape::from_seed(Seed(23));
@@ -433,9 +407,7 @@ mod tests {
         assert_eq!(&whole[16..], &tail, "the piece after the boundary moved");
     }
 
-    /// Every byte a stored run has ever read comes from the first segment, and its keying is the
-    /// one a single-keyed cipher used. This is what makes re-keying past the ceiling a change no
-    /// stored tape can notice.
+    /// Segment 0 matches a single-keyed cipher, so stored tapes read the same.
     #[test]
     fn the_first_segment_is_keyed_exactly_as_one_keying_was() {
         assert_eq!(segment_nonce(0), [0u8; 12], "segment nought must take the all-zero nonce");

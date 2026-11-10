@@ -1,9 +1,7 @@
 //! The scenarios in `tests/features`, run against the built binary.
 //!
-//! These are the contracts quoted outside the team — in documentation, in an issue, in an answer
-//! to "what does this tool actually promise". They are written in the product's own vocabulary and
-//! they drive the command line, because a promise checked against an internal function is a
-//! promise about the wrong thing. See `docs/TESTING.md` §5.
+//! These are the contracts quoted in documentation and issues. They use the product's vocabulary
+//! and drive the command line. See `docs/TESTING.md` §5.
 
 use std::{path::PathBuf, process::Command};
 
@@ -59,8 +57,7 @@ impl Bohr {
         self.runs.push(Invocation { code: out.status.code().unwrap_or(-1), output });
     }
 
-    /// A directory of this scenario's own, named after what the scenario is about so that a
-    /// failure leaves something a person can go and look at.
+    /// A directory of this scenario's own, named after it so a failure leaves something to inspect.
     fn dir(&mut self) -> PathBuf {
         let guest = self.guest.clone();
         self.dir
@@ -228,8 +225,7 @@ fn then_names_a_code(world: &mut Bohr) {
     assert!(run.output.contains("BOHR-"), "the refusal named no code:\n{}", run.output);
 }
 
-/// Named rather than merely present: a refusal that carried the wrong code would satisfy "names an
-/// error code" while sending a reader to the wrong page.
+/// The exact code, since a wrong one sends the reader to the wrong page.
 #[then(expr = "the message names error code {string}")]
 fn then_names_this_code(world: &mut Bohr, code: String) {
     if !HAS_BACKEND {
@@ -290,8 +286,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn main() {
-    // Scenarios that need a program on disk are only meaningful where one can be intercepted.
-    // They are named rather than silently skipped, so a run on Windows says what it did not check.
+    // Scenarios that need interception are skipped by name where there is none.
     if !HAS_BACKEND {
         eprintln!(
             "note: scenarios tagged @linux are not run here -- this build has no interceptor, so \

@@ -1,7 +1,7 @@
 //! The `.bohr` scenario bundle: a section table followed by section payloads.
 //!
-//! Sections are hashed independently, so a damaged bundle reports which part is bad rather than
-//! failing as a whole. Layout is normative in `docs/API.md` §4.1.
+//! Sections are hashed independently, so a damaged bundle names the bad
+//! part. Layout is normative in `docs/API.md` §4.1.
 
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -25,15 +25,12 @@ const SECTION_FLAG_ZSTD: u32 = 1;
 /// Below this a frame costs more than it saves, so a small section is stored as it is.
 const COMPRESS_THRESHOLD: usize = 512;
 
-/// Compression level. Fixed, because a level that varied would make two builds write different
-/// bytes for one run, and the reproducible-build job compares hashes.
+/// Compression level, fixed so every build writes the same bytes.
 const COMPRESS_LEVEL: i32 = 3;
 
 /// The largest a section may unpack to.
 ///
-/// A whole section is held in memory to be hashed, so the ceiling is what a reader is willing to
-/// hold at once. It is deliberately far above any section a run produces: it is there to bound a
-/// file written to be opened rather than to be read.
+/// Sections are hashed in memory. Far above any real section; it bounds hostile files.
 const MAX_SECTION_BYTES: u64 = 1 << 30;
 
 /// Domain separator for the run identifier.
@@ -65,10 +62,7 @@ pub enum SectionId {
     Notes = 10,
     /// What the prepared filesystem a run began from held: paths, lengths and digests.
     ///
-    /// The list and never the content. A state of any useful size inside a file maintainers are
-    /// meant to attach to an issue is not a format; what a bundle owes a reader is which state it
-    /// needs, so a replay against another one is refused rather than quietly being a different
-    /// run.
+    /// The list only, so the bundle stays attachable; a replay against another state is refused.
     StateManifest = 11,
     /// What each execution of a differential run was, and what it produced.
     ///
@@ -102,17 +96,14 @@ pub struct ProjectionRecord {
     pub len: u64,
     /// Whether the value ran past what may be held.
     ///
-    /// A truncated value is reported and never compared: two cut-off values that match agree about
-    /// nothing, and calling that agreement is worse than saying the question was not answered.
+    /// A truncated value is reported and never compared.
     pub truncated: bool,
 }
 
 /// Frames N per-execution streams into one section payload.
 ///
-/// `u32` index, `u64` length, bytes — ascending index, exactly one frame per execution, and a
-/// zero-length frame where an execution produced nothing. The frames are what let `EVENTS`,
-/// `SDK_RECORDS` and `COVERAGE` mean the same thing in a bundle holding one execution and in a
-/// bundle holding five (`docs/API.md` §4.2).
+/// `u32` index, `u64` length, bytes: ascending, one frame per execution, empty frames included
+/// (`docs/API.md` §4.2).
 #[must_use]
 pub fn frame_streams(streams: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -128,9 +119,7 @@ pub fn frame_streams(streams: &[Vec<u8>]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Refuses a payload that is truncated, one whose indices are not ascending from zero, and one
-/// holding a number of frames other than `expected`. Guessing at a damaged frame table would
-/// produce streams that parse and belong to nobody.
+/// Refuses truncation, indices not ascending from zero, and a frame count other than `expected`.
 pub fn read_streams(payload: &[u8], expected: u32) -> Result<Vec<Vec<u8>>, TraceError> {
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -138,8 +127,7 @@ pub fn read_streams(payload: &[u8], expected: u32) -> Result<Vec<Vec<u8>>, Trace
         if payload.len() - at < 12 {
             return Err(TraceError::BundleTruncated { offset: at as u64 });
         }
-        // Both widths were just checked against what is left, so the slices are the sizes the
-        // conversions want.
+        // Both widths were checked above.
         let index = u32::from_le_bytes(payload[at..at + 4].try_into().unwrap_or([0; 4]));
         let len = u64::from_le_bytes(payload[at + 4..at + 12].try_into().unwrap_or([0; 8]));
         at += 12;
@@ -152,9 +140,7 @@ pub fn read_streams(payload: &[u8], expected: u32) -> Result<Vec<Vec<u8>>, Trace
         out.push(payload[at..at + len].to_vec());
         at += len;
     }
-    // Not `MultipleExecutions`: that error names a bundle holding several runs, and this is a
-    // frame table disagreeing with the manifest about how many it holds. Reporting the count of
-    // frames as a count of executions told the reader a number that was never true.
+    // A frame table disagreeing with the manifest.
     if out.len() != expected as usize {
         return Err(TraceError::FrameCountMismatch { declared: expected, found: out.len() as u32 });
     }
@@ -163,9 +149,7 @@ pub fn read_streams(payload: &[u8], expected: u32) -> Result<Vec<Vec<u8>>, Trace
 
 /// What a differential run's digest is: the ordered per-execution digests and what each produced.
 ///
-/// The projections are absorbed deliberately. A trace digest is the definition of "which run this
-/// was", and in a run whose whole point is comparing what several implementations produced, what
-/// they produced is part of which run it was.
+/// The projections are part of the digest, since they are what a differential run compares.
 #[must_use]
 pub fn group_digest(executions: &[ExecutionRecord]) -> Digest {
     let mut canonical = Vec::new();
@@ -174,12 +158,8 @@ pub fn group_digest(executions: &[ExecutionRecord]) -> Digest {
     for execution in executions {
         canonical.extend_from_slice(execution.trace_digest.as_bytes());
         canonical.extend_from_slice(&(execution.projections.len() as u32).to_le_bytes());
-        // By label, so the order the configuration happens to list them in cannot move a digest.
-        // Sorted unstably and length-prefixed rather than separated by a zero byte: a label is a
-        // string out of a configuration file and a TOML string can hold a zero byte, so joining
-        // on one leaves two different lists able to flatten to the same bytes. Sorting stably
-        // would have left two labels that are equal in the order the file happened to list them,
-        // which is the very thing the sort is here to remove.
+        // Sorted by label (unstable, so equal labels never keep file order) and length-prefixed,
+        // since TOML strings can hold a zero byte.
         let mut sorted = execution.projections.clone();
         sorted.sort_unstable_by(|a, b| a.label.cmp(&b.label).then(a.digest.cmp(&b.digest)));
         for projection in sorted {
@@ -205,21 +185,15 @@ pub enum Outcome {
     GuestHung(String),
     /// A cluster that could talk to itself again went on committing nothing.
     ///
-    /// Its own outcome rather than a `PropertyViolated` with no assertions behind it, and the
-    /// reason is a live bug rather than taste: reduction identifies a property violation by the
-    /// set of assertions that failed, an SDK-free guest fails none, and the empty set is a subset
-    /// of every other — so any property violation would count as reproducing this one.
+    /// Separate from `PropertyViolated`, whose empty assertion set would match any violation.
     LivenessViolated(String),
     /// A node answered while what it had written was not durable, and came back without it.
     ///
-    /// Its own outcome for the same reason as the one above, and because the two are different
-    /// defects: a reduction that turned a lost write into a silent cluster would be reporting that
-    /// it had preserved the bug.
+    /// Separate for the same reason, and a different defect from liveness.
     DurabilityViolated(String),
     /// A probe asked a node's own API, and the answers broke the property it watched.
     ///
-    /// Its own outcome for the reason the two above have theirs: the guest asserted nothing, so a
-    /// reduction reading it as a property violation would match it against every other one.
+    /// Separate for the same reason: the guest asserted nothing.
     ProbeViolated(String),
     /// A syscall outside the support table was reached.
     UnsupportedSyscall(String),
@@ -229,9 +203,7 @@ pub enum Outcome {
     InternalError(String),
     /// The run was stopped at an event somebody named, and handed over.
     ///
-    /// Reachable only from `bohr replay --break-at`, which never writes a bundle — so no stored
-    /// file can carry this and no older tool can meet it. That is what makes adding it to a
-    /// serialised enum safe rather than a change to the format.
+    /// Only from `bohr replay --break-at`, which writes no bundle, so the format is unchanged.
     StoppedOnRequest(String),
 }
 
@@ -257,8 +229,7 @@ pub struct DeterminismReport {
 
 /// What a run amounted to.
 ///
-/// Recorded because "identical" is not the only question asked of a bundle: a gate that only
-/// compared digests could not tell a richer run from a shorter one that happened to repeat.
+/// Lets a gate tell a richer run from a shorter one with a matching digest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct Counters {
     /// Events recorded.
@@ -301,8 +272,7 @@ pub struct Manifest {
     pub run_id: String,
     /// When the bundle was written, RFC 3339 in UTC.
     ///
-    /// Outside the run identifier and outside the digest: it says when a finding was recorded,
-    /// never what the run was, so a reproducible build can pin it without changing any answer.
+    /// Outside the run identifier and the digest, so a reproducible build can pin it.
     pub created_utc: String,
     /// Seed the run was derived from.
     pub seed: u64,
@@ -326,9 +296,7 @@ pub struct Manifest {
     pub reduced_from: Option<String>,
     /// The prepared filesystem this run began from, where it began from one.
     ///
-    /// Checked before a replay for the same reason the binaries are: a run that started somewhere
-    /// else is a different run, and one that diverged at its first read would be reported as a
-    /// defect in the tool rather than as the state nobody carried over.
+    /// Checked before a replay, like the binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_digest: Option<String>,
 }
@@ -336,8 +304,7 @@ pub struct Manifest {
 impl Manifest {
     /// Refuses a bundle produced by different components.
     ///
-    /// Two world models answer the same syscall differently on purpose, so replaying across them
-    /// would produce a run that is self-consistent and wrong.
+    /// World models answer syscalls differently, so they are never mixed.
     pub fn check_provenance(
         &self,
         world: &WorldModelId,
@@ -354,8 +321,7 @@ impl Manifest {
 
     /// Refuses a multi-execution bundle where only one execution can be handled.
     ///
-    /// Reading the first stream and reporting success would silently discard the disagreement the
-    /// bundle exists to record.
+    /// Reading only the first stream would discard the disagreement.
     pub fn require_single_execution(&self) -> Result<(), TraceError> {
         if self.executions != 1 {
             return Err(TraceError::MultipleExecutions { count: self.executions });
@@ -365,8 +331,7 @@ impl Manifest {
 
     /// Refuses a bundle whose tape this build would interpret differently.
     ///
-    /// Not "best effort": the same bytes read under another draw ABI are another run, and one
-    /// that would look self-consistent. See `docs/API.md` §9.
+    /// Another draw ABI reads the same bytes as another run. See `docs/API.md` §9.
     pub fn check_tape_abi(&self, supported: u16) -> Result<(), TraceError> {
         if self.tape_abi != supported {
             return Err(TraceError::TapeAbiMismatch { found: self.tape_abi, supported });
@@ -377,8 +342,7 @@ impl Manifest {
 
 /// What the guest was shown of the machine, as recorded in `HostProfile` (`docs/API.md` §4.5).
 ///
-/// Every field says what was *presented*, never what the host is: a bundle that recorded the real
-/// machine would tempt a reader into explaining a divergence by hardware that the guest never saw.
+/// Every field is what the guest was shown, never the real host.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct HostProfile {
     /// Backend that executed the guest.
@@ -414,12 +378,7 @@ pub struct BinaryRecord {
     pub role: String,
     /// The arguments after the program's own name, where it was given any.
     ///
-    /// **A replay has to start the guest the way the run did.** Arguments sit on the stack the
-    /// guest is born with, so a run recorded with them and replayed without moves everything above
-    /// them -- the module that writes this records two environment variables shifting a stack by
-    /// sixty-four bytes and breaking a digest, and missing arguments shift it the same way. Absent
-    /// on every bundle written before this field existed, which is what makes it additive: a
-    /// reader that finds none starts the program with none, exactly as it did before.
+    /// Arguments sit on the initial stack, so a replay passes the same ones. Absent means none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
 }
@@ -435,10 +394,8 @@ fn compress(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Unpacks a section, refusing anything that does not unpack to the length recorded for it.
 ///
-/// A recorded length is a claim a file makes about itself, so it cannot be trusted with an
-/// allocation: the section is unpacked a piece at a time and stopped one byte past the claim,
-/// which means a frame written to expand without limit is paid for in the bytes it actually
-/// produces and refused for the length it promised.
+/// The recorded length is never trusted with an allocation: unpacking is incremental and stops
+/// one byte past it.
 fn decompress(payload: &[u8], original: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
 
@@ -458,8 +415,7 @@ fn decompress(payload: &[u8], original: u64) -> Result<Vec<u8>, String> {
 
 /// Derives the identifier of a run.
 ///
-/// Derived rather than random: randomness in the supervisor is forbidden, and two byte-identical
-/// runs producing byte-different bundles would be awkward to explain. See `docs/API.md` §4.1.
+/// Derived, since the supervisor uses no randomness. See `docs/API.md` §4.1.
 #[must_use]
 pub fn derive_run_id(seed: Seed, trace_digest: Digest) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
@@ -501,9 +457,7 @@ impl BundleWriter {
     ///
     /// # Panics
     ///
-    /// Panics on more sections than the header's count can hold. Truncating it silently produced
-    /// a container whose table said one thing and whose payloads said another, which the reader
-    /// would then have to guess about.
+    /// Panics on more sections than the header's count can hold.
     #[must_use]
     pub fn finish(&self, run_id: [u8; 16]) -> Vec<u8> {
         let count = self.sections.len();
@@ -522,14 +476,12 @@ impl BundleWriter {
         debug_assert_eq!(out.len(), BUNDLE_HEADER_BYTES);
 
         let mut payload_offset = (BUNDLE_HEADER_BYTES + table_bytes) as u64;
-        // Borrowed where a section is stored as it stands. A trace is the largest thing a bundle
-        // holds, and taking a copy of it to hand to the very next line would double the peak.
+        // Borrowed when stored as is, so a large trace is not copied.
         let mut payloads: Vec<Cow<'_, [u8]>> = Vec::with_capacity(count);
         for (id, bytes) in &self.sections {
             let original = bytes.len() as u64;
             let hash = Digest::of(bytes);
-            // Compression is attempted only where it can pay: below the threshold a frame costs
-            // more than it saves, and a section that does not shrink is stored as it is.
+            // Compressed only above the threshold and only if it shrinks.
             let (flags, payload) = match compress(bytes) {
                 Some(packed) => (SECTION_FLAG_ZSTD, Cow::Owned(packed)),
                 None => (0, Cow::Borrowed(bytes.as_slice())),
@@ -540,13 +492,12 @@ impl BundleWriter {
             out.extend_from_slice(&payload_offset.to_le_bytes());
             out.extend_from_slice(&stored.to_le_bytes());
             out.extend_from_slice(&original.to_le_bytes());
-            // Over the original bytes, so damage is named whatever the encoding.
+            // Hashed over the original bytes.
             out.extend_from_slice(hash.as_bytes());
             payload_offset += stored;
             payloads.push(payload);
         }
-        // The payload total is known now, and reserving it here is what keeps a large trace from
-        // being copied again at each doubling of the output.
+        // Reserve the known total to avoid regrowth.
         out.reserve(payload_offset as usize - out.len());
         for bytes in payloads {
             out.extend_from_slice(&bytes);
@@ -581,9 +532,7 @@ impl Bundle {
                 supported: BUNDLE_FORMAT,
             });
         }
-        // The tape container refuses a reserved field that is not zero, on the grounds that a
-        // container carrying one was not written by this tool. The same words in the same role
-        // here were read past.
+        // A non-zero reserved field is refused, as in the tape container.
         if bytes[12..16].iter().any(|b| *b != 0) {
             return Err(TraceError::BundleTruncated { offset: 12 });
         }
@@ -606,8 +555,7 @@ impl Bundle {
             let stored = u64::from_le_bytes(e[16..24].try_into().unwrap_or_default());
             let original = u64::from_le_bytes(e[24..32].try_into().unwrap_or_default());
             let expected = Digest(e[32..64].try_into().unwrap_or_default());
-            // An unknown flag is a section encoded in a way this build cannot read; guessing
-            // would produce plausible bytes that are not the ones recorded.
+            // An unknown flag is an unreadable encoding.
             if flags & !SECTION_FLAG_ZSTD != 0 {
                 return Err(TraceError::UnknownSectionFlags { id, flags });
             }
@@ -635,18 +583,14 @@ impl Bundle {
             if computed != expected {
                 return Err(TraceError::SectionHashMismatch { id, expected, computed });
             }
-            // Two entries for one number leave no way to say which payload the section is; a
-            // reader that took the last would disagree with one that took the first.
+            // Duplicate section numbers are refused.
             if sections.insert(id, payload).is_some() {
                 return Err(TraceError::DuplicateSection { id });
             }
             spans.push((start, end));
         }
 
-        // **Every byte after the table belongs to exactly one section.** Bytes nothing points at
-        // would never be read, so a container carrying them was not written here; two sections
-        // sharing a range means one of the two lengths is a lie. Both were accepted, and the tape
-        // container refuses the same shapes one crate away.
+        // Every byte after the table belongs to exactly one section: no gaps, no overlaps.
         spans.sort_unstable();
         let mut reach = table_end;
         for (start, end) in spans {
@@ -664,10 +608,7 @@ impl Bundle {
 
     /// The one execution this bundle holds, refusing a bundle that holds several.
     ///
-    /// The contract API §4.2 states in prose, made into something a reader has to pass through:
-    /// "a reader that does not understand `executions > 1` must refuse the bundle rather than read
-    /// the first stream and report success." A promise is not enough here, because the failure it
-    /// prevents looks exactly like success.
+    /// Enforces `docs/API.md` §4.2: a single-execution reader refuses `executions > 1`.
     ///
     /// # Errors
     ///
@@ -716,8 +657,7 @@ impl Bundle {
 
     /// Rebuilds a writer holding every section, including unrecognised ones.
     ///
-    /// A tool that rewrites a bundle must not drop what it does not understand, or passing a newer
-    /// bundle through an older tool would silently lose data.
+    /// Unknown sections are kept, so an older tool never loses data.
     #[must_use]
     pub fn to_writer(&self) -> BundleWriter {
         let mut w = BundleWriter::new();
@@ -730,8 +670,7 @@ impl Bundle {
 
 /// A bundle that holds exactly one execution, as the one thing it holds.
 ///
-/// Obtained from [`Bundle::single`], which is what makes the refusal unavoidable rather than
-/// remembered.
+/// Obtained only from [`Bundle::single`], which refuses several executions.
 #[derive(Clone, Copy, Debug)]
 pub struct SingleExecution<'a> {
     bundle: &'a Bundle,
@@ -811,8 +750,7 @@ impl Group<'_> {
         let Some(raw) = self.bundle.section(id) else {
             return Ok(Vec::new());
         };
-        // A bundle of one is not framed, so that a run against one implementation writes exactly
-        // the bytes it always did and every stored bundle still reads.
+        // A single execution is unframed.
         if self.executions <= 1 {
             return Ok(vec![raw.to_vec()]);
         }
@@ -825,8 +763,7 @@ impl Group<'_> {
 pub struct ManifestInputs {
     /// The run this one was reduced from, where it was reduced from anything.
     ///
-    /// Lineage rather than decoration: a reduced bundle is the one a maintainer is handed, and the
-    /// question it has to answer about itself is which finding it is the small form of.
+    /// Names the finding a reduced bundle came from.
     pub reduced_from: Option<String>,
     /// The prepared filesystem the run began from, where it began from one.
     pub state_digest: Option<String>,
@@ -850,10 +787,7 @@ pub struct ManifestInputs {
     pub degraded_reasons: Vec<String>,
     /// When the bundle was written, RFC 3339 in UTC.
     ///
-    /// Supplied rather than read here. §8 rule 9 names the two places in this tool that may ask
-    /// the host what time it is, and this crate is neither; a third one hidden behind a local
-    /// `allow` makes the rule's list false and gives the next reader nothing to check against.
-    /// [`now_utc`] is what the layer that may ask calls to produce this.
+    /// Supplied by the caller (§8 rule 9), usually from [`now_utc`].
     pub created_utc: String,
 }
 
@@ -887,12 +821,8 @@ pub fn manifest_for(inputs: ManifestInputs) -> Manifest {
 
 /// The moment a bundle is being written, RFC 3339 in UTC.
 ///
-/// `SOURCE_DATE_EPOCH` wins where it is set, so a reproducible build produces a byte-identical
-/// bundle. Nothing in a run reads this: it is metadata about the recording, not about the run.
-///
-/// Called by whoever is entitled to ask the host what time it is — the command layer — and handed
-/// back in [`ManifestInputs::created_utc`]. Public for that reason: the alternative was this crate
-/// asking on its own behalf, which is a third wall-clock site under a rule that names two.
+/// `SOURCE_DATE_EPOCH` wins when set. Called by the command layer, which may read the clock, and
+/// passed in [`ManifestInputs::created_utc`].
 #[must_use]
 #[allow(clippy::disallowed_methods)]
 pub fn now_utc() -> String {
@@ -911,8 +841,7 @@ pub fn now_utc() -> String {
 
 /// Formats seconds since the epoch as RFC 3339, by the civil-from-days algorithm.
 ///
-/// Hand-rolled rather than taken from a date library: this is the only date this tool formats,
-/// and a dependency for it would be a dependency in every bundle we write.
+/// Hand-rolled; this is the only date the tool formats.
 fn format_rfc3339(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64;
     let time = seconds % 86_400;
@@ -936,8 +865,7 @@ fn format_rfc3339(seconds: u64) -> String {
 
 /// The draw ABI this build records.
 ///
-/// Duplicated as a constant rather than taken from `bohr-tape`, which this crate does not depend
-/// on; a mismatch is caught by the check in `scripts/lint-rules.sh`.
+/// Duplicated from `bohr-tape`; `scripts/lint-rules.sh` checks they match.
 const fn bohr_tape_abi() -> u16 {
     2
 }
@@ -991,11 +919,10 @@ mod tests {
         w.finish(run_id)
     }
 
-    /// A length recorded in a file is a claim by that file, and a claim of a terabyte must cost a
-    /// refusal rather than a terabyte.
+    /// A recorded length of a terabyte is refused without allocating.
     #[test]
     fn a_section_claiming_an_impossible_length_is_refused() {
-        // A section large and dull enough to be packed, so the compressed path is the one taken.
+        // Large and repetitive, so it is compressed.
         let mut w = BundleWriter::new();
         w.section(SectionId::Manifest, vec![b'{'; 4096]);
         let mut bytes = w.finish([0; 16]);
@@ -1011,8 +938,7 @@ mod tests {
         );
     }
 
-    /// The other half of the same rule: a frame that expands far past what it recorded is stopped
-    /// while it expands, not after.
+    /// A frame expanding past its recorded length is stopped during unpacking.
     #[test]
     fn a_section_that_expands_past_its_record_is_refused() {
         let packed = zstd::bulk::compress(&vec![0u8; 1 << 20], COMPRESS_LEVEL).expect("packs");
@@ -1061,8 +987,7 @@ mod tests {
         for i in table_end..bytes.len() {
             let mut damaged = bytes.clone();
             damaged[i] ^= 0x01;
-            // Either the hash catches it or the encoding does; both name the section, which is
-            // the promise. Which one fires depends on whether the section was worth packing.
+            // The hash or the encoding catches it; both name the section.
             match Bundle::parse(&damaged) {
                 Err(
                     TraceError::SectionHashMismatch { .. } | TraceError::SectionUnreadable { .. },
@@ -1080,8 +1005,7 @@ mod tests {
         }
     }
 
-    /// Framing round-trips, including the empty stream: an execution that produced nothing is a
-    /// fact about that execution, and dropping the frame would renumber every one after it.
+    /// Framing round-trips, empty streams included.
     #[test]
     fn framed_streams_come_back_as_they_went_in() {
         let streams = vec![b"first".to_vec(), Vec::new(), b"third".to_vec()];
@@ -1089,8 +1013,7 @@ mod tests {
         assert_eq!(read_streams(&framed, 3).expect("it reads"), streams);
     }
 
-    /// A frame table that disagrees with the manifest is refused rather than read as far as it
-    /// goes: a group read short is a group whose executions belong to the wrong implementations.
+    /// A frame table that disagrees with the manifest is refused.
     #[test]
     fn framing_that_disagrees_with_the_manifest_is_refused() {
         let framed = frame_streams(&[b"first".to_vec(), b"second".to_vec()]);
@@ -1101,9 +1024,7 @@ mod tests {
         );
     }
 
-    /// The group digest is what "which run this was" means for a differential run, so what the
-    /// implementations produced is in it — and the order the configuration listed the projections
-    /// in is not.
+    /// The group digest includes the projections but not their listed order.
     #[test]
     fn a_group_digest_covers_what_was_produced_and_not_how_it_was_listed() {
         let one = execution(&[("root", "aaa"), ("height", "bbb")]);

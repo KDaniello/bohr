@@ -1,18 +1,12 @@
 //! A key-value service in front of the store an OP Stack execution client keeps its chain in, and
 //! a client that holds it to what it answered.
 //!
-//! The store is not instrumented and knows nothing about any of this. What is written here is a
-//! client, and the only claim it makes is the one every client makes: **a write the store
-//! acknowledged is a write the store still has.** A committed transaction is what the
-//! acknowledgement rests on, so a record missing after a crash is `commit` not having meant what
-//! it says.
+//! The store is not instrumented. The client claims only that an acknowledged write is still
+//! there; acknowledgement follows `commit`.
 //!
-//! Two roles in one binary, chosen by the first argument, because both run from the same scenario
-//! and a second crate would be a second thing to build.
+//! Two roles in one binary, chosen by node index.
 //!
-//! The store is opened exclusively, which is what one process per node actually is. That is not a
-//! way around anything: told it is alone with its files, the store stops keeping a reader table for
-//! readers that do not exist, and what is left is the path a single node really takes.
+//! The store is opened exclusively, as one process per node is, so it keeps no reader table.
 
 use std::{
     error::Error,
@@ -24,16 +18,13 @@ use std::{
 
 use libmdbx::{DatabaseFlags, Environment, EnvironmentFlags, Geometry, MdbxError, WriteFlags};
 
-/// Whatever the store failed with. The roles only ever format it into an answer, and the store has
-/// two error types for the two halves of its API; naming either here would make this file about
-/// that split rather than about durability.
+/// Any store error; the roles only format it.
 type Failed = Box<dyn Error>;
 
-/// Where the store keeps its files, on the node's own filesystem. A directory, because this store
-/// wants a data file and a lock file beside each other.
+/// The store's directory, holding its data and lock files.
 const STORE_PATH: &str = "/store";
 
-/// The one table. A hunt is about durability, not about schema.
+/// The one table.
 const TABLE: &str = "records";
 
 /// Port both roles use. Each node has an address of its own, so one port is enough.
@@ -68,9 +59,7 @@ const STORE_LIFETIME: Duration = Duration::from_secs(6);
 
 /// How large the store may grow.
 ///
-/// Named rather than defaulted, and small. A store left to choose reserves gigabytes of address
-/// space it will never touch, which costs a real machine nothing and costs a simulated one a window
-/// it has to keep truthful. Sixteen mebibytes is far past what these records need.
+/// Small, since a default would reserve gigabytes the world must keep in sync.
 const MAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// The address the world gives node `index`.
@@ -78,8 +67,7 @@ fn address_of(index: u64) -> SocketAddrV4 {
     SocketAddrV4::new([10, 66, 0, (index + 1) as u8].into(), PORT)
 }
 
-/// The node index decides the role, because a scenario gives every node the same argument list and
-/// substitutes only the index into it. Node zero owns the database; every other node is a client.
+/// Node 0 owns the database; every other node is a client.
 fn main() {
     let argument = std::env::args().nth(1).unwrap_or_default();
     let code = match argument.as_str() {
@@ -108,9 +96,7 @@ fn open(at: &Path) -> Result<Environment, MdbxError> {
 
 /// Lays down the database a run starts from, on the host and outside any supervisor.
 ///
-/// Run once, by hand or by a script, and the directory it writes is what `[state] dir` names. It
-/// is deliberately not part of a run: a prepared state is an input identified by digest, and a run
-/// that built its own would be measuring the building.
+/// Run once, outside any run; `[state] dir` names the result.
 fn prepare(dir: &str) -> i32 {
     if dir.is_empty() {
         eprintln!("usage: mdbx-hunt prepare <directory>");
@@ -130,8 +116,7 @@ fn prepare(dir: &str) -> i32 {
             return 2;
         }
     };
-    // One transaction rather than two thousand: what is wanted is a database with something in it,
-    // and the shape of how it got there is the run's business rather than the fixture's.
+    // One transaction.
     let value = vec![b'p'; RECORD_BYTES];
     let write = match environment.begin_rw_sync() {
         Ok(write) => write,
@@ -199,8 +184,7 @@ fn solo() -> i32 {
 
 /// Answers requests from the database, acknowledging a write only after the commit returns.
 ///
-/// The order is the whole point: the acknowledgement leaves after the commit has returned, so the
-/// store has been asked for durability before the client is told it has it.
+/// The acknowledgement leaves only after the commit returns.
 fn store(index: u64) -> i32 {
     let environment = match open(Path::new(STORE_PATH)) {
         Ok(environment) => environment,
@@ -249,8 +233,7 @@ fn store(index: u64) -> i32 {
                 Ok(false) => format!("missing {key}"),
                 Err(e) => format!("err {key} {e}"),
             },
-            // A removal is a promise like any other: what the store said it took away must stay
-            // away, and a crash that brings it back is a resurrection rather than a loss.
+            // A removal must stay removed.
             "drop" => match drop_record(&environment, key) {
                 Ok(()) => format!("gone {key}"),
                 Err(e) => format!("err {key} {e}"),
@@ -265,9 +248,7 @@ fn store(index: u64) -> i32 {
 
 /// Offers records, remembers what was acknowledged, and asks for it back.
 ///
-/// The verdict is entirely about what the store said: a record the store never acknowledged is
-/// nobody's fault and is not asked about. Only an acknowledged record that comes back missing is a
-/// finding, and it is a finding whatever the store did in between.
+/// Only an acknowledged record that comes back missing is a finding.
 fn client(index: u64) -> i32 {
     let socket = match UdpSocket::bind(address_of(index)) {
         Ok(s) => s,
@@ -282,9 +263,7 @@ fn client(index: u64) -> i32 {
     }
     let store = address_of(0);
 
-    // Which prepared records the store actually had before anything happened. Only these are asked
-    // for at the end: a scenario that prepared no state has none of them, and holding a store to
-    // records nobody ever wrote would report a finding on every run of every empty database.
+    // Prepared records seen at the start; only these are checked at the end.
     let prepared: Vec<u64> = (0..PREPARED_SAMPLE)
         .map(|i| PREPARED_BASE + i * (PREPARED_RECORDS / PREPARED_SAMPLE).max(1))
         .filter(|key| {
@@ -293,15 +272,13 @@ fn client(index: u64) -> i32 {
         .collect();
 
     let mut acknowledged: Vec<u64> = Vec::new();
-    // Offers the store refused. A refusal is a promise not made, so nothing is owed — but a
-    // refused write that is there afterwards is the store having said no and done yes, and
-    // nothing else in the run would notice.
+    // Refused offers, checked later for writes that landed anyway.
     let mut refused: Vec<u64> = Vec::new();
     for key in 0..RECORDS_TO_WRITE {
         match ask(&socket, store, &format!("put {key}")) {
             Some(answer) if answer.starts_with("ack ") => acknowledged.push(key),
             Some(answer) if answer.starts_with("err ") => refused.push(key),
-            // Silence is neither: the store may have applied the write and died before saying so.
+            // Silence is neither acknowledgement nor refusal.
             _ => {}
         }
     }
@@ -312,15 +289,12 @@ fn client(index: u64) -> i32 {
         match ask(&socket, store, &format!("get {key}")) {
             Some(answer) if answer.starts_with("have ") => verified += 1,
             Some(answer) if answer.starts_with("missing ") => lost.push(*key),
-            // No answer at all is the store being dead or unreachable, which is the world doing
-            // what it was told rather than the store breaking a promise.
+            // No answer: the store is dead or unreachable.
             _ => {}
         }
     }
 
-    // What the store took away must stay away. Half of the acknowledged records are removed and
-    // asked about again: a crash that brings one back is a resurrection, and it is a defect of the
-    // same family as a loss — the store answered, and what it answered is not what it holds.
+    // Half the acknowledged records are removed and checked again for resurrection.
     let mut resurrected_after_drop = Vec::new();
     for key in acknowledged.iter().step_by(2) {
         if matches!(ask(&socket, store, &format!("drop {key}")), Some(a) if a.starts_with("gone ")) {
@@ -331,8 +305,7 @@ fn client(index: u64) -> i32 {
         }
     }
 
-    // Records that were durable before the run began. Nothing this run did was about them, so a
-    // store that lost one lost data no crash in this run had any business touching.
+    // Records durable before the run; losing one is a finding.
     let mut prepared_lost = Vec::new();
     for key in &prepared {
         if matches!(ask(&socket, store, &format!("get {key}")), Some(a) if a.starts_with("missing "))
@@ -341,10 +314,7 @@ fn client(index: u64) -> i32 {
         }
     }
 
-    // A write the store refused and has anyway. Reported beside the verdict rather than as one,
-    // because whether it is a defect depends on what the refusal meant: a commit that failed
-    // during its durability step may legitimately have the data in memory, and only a crash
-    // decides.
+    // Refused but present: reported without a verdict, since a failed commit may keep data in memory.
     let mut resurrected = Vec::new();
     for key in &refused {
         if matches!(ask(&socket, store, &format!("get {key}")), Some(a) if a.starts_with("have ")) {
@@ -354,11 +324,7 @@ fn client(index: u64) -> i32 {
 
     let _ = socket.send_to(b"done 0", store);
 
-    // One line, always, carrying every number. A run whose client said nothing is a run that
-    // checked nothing, and it must not be possible to mistake it for a run that passed.
-    // `prepared_seen` is the denominator of the last claim, and without it that claim cannot be
-    // read: a run that never found a prepared record reports none lost, which is the same line a
-    // run that found two thousand and kept them all prints.
+    // One line with every number, including `prepared_seen`, the denominator.
     println!(
         "acknowledged {} verified {} lost {} refused {} resurrected {} undropped {} \
          prepared_seen {} prepared_lost {} · lost={lost:?} resurrected={resurrected:?} \
@@ -373,16 +339,13 @@ fn client(index: u64) -> i32 {
         prepared_lost.len()
     );
 
-    // Three claims, and a run is a finding if it broke any of them: a record the store said it had
-    // and lost, one it said it removed and kept, and one that was durable before the run began.
+    // A finding if any claim broke: an acknowledged write lost, a removal kept, a prepared record
+    // lost.
     if lost.is_empty() && resurrected_after_drop.is_empty() && prepared_lost.is_empty() {
         return 0;
     }
 
-    // Aborted rather than returned, and the difference decides whether the finding is seen at all.
-    // A run's exit status is the last task's, and this client is not the last: the store outlives
-    // it and ends cleanly, so a status of one is overwritten by a status of zero and the run reads
-    // as clean. A signal is not overwritten — it is what the oracle looks at first.
+    // Aborted, since the store exits later and cleanly; the oracle reads a signal first.
     std::io::Write::flush(&mut std::io::stdout()).ok();
     std::process::abort();
 }
@@ -422,13 +385,10 @@ fn drop_record(environment: &Environment, key: u64) -> Result<(), Failed> {
 
 /// Whether the store still holds a record.
 ///
-/// A read that fails is reported as a failure and never as an absence: telling "the store lost it"
-/// apart from "the store could not be asked" is the whole difference between a finding and a
-/// question nobody answered.
+/// A failed read is reported as a failure, never as an absence.
 fn holds(environment: &Environment, key: u64) -> Result<bool, Failed> {
     let read = environment.begin_ro_sync()?;
-    // A table that does not exist holds nothing, which is a legitimate answer to the question and
-    // not an error: a crash before the first commit leaves exactly this.
+    // A missing table holds nothing, as after a crash before the first commit.
     let Ok(table) = read.open_db(Some(TABLE)) else {
         return Ok(false);
     };

@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod check;
+mod confirm;
 mod disclose;
 mod doctor;
 mod execute;
@@ -37,8 +38,8 @@ use clap::{Parser, Subcommand};
 
 use crate::guests::Demo;
 
-/// Exit codes are part of the contract: a pipeline branches on them, so "the tool found a bug" and
-/// "the tool is broken" must never share one. See `docs/API.md` §7.10.
+/// Exit codes, part of the contract: "found a bug" and "the tool is broken" never share one. See
+/// `docs/API.md` §7.10.
 mod exit {
     /// Nothing was found.
     pub(crate) const CLEAN: u8 = 0;
@@ -55,14 +56,12 @@ mod exit {
     pub(crate) const DEGRADED: u8 = 4;
 }
 
-/// What `bohr selftest` interleaves with. Uniform choice, because the guests it runs are checks on
-/// the machinery rather than a search for bugs in them.
+/// The scheduler `bohr selftest` uses: uniform, since its guests check the machinery.
 const SELFTEST_SCHEDULER: &str = "random";
 
 /// Interleaving policies this build implements.
 ///
-/// A policy named here but absent from the binary would silently run something else, so the list is
-/// the set of policies that exist rather than the set that is planned.
+/// Only policies that exist; a listed but missing one would silently run something else.
 const SCHEDULERS: [&str; 3] = ["pct", "random", "fair"];
 
 /// Failures that stop a command before it produces a verdict.
@@ -74,8 +73,7 @@ pub(crate) enum CliError {
     Internal(String),
 }
 
-/// A configuration the world refused is a usage error here: the file is the user's, and what is
-/// wrong with it is already said in the message the parser produced.
+/// A configuration the world refused is a usage error; the parser's message says what is wrong.
 impl From<bohr_world::ConfigError> for CliError {
     fn from(error: bohr_world::ConfigError) -> Self {
         Self::Usage(error.to_string())
@@ -172,8 +170,7 @@ enum Command {
 
     /// Run the guests built into this binary and check they reproduce.
     ///
-    /// Needs no program on disk and no privileges, so it answers "is this build deterministic on
-    /// this machine" anywhere the binary runs.
+    /// Needs no program on disk and no privileges, so it checks determinism on any machine.
     Selftest {
         /// Seed the runs are derived from.
         #[arg(long, default_value_t = 0)]
@@ -189,12 +186,11 @@ enum Command {
         save_dir: Option<String>,
     },
 
-    /// Search for a finding, rather than run what was asked for.
+    /// Search for a finding.
     ///
-    /// A campaign is a function of its master seed and its run budget: `--runs` reproduces
-    /// exactly, whatever `-j` says, because the work is planned a generation at a time and folded
-    /// in the order it was planned. `--time` is the convenient budget and records how many runs it
-    /// reached, so the same campaign can be repeated with `--runs`. See `docs/API.md` §7.2.
+    /// A campaign depends only on its master seed and run budget: `--runs` reproduces exactly for
+    /// any `-j`. `--time` records how many runs it reached, so `--runs` can repeat it. See
+    /// `docs/API.md` §7.2.
     Explore {
         /// Wall-clock budget: `90s`, `30m`, `1h`, `2d`, or bare seconds. Not reproducible alone.
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -231,7 +227,7 @@ enum Command {
         program: Vec<String>,
     },
 
-    /// Carry out a campaign's runs. Started by `bohr explore`, not by a person.
+    /// Carry out a campaign's runs. Started by `bohr explore`.
     #[command(hide = true)]
     ExploreWorker {
         /// Take items on stdin and answer each on stdout until stdin closes.
@@ -283,8 +279,8 @@ enum Command {
 
     /// Hold subjects to the checks they declare: a pack's `[check]`, a seeded defect's `bug.toml`.
     ///
-    /// Each check is a property of runs — they repeat, stay clean without faults, find what was
-    /// seeded — and is the same code for every subject. See `docs/API.md` §7.9.
+    /// Each check is a property of runs (they repeat, stay clean without faults, find what was
+    /// seeded), the same code for every subject. See `docs/API.md` §7.9.
     Check {
         /// Subjects: a pack name, a defect's directory name, or the path of either's file.
         subjects: Vec<String>,
@@ -353,9 +349,8 @@ enum Command {
 
     /// List the syscalls a program asks for that this build does not model.
     ///
-    /// Not a run: every unmodelled call is answered `ENOSYS` so the next one can be reached, so
-    /// nothing here says whether the program behaves. It writes no bundle and exits 4 when it
-    /// found anything, because what it found is about this build rather than about the guest.
+    /// Every unmodelled call is answered `ENOSYS` so the next one is reached; the result says
+    /// nothing about the program's correctness. Writes no bundle, and exits 4 when it found any.
     Survey {
         /// Seed the run is derived from.
         #[arg(long, default_value_t = 1)]
@@ -420,6 +415,22 @@ enum Command {
         sarif: bool,
     },
 
+    /// Write a script that stages a stored finding on an ordinary Linux host, without bohr.
+    ///
+    /// The recorded programs as plain processes, the recorded node faults as signals and, for a
+    /// crash, a device that drops unsynced writes; repeated, it prints how often the failure came
+    /// back. See `docs/API.md` §7.11.
+    Confirm {
+        /// The bundle of the finding.
+        bundle: String,
+        /// Where the script is written.
+        #[arg(short = 'o', long, value_name = "PATH", default_value = "confirm.sh")]
+        out: String,
+        /// How many repetitions the script runs unless `RUNS` says otherwise.
+        #[arg(long, default_value_t = 100)]
+        runs: u32,
+    },
+
     /// Write a line on a stored run, for whoever opens it next.
     Note {
         /// The bundle to write on.
@@ -430,9 +441,8 @@ enum Command {
 
     /// Print a stored run's event log.
     ///
-    /// The whole log, in the order it was recorded, without replaying anything: what a bundle
-    /// carries is what this prints. `json` is the same projection a report leaves beside itself
-    /// for the events it did not show.
+    /// The whole log in recorded order, read from the bundle without replaying. `json` is the same
+    /// projection a report writes for the events it does not draw.
     Trace {
         /// The bundle to read.
         bundle: String,
@@ -474,7 +484,7 @@ enum Command {
 
     /// Print the version, and the four contract numbers a bug report needs.
     Version {
-        /// Print every contract number rather than the tool version alone.
+        /// Print every contract number as well as the tool version.
         #[arg(long)]
         verbose: bool,
     },
@@ -482,9 +492,7 @@ enum Command {
 
 /// The world a campaign runs in, read once and carried with the text it came from.
 ///
-/// The text travels because a finding's bundle records the configuration that produced it, and a
-/// bundle that named a file rather than carrying its contents would replay differently the moment
-/// somebody edited it.
+/// The text is kept because a finding's bundle stores the configuration itself.
 fn read_scenario(
     path: Option<&str>,
 ) -> Result<Option<(bohr_world::LoadedConfig, String)>, CliError> {
@@ -513,8 +521,7 @@ fn subject_of(guest: Option<Demo>, program: Vec<String>) -> Result<explore::Subj
 
 /// The components a run is wired with, by whether it is configured as a cluster.
 ///
-/// Named in one place because a bundle records them and a replay checks them: two answers to
-/// "which world was this" is how a bundle comes to be refused for the wrong reason.
+/// Defined once, because a bundle records the names and a replay checks them.
 pub(crate) fn identities(
     loaded: Option<&bohr_world::LoadedConfig>,
 ) -> (bohr_types::WorldModelId, bohr_types::OracleId) {
@@ -523,9 +530,7 @@ pub(crate) fn identities(
     } else {
         bohr_kernel::WorldModel::identity(&bohr_world::MinimalWorld::new())
     };
-    // The same panel the run would be judged by, asked for its name rather than told one: two
-    // places that each spelled the identity out would be two places that can disagree, and the
-    // disagreement is only visible when a replay refuses a bundle that was fine.
+    // The name comes from the panel that judges the run, so it cannot disagree with it.
     (
         world,
         bohr_kernel::Oracle::identity(&bohr_world::panel(
@@ -536,10 +541,7 @@ pub(crate) fn identities(
 
 /// The bounds a run is carried out under, from the scenario and the command line.
 ///
-/// One place, because a horizon that reached some commands and not others would be worse than one
-/// that reached none: a bundle recorded with a horizon and replayed without it diverges at the
-/// first event past where the horizon would have ended it, and the divergence is reported as a
-/// defect in the tool rather than as the missing bound it is.
+/// Shared by every command, so a bundle replays under the horizon it was recorded with.
 pub(crate) fn run_config_for(
     loaded: Option<&bohr_world::LoadedConfig>,
     max_events: Option<u64>,
@@ -560,9 +562,8 @@ pub(crate) fn run_config_for(
 
 /// Writes a copy of a program with its processor questions made to fault, and names the copy.
 ///
-/// A copy and never the file itself: rewriting what somebody handed us is the one thing
-/// `ARCHITECTURE.md` §5.8 forbids outright. The copy lands beside the original with a suffix, so a
-/// reader looking at a report and a reader looking at a directory see the same name.
+/// Always a copy; `ARCHITECTURE.md` §5.8 forbids rewriting the user's file. The copy sits beside
+/// the original with a suffix.
 fn trapped_copy(program: &str) -> Result<String, CliError> {
     let bytes = std::fs::read(program)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {program}: {e}")))?;
@@ -587,28 +588,21 @@ fn trapped_copy(program: &str) -> Result<String, CliError> {
 
 /// One guest specification per node, from a command line and the configuration.
 ///
-/// A single-node `[cluster]` may still shape the run: its environment is presented, and `{node}` in
-/// its argv is substituted, so a scenario file and the command line agree on what node zero is.
-/// Without a `[cluster]`, the command line is node zero and there is nothing else.
+/// A single-node `[cluster]` still applies its environment and `{node}` substitution. Without a
+/// `[cluster]`, the command line is node zero.
 ///
-/// **`standing_in` is one execution of a comparison, and it replaces exactly one node.** A cluster
-/// of unlike nodes is how a real client is driven at all — one node is the client, another is the
-/// caller that makes it do anything — so replacing the whole cluster would replace the caller too,
-/// and every implementation would then run the identical scenario and agree with itself.
+/// `standing_in` replaces exactly one node for one execution of a comparison; the other nodes,
+/// such as the caller driving a client, stay as the scenario says.
 ///
-/// **One function, and it matters.** A run and its replay build their guests from different
-/// starting points -- a command line here, a stored configuration there -- and two spellings of
-/// this rule that differ by two environment variables move the guest's stack by sixty-four bytes:
-/// any guest that reads a stack address then replays to a different digest than it recorded.
+/// Run and replay both build their guests here: two versions differing by one environment
+/// variable would move the guest's stack and change its digest.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn specs_for(
     argv: Vec<String>,
     loaded: Option<&bohr_world::LoadedConfig>,
     standing_in: Option<&bohr_world::Implementation>,
 ) -> Result<Vec<bohr_backend::GuestSpec>, CliError> {
-    // The one node a comparison replaces, where this is one execution of one. Everything else the
-    // scenario describes is left alone: the caller that drives the node under comparison is part of
-    // the conditions, not part of what is being compared.
+    // The one node a comparison replaces; the rest of the scenario stays.
     let standing_in = standing_in.and_then(|i| i.argv_for().map(|own| (i.node, own)));
 
     let specs = match loaded.and_then(|l| l.cluster.as_ref()) {
@@ -620,9 +614,7 @@ pub(crate) fn specs_for(
                     _ => cluster.argv_for(index),
                 };
                 let mut env = cluster.env.clone();
-                // Where the guest's SDK writes what it has to say about itself, and which node
-                // it is. Both are presented rather than inherited: a guest that read them from
-                // the host would be told about a machine it is not on.
+                // The SDK's record channel and the node's number, set here.
                 env.push(("BOHR_SDK_OUTPUT".to_owned(), execute::SDK_RECORD_PATH.to_owned()));
                 env.push(("BOHR_SDK_NODE".to_owned(), index.to_string()));
                 bohr_backend::GuestSpec { argv, env, executable: None }
@@ -636,16 +628,13 @@ pub(crate) fn specs_for(
     with_probe(specs, loaded)
 }
 
-/// What the probe is called inside a run: one name on every host, so a bundle replays wherever the
-/// file is kept.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const PROBE_ARGV0: &str = "/bohr/probe";
+/// The probe's name inside a run, the same on every host so bundles replay anywhere.
+pub(crate) const PROBE_ARGV0: &str = "/bohr/probe";
 
 /// The specs with the probe appended as the last node, where the scenario has probes.
 ///
-/// Last, so every node the scenario numbers keeps its number and its address; the probe takes the
-/// next one. Its environment is the SDK's and nothing of the cluster's, because it is not one of
-/// the nodes the cluster's environment describes.
+/// Last, so the scenario's nodes keep their numbers and addresses. The probe gets only the SDK's
+/// environment.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn with_probe(
     mut specs: Vec<bohr_backend::GuestSpec>,
@@ -670,10 +659,8 @@ fn with_probe(
 
 /// Runs every implementation a differential scenario names, and says what came of it.
 ///
-/// **`Skipped` is not clean, and that is the sharpest thing here.** A group verdict of "nothing was
-/// compared" — a projection path nobody writes, a label one implementation never produced — folded
-/// into a clean run would let a campaign of a million differential runs report a million clean runs
-/// while comparing nothing at all. It gets a code of its own and a non-zero exit.
+/// A `Skipped` verdict (nothing was compared) gets its own code and a non-zero exit, so it is never
+/// counted as clean.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn compare_implementations(
     program: Vec<String>,
@@ -694,8 +681,7 @@ fn compare_implementations(
         );
     }
 
-    // An execution that went wrong on its own is a sharper answer than "they disagreed", and it is
-    // also why they would have: an implementation that crashed produced no value to compare.
+    // An implementation that failed on its own is reported first; it produced nothing to compare.
     for (name, completed) in group.names.iter().zip(&group.executions) {
         if !matches!(completed.report.outcome, Outcome::Clean) {
             let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
@@ -753,8 +739,7 @@ fn compare_implementations(
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        // A command line clap refuses is an error like any other, and under `--json` it is said
-        // as one; help and the version are what was asked for, and are printed as asked.
+        // Under `--json` a refused command line is a `bohr.error`; help and version print as usual.
         Err(e) if std::env::args().any(|a| a == "--json") && e.use_stderr() => {
             let message = e.to_string();
             let first = message.lines().next().unwrap_or("").trim_start_matches("error: ");
@@ -805,8 +790,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                 )));
             }
             let tape = load_tape(seed, tape.as_deref())?;
-            // The text is kept as well as the parsed form: a bundle records the configuration
-            // verbatim, and re-serialising a parsed one would record what we understood of it.
+            // The text is kept: a bundle stores the configuration verbatim.
             let config_text =
                 match config_path.as_deref() {
                     Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
@@ -818,9 +802,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                 Some(text) => Some(bohr_world::config::load(text)?),
                 None => None,
             };
-            // Said out loud, once, before the run: a guest that asked the processor for a number
-            // and was handed a fixed one is not the guest anybody shipped, and a reader looking at
-            // the report later has to be able to see that this was done.
+            // Printed before the run: the patched guest is not the one that shipped.
             if patch_rdrand {
                 let state = loaded.as_mut().and_then(|scenario| scenario.state.take());
                 match state {
@@ -845,11 +827,8 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                     }
                 }
             }
-            // The program is not among the prepared files -- it is started by the interceptor and
-            // mapped by the kernel -- so it is rewritten into a copy of its own and the run is
-            // pointed at that. Its own path is what a bundle records and what `/proc/self/exe`
-            // answers, so the copy is what the run was of, and saying so is the point of printing
-            // it.
+            // The program itself is not a prepared file, so a patched copy is written and run. The
+            // copy's path is what the bundle records, so it is printed.
             let mut program = program;
             if patch_cpuid {
                 if let Some(state) = loaded.as_mut().and_then(|scenario| scenario.state.take()) {
@@ -883,8 +862,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             )
         }
         Command::Replay { binaries, verify_only, gdb, break_at, bundle } => {
-            // Refused here rather than after replaying: a run that ends in a hand-over nobody can
-            // use has cost as long as the original took to learn nothing.
+            // Refused before replaying, which can take as long as the original run.
             let break_at =
                 match (gdb, break_at) {
                     (true, Some(_)) => return Err(CliError::Usage(
@@ -1060,8 +1038,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
                     "BOHR-1002: a survey needs a program, after `--`".to_owned(),
                 ));
             }
-            // The same preparation a run makes, because a survey of a program prepared differently
-            // is a survey of a different program.
+            // Prepared as a run would be, so the survey sees the same program.
             let program = if patch_cpuid {
                 let mut program = program;
                 if let Some(first) = program.first().cloned() {
@@ -1077,6 +1054,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             survey::run(program, seed, config.as_deref(), max_events, patch_cpuid)
         }
         Command::Note { bundle, text } => note(&bundle, &text),
+        Command::Confirm { bundle, out, runs } => confirm::confirm(&bundle, &out, runs),
         Command::Trace { bundle, format, node, kind, from, to, around, squash } => {
             trace(&bundle, &format, &Selection { node, kind, from, to, around }, squash)
         }
@@ -1090,8 +1068,7 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
 
 /// The tape a run is driven by: a stored one, or one derived from a seed.
 ///
-/// A stored tape already carries the seed it came from, so naming both leaves two answers to one
-/// question and is refused rather than resolved by precedence.
+/// A stored tape carries its seed, so giving both is refused.
 fn load_tape(seed: Option<u64>, file: Option<&str>) -> Result<Tape, CliError> {
     let Some(path) = file else {
         return Ok(Tape::from_seed(Seed(seed.unwrap_or(0))));
@@ -1108,8 +1085,7 @@ fn load_tape(seed: Option<u64>, file: Option<&str>) -> Result<Tape, CliError> {
 
 /// Replays every named bundle, reporting the worst outcome any of them reached.
 ///
-/// The worst rather than the first: a glob of bundles is checked to learn whether they all still
-/// replay, and stopping at the first failure would hide how many others are broken too.
+/// Every bundle is replayed, so one failure does not hide others.
 fn replay_bundles(
     paths: &[String],
     binaries: Option<&str>,
@@ -1119,8 +1095,7 @@ fn replay_bundles(
     let mut worst = exit::CLEAN;
     let mut answers = Vec::new();
     for path in paths {
-        // A bundle that cannot be read is reported like one that failed to replay, so a glob
-        // with a hole in it still says what happened to every other bundle in it.
+        // An unreadable bundle is reported like a failed replay, and the rest still run.
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1176,16 +1151,10 @@ fn replay_bundles(
     worst
 }
 
-/// Writes a stored run as one page, and the events it could not draw beside it.
-///
-/// Two files rather than one only where the run was too long to draw whole. The page names the
-/// second and says what is in it, so a reader who has both knows why, and a reader who has only
-/// the page is not left wondering what it is not showing them.
 /// What each probe request of a stored run reads: its node, and the fields of its answer.
 ///
-/// Derived from the scenario the bundle carries, by the same code that wrote the probe's plan, so
-/// request `i` on the page is request `i` the probe asked. A bundle with no scenario, or no probe
-/// in it, has no lanes and the page draws no chain.
+/// Derived from the bundle's scenario by the code that planned the probe, so request `i` on the
+/// page is the probe's request `i`. No scenario or no probe gives no lanes.
 fn chain_lanes(bundle: &bohr_trace::Bundle) -> Vec<bohr_report::chain::Lane> {
     let Some(text) = bundle.section(bohr_trace::SectionId::Config) else {
         return Vec::new();
@@ -1213,21 +1182,22 @@ fn chain_lanes(bundle: &bohr_trace::Bundle) -> Vec<bohr_report::chain::Lane> {
         .collect()
 }
 
+/// Writes a stored run as one page, with a sidecar of the events it does not draw.
+///
+/// The sidecar exists only for a run too long to draw whole; the page names it.
 fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
     let bundle = bohr_trace::Bundle::parse(&bytes).map_err(|e| CliError::Usage(e.to_string()))?;
 
-    // One suffix and not every one of them: `trim_end_matches` strips repeats, so `a.html.html`
-    // became `a` and the sidecar took a name the reader would not have guessed.
+    // Strips one `.html` suffix only.
     let stem = out.strip_suffix(".html").unwrap_or(out);
     let sidecar_name = format!("{stem}.events.jsonl");
     let short = std::path::Path::new(&sidecar_name)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| sidecar_name.clone());
-    // The page prints a command to copy, so it is told what the bundle it was made from is
-    // called rather than deriving a name from the run identifier that nothing writes.
+    // The page prints a command to copy, so it gets the bundle's actual file name.
     let named = std::path::Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1255,8 +1225,7 @@ fn report(path: &str, out: &str, redact: bool) -> Result<u8, CliError> {
     }
 
     if redact {
-        // Beside the original rather than over it: what circulates is a pair, and the bundle with
-        // everything in it is what the person who ran it keeps.
+        // Written beside the original, which the person who ran it keeps.
         let cleaned = bohr_trace::redact(&bundle).map_err(|e| CliError::Usage(e.to_string()))?;
         let name = format!("{}.redacted.bohr", path.trim_end_matches(".bohr"));
         std::fs::write(&name, cleaned)
@@ -1283,10 +1252,7 @@ pub(crate) fn wrote(kind: &str, bundle: &str, written: &[String]) {
 
 /// Adds a line to a bundle's notes, in place.
 ///
-/// No timestamp and no author. The host clock is banned everywhere a run could read it, and a note
-/// that carried one would make two identical invocations produce different bytes — which is the
-/// property every stored artefact in this tool is built to have. What a note is for is the sentence
-/// somebody wants the next reader to see.
+/// No timestamp and no author, so two identical invocations produce identical bytes.
 fn note(path: &str, text: &str) -> Result<u8, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot read {path}: {e}")))?;
@@ -1304,10 +1270,8 @@ fn note(path: &str, text: &str) -> Result<u8, CliError> {
 
     let mut writer = bundle.to_writer();
     writer.section(bohr_trace::SectionId::Notes, notes.clone().into_bytes());
-    // **Written beside and moved into place, never over the top.** `write` truncates first, so a
-    // crash or a full disk part-way through left nothing where a finding had been -- and a finding
-    // is the one file in this tool that cannot be produced again on demand. A rename is atomic on
-    // every filesystem this runs on, so the bundle is either the old one or the new one.
+    // Written beside and renamed into place, so a crash leaves the old bundle or the new one,
+    // never a truncated file.
     let staged = format!("{path}.writing");
     std::fs::write(&staged, writer.finish(bundle.run_id))
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {staged}: {e}")))?;
@@ -1324,14 +1288,9 @@ fn note(path: &str, text: &str) -> Result<u8, CliError> {
     Ok(exit::CLEAN)
 }
 
-/// Prints a stored run's event log, in the form asked for.
-///
-/// Read rather than replayed: a bundle carries its log, and re-running the guest to print what is
-/// already in the file would need the guest to still exist and would take as long as the run did.
 /// Which events `bohr trace` prints.
 ///
-/// By the events' own fields, never by the text of a line: a selection and its complement are the
-/// whole log, and `json` selects exactly what `text` does.
+/// Selected by event fields, never by line text, so `json` and `text` select the same events.
 #[derive(Debug, Default)]
 struct Selection {
     node: Vec<u32>,
@@ -1383,6 +1342,7 @@ fn parse_virtual(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{text:?} is longer than a run can be"))
 }
 
+/// Prints a stored run's event log from the bundle, without replaying it.
 fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Result<u8, CliError> {
     for kind in &selection.kind {
         if !bohr_report::text::KINDS.contains(&kind.as_str()) {
@@ -1423,8 +1383,7 @@ fn trace(path: &str, format: &str, selection: &Selection, squash: bool) -> Resul
     };
     print!("{written}");
 
-    // Said on stderr so it cannot land in a file somebody is parsing. A log that stops early is
-    // the most misleading thing a bundle can hand a reader, because every event in it is true.
+    // On stderr, so it never lands in parsed output. A truncated log looks complete otherwise.
     if let Some(damage) = &model.truncated {
         eprintln!("{path}: the log ends early: {damage}");
     }
@@ -1480,7 +1439,7 @@ fn version(verbose: bool) {
         println!("bohr {tool}");
         return;
     }
-    // All four appear in every bundle, and a bug report is unactionable without them.
+    // All four are in every bundle, and a bug report needs them.
     println!("bohr {tool}");
     println!("  tape ABI       {TAPE_ABI}");
     println!("  bundle format  {BUNDLE_FORMAT}");
@@ -1505,11 +1464,9 @@ fn run_program(
     if repeat == 0 {
         return Err(CliError::Usage("BOHR-1002: --repeat must be at least 1".to_owned()));
     }
-    // A differential scenario names its own programs, so the command line has nothing to add and
-    // a program after `--` would be a third thing nobody asked to run.
+    // A differential scenario names its own programs.
     if let Some(scenario) = loaded.filter(|l| l.differential.is_some()) {
-        // Refused rather than ignored. Both were accepted and silently did nothing here, so
-        // somebody who asked for a bundle got a clean exit and no file, and learned it later.
+        // Refused, since a differential run would ignore them.
         if save.is_some() {
             return Err(CliError::Usage(
                 "BOHR-1002: --save has nothing to write for a differential run, which produces a \
@@ -1581,8 +1538,7 @@ fn run_program(
                 std::fs::write(file, line)
                     .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {file}: {e}")))?;
             }
-            // A degraded run is reported either way; the exit code changes only where the caller
-            // asked for the guarantee rather than for the result.
+            // A degraded run is always reported; it changes the exit code only under `--strict`.
             let code = if !matches!(completed.report.outcome, Outcome::Clean) {
                 exit::FINDING
             } else if strict && !completed.degradations.is_empty() {
@@ -1636,8 +1592,7 @@ fn run_program(
 
 /// A wall-clock budget as a person writes one: a number and a unit, or a number of seconds.
 ///
-/// One parser for every command that takes `--time`, so a value written for one means the same in
-/// another; a unit nobody defined is an error rather than a guess.
+/// Shared by every command with `--time`. An unknown unit is an error.
 pub(crate) fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     let text = text.trim();
     let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
@@ -1660,12 +1615,10 @@ pub(crate) fn parse_duration(text: &str) -> Result<std::time::Duration, String> 
 
 /// One line per completed run, in the form both commands report.
 ///
-/// Written to standard error, because standard output carries whatever the guest itself wrote and
-/// mixing the two would corrupt both.
+/// Written to standard error; standard output carries the guest's own output.
 ///
-/// `armed` says the scenario asked for something to go wrong, which is read against what landed:
-/// the two come apart, and a run that met no adversity at all reads exactly like one that met
-/// plenty and answered it.
+/// `armed` means the scenario configured faults; it is compared with what landed, since a run
+/// with no faults looks like one that handled them all.
 fn report_run(
     label: &str,
     repeat: usize,
@@ -1680,8 +1633,7 @@ fn report_run(
         .map_or_else(|| label.to_owned(), |n| n.to_string_lossy().into_owned());
     let virtual_time = bohr_report::narrate::seconds(completed.report.ticks.get());
     let nodes = completed.counters.nodes;
-    // The verdict first, in words, with its code to search by; the counters last, where a reader
-    // who fixes bohr itself looks and nobody else has to.
+    // The verdict first, with its code; the counters last.
     if verdict.found {
         eprintln!("FINDING  {}    {}", verdict.headline, verdict.code);
     } else {
@@ -1691,8 +1643,7 @@ fn report_run(
         );
     }
     if verdict.found {
-        // What else the outcome names, once each: the verdict says the first, and a diagnostic
-        // repeating the outcome's own words is the same fact a second time.
+        // The outcome's other details, once each, skipping diagnostics that repeat them.
         let detail = bohr_report::describe::outcome_detail(outcome).unwrap_or("");
         for also in detail.split("; ").skip(1) {
             eprintln!("  also     {also}");
@@ -1703,8 +1654,7 @@ fn report_run(
                 eprintln!("  {note}");
             }
         }
-        // A run that hung says nothing about where. The calls it made most is the shortest route
-        // to the loop it is in.
+        // For a hang, the most frequent calls point to the loop.
         if matches!(outcome, Outcome::GuestHung(_)) {
             let (_, busiest) = execute::syscall_profile(&completed.stats, 5);
             eprintln!("  the calls it made most");
@@ -1722,9 +1672,7 @@ fn report_run(
             None => eprintln!("    run it again with --save run.bohr, then bohr explain run.bohr"),
         }
     }
-    // Where the guest carries the coverage runtime, what it covered and whether the map could
-    // hold it. A map with fewer counters than the guest has edges puts two edges on one, and the
-    // search that follows cannot tell those two paths apart — see `docs/API.md` §5.5.
+    // Coverage and whether the map is big enough; see `docs/API.md` §5.5.
     if let (Some(map), edges @ 1..) = (&completed.coverage, completed.coverage_edges) {
         eprintln!("  covered {} of {edges} edges · map holds {}", map.edges(), map.cells());
         if edges > map.cells() as u64 {
@@ -1741,7 +1689,7 @@ fn report_run(
         }
     }
     if !completed.degradations.is_empty() {
-        // Once per cause with how many said it: one per node made the same line seven times.
+        // Once per cause, with a count.
         let mut causes: Vec<(&str, usize)> = Vec::new();
         for cause in &completed.degradations {
             match causes.iter_mut().find(|(c, _)| c == cause) {
@@ -1756,8 +1704,8 @@ fn report_run(
         eprintln!("  degraded: {}", said.join(", "));
     }
     let (syscalls, _) = execute::syscall_profile(&completed.stats, 0);
-    // `stops` is how many times the guest crossed into the supervisor, which is what a run costs;
-    // `syscalls` counts what the trace records, where one ring entry is a call of its own.
+    // `stops` counts entries into the supervisor, the run's cost; `syscalls` counts trace entries,
+    // where each ring entry is its own call.
     eprintln!(
         "  {repeat} runs · {} events · {syscalls} syscalls · {} stops · {} draws · {}",
         completed.report.events,

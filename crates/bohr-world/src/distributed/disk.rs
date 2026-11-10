@@ -1,16 +1,10 @@
 //! The virtual disk's crash semantics: what survives a kill, and what it survives as.
 //!
-//! Reads always see the live disk — visibility and durability are different promises, and only the
-//! second survives a power cut. Durability is `fsync`'s, and it is **that file's**: syncing one
-//! descriptor says nothing about any other file, which is what makes a write-ahead log worth
-//! having and what makes a store that syncs the wrong one lose data.
+//! Reads see the live disk. Durability comes from `fsync` and covers only the synced file.
 //!
-//! **A crash leaves a state the disk was never in.** Between a file's last sync and the crash,
-//! each sector it was written on either landed or did not, independently of its neighbours. That
-//! is the whole reason crash consistency is a discipline: a model that restored some earlier
-//! moment would only ever produce states the store had already survived once. The two axes are
-//! atomicity — how much of a write persists — and ordering, from Pillai et al., *All File Systems
-//! Are Not Created Equal* (OSDI '14). Semantics are normative in `docs/API.md` §5.1.
+//! A crash decides each sector written since the file's last sync independently, so the result
+//! can be a state the disk never passed through. The axes are atomicity and ordering, after Pillai
+//! et al., *All File Systems Are Not Created Equal* (OSDI '14). Normative: `docs/API.md` §5.1.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -29,10 +23,7 @@ const SECTOR: u64 = 512;
 
 /// What this world says when it has presented the guest with something no machine could.
 ///
-/// Its own code rather than the general internal one, because what it means is narrower and more
-/// useful: whatever the guest did next is not evidence about the guest. Three of the four defects
-/// this tool was blamed for on its first real target were of exactly this shape, and each cost a
-/// reading of the target's source to disprove.
+/// Its own code: whatever the guest did next is not evidence about the guest.
 pub(crate) const IMPOSSIBLE_STATE: &str = "BOHR-5005";
 
 /// The disk's tunables. Defaults: nothing stalls, nothing fails, four snapshots kept.
@@ -77,9 +68,7 @@ pub(crate) struct InFlightFsync {
 
 /// What one crash does to everything a file's last sync did not promise.
 ///
-/// Drawn once per crash and applied to every dirty sector of every file, so that the number of
-/// draws is a fact about the crash rather than about the disk. A draw per sector would make one
-/// mutated byte shift every decision after it, which is the property the whole draw ABI protects
+/// Drawn once per crash, so tape use does not depend on the dirty sector count
 /// (`docs/ARCHITECTURE.md` §5.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Landing {
@@ -94,8 +83,7 @@ enum Landing {
 impl Landing {
     /// Half of all crashes lose everything unsynced, a quarter keep it, a quarter tear.
     ///
-    /// Weighted rather than uniform because the extremes are what a store is usually written
-    /// against, and a model that only ever produced mixtures would rarely exercise either.
+    /// Weighted toward the extremes, which stores are written against.
     const fn of(seed: u64) -> Self {
         match seed & 0b11 {
             0 | 1 => Self::Nothing,
@@ -107,33 +95,22 @@ impl Landing {
 
 /// One node's durability state.
 ///
-/// Images are held behind a counted pointer rather than by value. A node's disk is the largest
-/// thing this model keeps, the promise and the newest ring entry are the same bytes, and a rewind
-/// moves an image rather than producing one.
+/// Images are shared behind counted pointers, since the promise and the newest ring entry are the
+/// same bytes.
 #[derive(Debug)]
 pub(crate) struct NodeDisk {
     /// What a crash starts from: for each file, what that file's last completed `fsync` promised.
     ///
-    /// Per file and not per disk. A sync on one descriptor promises nothing about any other file,
-    /// and a model that promised otherwise would keep a data file's writes alive because a log was
-    /// synced — hiding exactly the defect a write-ahead log exists to prevent.
+    /// Per file, since a sync covers only its own file.
     durable: Arc<DiskImage>,
     /// Byte ranges written to each file since that file's own last completed sync.
     ///
-    /// Ranges rather than content: the bytes are in the live file, and holding a second copy of
-    /// every write would cost the run its memory. Coalesced on insert, because a store writing a
-    /// page at a time would otherwise accumulate an entry per call.
+    /// Ranges, since the bytes are in the live file; coalesced on insert.
     pending: BTreeMap<u64, Vec<(u64, u64)>>,
     /// Whole-disk images at each completed sync, newest last, for restart-from-snapshot.
     snapshots: VecDeque<Arc<DiskImage>>,
-    /// The stalled `fsync`, if one is in flight.
-    /// Syncs that stalled and are waiting for their timers, by the task that made each.
-    ///
-    /// **One slot held one, and a store syncs from more than one thread.** Two stalls in flight
-    /// and the second overwrote the first: the first timer committed the second's file early
-    /// and woke the second's task, the second timer fired into nothing, and the first task
-    /// stayed parked for ever -- a deadlock this model invented, in exactly the configuration
-    /// a stall campaign runs.
+    /// Stalled syncs waiting for their timers, by task, since a store syncs from several
+    /// threads.
     inflight: BTreeMap<TaskId, InFlightFsync>,
 }
 
@@ -150,16 +127,14 @@ impl NodeDisk {
 
     /// Whether any file holds something no completed `fsync` has promised.
     ///
-    /// The window a crash has to land in to lose an acknowledged write, and therefore the moment
-    /// guided fault targeting aims at.
+    /// The window guided fault targeting aims at.
     pub(crate) fn is_dirty(&self) -> bool {
         !self.pending.is_empty()
     }
 
     /// Records bytes that reached a file and that no `fsync` has promised yet.
     ///
-    /// Coalesced against the last range recorded for the file, because a store writing a page at a
-    /// time in ascending order is the common case and would otherwise leave one entry per call.
+    /// Coalesced with the file's last range, for ascending page writes.
     pub(crate) fn mark_written(&mut self, inode: u64, offset: u64, len: u64) {
         if len == 0 {
             return;
@@ -179,11 +154,7 @@ impl NodeDisk {
 
     /// Cuts the pending ranges of a file down to a new length.
     ///
-    /// **A truncation takes the bytes above it, and the marks on them go too.** Left behind, a mark
-    /// named a sector the file no longer has: the crash image then tried to copy a sector out of a
-    /// file shorter than the mark said, which is a panic in the sans-io core. The write that made
-    /// the mark did happen -- what a crash could bring back of it is nothing, because the bytes are
-    /// gone whether the truncation was durable or not.
+    /// Marks above the new length go with the bytes, so a crash never reads past the file.
     pub(crate) fn mark_truncated(&mut self, inode: u64, length: u64) {
         let Some(ranges) = self.pending.get_mut(&inode) else {
             return;
@@ -207,8 +178,7 @@ impl NodeDisk {
 
     /// Takes the stall a timer belongs to, where it is still in flight.
     ///
-    /// By task, because several can be waiting at once. A stall whose node crashed meanwhile has
-    /// already been consumed by the crash, which is what tore the file.
+    /// By task. A crash has already consumed the stalls of its node.
     pub(crate) fn take_inflight(&mut self, task: TaskId) -> Option<InFlightFsync> {
         self.inflight.remove(&task)
     }
@@ -220,16 +190,11 @@ impl NodeDisk {
 
     /// Completes a sync of one file: its live content becomes durable, and the disk joins the ring.
     ///
-    /// Only that file. Names and numbering are taken whole, because directory operations are an
-    /// axis of their own that this model does not separate — a limitation stated in
-    /// `docs/API.md` §5.1 rather than left to be discovered.
+    /// Only that file's content; the namespace is taken whole (`docs/API.md` §5.1).
     pub(crate) fn commit(&mut self, world: &MinimalWorld, inode: Option<u64>, depth: usize) {
         let mut image = self.durable_image();
         let mut live = world.disk_image();
-        // The namespace goes over whole, names and the directories they sit in together. Half of it
-        // is worse than neither: a directory left behind comes back as a name with no content,
-        // which is a file — and a store that made itself a directory finds a file there instead,
-        // decides it is looking at something else entirely, and starts again from nothing.
+        // Names and their directories go together, so no directory returns as an empty file.
         image.names = std::mem::take(&mut live.names);
         image.directories = std::mem::take(&mut live.directories);
         image.next_inode = live.next_inode;
@@ -254,10 +219,8 @@ impl NodeDisk {
 
     /// A sync that reported failure: what it was asked to make durable is gone.
     ///
-    /// Linux reports a failed sync once and drops the dirty pages with it, so a second `fsync` on
-    /// the same descriptor reports success having written nothing. Only the named file is affected,
-    /// which is what makes the failure worth injecting: a store that retries and carries on has
-    /// acknowledged data it no longer has.
+    /// As on Linux, the dirty pages are dropped and a retried `fsync` succeeds with nothing
+    /// written. Only the named file is affected.
     pub(crate) fn fail_sync(&mut self, world: &mut MinimalWorld, inode: Option<u64>) {
         let Some(inode) = inode else {
             return;
@@ -271,14 +234,9 @@ impl NodeDisk {
     /// `back` counts from the newest, so `0` is the latest `fsync` and `1` the one before it.
     /// Answers what it actually rewound to, which may be shallower than what was asked for.
     ///
-    /// **The ring is truncated, and that is the whole point.** A rewind that left the newer
-    /// images in place would not produce a fork point: the future it stepped past would still be
-    /// there, and a second rewind would count back from it. That is not a chain, it is a stutter.
+    /// Newer images are dropped, so the next rewind counts from the fork point.
     ///
-    /// Clamped rather than refused, unlike the node-level rewind this grew out of. A cluster has
-    /// as many independent sync histories as it has nodes, so a depth that is valid on the leader
-    /// may be past the ring on a node that synced twice — and aborting the run there would make
-    /// the fault unusable at exactly the scenarios it exists for.
+    /// Clamped, since each node has its own sync history.
     pub(crate) fn rewind(&mut self, back: usize) -> usize {
         let deepest = self.snapshots.len().saturating_sub(1);
         let applied = back.min(deepest);
@@ -294,16 +252,11 @@ impl NodeDisk {
 
     /// The image a crash leaves behind.
     ///
-    /// Everything each file's own last sync promised, plus whatever of the writes since then
-    /// happened to land. One drawn value decides the regime and, where the regime is a mixture,
-    /// every sector of it: a sector that landed holds what the guest wrote, and one that did not
-    /// holds what was there before. A file reached by a surviving sector past its durable length
-    /// grows to it, and the gap below reads as zeroes, which is what a sparse file gives.
+    /// Each file's last sync plus whichever later writes landed. One draw decides the regime and,
+    /// for a mixture, each sector. A surviving sector past the durable length grows the file, with
+    /// zeros below.
     ///
-    /// A tear — some sectors landing and others not — is narrated, because a file that came back
-    /// neither as it was nor as it should be, with nothing on the timeline to say why, is a run
-    /// nobody can read; and a campaign cannot claim to have exercised a fault it left no evidence
-    /// of. Stated in `docs/API.md` §5.1.
+    /// A tear is narrated (`docs/API.md` §5.1).
     pub(crate) fn crash_image(
         &mut self,
         node: NodeId,
@@ -311,19 +264,15 @@ impl NodeDisk {
         reorder: bool,
         ctx: &mut WorldCtx<'_, '_>,
     ) -> Result<DiskImage, KernelError> {
-        // One draw, always, whatever the disk holds. Its width is a fact about the crash rather
-        // than about how many sectors happened to be dirty.
+        // One draw, always.
         let mut drawn = [0u8; 8];
         ctx.draw_into(&mut drawn, DrawSite::DiskTear);
         let seed = u64::from_le_bytes(drawn);
-        // Every stall in flight goes with the crash: it is what tore their files, and none of
-        // their timers will find anything to commit.
+        // Stalls in flight end with the crash.
         self.inflight.clear();
 
         let mut image = self.durable_image();
-        // Without reordering a crash keeps all of what was unsynced or none of it: the quarter of
-        // crashes that would have decided sector by sector lose it all, which is the harsher of
-        // the two states a store has to survive anyway. The draw is the same either way.
+        // Without reordering, a mixed crash loses everything; the draw is unchanged.
         let landing = match Landing::of(seed) {
             Landing::PerSector if !reorder => Landing::Nothing,
             other => other,
@@ -342,17 +291,9 @@ impl NodeDisk {
                 }
                 Landing::PerSector => {
                     let mut out = image.content.get(inode).cloned().unwrap_or_default();
-                    // **A length is metadata, and it survives whole.** The size that comes back is
-                    // the one the file had or the one it grew to, never a figure between them, and
-                    // under the ordered mode every mainstream filesystem defaults to the data a
-                    // grown size refers to is written before the size that refers to it. So a file
-                    // that grew brought its tail with it, and sectors decide for themselves only
-                    // *below* the length that was already durable — which is where an overwrite
-                    // lands, and where a database does nearly all of its writing.
-                    //
-                    // Without this the model produces lengths no journalling filesystem can leave,
-                    // and a store that trusts its own length is accused of a state it will never
-                    // meet.
+                    // The length survives whole: the old one or the grown one. As in ordered mode,
+                    // a grown file keeps its tail, and sectors decide independently only below the
+                    // durable length.
                     let durable_len = out.len() as u64;
                     let tail_landed = landed_at(seed, *inode, u64::MAX);
                     if tail_landed && current.len() as u64 > durable_len {
@@ -360,23 +301,13 @@ impl NodeDisk {
                         out.write_at(durable_len as usize, &tail);
                     }
 
-                    // **Bounded by both files, not by one of them.** A sector is copied out of
-                    // the live file and into the durable image, so a range past the end of either
-                    // is not a sector there is anything to copy. The live file can be the shorter
-                    // of the two: a write marks its sectors pending, and a later `ftruncate` cuts
-                    // the file without taking the marks with it. Bounded by the durable length
-                    // alone, this indexed a live file that had been cut down -- a panic in the
-                    // sans-io core, from a guest that wrote, synced, wrote and truncated, and one
-                    // drawn crash. A panic there destroys the run it exists to record, and the
-                    // audit that would have named an impossible image runs after this arithmetic.
+                    // Bounded by both the live and the durable length, since either can be
+                    // shorter.
                     let reach = durable_len.min(current.len() as u64);
-                    // Whether a write before this one lost a sector: a write that then lands is a
-                    // later write kept where an earlier was not, which is reordering, and the
-                    // state a store that orders its writes by issuing them in order never sees.
+                    // Whether an earlier write lost a sector; this one landing is reordering.
                     let mut earlier_lost = false;
-                    // Each write's bytes are decided by what decided them: below the durable length
-                    // by their sector's coin, above it by the tail's, and past what the live file
-                    // still holds by nothing, since there is nothing there to land.
+                    // Below the durable length by sector, above it by the tail, past the live file
+                    // not at all.
                     let live_len = current.len() as u64;
                     for (offset, len) in ranges {
                         let (mut range_landed, mut range_lost) = (false, false);
@@ -420,8 +351,7 @@ impl NodeDisk {
             }
         }
 
-        // Before the pending set is cleared, because what the audit reads is which files this
-        // crash was entitled to touch at all.
+        // Before clearing pending, which the audit reads.
         if let Some(reason) = self.impossible(&image, live) {
             return Err(KernelError::World {
                 code: IMPOSSIBLE_STATE,
@@ -445,8 +375,7 @@ impl NodeDisk {
                 },
             )?;
         }
-        // One fault per crash and kind: a tear is a write split, a reorder is a later write kept
-        // where an earlier was lost, and a crash that did both did both.
+        // One fault per crash and kind: tear, reorder, or both.
         if torn {
             ctx.emit_for(
                 node,
@@ -462,15 +391,10 @@ impl NodeDisk {
 
     /// Why the image a crash produced is not one a real machine could have left, where it is not.
     ///
-    /// **Stated independently of the code that built it, or it would prove nothing.** An audit
-    /// derived from the same arithmetic says only that the arithmetic is repeatable. What this
-    /// says is what a disk is allowed to do — a file comes back at a length it held, holding bytes
-    /// somebody wrote, and nothing the kernel answers out of itself is on it at all — and what it
-    /// therefore rules out is a class of findings that are this world's rather than the guest's.
+    /// Written independently of the crash code: a file returns at a length it held, with bytes
+    /// someone wrote, and no kernel-generated file is on the disk.
     ///
-    /// Nearly free, because a file no write touched is the same counted pointer the durable image
-    /// holds: proving that is one comparison, and only the files this crash could have changed are
-    /// read through.
+    /// Untouched files are the same pointer, so only changed files are read.
     fn impossible(&self, image: &DiskImage, live: &MinimalWorld) -> Option<String> {
         for (inode, content) in &image.content {
             if live.is_synthetic(*inode) {
@@ -492,9 +416,7 @@ impl NodeDisk {
                     content.len()
                 ));
             }
-            // Every byte is one somebody put there: what the last sync promised, what a write
-            // since then put in its place, or nothing at all where the file grew past what was
-            // durable and the hole below reads as a sparse file does.
+            // Every byte is from the last sync, a later write, or a sparse hole.
             for (at, byte) in
                 content.segments(0..content.len()).flat_map(|(from, part)| (from..).zip(part))
             {
@@ -511,11 +433,7 @@ impl NodeDisk {
             }
         }
         for (name, inode) in &image.names {
-            // The name and not only the content, because a namespace goes into the durable image
-            // whole at every sync while content goes in one file at a time — so a file the kernel
-            // answers reaches a disk image as a name long before it could reach one as bytes, and
-            // what a crash then restores is a name with nothing behind it. That is the shape the
-            // defect actually had.
+            // The name too, since the namespace is synced whole and content per file.
             if live.is_synthetic(*inode) {
                 return Some(format!(
                     "{name} is answered by the kernel and is not a name on any disk"
@@ -531,9 +449,8 @@ impl NodeDisk {
 
 /// Whether one sector of one file reached the platter before the power went.
 ///
-/// A pure function of the crash's single drawn value, so that a disk with a thousand dirty sectors
-/// and one with two consume the same tape. The mixing is `splitmix64`, chosen because it is short,
-/// frozen, and has no state to carry between sectors.
+/// A pure function of the crash's one draw, mixed with `splitmix64`, which is short and
+/// stateless.
 fn landed_at(seed: u64, inode: u64, sector: u64) -> bool {
     let mut z = seed
         .wrapping_add(inode.wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -550,8 +467,7 @@ mod tests {
 
     /// A disk holding `count` synced images, the newest last, each one byte longer than the last.
     ///
-    /// Built through the world rather than around it, so what the ring holds is what a run would
-    /// have put there.
+    /// Built through the world, as a run would.
     fn with_history(count: usize) -> NodeDisk {
         let world = MinimalWorld::new();
         let mut disk = NodeDisk::new(&world);
@@ -591,12 +507,7 @@ mod tests {
         image
     }
 
-    /// The rule that would have cost nothing and saved a day: a length nothing produced.
-    ///
-    /// Between what the last sync promised and what the file had grown to, and no third value:
-    /// a size is metadata and it survives whole. A store that trusts its own length being accused
-    /// of a state no journalling filesystem can leave is a finding against this tool, and the
-    /// point of stating the rule is that it is caught here rather than in somebody's source.
+    /// A length that is neither the synced nor the grown one is caught.
     #[test]
     fn a_length_between_the_durable_one_and_the_live_one_is_refused() {
         let mut disk = NodeDisk::new(&MinimalWorld::new());
@@ -612,7 +523,7 @@ mod tests {
         );
     }
 
-    /// And a byte nothing wrote: what comes back is what somebody put there.
+    /// A byte nothing wrote is caught.
     #[test]
     fn a_byte_nothing_wrote_is_refused() {
         let mut disk = NodeDisk::new(&MinimalWorld::new());
@@ -628,11 +539,7 @@ mod tests {
         );
     }
 
-    /// And what the kernel answers about a process, which is on no disk at all.
-    ///
-    /// The defect this tool actually had. A generated `/proc` file was on the modelled disk, a
-    /// crash rolled it back, and an execution client panicked reading its own status — a syscall
-    /// away from being reported as the client's bug.
+    /// A `/proc` file on the disk image is caught.
     #[test]
     fn a_file_the_kernel_answers_out_of_itself_is_refused() {
         let mut disk = NodeDisk::new(&MinimalWorld::new());
@@ -647,12 +554,7 @@ mod tests {
         );
     }
 
-    /// The property the reorg rests on: a rewind forgets what it stepped past, so the next one
-    /// counts from where this one left the history rather than from where it found it.
-    ///
-    /// Without the truncation the fork point is not a fork point — the future is still in the ring,
-    /// and a second rewind lands in the same place as the first. That is not a chain, it is a
-    /// stutter.
+    /// A rewind drops what it stepped past, so the next one counts from the fork point.
     #[test]
     fn a_rewind_forgets_the_history_it_stepped_past() {
         let mut disk = with_history(4);
@@ -665,8 +567,7 @@ mod tests {
         assert_eq!(length(&disk), 2);
     }
 
-    /// Deeper than the history is clamped and says so, rather than ending the run: a cluster has
-    /// as many sync histories as it has nodes, and a depth valid on one may be past another's.
+    /// A depth past the history is clamped and reported.
     #[test]
     fn a_rewind_past_the_history_goes_as_far_as_there_is() {
         let mut disk = with_history(2);
@@ -677,12 +578,9 @@ mod tests {
         assert_eq!(length(&disk), 1);
     }
 
-    /// A sync copies the file it names and shares the rest, which is what keeps its cost a fact
-    /// about the write rather than about the disk.
+    /// A sync copies the file it names and shares the rest, so its cost follows the write.
     ///
-    /// Checked by identity rather than by a clock. The behaviour is the same either way — what
-    /// changes is only how much is copied — so nothing else in the suite would notice a sync that
-    /// went back to copying the whole disk, and a test that timed one would be flaky.
+    /// Checked by pointer identity.
     #[test]
     fn a_sync_shares_every_file_it_was_not_about() {
         let mut world = MinimalWorld::new();
@@ -706,7 +604,7 @@ mod tests {
         assert!(held.same(live), "syncing one file copied another");
     }
 
-    /// A node that never synced has nothing to rewind to, and asking for one is not an error.
+    /// A node that never synced rewinds to nothing, without error.
     #[test]
     fn a_disk_with_no_history_rewinds_nowhere() {
         let world = MinimalWorld::new();

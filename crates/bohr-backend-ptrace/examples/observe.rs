@@ -1,7 +1,6 @@
-//! Prints every stop a guest produces, admitting each syscall unchanged.
+//! Prints every stop a guest produces and lets each syscall through unchanged.
 //!
-//! The support table grows from what real programs actually do, so this is how a new guest's
-//! requirements are read off rather than guessed at.
+//! Use it to see which syscalls a new guest makes before modelling them.
 //!
 //! `cargo run -p bohr-backend-ptrace --example observe -- ./testdata/guests/build/clock_and_random`
 
@@ -63,7 +62,7 @@ mod linux {
                         args[1],
                         args[2]
                     );
-                    // Admitted unchanged: the point here is to see the sequence, not to model it.
+                    // Let through unchanged: this example only records the sequence.
                     backend.resume(stop.task, Resume::Continue).expect("resume");
                 }
                 StopKind::TaskExited { status } => {

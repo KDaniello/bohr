@@ -1,24 +1,14 @@
 //! The event log as JSON Lines: one object per event, one event per line.
 //!
-//! What `bohr trace --format json` writes, and what a windowed report leaves beside itself so the
-//! events it did not show are still there. The two are the same bytes on purpose — a report that
-//! elided events and pointed at a file in a different shape would be asking a reader to learn two
-//! formats to read one run.
+//! `bohr trace --format json` and a windowed report's sidecar write the same bytes.
 //!
-//! # Two decisions worth stating
+//! Every line has the envelope `id`, `tick`, `node`, `task`, `kind`, with the variant's fields
+//! under a key named by `kind`, so an unknown event can still be placed.
 //!
-//! **The envelope comes first and always.** `id`, `tick`, `node`, `task`, `kind` are on every
-//! line whatever the event was, and the variant's own fields sit under a key named by `kind`. A
-//! reader that meets an event this build has never heard of can still place it in the run.
+//! Addresses, registers and digests are hex strings, since `JSON.parse` loses precision above 2^53.
+//! Counts and ids stay numbers.
 //!
-//! **Anything that is an address, a register or a digest is a hex string.** `JSON.parse` reads
-//! numbers as doubles and loses precision above 2^53; syscall arguments and guest addresses go
-//! well past that, so a number there would be a value quietly changed by being read. Counts and
-//! identifiers stay numbers because they are small and are what a reader sorts and filters by.
-//!
-//! The projection lives here rather than in the crate that owns the event: that crate owns the
-//! *canonical* encodings — the framing and the digest — and a second serialisation beside them is
-//! an invitation to digest the wrong one.
+//! This lives here, apart from the canonical encodings in `bohr-trace`, so nothing digests it.
 
 use bohr_trace::{
     AssertionKind, DiskOpKind, Endpoint, Event, EventKind, ExitStatus, FaultKind, FaultTarget,
@@ -47,7 +37,7 @@ pub fn write_event(event: &Event, out: &mut String) {
 /// Writes a whole log.
 #[must_use]
 pub fn write_log(events: &[Event]) -> String {
-    // Roughly what an event costs once written out, so a long log is not re-allocated per line.
+    // Roughly one event's size, to avoid re-allocating per line.
     let mut out = String::with_capacity(events.len() * 160);
     for event in events {
         write_event(event, &mut out);
@@ -57,8 +47,7 @@ pub fn write_log(events: &[Event]) -> String {
 
 /// The name a `kind` field carries, in the snake case the rest of the format uses.
 ///
-/// Exhaustive on purpose and with no wildcard: a seventeenth kind of event must not compile until
-/// somebody has decided how a reader is shown it.
+/// Exhaustive with no wildcard, so a new event kind fails to compile until it is projected.
 const fn kind_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::Syscall { .. } => "syscall",
@@ -297,8 +286,7 @@ fn bytes_as_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        // Written into the buffer rather than formatted into a string of its own: this runs once
-        // per byte of every payload in a log that holds millions of events.
+        // Written straight into the buffer; this runs per payload byte.
         let _ = write!(out, "{byte:02x}");
     }
     out
@@ -310,11 +298,9 @@ fn key(out: &mut String, name: &str) {
     out.push_str("\":");
 }
 
-/// A string value, escaped by the JSON library rather than by hand.
+/// A string value, escaped by the JSON library.
 ///
-/// Every string here came out of a guest — an assertion's own words, a diagnostic, a path — so it
-/// is exactly the place a quote or a control character arrives from somewhere with no interest in
-/// producing valid JSON.
+/// These strings come from the guest and may hold quotes or control characters.
 fn text(out: &mut String, name: &str, value: &str) {
     key(out, name);
     match serde_json::to_string(value) {

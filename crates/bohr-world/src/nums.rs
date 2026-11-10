@@ -1,7 +1,6 @@
 //! Linux x86-64 numbering shared by every model in this crate: syscalls and errnos.
 //!
-//! Spelled out here so no model needs libc, whose constants belong to the host rather than to
-//! the world the guest is shown.
+//! Spelled out here so no model needs libc, whose constants are the host's.
 
 /// Linux x86-64 syscall numbers this model answers.
 pub(crate) mod sys {
@@ -51,7 +50,7 @@ pub(crate) mod sys {
     pub(crate) const STATX: u32 = 332;
     /// `newfstatat`.
     pub(crate) const NEWFSTATAT: u32 = 262;
-    /// `open`: `openat` without the descriptor to be relative to, which nothing here is.
+    /// `open`.
     pub(crate) const OPEN: u32 = 2;
     /// `getrusage`.
     pub(crate) const GETRUSAGE: u32 = 98;
@@ -154,7 +153,7 @@ pub(crate) mod sys {
     pub(crate) const IO_URING_ENTER: u32 = 426;
     /// `io_uring_register`: answered `EINVAL`, so a caller takes the unregistered path.
     pub(crate) const IO_URING_REGISTER: u32 = 427;
-    /// The three ring calls, which a refusal names under `BOHR-2004` rather than `BOHR-2001`.
+    /// The three ring calls, which a refusal names under `BOHR-2004`.
     pub(crate) const IO_URING: [u32; 3] = [425, 426, 427];
     /// `readahead`, a hint nothing here acts on.
     pub(crate) const READAHEAD: u32 = 187;
@@ -179,8 +178,7 @@ pub(crate) mod sys {
     /// `sched_setscheduler`, the ordinary policies accepted and the real-time ones refused.
     pub(crate) const SCHED_SETSCHEDULER: u32 = 144;
 
-    /// `mmap`, which reaches here only where it named a file: the filter admits an anonymous
-    /// mapping, which shapes the guest's own address space and nothing this model holds.
+    /// `mmap`, which reaches here only for file mappings.
     pub(crate) const MMAP: u32 = 9;
     /// `munmap`.
     pub(crate) const MUNMAP: u32 = 11;

@@ -1,13 +1,9 @@
 //! Writes the seeds the fuzz targets start from.
 //!
-//! Seeds are produced by the same writers the tool itself uses, so a format change moves them
-//! with it: seeds written by hand would quietly stop reaching past the header the day a section
-//! was added, and a fuzz run that never gets past the header finds nothing.
+//! Seeds come from the tool's own writers, so they follow format changes.
 //!
-//! These are seeds, not a corpus. They are few, named, and committed; the corpus a fuzzer grows
-//! from them is machine-written, unbounded, and kept out of the history. Two of them are inputs
-//! that once brought the reader down, kept so that a fuzzer starts from the ground it has already
-//! been shown.
+//! Seeds are few, named and committed; the corpus grown from them stays out of the history. Two are
+//! inputs that once crashed a reader.
 //!
 //! Run it with `make fuzz-seed`.
 
@@ -21,7 +17,7 @@ use bohr_testkit::Fixture;
 use bohr_trace::TraceWriter;
 use bohr_types::{OracleId, Seed};
 
-/// Judges nothing: the corpus is about what the formats look like, not about verdicts.
+/// Judges nothing; seeds are about formats.
 struct AcceptEverything;
 
 impl Oracle for AcceptEverything {
@@ -47,19 +43,16 @@ fn main() {
         &Tape::with_prefix(Seed(1), vec![0xA5; 64]).to_container(),
     );
 
-    // An event log, taken from a run rather than assembled, so every framing decision the writer
-    // makes is in the corpus.
+    // An event log from a real run, with every framing the writer produces.
     for fixture in Fixture::all() {
         write(&seeds, "fuzz_event_log", fixture.name(), &record(fixture));
     }
 
-    // Bundles and SDK output already exist as fixtures; the corpus points at the same bytes so
-    // the two never disagree about what a well-formed one looks like.
+    // Bundles and SDK output reuse the fixtures' bytes.
     copy_all(&root.join("testdata/bundles"), &seeds.join("fuzz_bundle"), "bohr");
     copy_all(&root.join("testdata/sdk/antithesis"), &seeds.join("fuzz_sdk_record"), "jsonl");
 
-    // Scripted syscalls: a seed, then a number and six registers each. These are the calls a real
-    // guest opens with, which is where a mutation has somewhere to go.
+    // Scripted syscalls: a seed, then a number and six registers each, as a real guest opens.
     for (label, script) in [
         ("clock", &[(228u32, [0u64, 0x1000, 0, 0, 0, 0])][..]),
         ("write", &[(1, [1, 0x1000, 16, 0, 0, 0])][..]),
@@ -68,8 +61,7 @@ fn main() {
         write(&seeds, "fuzz_syscall_args", label, &calls(script));
     }
 
-    // The two that once brought a reader down. A fuzzer rediscovering them costs nothing; a
-    // fuzzer never being shown them is how a fixed defect comes back.
+    // The two inputs that once crashed a reader.
     write(&seeds, "fuzz_bundle", "regression-impossible-length", &impossible_length());
     write(
         &seeds,
@@ -145,9 +137,7 @@ fn write(seeds: &Path, target: &str, name: &str, bytes: &[u8]) {
 
 /// Copies the fixtures of one kind across, under names of their own.
 ///
-/// The extension is dropped on the way: a seed is bytes for a fuzzer to mutate, not a file of the
-/// kind it came from, and the working copies of those kinds are kept out of the history by
-/// extension.
+/// The extension is dropped, since the history ignores working copies by extension.
 fn copy_all(from: &Path, to: &Path, extension: &str) {
     std::fs::create_dir_all(to).expect("the seed directory can be created");
     let entries = std::fs::read_dir(from).expect("the fixture directory is there");

@@ -1,14 +1,8 @@
 //! A node that failed is a finding whoever exits after it.
 //!
-//! A cluster's caller routinely outlives the node it was driving: it asks its questions, the node
-//! dies behind it, and the caller finishes and returns nought. Taking the last status to leave
-//! would let that nought stand for the run, and a campaign would report its worst outcome as its
-//! best — a node that never started again, counted clean.
-//!
-//! Its own test because the failure is silent in the way that matters: nothing in the timeline
-//! looks wrong, the run is judged clean, and only somebody reading the node's own output would ever
-//! know. Measured against a real execution client, where two seeds in twenty ended with the client
-//! unable to start and the campaign called both of them clean.
+//! A cluster's caller often outlives the node it drove and exits 0. The run keeps the node's
+//! failure as its status. Against a real execution client, two seeds in twenty left the client
+//! unable to start.
 
 use bohr_backend_null::{GuestOp, NullProgram};
 use bohr_kernel::RunConfig;
@@ -26,7 +20,7 @@ fn fails_at_once(code: i32) -> NullProgram {
     NullProgram::single(vec![GuestOp::Exit(code)])
 }
 
-/// Stands aside for a while, then ends well — so it is the last to leave.
+/// Yields for a while, then ends well, so it exits last.
 fn succeeds_later() -> NullProgram {
     let mut ops: Vec<GuestOp> =
         (0..8).map(|_| GuestOp::Syscall { nr: SCHED_YIELD, args: [0; 6] }).collect();
@@ -44,7 +38,7 @@ fn judge(programs: Vec<NullProgram>) -> Outcome {
         .outcome
 }
 
-/// The claim.
+/// The first failure is the run's status.
 #[test]
 fn a_node_that_failed_is_not_hidden_by_a_caller_that_finished() {
     match judge(vec![fails_at_once(1), succeeds_later()]) {
@@ -55,7 +49,7 @@ fn a_node_that_failed_is_not_hidden_by_a_caller_that_finished() {
     }
 }
 
-/// And a cluster where nothing failed is clean, so the pair means something.
+/// A cluster where nothing failed is clean.
 #[test]
 fn a_cluster_where_every_node_succeeded_is_clean() {
     assert_eq!(judge(vec![succeeds_later(), succeeds_later()]), Outcome::Clean);

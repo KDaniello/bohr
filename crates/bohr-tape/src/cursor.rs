@@ -1,9 +1,7 @@
 //! The draw ABI: the normative mapping from tape bytes to decisions.
 //!
-//! Byte consumption is a function of the request alone, never of the value drawn. A flipped byte
-//! therefore changes one decision and leaves every later draw reading from the same offset; if
-//! consumption depended on the value, one flip would shift everything downstream. Every definition
-//! here follows from that rule. Normative text: `docs/API.md` §2.4.
+//! Byte consumption depends on the request alone, never on the value drawn, so a flipped byte
+//! changes one decision and every later draw keeps its offset. Normative text: `docs/API.md` §2.4.
 
 use bohr_types::{EventId, TapeOffset};
 
@@ -15,8 +13,7 @@ use crate::{
 
 /// A position on a tape, plus the journal of what has been drawn from it.
 ///
-/// Threaded by hand into every place a decision is made. The inconvenience is deliberate: an
-/// ambient generator would remove determinism without any call site changing. See
+/// Passed explicitly to every decision, so no call site can draw ambiently. See
 /// `docs/ARCHITECTURE.md` §5.1.
 pub struct TapeCursor<'a> {
     reader: TapeReader<'a>,
@@ -64,8 +61,7 @@ impl<'a> TapeCursor<'a> {
         crate::chaos::overwrite(out);
         self.pos += out.len() as u64;
 
-        // A raw draw can be a whole page; the journal keeps its first eight bytes so a report has
-        // something to show without carrying the payload twice.
+        // The journal keeps the first eight bytes of a raw draw.
         let mut head = [0u8; 8];
         let take = out.len().min(8);
         head[..take].copy_from_slice(&out[..take]);
@@ -84,29 +80,20 @@ impl<'a> TapeCursor<'a> {
 
     /// Uniform in `0..n`.
     ///
-    /// Plain modulo at a fixed width, with no rejection loop: a retry consumes extra bytes and so
-    /// makes consumption depend on the drawn value, which is the one property the whole ABI rests
-    /// on ([`crate::draw_width_bytes`]).
+    /// Plain modulo at a fixed width; a rejection loop would make consumption depend on the value
+    /// ([`crate::draw_width_bytes`]).
     ///
-    /// **The bias this buys is not small at every `n`.** The first `2^8w mod n` values come up
-    /// twice as often as the rest, so the excess mass is `(2^8w mod n) / 2^8w`: 1.6% at `n = 7`,
-    /// and 49.6% at `n = 129`, where 127 of the 129 values are twice as likely as the other two.
-    /// The worst `n` for a given width is one more than a power of two, and `draw_index` over 129
-    /// runnable tasks is an ordinary shape for a threaded guest.
-    ///
-    /// What that costs is search coverage, never reproduction: the mapping is a pure function of
-    /// the bytes, so a run repeats whatever the skew. Removing it means widening the draw, which
-    /// re-reads every stored tape, so it belongs to a change of [`crate::TAPE_ABI`] rather than
-    /// here. Pinned by `worst_case_bias_is_the_documented_one` so the number in this paragraph
-    /// cannot drift from the code.
+    /// The first `2^8w mod n` values are twice as likely: 1.6% excess at `n = 7`, 49.6% at
+    /// `n = 129`. The worst `n` is one above a power of two. This costs search coverage, never
+    /// reproduction; fixing it needs a new [`crate::TAPE_ABI`]. Pinned by
+    /// `worst_case_bias_is_the_documented_one`.
     pub fn draw_range(&mut self, n: u64, site: DrawSite) -> Result<u64, TapeError> {
         if n == 0 {
             return Err(TapeError::InvalidDraw("draw_range(0)"));
         }
         let offset = TapeOffset(self.pos);
         let width = draw_width_bytes(n);
-        // A choice with one option is not a decision, and charging it a byte would make tape
-        // layout depend on how many degenerate choices a run happened to contain.
+        // A one-option choice consumes nothing.
         let value = if width == 0 { 0 } else { self.take_uint(width) % n };
         self.journal.push(offset, self.event, site, width as u32, value);
         Ok(value)
@@ -120,8 +107,7 @@ impl<'a> TapeCursor<'a> {
 
     /// True with probability `num/den`, consuming a fixed two bytes whatever the probability is.
     ///
-    /// Not `draw_range(den) < num`: that ties the width to the denominator, so editing a
-    /// probability literal in a config re-lays-out every tape in the corpus.
+    /// A fixed width, so editing a probability in a config moves no stored tape.
     pub fn draw_bool(&mut self, num: u32, den: u32, site: DrawSite) -> Result<bool, TapeError> {
         if den == 0 {
             return Err(TapeError::InvalidDraw("draw_bool with zero denominator"));
@@ -132,7 +118,7 @@ impl<'a> TapeCursor<'a> {
             ));
         }
         let offset = TapeOffset(self.pos);
-        // Certainties consume nothing, by the same reasoning as a one-option choice.
+        // Certainties consume nothing.
         let (value, width) = if num == 0 {
             (0u64, 0usize)
         } else if num >= den {
@@ -148,8 +134,8 @@ impl<'a> TapeCursor<'a> {
 
     /// True with probability `num/den`, consuming two bytes whatever the probability is.
     ///
-    /// Not [`Self::draw_bool`], which charges nothing for a certainty: there an override or a
-    /// zeroed default would change what a request costs in tape.
+    /// Unlike [`Self::draw_bool`], a certainty also costs two bytes, so overrides never change
+    /// layout.
     pub fn draw_odds(&mut self, num: u32, den: u32, site: DrawSite) -> bool {
         let offset = TapeOffset(self.pos);
         let drawn = self.take_uint(2);
@@ -160,8 +146,7 @@ impl<'a> TapeCursor<'a> {
 
     /// An index into `weights`, proportional to weight, consuming a fixed four bytes.
     ///
-    /// Same hazard and same fix as [`Self::draw_bool`]: `draw_range(sum)` would tie the width to
-    /// weight magnitudes, and weights are configuration.
+    /// A fixed width, so editing weights moves no stored tape.
     pub fn draw_weighted(&mut self, weights: &[u32], site: DrawSite) -> Result<usize, TapeError> {
         let mut sum: u64 = 0;
         let mut nonzero = 0usize;
@@ -176,8 +161,7 @@ impl<'a> TapeCursor<'a> {
         if sum == 0 {
             return Err(TapeError::InvalidDraw("draw_weighted with all-zero weights"));
         }
-        // Bounded so the scaling below stays inside u64; a larger total is a caller bug, not a
-        // case to silently widen for.
+        // Bounded so the scaling stays inside u64; a larger total is a caller bug.
         if sum > u64::from(u32::MAX) {
             return Err(TapeError::InvalidDraw("draw_weighted total above u32::MAX"));
         }
@@ -205,9 +189,7 @@ impl<'a> TapeCursor<'a> {
 
     /// An exponentially distributed value with the given mean, consuming a fixed four bytes.
     ///
-    /// The journal records the uniform draw, not the mapped value: the mapping is a pure function
-    /// evaluated in fixed point (`crate::fixed`), so a mutator edits the underlying uniform and
-    /// the journal stays regenerable from the tape alone.
+    /// The journal records the uniform draw; the fixed-point mapping (`crate::fixed`) is pure.
     pub fn draw_exponential(&mut self, mean: u64, site: DrawSite) -> Result<u64, TapeError> {
         let u = self.draw_range(1 << 32, site)?;
         Ok(crate::fixed::exp_inverse_cdf(mean, u))
@@ -272,9 +254,7 @@ mod tests {
         assert_eq!(crate::fixed::exp_inverse_cdf(1_000_000, record.value), value);
     }
 
-    /// The number the doc comment on [`TapeCursor::draw_range`] states, computed rather than
-    /// asserted from memory. A bound written in prose drifts from the code the first time either
-    /// moves; this is what keeps the paragraph honest.
+    /// The bias [`TapeCursor::draw_range`] documents, computed.
     #[test]
     fn worst_case_bias_is_the_documented_one() {
         let excess = |n: u64| {
@@ -282,19 +262,16 @@ mod tests {
             let span = 1u128 << (8 * width as u32);
             (span % u128::from(n)) as f64 / span as f64
         };
-        // The scheduler's small draws, where the skew is the 1.6% the documentation quotes.
+        // A small scheduler draw: 1.6%.
         assert!((excess(7) - 0.015_625).abs() < 1e-9, "{}", excess(7));
-        // One more than a power of two is the worst case for a width, and it is not small.
+        // One above a power of two is the worst case.
         assert!(excess(129) > 0.49, "the worst case moved: {}", excess(129));
-        // A range that divides its width exactly has none at all.
+        // A range dividing its width has none.
         assert!(excess(256).abs() < 1e-12);
         assert!(excess(2).abs() < 1e-12);
     }
 
-    /// A certainty and a single-outcome weighting consume nothing, which is a discontinuity in an
-    /// ABI whose whole point is that consumption does not move. It is deliberate — a decision with
-    /// one outcome is not a decision — and it is pinned here because `docs/API.md` §2.4 states it
-    /// and nothing else would notice it changing.
+    /// A certainty and a single-outcome weighting consume nothing, as `docs/API.md` §2.4 states.
     #[test]
     fn a_certainty_is_not_a_decision_and_costs_nothing() {
         let tape = Tape::from_seed(Seed(4));
@@ -314,7 +291,7 @@ mod tests {
         assert_eq!(cursor.draw_weighted(&[0, 3, 0], DrawSite::NodeFault).expect("draw"), 1);
         assert_eq!(cursor.position().get(), 0, "a single-outcome weighting read a byte");
 
-        // And an ordinary probability still costs its fixed two bytes.
+        // An ordinary probability costs two bytes.
         let _ = cursor.draw_bool(1, 2, DrawSite::NetDeliver).expect("draw");
         assert_eq!(cursor.position().get(), 2);
     }

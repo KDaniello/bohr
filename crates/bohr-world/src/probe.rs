@@ -1,13 +1,9 @@
 //! Asking a node's own API what it did, and judging the answers.
 //!
-//! A blockchain client neither adopts an SDK nor exits when it is wrong: it finalises a block and
-//! later reports another at the same height, and goes on answering. What it does offer is its own
-//! API, so the judgement is made from what that API says. The asking is done by a guest, the
-//! probe, which the world starts as one more node; the judging is done here, from the records the
-//! probe writes. See `docs/ARCHITECTURE.md` §5.17.
+//! A blockchain client has no SDK and keeps running when wrong, so it is judged by its own API. The
+//! probe guest asks; this module judges its records. See `docs/ARCHITECTURE.md` §5.17.
 //!
-//! The division of labour is the one the liveness and durability watches keep: **this states a
-//! fact and gives it a code; an oracle decides the fact is a finding.**
+//! This states a fact and gives it a code; an oracle decides whether it is a finding.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,9 +19,7 @@ pub const KEYS_FULL_CODE: &str = "BOHR-2045";
 
 /// Keys one probe holds before it stops taking new ones.
 ///
-/// A bound because the keys are the node's to choose: a probe keyed by something that never repeats
-/// grows by one entry per answer, and supervisor memory is the one thing that may not run out
-/// first. A finalised height per answer over a 10,000-block run is far inside it.
+/// The node chooses keys, so they are bounded; 10 000 blocks fit easily.
 pub const MOST_KEYS: usize = 1 << 16;
 
 /// What a probe holds the answers to.
@@ -121,8 +115,7 @@ pub struct Request {
     pub params: String,
     /// The fields of the result the probe reports back, and no others.
     ///
-    /// Reported rather than the whole result, because a record is kept in the bundle verbatim and
-    /// a block with its transactions is kilobytes per answer.
+    /// Only these, since records are stored verbatim and blocks are large.
     pub fields: Vec<String>,
     /// The shortest interval any probe sharing it asked for.
     pub every: Tick,
@@ -130,8 +123,7 @@ pub struct Request {
 
 /// The calls a set of probes amounts to, one per distinct question per node.
 ///
-/// Derived the same way by the tool that starts the probe and by the world that reads its records,
-/// so a request's index is the one name both halves use for it.
+/// Derived identically by the tool and the world, so request indices agree.
 #[must_use]
 pub fn requests_of(probes: &[ProbeSpec]) -> Vec<Request> {
     let mut requests: Vec<Request> = Vec::new();
@@ -202,8 +194,7 @@ pub enum Answer {
 
 /// Reads one round the probe reported, as `(request, answer)` pairs.
 ///
-/// A round that does not have the shape the probe writes is no round at all. Answers naming a
-/// request the plan does not have are dropped.
+/// A malformed round is ignored; answers for unknown requests are dropped.
 #[must_use]
 pub fn answers_in(details: &Json, requests: usize) -> Vec<(usize, Answer)> {
     let Some(Json::Array(round)) = details.get("round") else {
@@ -305,8 +296,7 @@ impl Observer {
 
     /// A node the world took away, which is silent by our doing.
     ///
-    /// Its progress is forgotten, so a node coming back is timed from its first answer after and
-    /// its boot is not counted as a stall.
+    /// Its progress is reset, so its boot is not a stall.
     pub fn node_down(&mut self, node: u32) {
         self.down.insert(node);
         for learned in &mut self.learned {
@@ -322,7 +312,7 @@ impl Observer {
 
     /// A node the world rolled back, by a reorg or a restart from an older snapshot.
     ///
-    /// What it answered before is forgotten: a value the world took back is not the node's revert.
+    /// Its earlier answers are forgotten, so the rollback is not its revert.
     pub fn rewound(&mut self, node: u32) {
         for learned in &mut self.learned {
             learned.by_node.retain(|(n, _), _| *n != node);
@@ -339,8 +329,7 @@ impl Observer {
 
     /// Takes one answer and says what it broke.
     ///
-    /// `cut` is whether any partition is in force now: a value that does not move while the
-    /// cluster cannot talk to itself is the fault's doing, not the node's.
+    /// `cut` says whether a partition is in force, which excuses a stall.
     pub fn answer(&mut self, now: Tick, cut: bool, request: usize, answer: &Answer) -> Vec<Broken> {
         let Some(node) = self.requests.get(request).map(|r| r.node) else {
             return Vec::new();
@@ -361,8 +350,7 @@ impl Observer {
                 _ => self.keyed(p, node, &seen),
             };
             for message in found {
-                // The bound is said once, apart from findings, and never stands in for one:
-                // comparing goes on for the keys already held.
+                // Reported once; held keys are still compared.
                 if message.0 == KEYS_FULL_CODE || self.reported.insert((p, node)) {
                     broken.push(Broken { code: message.0, node, message: message.1 });
                 }
@@ -446,9 +434,7 @@ impl Observer {
                         }
                     }
                 }
-                // Each node's latest answer against every other node's latest. A node that changed
-                // its own answer has reverted, which is another property's business, and is
-                // compared from then on by what it says now.
+                // Latest answers compared across nodes.
                 Property::Agrees => {
                     let answers = learned.latest.entry(key.as_str().into()).or_default();
                     let other = answers
@@ -493,9 +479,8 @@ impl Observer {
 
     /// Judges whether a node's value moved within the span.
     ///
-    /// Timed from the latest of the value's last change, the node's first answer since it last came
-    /// up, and the cluster last becoming whole; judged only while nothing is down and nothing is
-    /// cut. A node that has not answered since it came up is booting, not stalled.
+    /// Timed from the latest of the value's change, the node's first answer since coming up, and
+    /// the cluster becoming whole; judged only when nothing is down or cut.
     fn advances(
         &mut self,
         p: usize,
@@ -551,8 +536,7 @@ fn observations(result: &Json, key: &[String], value: &str) -> Vec<(String, Stri
         if *v == Json::Null {
             return None;
         }
-        // A missing key field is no key at all: read as empty, every such answer would share one
-        // key and two of them would be called a contradiction.
+        // A missing key field means no key.
         let k: Vec<String> = key.iter().map(|k| field(item, k).map(text)).collect::<Option<_>>()?;
         Some((k.join("/"), text(v)))
     };
@@ -681,8 +665,7 @@ mod tests {
         assert_eq!(broken[0].code, ADVANCES_CODE);
     }
 
-    /// A node that changed its own answer is compared by what it says now, so a node that agrees
-    /// with it is not called a disagreement.
+    /// A node is compared by its latest answer.
     #[test]
     fn agreement_is_with_what_the_others_say_now() {
         let mut o = Observer::new(vec![spec(Property::Agrees)]);
@@ -691,8 +674,7 @@ mod tests {
         assert!(o.answer(Tick(3), false, 1, &block("0x5", "0xbb")).is_empty(), "agrees now");
     }
 
-    /// An answer without a key field has no key, rather than the empty one every such answer
-    /// would share.
+    /// An answer without a key field has no key.
     #[test]
     fn an_answer_missing_a_key_field_is_no_observation() {
         let mut probe = spec(Property::Unique);
@@ -702,7 +684,7 @@ mod tests {
         assert!(o.answer(Tick(2), false, 0, &block("0x6", "0xbb")).is_empty());
     }
 
-    /// A node booting after it comes back is timed from its first answer, not from before it went.
+    /// A restarted node is timed from its first answer.
     #[test]
     fn a_node_is_not_stalled_while_it_boots() {
         let mut o = Observer::new(vec![spec(Property::Advances)]);
@@ -717,7 +699,7 @@ mod tests {
         assert_eq!(o.answer(Tick(401), false, 0, &block("0x1", "0xa"))[0].code, ADVANCES_CODE);
     }
 
-    /// What the world took back is not held against the node.
+    /// A world rollback is not the node's revert.
     #[test]
     fn a_rewind_by_the_world_is_not_a_revert() {
         let mut o = Observer::new(vec![spec(Property::NeverReverts)]);

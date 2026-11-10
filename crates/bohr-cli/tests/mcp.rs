@@ -1,9 +1,8 @@
 //! `bohr mcp` against the command line: every tool answers what `--json` writes for its command.
 //!
-//! A client here is a child process spoken to on its standard input, as an agent's client speaks
-//! to it. What is compared is the tool's structured content against the object the same command
-//! writes when run by hand, field for field; the only fields left out are the ones that measure
-//! the host rather than the run.
+//! The server is a child process on stdin, as an agent's client runs it. Each tool's structured
+//! content is compared field by field with the command's `--json` object, except host
+//! measurements.
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -117,7 +116,7 @@ fn the_tools_are_the_commands() {
     }
 }
 
-/// What an agent is told is what the command line writes, for the tools no backend is needed for.
+/// Tools that need no backend answer what the command line writes.
 #[test]
 fn an_agent_gets_what_the_command_line_gives() {
     let dir = workdir("same");
@@ -131,7 +130,7 @@ fn an_agent_gets_what_the_command_line_gives() {
             .call("report", json!({ "bundle": "findings/two-tasks-seed0.bohr", "out": "a.html" })),
         by_hand(&dir, &["report", "findings/two-tasks-seed0.bohr", "-o", "a.html"])
     );
-    // A refusal is an answer too, and the same one.
+    // A refusal is the same refusal.
     assert_eq!(
         client.call("run", json!({ "program": ["x"], "seed": 1, "config": "missing.toml" })),
         by_hand(&dir, &["run", "--seed", "1", "--config", "missing.toml", "--", "x"])
@@ -140,7 +139,7 @@ fn an_agent_gets_what_the_command_line_gives() {
 }
 
 /// A run, a replay and a reduction on a real backend, the reduction followed through its handle;
-/// and a question about a running job answered in under a tenth of a second.
+/// a job's status answers in under 100 ms.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod real {
     use super::*;
@@ -174,7 +173,7 @@ mod real {
         value
     }
 
-    /// The host clock is read, which nothing in the engine may do: a status's latency is real time.
+    /// A status's latency is real time, so this reads the host clock.
     #[allow(clippy::disallowed_methods)]
     #[test]
     fn a_run_a_replay_and_a_reduction_are_the_same_through_either() {

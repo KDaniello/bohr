@@ -1,15 +1,12 @@
 //! Driving a campaign, and the workers that carry it out.
 //!
-//! The search itself is in `bohr-explorer` and knows nothing about processes. What is here is the
-//! plumbing: hand a generation's items to workers as they come free, gather the results in one
-//! piece, and save what was found. The division matters — every claim about reproducibility is
-//! decided in the crate that has no processes in it, and this file cannot weaken one by being
-//! written badly. The worst it can do is be slow, or lose a result and say so.
+//! The search lives in `bohr-explorer`, which has no processes. This is the plumbing: hand a
+//! generation's items to free workers, gather the results, save what was found. Reproducibility is
+//! decided in the explorer; this file can only be slow or lose a result, and says so if it does.
 //!
-//! **Workers are processes.** A guest wedged in a way that confuses the kernel's `ptrace`
-//! bookkeeping must take one worker with it and not the campaign; and two traced guests in one
-//! process wait on each other's children, which is not a thing that can be worked around from
-//! above. See `docs/ARCHITECTURE.md` §6.2.
+//! Workers are processes. A guest that confuses the kernel's `ptrace` bookkeeping takes down one
+//! worker only, and two traced guests in one process would wait on each other's
+//! children. See `docs/ARCHITECTURE.md` §6.2.
 
 use std::{
     path::{Path, PathBuf},
@@ -25,15 +22,11 @@ use crate::{CliError, execute, guests::Demo, wire};
 
 /// How many items a generation holds.
 ///
-/// **Fixed, and deliberately not a function of the worker count.** A generation is the unit the
-/// campaign plans and folds, so sizing it by `-j` would make the shape of the search a property of
-/// the machine it ran on — and then eight workers and one would explore different things from the
-/// same master seed, which is the exact promise this design exists to keep. Workers slice a
-/// generation; they do not size it, and running with more than this many gives the extra ones
-/// nothing to do.
+/// Fixed, independent of `-j`, so one master seed explores the same things on any number of
+/// workers. Workers beyond this many have nothing to do.
 ///
-/// Thirty-two because a generation ends when its slowest item does: with eight workers that is
-/// four items each, so a straggler costs a quarter of a worker's time rather than all of it.
+/// A generation ends with its slowest item; 32 gives eight workers four items each, so a straggler
+/// costs a quarter of a worker's time.
 const GENERATION_ITEMS: usize = 32;
 
 /// What to search.
@@ -84,16 +77,14 @@ pub(crate) struct Request {
     pub(crate) scenario_path: Option<PathBuf>,
     /// The world the search runs in: cluster, network, disk and drawn faults.
     ///
-    /// Without one a campaign searches a single node on a quiet network, which is not where the
-    /// defects worth hunting live. Carried as the text as well as the parsed form, because every
-    /// finding's bundle records the configuration that produced it.
+    /// Without one the campaign searches a single node on a quiet network. Kept as text too, since
+    /// every finding's bundle records it.
     pub(crate) scenario: Option<(bohr_world::LoadedConfig, String)>,
 }
 
 /// Runs a campaign and reports what it found.
 ///
-/// The exit code is the usual one: nothing found is zero, something found is one. A campaign that
-/// finds a bug has succeeded, and a pipeline branching on that must not have to parse text.
+/// Exits 0 when nothing was found and 1 when something was.
 pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     std::fs::create_dir_all(&request.findings).map_err(|e| {
         CliError::Usage(format!("BOHR-1002: cannot use {}: {e}", request.findings.display()))
@@ -109,10 +100,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     let started = Instant::now();
     let mut saved: Vec<PathBuf> = Vec::new();
 
-    // A stored corpus is tapes and nothing else, so what those tapes covered has to be learned by
-    // running them. One generation buys back everything a previous campaign found out, and keeps
-    // the stored form to a few kilobytes an entry instead of the sixty-four a coverage map costs.
-    // A resumed campaign has its corpus already, and carrying one in would change it.
+    // A stored corpus holds only tapes, so their coverage is learned by running them: one
+    // generation, and a few KB per entry instead of a 64 KB map. A resumed campaign already has
+    // its corpus.
     if let Some(dir) = &request.corpus
         && campaign.runs() == 0
         && pending.is_empty()
@@ -125,10 +115,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         }
     }
 
-    // **A generation is folded only when it is whole.** The last one a run budget cuts short is
-    // held as results, not folded: a trimmed plan is a prefix of the full one, so a campaign
-    // resumed from here runs the rest of the same generation and folds all of it at once, as an
-    // uninterrupted campaign does. What is reported folds the held part into a copy.
+    // A generation is folded only when whole. One cut short by a run budget is held as results; a
+    // resumed campaign runs the rest and folds it all, as an uninterrupted one would. The report
+    // folds the held part into a copy.
     while more_to_do(request, campaign.runs() + pending.len() as u64, started) {
         let planned = campaign.plan(GENERATION_ITEMS);
         let size = generation_size(request, campaign.runs()).max(pending.len());
@@ -139,10 +128,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         }
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         campaign.fold(&planned, std::mem::take(&mut pending));
-        // Saved after folding, so that a finding reached twice in one generation is written once.
+        // Saved after folding, so a finding reached twice in a generation is written once.
         saved.extend(save_new_findings(request, &campaign, &known)?);
-        // Written down after every whole generation, so a campaign stopped at any moment resumes
-        // from the last one rather than from nothing.
+        // Saved after every whole generation, so a stopped campaign resumes from the last one.
         if let Some(dir) = &request.resume {
             resume::save(dir, request, &campaign, &pending)?;
         }
@@ -171,11 +159,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         })?;
     }
 
-    // **A campaign that armed adversity and landed none has measured a guest under no pressure**,
-    // and is indistinguishable from one that pressed hard and was answered well. Refused for the
-    // same reason a comparison that compared nothing is: reporting it clean is reporting that a
-    // question was asked when it was not. Findings first, because a campaign that found something
-    // clearly reached the guest whatever this counted.
+    // A campaign that armed faults and landed none tested nothing, so it is refused instead of
+    // reported clean. Findings are checked first: a campaign that found something reached the
+    // guest.
     let armed = request.scenario.as_ref().is_some_and(|(c, _)| c.asks_for_adversity());
     if campaign.findings().is_empty() && armed && campaign.adversity() == 0 {
         return Err(CliError::Internal(format!(
@@ -194,13 +180,11 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     Ok(if campaign.findings().is_empty() { crate::exit::CLEAN } else { crate::exit::FINDING })
 }
 
-/// The one place in the tool that reads the host clock, and the reason it is allowed to.
+/// Reads the host clock for a wall-clock budget.
 ///
-/// A wall-clock budget cannot be served without one, and §5.5 bans the host clock because a *run*
-/// that read it would stop reproducing. This reading cannot reach a run: it decides only whether
-/// to plan another generation, it is taken at a generation boundary, and what it decides is
-/// recorded as a run count so the same campaign can be repeated exactly with `--runs`. That is
-/// also why `--time` is documented as the budget that does not reproduce.
+/// §5.5 bans the clock inside runs. This is read only at generation boundaries to decide whether
+/// to plan another; the result is recorded as a run count, so `--runs` repeats the campaign
+/// exactly. `--time` itself does not reproduce.
 #[allow(clippy::disallowed_methods)]
 fn elapsed_since(started: Instant) -> Duration {
     started.elapsed()
@@ -227,8 +211,7 @@ fn more_to_do(request: &Request, done: u64, started: Instant) -> bool {
         return done < runs;
     }
     match request.time {
-        // Checked at a generation boundary, never inside one: cutting a generation short would
-        // make the campaign depend on when the clock was read, which is the one thing it may not.
+        // Checked only between generations, so the clock never cuts one short.
         Some(budget) => elapsed_since(started) < budget,
         None => false,
     }
@@ -238,8 +221,7 @@ fn more_to_do(request: &Request, done: u64, started: Instant) -> bool {
 fn generation_size(request: &Request, folded: u64) -> usize {
     let full = GENERATION_ITEMS;
     match request.runs {
-        // Trimmed so a run budget is met exactly. `--runs 10` that ran 12 would be a budget in
-        // name only, and two campaigns asked for the same number would have done different work.
+        // Trimmed so `--runs` is met exactly.
         Some(runs) => full.min((runs.saturating_sub(folded)) as usize).max(1),
         None => full,
     }
@@ -247,9 +229,8 @@ fn generation_size(request: &Request, folded: u64) -> usize {
 
 /// Carries out `planned` on the pool and gathers what the workers answer.
 ///
-/// Items whose worker died come back missing, and are reissued once. A second failure is reported
-/// rather than skipped: a campaign quietly missing a run is a campaign that cannot be repeated,
-/// which is worse than one that stopped.
+/// An item whose worker died is reissued once. A second failure is an error, since a campaign
+/// missing a run could not be repeated.
 fn carry_out(pool: &mut Pool, planned: &[WorkItem]) -> Result<Vec<RunResult>, CliError> {
     let mut queue: std::collections::VecDeque<WorkItem> = planned.iter().cloned().collect();
     let mut failed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -307,17 +288,14 @@ struct Worker {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     busy: Option<WorkItem>,
-    /// Which life of this slot the process is, so a message from one that was replaced is known
-    /// for what it is.
+    /// Which incarnation of this slot the process is, to ignore messages from a replaced one.
     life: u64,
 }
 
 impl Pool {
     fn start(request: &Request, jobs: usize) -> Result<Self, CliError> {
         let mut args = vec!["explore-worker".to_owned(), "--serve".to_owned()];
-        // Before the subject, always. Everything after `--` belongs to the guest, so a flag placed
-        // after it is not a flag at all — it is an argument the guest ignores, and the worker then
-        // runs the wrong world without either side saying so.
+        // Before the subject: everything after `--` goes to the guest.
         if let Some(path) = &request.scenario_path {
             args.push("--config".to_owned());
             args.push(path.to_string_lossy().into_owned());
@@ -339,10 +317,8 @@ impl Pool {
             })?);
         command.args(&self.request_args);
         command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
-        // A core of its own per worker, its supervisor and its guests together on it: the guest
-        // and its supervisor share a core because a stop between cores is a cross-core wake-up,
-        // and workers do not share one because eight of them on one core is one of them. The
-        // position is taken among the cores this process may use, by the backend.
+        // One core per worker, shared by its supervisor and guests: a stop across cores is a
+        // cross-core wake-up. The backend maps the position to an allowed core.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         command.env(bohr_backend_ptrace::CORE_VARIABLE, slot.to_string());
         let mut child = command
@@ -374,8 +350,8 @@ impl Pool {
 
     /// Hands one item to a worker, starting it again first where it has gone.
     ///
-    /// A worker that died idle is not the item's failure: the write that finds it gone starts a
-    /// new one and writes again, and only a worker that dies holding the item charges it.
+    /// A worker that died idle is replaced without charging the item; only dying with the item
+    /// counts against it.
     fn hand(&mut self, slot: usize, item: WorkItem) -> Result<(), CliError> {
         let frame = framed(&wire::encode_work(std::slice::from_ref(&item)));
         for _ in 0..2 {
@@ -402,13 +378,12 @@ impl Pool {
                 CliError::Internal("BOHR-3006: every worker's reader has gone".to_owned())
             })?;
             let Some(worker) = self.workers.get_mut(slot) else { continue };
-            // A message from a process this slot has since replaced answers nothing.
+            // Ignore messages from a replaced process.
             if life != worker.life {
                 continue;
             }
             let Some(item) = worker.busy.take() else {
-                // A worker that spoke unasked, or ended while idle; an idle one ending is
-                // restarted when it is next handed work.
+                // Unsolicited output, or an idle worker ending; it restarts when next given work.
                 if frame.is_none() {
                     worker.stdin = None;
                 }
@@ -444,8 +419,7 @@ impl Pool {
 }
 
 impl Drop for Pool {
-    /// An idle worker is told the campaign is over by its stdin closing; a busy one is killed,
-    /// since a pool dropped mid-generation is one whose campaign has already failed.
+    /// Idle workers see their stdin close; busy ones are killed, since the campaign has failed.
     fn drop(&mut self) {
         for worker in &mut self.workers {
             worker.stdin = None;
@@ -483,8 +457,8 @@ fn read_frame(from: &mut impl std::io::Read) -> Option<Vec<u8>> {
 
 /// Serves items from stdin until it closes: the other half of a pooled worker's life.
 ///
-/// Each item's result is written and flushed before the next is read, so the campaign hears of
-/// every run the moment it ends and a worker killed between two runs has answered for all it ran.
+/// Each result is flushed before the next item is read, so a worker killed between runs has
+/// reported every run it finished.
 pub(crate) fn serve(request: &Request) -> Result<u8, CliError> {
     use std::io::Write as _;
 
@@ -511,8 +485,7 @@ fn carry_out_one(request: &Request, item: &WorkItem) -> Result<RunResult, CliErr
         Some((loaded, text)) => (Some(loaded), text.as_str()),
         None => (None, ""),
     };
-    // The log is not kept: a campaign runs millions of these, and a trace is a pure function of
-    // the tape that produced it. Whoever wants to look at one replays it.
+    // No log: a trace follows from its tape, so anyone who needs it replays the run.
     let completed = execute::run_with(execute::Execution {
         target: &target,
         tape: &tape,
@@ -541,8 +514,7 @@ fn carry_out_one(request: &Request, item: &WorkItem) -> Result<RunResult, CliErr
 
 /// How a campaign's runs are interleaved.
 ///
-/// Priority-based, because the search is looking for orderings and a policy with a guarantee about
-/// which ones it reaches is worth more here than anywhere else.
+/// Priority-based (PCT), which guarantees which orderings it reaches.
 const SCHEDULER: &str = "pct";
 
 /// The target to run, from what the campaign was pointed at.
@@ -551,10 +523,7 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
         Subject::Demo(demo) => Ok(execute::Target::Demo(demo.name().to_owned(), demo.program())),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         Subject::Program(argv) => {
-            // **The whole command line, as `run` and `survey` pass it.** Taking only the program
-            // meant `bohr explore -- ./guest --config x.toml` searched `./guest` with no arguments
-            // -- a different program, silently: the findings it saved carried the same truncated
-            // target, so nothing ever disagreed and said so.
+            // The whole command line, as `run` and `survey` pass it.
             let loaded = request.scenario.as_ref().map(|(loaded, _)| loaded);
             Ok(execute::Target::Program(crate::specs_for(argv.clone(), loaded, None)?))
         }
@@ -566,8 +535,8 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
     }
 }
 
-/// Writes a finding's bundle, and says where, if it wrote one: a bundle already on disk under its
-/// digest's name is the same run, written before a campaign was stopped and resumed.
+/// Writes a finding's bundle and returns its path. A bundle already under its digest's name is the
+/// same run, written before the campaign was resumed.
 fn save_finding(
     request: &Request,
     finding: &bohr_explorer::Finding,
@@ -578,9 +547,7 @@ fn save_finding(
     if path.is_file() {
         return Ok(None);
     }
-    // Re-run with the log kept. The campaign never held one — a trace is a pure function of the
-    // tape — so the bundle is made by running the finding again, which by construction produces
-    // the same run.
+    // Re-run with the log kept; the same tape gives the same run.
     let tape = Tape::with_prefix(finding.seed, finding.prefix.clone());
     let target = target_for(request)?;
     let (scenario, config_text) = match &request.scenario {
@@ -609,11 +576,8 @@ fn save_finding(
 /// What the campaign amounted to.
 fn report(campaign: &Campaign, started: Instant, saved: u64) {
     let millis = elapsed_since(started).as_millis().max(1);
-    // Integer arithmetic, because floating point is banned in this repository for a reason that
-    // applies even here: a number that is nearly the same on two machines is the hardest kind of
-    // difference to notice. Carried in hundredths because a traced cluster takes longer than a
-    // second a run, and a whole-number rate reports every such campaign as zero. Reported and
-    // never decided on — no branch reads it.
+    // Integer arithmetic; the repository bans floating point. Hundredths, because a traced cluster
+    // takes over a second a run and a whole-number rate would read zero. Only reported.
     let hundredths = u128::from(campaign.runs()) * 100_000 / millis;
 
     eprintln!(
@@ -625,19 +589,14 @@ fn report(campaign: &Campaign, started: Instant, saved: u64) {
         campaign.corpus().len(),
         campaign.corpus().seen().edges(),
     );
-    // Said whether or not anything was found, and for the same reason the map of the untested is:
-    // a campaign that injected nothing looks exactly like one that injected plenty and was answered
-    // well, and nothing else here separates them. Faults are drawn, so this is a fact about the
-    // runs rather than about the configuration that armed them.
+    // Always printed, counting faults that landed, so a campaign that injected nothing shows.
     eprintln!("  findings {saved} · adversity landed {}", campaign.adversity());
     if saved > 0 {
         eprintln!("  next     bohr findings <dir> groups them; bohr explain <bundle> tells one");
     }
-    // **The number that says whether the feedback still discriminates.** A map with fewer counters
-    // than the guest has edges puts two edges on one counter, and two runs that differ only there
-    // are one run to the corpus. Said whenever the guest reported an edge count, because a search
-    // whose feedback has quietly stopped choosing looks exactly like one that has covered
-    // everything there is — and the remedy is a number in the scenario, not more campaigning.
+    // Whether the map still tells edges apart: with fewer counters than edges, runs that differ
+    // only there look the same. Printed whenever the guest reports an edge count; the remedy is
+    // the map size in the scenario.
     let guest_edges = campaign.guest_edges();
     if guest_edges > 0 {
         let cells = campaign.corpus().seen().cells() as u64;
@@ -653,9 +612,7 @@ fn report(campaign: &Campaign, started: Instant, saved: u64) {
         eprintln!("  {:<12} {kept} entries", operator.name());
     }
 
-    // The map of the untested, and the reason a campaign that found nothing is still worth
-    // reading. A property the guest states and the search never once brought about is a gap in the
-    // testing rather than in the guest, and it appears in no crash report — so it is printed here,
+    // Properties the guest stated and the search never satisfied: gaps in the testing. Printed
     // whether or not anything was found.
     let properties = campaign.properties();
     if !properties.is_empty() {
@@ -673,10 +630,8 @@ fn report(campaign: &Campaign, started: Instant, saved: u64) {
 
 /// The campaign as one machine-readable object.
 ///
-/// **Written through a serialiser, because the strings in it are the guest's.** A finding's kind
-/// is `format!("{:?}")` of an outcome and a property name comes from a record the guest wrote, so
-/// hand-assembled JSON would let a guest naming a property `x", "satisfied": 999999, "y` rewrite
-/// the account of the campaign that ran it.
+/// Built with a serialiser, because property names come from the guest and hand-written JSON
+/// would let a guest inject fields.
 fn account(request: &Request, campaign: &Campaign) -> serde_json::Value {
     let findings: Vec<serde_json::Value> = campaign
         .findings()
@@ -696,8 +651,7 @@ fn account(request: &Request, campaign: &Campaign) -> serde_json::Value {
         .map(|(op, kept)| (op.name().to_owned(), serde_json::json!(kept)))
         .collect();
 
-    // Every property the guests stated, satisfied or not. The unsatisfied ones are the map of
-    // what was never tested, and they are the reason this section exists at all.
+    // Every property the guests stated; the unsatisfied ones show what was never tested.
     let properties: Vec<serde_json::Value> = campaign
         .properties()
         .tallies()
@@ -722,8 +676,7 @@ fn account(request: &Request, campaign: &Campaign) -> serde_json::Value {
         "guest_edges": campaign.guest_edges(),
         "map_cells": campaign.corpus().seen().cells(),
         "covered": campaign.corpus().seen().digest().to_string(),
-        // Names the campaign had no room for, so a map of the untested that stopped growing says
-        // so rather than reading as a guest with few promises.
+        // Names the campaign had no room for, so a capped list is not read as a short one.
         "properties_refused": campaign.properties().refused(),
         "findings": findings,
         "kept_by_operator": credit,
@@ -731,8 +684,7 @@ fn account(request: &Request, campaign: &Campaign) -> serde_json::Value {
     })
 }
 
-/// The `--summary` file: the account, pretty, because a person reads it as often as a machine
-/// does, and stable, because the gate compares two of them byte for byte.
+/// The `--summary` file: the account, pretty-printed for people and stable for byte comparison.
 fn summary(request: &Request, campaign: &Campaign) -> String {
     let mut text = serde_json::to_string_pretty(&account(request, campaign))
         .unwrap_or_else(|_| "{}".to_owned());
@@ -771,10 +723,8 @@ fn result(
 
 /// Reads the tapes a previous campaign left behind.
 ///
-/// Damage is skipped rather than refused: a corpus is somebody's working directory, and a campaign
-/// that will not start because one file in four thousand is truncated has confused an
-/// inconvenience with a defect. What it may not do is read a damaged file as a different tape,
-/// which is why the handover format checks itself.
+/// A damaged file is skipped, so one bad entry does not stop a campaign. The format checks itself,
+/// so a damaged file is never read as a different tape.
 fn load_corpus(dir: &Path) -> Result<Vec<WorkItem>, CliError> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
@@ -784,8 +734,7 @@ fn load_corpus(dir: &Path) -> Result<Vec<WorkItem>, CliError> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "tape"))
         .collect();
-    // Sorted, because the order entries are re-run in decides the order they enter the corpus,
-    // and a directory listing is not a stable order on any filesystem.
+    // Sorted: the order decides corpus order, and directory listings are not stable.
     paths.sort();
 
     let mut carried = Vec::new();
@@ -806,8 +755,7 @@ fn load_corpus(dir: &Path) -> Result<Vec<WorkItem>, CliError> {
 fn save_corpus(dir: &Path, campaign: &Campaign) -> Result<(), CliError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot use {}: {e}", dir.display())))?;
-    // Cleared first: an entry the campaign evicted must not survive in the directory and be
-    // carried back in next time, which would make a corpus that only ever grows.
+    // Cleared first, so evicted entries do not come back next time.
     if let Ok(existing) = std::fs::read_dir(dir) {
         for path in existing.flatten().map(|e| e.path()) {
             if path.extension().is_some_and(|x| x == "tape") {
@@ -833,13 +781,9 @@ fn save_corpus(dir: &Path, campaign: &Campaign) -> Result<(), CliError> {
 
 /// The campaign-scoped promises a guest made in this run.
 ///
-/// Only `sometimes` and `reachable`: whether an `always` held is this run's own verdict and is
-/// already an outcome. Whether a `sometimes` has *ever* held is a question about the campaign, and
-/// these are what a campaign answers it from.
+/// Only `sometimes` and `reachable`; an `always` is already this run's outcome.
 ///
-/// A line that does not parse is skipped. The supervisor already counts and reports malformed
-/// records when it takes them; counting them twice here would say the guest wrote twice as much
-/// nonsense as it did.
+/// Unparsable lines are skipped; the supervisor already counts and reports them.
 fn campaign_properties(records: &[u8]) -> Vec<(String, bool)> {
     String::from_utf8_lossy(records)
         .lines()
@@ -856,12 +800,10 @@ fn campaign_properties(records: &[u8]) -> Vec<(String, bool)> {
 
 /// A campaign written down in a directory between generations, and taken up again.
 ///
-/// `campaign.bin` holds the whole search — the explorer's versioned state and the results of a
-/// generation a run budget cut short, not yet folded — written to a part file and renamed, so a
-/// stop at any moment leaves the last whole save or this one, never half of each. `campaign.toml`
-/// is what a person reads and what a resume is checked against: the master seed, and the question
-/// asked — the program's digest, its arguments and the scenario. A directory holding another
-/// question is refused rather than continued as though it were this one.
+/// `campaign.bin` holds the explorer's versioned state and any unfolded results, written to a part
+/// file and renamed, so a stop leaves either save whole. `campaign.toml` holds what a resume is
+/// checked against: the master seed and the question (program digest, arguments, scenario). A
+/// directory for another question is refused.
 mod resume {
     use std::path::Path;
 
@@ -969,8 +911,7 @@ mod resume {
             campaign.generation(),
             question(request)
         );
-        // The header first: its fields are fixed for a campaign's life, so a stop between the two
-        // renames leaves a header that still describes the state beside it.
+        // The header first: its fields never change, so it matches either state file.
         for (name, content) in [("campaign.toml", header.into_bytes()), ("campaign.bin", bytes)] {
             let at = dir.join(name);
             let part = dir.join(format!("{name}.part"));
@@ -986,8 +927,7 @@ mod resume {
 mod tests {
     use super::*;
 
-    /// The object is the `--summary` account and what this invocation wrote beside it: a reader of
-    /// one learns nothing the other contradicts.
+    /// The object is the `--summary` account plus what this invocation wrote; the two agree.
     #[test]
     fn the_object_is_the_summary_and_what_was_written() {
         let request = Request {

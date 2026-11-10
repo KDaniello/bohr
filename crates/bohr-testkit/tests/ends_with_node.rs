@@ -1,12 +1,7 @@
-//! A run can end when the node it was for ends, rather than when a horizon runs out.
+//! A run can end when the node it was for ends.
 //!
-//! A cluster of a service and the thing that drives it has no ending of its own: the driver asks
-//! its questions and finishes, and the service goes on serving nobody. A horizon covers that by
-//! being guessed at generously, and every tick of the guess is paid for — most of a run, against a
-//! client that polls while it waits.
-//!
-//! Stated as a pair, because the saving is the whole point: the same two programs and the same
-//! horizon, and the only difference is whether the scenario named the node whose ending it meant.
+//! A service never ends, and a generous horizon wastes most of the run. Naming the driver's node
+//! ends the run with it; the pair differs only in that.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::{RunConfig, StopReason};
@@ -26,7 +21,7 @@ const TIMESPEC_AT: u64 = MEMORY_BASE;
 /// Long enough that a horizon is what would stop it.
 const HORIZON: Tick = Tick(200 * Tick::MILLISECOND.get());
 
-/// Serves for ever, which is what a service does.
+/// Serves for ever.
 fn serves_for_ever() -> NullProgram {
     NullProgram::single(
         (0..10_000)
@@ -35,7 +30,7 @@ fn serves_for_ever() -> NullProgram {
     )
 }
 
-/// Asks four questions and is done, which is what a driver does.
+/// Asks four questions and exits.
 fn drives_and_finishes() -> NullProgram {
     let mut ops: Vec<GuestOp> = (0..4)
         .map(|_| GuestOp::Syscall { nr: SLEEP, args: [TIMESPEC_AT, 0, 0, 0, 0, 0] })
@@ -66,7 +61,7 @@ fn run(ends_with: Option<NodeId>) -> (StopReason, u64) {
     (judged.report.stop_reason, judged.report.events)
 }
 
-/// The claim, and the number it is worth.
+/// Naming the node shortens the run.
 #[test]
 fn a_run_ends_with_the_node_it_was_for() {
     let (waited_out, spent) = run(None);
@@ -81,7 +76,7 @@ fn a_run_ends_with_the_node_it_was_for() {
     );
 }
 
-/// And the node that is not the one named does not end the run, so the key means what it says.
+/// Only the named node ends the run.
 #[test]
 fn another_nodes_ending_is_not_the_runs() {
     // Node zero never ends, so naming it leaves the horizon to do the work.
@@ -91,18 +86,13 @@ fn another_nodes_ending_is_not_the_runs() {
 
 /// A driver with more than one thread still ends the run when it ends.
 ///
-/// **The shape this variant exists for, and the one it did not cover.** A program that exits with
-/// threads still parked is what `exit_group` does, and a Go program does it every time. The node's
-/// spared task was removed from the queues but left in the table of which node owns which task, so
-/// "does this node still have tasks" answered yes for ever: the node never reached `Dead`, so
-/// `ends_with` never fired and the run fell back to the horizon it was written to avoid.
+/// `exit_group` with parked threads, as Go programs do, still makes the node `Dead`.
 #[test]
 fn a_driver_that_ends_with_threads_still_parked_ends_the_run() {
     let mut driver: Vec<GuestOp> = vec![GuestOp::Spawn, GuestOp::Spawn];
     driver
         .extend((0..4).map(|_| GuestOp::Syscall { nr: SLEEP, args: [TIMESPEC_AT, 0, 0, 0, 0, 0] }));
-    // `exit_group`, not the scripted `Exit`: what a program with threads does to end is take them
-    // with it, and that is the syscall the world turns into a node having ended.
+    // `exit_group` takes every thread with it.
     driver.push(GuestOp::Syscall { nr: EXIT_GROUP, args: [0; 6] });
 
     // Two threads that go to sleep and are still there when the program ends.

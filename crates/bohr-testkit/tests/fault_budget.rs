@@ -1,18 +1,10 @@
 //! A run can be told how many faults it gets.
 //!
-//! Odds say when a fault fires and never how many. At one part in a thousand per eligible call, a
-//! guest making millions of them is killed hundreds of times over: measured against an execution
-//! client, two hundred and seventy kills across twenty runs. What such a run reports on is the
-//! restart path, over and over, and never the one thing the campaign wanted to know — because by
-//! the time an answer would have been due, the node has died four more times.
+//! Odds set when a fault fires; a budget sets how many. At 1/1000 per call an execution client was
+//! killed 270 times in 20 runs, testing only its restart path.
 //!
-//! Two claims:
-//!
-//! **A budget is a ceiling on fires**, and the run stops offering faults once it is spent.
-//!
-//! **Spending it costs the same tape as not spending it.** A spent budget returns nought odds
-//! rather than skipping the draw, so consumption stays a function of the request — the rule the
-//! whole draw ABI rests on.
+//! A budget caps the fires. A spent budget still draws, with zero odds, so tape consumption is
+//! unchanged.
 
 use bohr_backend_null::{GuestOp, MEMORY_BASE, NullProgram};
 use bohr_kernel::RunConfig;
@@ -41,7 +33,7 @@ const DATA_FD: u64 = 3;
 /// What a budget is meant to hold a run to.
 const BUDGET: u32 = 2;
 
-/// Writes without syncing, for a long time, so every moment is one a guided kill may fire at.
+/// Writes without syncing for a long time, so a kill can fire at any moment.
 fn writes_for_ever() -> NullProgram {
     let mut ops =
         vec![GuestOp::Syscall { nr: OPENAT, args: [u64::MAX, PATH_AT, OPEN_FLAGS, 0o644, 0, 0] }];
@@ -69,8 +61,7 @@ fn run(budget_per_run: Option<u32>, seed: u64) -> Judged {
             kill: (1, 16),
             enomem: (0, 0),
             targeting: Targeting::Guided,
-            // Short enough that the node is back in time to be killed again, which is what makes
-            // an unbudgeted run spend itself on restarts.
+            // Short, so the node is back in time to be killed again.
             restart_after: Tick(Tick::MILLISECOND.get() / 4),
             arm_after: Tick(0),
             budget_per_run,
@@ -96,10 +87,7 @@ fn kills(judged: &Judged) -> usize {
         .count()
 }
 
-/// The claim: a budgeted run fires what it was given and no more, and an unbudgeted one runs away.
-///
-/// Stated as a pair, because a scenario that killed nothing either way would satisfy any claim
-/// made about a ceiling.
+/// A budgeted run fires its budget and no more; an unbudgeted one fires far more.
 #[test]
 fn a_run_fires_what_it_was_budgeted_and_no_more() {
     let unbounded = kills(&run(None, 7));
@@ -117,11 +105,8 @@ fn a_run_fires_what_it_was_budgeted_and_no_more() {
 
 /// A spent budget goes on drawing, and moves nothing decided before it ran out.
 ///
-/// Two things are asserted, and the second is the one stored bundles depend on. A budgeted run
-/// keeps drawing the odds at full width after it is spent — nought odds rather than no draw — so
-/// nothing downstream of the fault site shifts. And up to the last fire the ceiling allowed, the
-/// budgeted run and the unbounded one are byte for byte the same run: what a ceiling changes is
-/// what happens after it, never what happened before.
+/// A spent budget keeps drawing two-byte odds, and up to the last allowed fire the budgeted and
+/// unbounded runs are identical.
 #[test]
 fn a_budget_costs_no_tape() {
     let bounded = run(Some(BUDGET), 7);
@@ -141,8 +126,7 @@ fn a_budget_costs_no_tape() {
     let (bounded, unbounded) = (widths(&bounded), widths(&unbounded));
     assert!(!bounded.is_empty(), "the budgeted run never drew at the fault site");
 
-    // The odds are two bytes and the kind of a single-kind policy is nothing; a spent budget adds
-    // no third width, which is what "the draw still happens" means in the journal.
+    // Two-byte odds and a zero-width kind; a spent budget adds no other width.
     for width in &bounded {
         assert!(*width == 0 || *width == 2, "a spent budget drew {width} bytes at the fault site");
     }

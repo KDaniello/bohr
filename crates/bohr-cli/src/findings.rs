@@ -1,17 +1,13 @@
-//! `bohr findings <dir>`: what a campaign found, grouped by what went wrong rather than by run.
+//! `bohr findings <dir>`: what a campaign found, grouped by what went wrong.
 //!
-//! A campaign against a real client writes one bundle per distinct run that went wrong, and one
-//! defect reached from many seeds is many bundles. Grouped by the violation's signature — the
-//! nodes and exit statuses of a crash, the promises a property run broke, the files a durability
-//! failure lost — they read as defects, each led by its smallest bundle, which is the one to reduce
-//! and the one to read.
+//! One defect reached from many seeds gives many bundles. Grouped by the violation's signature
+//! (the nodes and exit statuses of a crash, the broken promises, the lost files), they read as
+//! defects, each led by its smallest bundle.
 //!
-//! The programs a run executed are part of the signature: two programs that both exit 1 are two
-//! defects, and nothing in an exit status says which program it came from.
+//! The programs a run executed are part of the signature: two programs exiting 1 are two defects.
 //!
-//! What this does not do: tell two defects of one program apart that leave the same signature, or
-//! join one defect that leaves two. The signature is what a reduction already treats as "the same
-//! finding".
+//! Two defects with the same signature fall in one group, and one defect with two signatures
+//! falls in two.
 
 use std::path::{Path, PathBuf};
 
@@ -31,9 +27,8 @@ struct Read {
 
 /// The signature a bundle's violation is grouped by.
 ///
-/// A hang is named by its words with the numbers taken out, because the stop reason the
-/// signature would carry is not in the manifest and the words say it: "event budget reached at
-/// 1000000" and "at 1000001" are one way of not finishing.
+/// A hang is named by its words with digits removed, since the manifest lacks the stop reason:
+/// "event budget reached at 1000000" and "at 1000001" are the same hang.
 fn signature_of(outcome: &Outcome, events: &[bohr_trace::Event]) -> String {
     if let Outcome::GuestHung(said) = outcome {
         let words: String = said.chars().filter(|c| !c.is_ascii_digit()).collect();
@@ -105,7 +100,7 @@ fn grouped(dir: &str) -> Result<(usize, Groups), CliError> {
 
     let mut groups: std::collections::BTreeMap<String, Vec<Read>> =
         std::collections::BTreeMap::new();
-    // A bundle that does not read is named and left out, not allowed to hide every other group.
+    // An unreadable bundle is named and skipped.
     for path in &paths {
         match read(path) {
             Ok(one) => groups.entry(one.signature.clone()).or_default().push(one),

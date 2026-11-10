@@ -2,8 +2,8 @@
 //! so resuming costs nothing a campaign notices.
 //!
 //! A measurement, ignored by default: `cargo test -p bohr-cli --release --test resume_speed --
-//! --ignored --nocapture` prints what the gate records. Here rather than in the explorer, because
-//! the explorer may not read a clock and this is nothing but reading one.
+//! --ignored --nocapture` prints what the gate records. It lives here because the explorer may not
+//! read a clock.
 
 use bohr_backend::CoverageMap;
 use bohr_explorer::{Campaign, RunResult};

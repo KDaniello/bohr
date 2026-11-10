@@ -1,8 +1,7 @@
 //! Records written by Antithesis's own SDKs must read here.
 //!
-//! The compatible subset is an external contract we do not own (`docs/ARCHITECTURE.md` §5.14), so
-//! it is checked against captured records rather than against our reading of their documentation. A
-//! field we do not model is preserved, never reinterpreted.
+//! Checked against captured records (`docs/ARCHITECTURE.md` §5.14). Unmodelled fields are
+//! preserved.
 
 use bohr_sdk_proto::{AssertType, Record, json::Json};
 
@@ -42,13 +41,8 @@ fn a_numeric_guard_reads_as_a_campaign_claim() {
     assert!(!assertion.assert_type.is_per_run(), "a numeric guard is judged over a campaign");
 }
 
-/// A field of theirs we do not model — `details`, `location.class`, their spelling of
-/// `display_type` — survives the trip a record actually makes.
-///
-/// Through `Record` rather than through the parser under it: reading and writing back is what
-/// redaction does to every record it keeps, and a field lost between the two is a field the
-/// bundle no longer holds. Testing the layer below would prove the parser keeps what the layer
-/// above then drops.
+/// Unmodelled fields (`details`, `location.class`, their `display_type`) survive a read and write
+/// through `Record`, as redaction does.
 #[test]
 fn fields_we_do_not_model_survive_being_read_and_written_back() {
     let line = fixtures()
@@ -77,8 +71,7 @@ fn fields_we_do_not_model_survive_being_read_and_written_back() {
     );
 }
 
-/// Their name for a type is theirs. We synthesise `display_type` for the records we write, and a
-/// record we merely read back must keep the spelling it arrived with.
+/// A read record keeps its `display_type` spelling.
 #[test]
 fn their_spelling_of_a_type_is_not_replaced_with_ours() {
     let line = fixtures()
@@ -90,8 +83,7 @@ fn their_spelling_of_a_type_is_not_replaced_with_ours() {
     assert!(written.contains("AlwaysGreaterThan"), "we overwrote their spelling: {written}");
 }
 
-/// Their records carry no `bohr` key, and inventing one would put a foreign record into a
-/// sequence it was never part of — which the supervisor then reads as records having gone missing.
+/// Their records get no `bohr` key.
 #[test]
 fn a_foreign_record_claims_no_place_in_our_sequence() {
     for line in fixtures().lines().filter(|l| !l.trim().is_empty()) {
@@ -101,8 +93,7 @@ fn a_foreign_record_claims_no_place_in_our_sequence() {
     }
 }
 
-/// The schema a job regenerates and diffs. Checked here as well so a malformed one is a failing
-/// test rather than a failing pipeline: the difference is a minute against a round trip.
+/// The exported schema is valid JSON.
 #[test]
 fn the_committed_schema_is_readable_and_describes_this_version() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schema/records.schema.json");

@@ -1,11 +1,9 @@
 //! What one run came to, as a file a program reads: `bohr run --facts FILE`.
 //!
-//! **Not the bundle, and not the text on standard error.** A bundle holds the whole run and has to
-//! be decoded; the text is for a person and changes when its wording does. A check that counts
-//! findings over sixty seeds needs neither — it needs the outcome, the codes, the digest and the
-//! few numbers a judgement is made from, in a shape that does not move.
+//! A check over many seeds needs the outcome, codes, digest and a few numbers in a stable shape,
+//! without decoding a bundle or parsing text meant for people.
 //!
-//! What this does not carry: the events. A reader that wants to know *why* opens the bundle.
+//! No events are included; the bundle has them.
 
 use serde::{Deserialize, Serialize};
 
@@ -97,7 +95,7 @@ impl Facts {
 
 /// The supervisor's peak resident set, read from `/proc/self/status`; 0 where there is none.
 ///
-/// Read once the run is over, so it is the peak of the whole run and costs the run nothing.
+/// Read after the run, so it covers the whole run at no cost to it.
 fn own_peak_rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -113,8 +111,7 @@ fn own_peak_rss_kib() -> u64 {
 /// The supervisor's user and system time and its reaped guests' time, in milliseconds, read from
 /// `/proc/self/stat`; zeros where there is none.
 ///
-/// The fields count clock ticks of 10 ms: the tick every x86-64 Linux kernel reports to user space,
-/// whatever it runs on internally.
+/// The fields count 10 ms ticks, the unit x86-64 Linux reports to user space.
 fn own_cpu_ms() -> (u64, u64, u64) {
     let Ok(text) = std::fs::read_to_string("/proc/self/stat") else {
         return (0, 0, 0);
@@ -134,8 +131,7 @@ fn own_cpu_ms() -> (u64, u64, u64) {
 
 /// An outcome's debug form, `Kind("detail")`, as its kind and its detail.
 ///
-/// From the debug form rather than a match, so an outcome this file has no case for is named by its
-/// own variant without this file learning about it.
+/// Parsed from the debug form, so a new outcome variant needs no change here.
 fn split(debug: &str) -> (String, String) {
     match debug.split_once('(') {
         Some((kind, rest)) => {
@@ -169,10 +165,8 @@ fn codes_in(text: &str) -> Vec<String> {
 /// How many requests the probes made once each was first answered, and how many of those came back
 /// with a result.
 ///
-/// **Counted from a request's first answer, not from the start of the run.** A node asked before it
-/// serves its API — reth answers from its tenth virtual second — is starting, not failing, and
-/// counting those rounds measured the node's start-up instead of whether it keeps answering. A
-/// request never answered counts nothing, so a node that never served reads as 0 of 0.
+/// Counted from each request's first answer, so a node's start-up is not counted as failure (reth
+/// answers from its tenth virtual second). A request never answered counts nothing: 0 of 0.
 fn probe_answers(records: &[u8]) -> (u64, u64) {
     let (mut asked, mut answered) = (0, 0);
     let mut started: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();

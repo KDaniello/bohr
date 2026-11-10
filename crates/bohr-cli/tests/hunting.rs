@@ -1,28 +1,20 @@
 //! Whether the search still reaches the defects we planted for it.
 //!
-//! Correctness gates say we did not break anything. This one says the tool is still *good*, which
-//! is a different question and the only one that measures the product's actual claim: that it
-//! reaches what ordinary testing cannot.
+//! These measure the product claim: the search reaches what ordinary testing cannot.
 //!
-//! **Reach, not rate.** A defect of depth 3 needs three things to fall together, and reaching one
-//! at all is the qualitative difference. How quickly is a property of the machine and of the fault
-//! probability — and raising that probability is the cheapest way to make any defect appear
-//! sooner, which is more chaos rather than a better search. So the assertion is that the campaign
-//! finds it, and the time it took is printed rather than asserted on.
+//! Reach is asserted; time is printed. Speed depends on the machine and the fault probability, and
+//! raising the probability makes any defect appear sooner without a better search.
 //!
-//! Slow by construction: each run is a three-node cluster under interception. Run nightly, and
-//! skipped by name where the example has not been built.
+//! Each run is a traced three-node cluster, so these run nightly and skip when the example is not
+//! built.
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::{path::PathBuf, process::Command, time::Instant};
 
-/// Runs in one campaign, which is the budget `docs/TESTING.md` §8 records for this defect: about
-/// ten minutes on the machine the corpus was measured on.
+/// Runs per campaign: the budget `docs/TESTING.md` §8 records for this defect, about ten minutes.
 ///
-/// Not a threshold — the budget bounds the experiment and the reach is what is asserted. Chosen
-/// from the documented figure rather than from what happens to pass: a budget picked to make the
-/// number look right is the same mistake as a fault probability picked that way.
+/// It bounds the experiment; reach is what is asserted.
 const RUNS: &str = "256";
 
 /// Where the repository sits, from this crate.
@@ -62,7 +54,6 @@ fn campaign(config: &str, master: u32) -> bool {
         .expect("the binary under test must be runnable");
 
     match out.status.code() {
-        // One is a finding, which is what a campaign against a seeded defect is looking for.
         Some(1) => true,
         Some(0) => false,
         other => panic!(
@@ -72,11 +63,8 @@ fn campaign(config: &str, master: u32) -> bool {
     }
 }
 
-/// The milestone gate: the search reaches a depth-3 consensus defect, and reaches it as a matter of
-/// course rather than on a lucky seed.
-// The host clock is banned everywhere a run could read it, and this is not one of those places: it
-// is read once, outside every campaign, and what it produces is printed rather than asserted on.
-#[allow(clippy::disallowed_methods)]
+/// The search reaches a depth-3 consensus defect on most master seeds.
+#[allow(clippy::disallowed_methods, reason = "elapsed time is printed, outside every campaign")]
 #[test]
 #[ignore = "nightly: each run is a traced three-node cluster"]
 fn the_search_reaches_a_depth_three_defect() {
@@ -91,8 +79,6 @@ fn the_search_reaches_a_depth_three_defect() {
     let reached =
         masters.iter().filter(|m| campaign("examples/raft-toy/scenario.toml", **m)).count();
 
-    // Printed rather than asserted on. A search that has become twice as slow is worth noticing;
-    // it is not what this milestone claims.
     eprintln!("reached on {reached} of {total} master seeds in {:?}", started.elapsed());
 
     assert!(
@@ -102,9 +88,7 @@ fn the_search_reaches_a_depth_three_defect() {
     );
 }
 
-/// The other half, and the one that keeps the gate meaningful: without faults the defect is not
-/// there to be found. A defect an ordinary interleaving reaches would make the gate measure the
-/// scheduler instead of the search.
+/// Without faults the defect is unreachable, so the gate measures the search.
 #[test]
 #[ignore = "nightly: each run is a traced three-node cluster"]
 fn the_defect_is_out_of_reach_without_faults() {
@@ -149,8 +133,7 @@ fn chain_codes(scenario: &str, seed: u32) -> Vec<String> {
 
 /// Each blockchain oracle reports its own code on most seeds of the chain with its defect.
 ///
-/// Ten seeds rather than the sixty the gate in `docs/TESTING.md` §8 uses: this is the nightly check
-/// that the reach has not collapsed, and the gate is where the number is recorded.
+/// Ten seeds; the gate in `docs/TESTING.md` §8 uses sixty and records the number.
 #[test]
 #[ignore = "nightly: each run is a traced three-node chain and its probe"]
 fn each_chain_oracle_catches_its_defect() {
@@ -171,7 +154,7 @@ fn each_chain_oracle_catches_its_defect() {
     }
 }
 
-/// And none of them reports anything on the chain without a defect.
+/// No chain oracle reports anything on the correct chain.
 #[test]
 #[ignore = "nightly: each run is a traced three-node chain and its probe"]
 fn no_chain_oracle_cries_wolf() {
