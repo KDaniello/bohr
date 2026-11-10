@@ -19,7 +19,9 @@ mod bundle;
 mod chaos;
 mod event;
 mod log;
+mod output;
 mod redact;
+mod spool;
 mod syscalls;
 
 pub use bundle::{
@@ -30,16 +32,22 @@ pub use bundle::{
 };
 pub use event::{
     ADVANCES_CODE, AGREES_CODE, AssertionKind, DURABILITY_CODE, DiskOpKind, Endpoint, Event,
-    EventKind, ExitStatus, FaultKind, FaultTarget, LIVENESS_CODE, MONOTONIC_CODE,
+    EventKind, ExitStatus, FaultGrade, FaultKind, FaultTarget, LIVENESS_CODE, MONOTONIC_CODE,
     NEVER_REVERTS_CODE, NodeState, PROBE_CODES, PacketFate, SwitchReason, UNIQUE_CODE,
     short_digest,
 };
-pub use log::{TraceStats, TraceWriter, digest_of, read_events, read_events_lossy};
+pub use log::{
+    TraceStats, TraceWriter, digest_of, read_events, read_events_lossy, read_events_where,
+};
+pub use output::{OUTPUT_TAIL_BYTES, OutputTail, OutputTails};
 pub use redact::redact;
+pub use spool::{Spool, Spooled};
 pub use syscalls::{Arg, named_syscalls, syscall_args, syscall_name};
 
 /// Version of the bundle layout.
-pub const BUNDLE_FORMAT: u16 = 2;
+///
+/// 3 adds `GUEST_OUTPUT`, which an older tool would carry through a redaction it cannot clean.
+pub const BUNDLE_FORMAT: u16 = 3;
 
 /// Version of the SDK record schema recorded in a manifest.
 pub const SDK_SCHEMA: u16 = 1;

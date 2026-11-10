@@ -259,27 +259,7 @@ const fn assertion_kind(kind: AssertionKind) -> &'static str {
 }
 
 const fn fault_kind(fault: FaultKind) -> &'static str {
-    match fault {
-        FaultKind::NetDelay => "net_delay",
-        FaultKind::NetDrop => "net_drop",
-        FaultKind::NetDuplicate => "net_duplicate",
-        FaultKind::NetReorder => "net_reorder",
-        FaultKind::NetPartition => "net_partition",
-        FaultKind::DiskTear => "disk_tear",
-        FaultKind::DiskReorder => "disk_reorder",
-        FaultKind::DiskStall => "disk_stall",
-        FaultKind::DiskFull => "disk_full",
-        FaultKind::DiskError => "disk_error",
-        FaultKind::NodeKill => "node_kill",
-        FaultKind::NodeFreeze => "node_freeze",
-        FaultKind::NodeThaw => "node_thaw",
-        FaultKind::NodeRestart => "node_restart",
-        FaultKind::ClockStep => "clock_step",
-        FaultKind::ClockDrift => "clock_drift",
-        FaultKind::ChainReorg => "chain_reorg",
-        FaultKind::MemoryExhausted => "memory_exhausted",
-        FaultKind::NetCorrupt => "net_corrupt",
-    }
+    fault.name()
 }
 
 fn bytes_as_hex(bytes: &[u8]) -> String {

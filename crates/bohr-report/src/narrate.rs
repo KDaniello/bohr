@@ -48,6 +48,8 @@ pub struct Step {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Story {
     pub verdict: Verdict,
+    /// Where it fell, read from what the failing nodes printed, where the bundle kept it.
+    pub place: Option<crate::locate::Place>,
     /// What the run was: seed, nodes, virtual time, faults.
     pub run: String,
     pub steps: Vec<Step>,
@@ -261,7 +263,32 @@ pub fn story(model: &RunModel, bundle: &str) -> Story {
         ));
     }
     next.push((format!("bohr replay {bundle}"), "the same run again, checked against its digest"));
-    Story { verdict, run, steps, elided, next }
+    let place = verdict.found.then(|| place_of(model)).flatten();
+    Story { verdict, place, run, steps, elided, next }
+}
+
+/// The nodes a run's failure is on: those whose task exited with an error or a signal not sent
+/// by a kill.
+#[must_use]
+pub fn failing_nodes(events: &[Event]) -> Vec<u32> {
+    let mut nodes: Vec<u32> = events
+        .iter()
+        .filter(|e| match e.kind {
+            EventKind::TaskExited { status: ExitStatus::Exited(code) } => code != 0,
+            EventKind::TaskExited { status: ExitStatus::Signalled(signal) } => signal != 9,
+            _ => false,
+        })
+        .map(|e| e.node.get())
+        .collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
+}
+
+/// Where a run fell, read from its kept output.
+#[must_use]
+pub fn place_of(model: &RunModel) -> Option<crate::locate::Place> {
+    crate::locate::locate(&model.output, &failing_nodes(&model.events))
 }
 
 /// A story as text, for `bohr explain`.
@@ -270,6 +297,27 @@ pub fn write_story(story: &Story) -> String {
     let mut out = String::new();
     let v = &story.verdict;
     let _ = writeln!(out, "What was found\n  {} ({})\n", v.headline, v.code);
+    if let Some(place) = &story.place {
+        let _ = writeln!(
+            out,
+            "Where it fell\n  n{} (start {})  {}: {}",
+            place.node,
+            place.incarnation + 1,
+            place.kind.name(),
+            crate::locate::clipped(&place.message)
+        );
+        if let Some(frame) = &place.frame {
+            match &place.function {
+                Some(function) => {
+                    let _ = writeln!(out, "  {frame}\n      in {function}");
+                }
+                None => {
+                    let _ = writeln!(out, "  {frame}");
+                }
+            }
+        }
+        out.push('\n');
+    }
     let _ = writeln!(out, "What the run was\n  {}\n", story.run);
     if !story.steps.is_empty() {
         let _ = writeln!(out, "How it got there{:>56}", "event       time");
@@ -308,6 +356,10 @@ pub fn story_json(story: &Story) -> serde_json::Value {
         "found": story.verdict.found,
         "headline": story.verdict.headline,
         "code": story.verdict.code,
+        "where": story.place.as_ref().map(|p| serde_json::json!({
+            "node": p.node, "incarnation": p.incarnation, "kind": p.kind.name(),
+            "message": p.message, "frame": p.frame, "function": p.function,
+        })),
         "run": story.run,
         "elided": story.elided,
         "steps": story.steps.iter().map(|s| serde_json::json!({

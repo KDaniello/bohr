@@ -192,9 +192,17 @@ pub struct Cluster {
     pub programs: Vec<Vec<String>>,
     /// Environment presented to every node.
     pub env: Vec<(String, String)>,
+    /// Each node's role, one of [`ROLES`]; empty where every node is a target.
+    pub roles: Vec<String>,
 }
 
 impl Cluster {
+    /// The role of node `index`: `target` unless the scenario names another.
+    #[must_use]
+    pub fn role_of(&self, index: u32) -> &str {
+        self.roles.get(index as usize).map_or("target", String::as_str)
+    }
+
     /// The argument vector node `index` runs, with the `{node}` token substituted.
     ///
     /// Its own argv if given, else the shared template; `{node}` is substituted in both.
@@ -324,6 +332,8 @@ struct RawFaults {
     targeting: Option<String>,
     restart_after_ticks: Option<u64>,
     arm_after_ticks: Option<u64>,
+    disarm_after_ticks: Option<u64>,
+    ablate: Option<Vec<String>>,
     budget_per_run: Option<u32>,
     draw: Option<Vec<String>>,
     fault_points: Option<Vec<String>>,
@@ -347,7 +357,14 @@ struct RawCluster {
     programs: Vec<Vec<String>>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    roles: Vec<String>,
 }
+
+/// What a node is to a run: the system under test, or part of the bench around it.
+///
+/// A finding whose failing nodes are all bench is the bench's, never the target's.
+pub const ROLES: [&str; 3] = ["target", "load", "driver"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -598,6 +615,27 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
         };
         fault_policy.restart_after = bohr_types::Tick(raw_faults.restart_after_ticks.unwrap_or(0));
         fault_policy.arm_after = bohr_types::Tick(raw_faults.arm_after_ticks.unwrap_or(0));
+        fault_policy.disarm_after = raw_faults.disarm_after_ticks.map(bohr_types::Tick);
+        for name in raw_faults.ablate.iter().flatten() {
+            let kind = bohr_trace::FaultKind::named(name).ok_or_else(|| {
+                ConfigError::Refused(format!(
+                    "BOHR-1002: faults.ablate names {name:?}, which is no fault kind; the kinds are \
+                     {}",
+                    bohr_trace::FaultKind::ALL.map(bohr_trace::FaultKind::name).join(", ")
+                ))
+            })?;
+            fault_policy.suppressed = fault_policy.suppressed.with(kind);
+        }
+        if let Some(closes) = fault_policy.disarm_after
+            && closes <= fault_policy.arm_after
+        {
+            return Err(ConfigError::Refused(format!(
+                "BOHR-1002: faults.disarm_after_ticks is {} and faults.arm_after_ticks is {}, so \
+                 no drawn fault could ever fire",
+                closes.get(),
+                fault_policy.arm_after.get()
+            )));
+        }
         if let Some(budget) = raw_faults.budget_per_run {
             if budget == 0 {
                 return Err(ConfigError::Refused(
@@ -769,11 +807,25 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
                     c.nodes
                 )));
             }
+            if !c.roles.is_empty() && c.roles.len() != c.nodes as usize {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: [cluster] names {} roles for {} nodes",
+                    c.roles.len(),
+                    c.nodes
+                )));
+            }
+            if let Some(unknown) = c.roles.iter().find(|r| !ROLES.contains(&r.as_str())) {
+                return Err(ConfigError::Refused(format!(
+                    "BOHR-1002: [cluster] role {unknown:?} is none of {}",
+                    ROLES.join(", ")
+                )));
+            }
             Some(Cluster {
                 nodes: c.nodes,
                 argv: c.argv,
                 programs: c.programs,
                 env: c.env.into_iter().collect(),
+                roles: c.roles,
             })
         }
     };
@@ -794,6 +846,17 @@ pub fn load(text: &str) -> Result<LoadedConfig, ConfigError> {
             "BOHR-1002: faults.arm_after_ticks is {} and run.horizon_ticks is {}, so the run \
                  would end before a drawn fault was ever offered",
             fault_policy.arm_after.get(),
+            horizon.get()
+        )));
+    }
+    // A window closing at or after the end closes nothing, which a scenario would not mean.
+    if let (Some(horizon), Some(closes)) = (run.horizon, fault_policy.disarm_after)
+        && closes >= horizon
+    {
+        return Err(ConfigError::Refused(format!(
+            "BOHR-1002: faults.disarm_after_ticks is {} and run.horizon_ticks is {}, so the window \
+             would close after the run ended",
+            closes.get(),
             horizon.get()
         )));
     }
@@ -1511,6 +1574,30 @@ mode = \"shm\"
         let err = load("[network]\ndrop_probability = \"1/100000\"\n").expect_err("refused");
         let text = err.to_string();
         assert!(text.contains("BOHR-1003") && text.contains("1/65536"), "got: {text}");
+    }
+
+    #[test]
+    fn a_fault_window_is_read_and_an_empty_or_late_one_is_refused() {
+        let faults = "[faults]\nkill_probability = \"1/1000\"\narm_after_ticks = 5\n";
+        let loaded = load(&format!("{faults}disarm_after_ticks = 9\n")).expect("a window");
+        assert_eq!(loaded.fault_policy.disarm_after, Some(bohr_types::Tick(9)));
+
+        let empty = load(&format!("{faults}disarm_after_ticks = 5\n")).expect_err("refused");
+        assert!(empty.to_string().contains("faults.disarm_after_ticks is 5"), "got: {empty}");
+
+        let late = load(&format!("[run]\nhorizon_ticks = 9\n{faults}disarm_after_ticks = 9\n"))
+            .expect_err("refused");
+        assert!(late.to_string().contains("would close after the run ended"), "got: {late}");
+    }
+
+    #[test]
+    fn an_ablation_names_kinds_and_refuses_a_name_that_is_none() {
+        let loaded = load("[faults]\nkill_probability = \"1/1000\"\nablate = [\"disk_tear\"]\n")
+            .expect("an ablation");
+        assert!(loaded.fault_policy.suppressed.contains(bohr_trace::FaultKind::DiskTear));
+        assert!(!loaded.fault_policy.suppressed.contains(bohr_trace::FaultKind::NodeKill));
+        let err = load("[faults]\nablate = [\"disk_torn\"]\n").expect_err("refused");
+        assert!(err.to_string().contains("\"disk_torn\""), "got: {err}");
     }
 
     #[test]

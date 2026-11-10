@@ -61,6 +61,8 @@ pub(crate) struct Request {
     pub(crate) runs: Option<u64>,
     /// The convenient budget: this long, and the report says how many runs it reached.
     pub(crate) time: Option<Duration>,
+    /// Stop after this many runs that added no new group of findings.
+    pub(crate) quiet_runs: Option<u64>,
     /// How many workers.
     pub(crate) jobs: usize,
     /// Where findings are written.
@@ -109,7 +111,7 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     {
         let carried = load_corpus(dir)?;
         if !carried.is_empty() {
-            let results = carry_out(&mut pool, &carried)?;
+            let results = carry_out(&mut pool, &carried, None)?;
             campaign.adopt(&carried, results);
             eprintln!("carried {} tapes in from {}", carried.len(), dir.display());
         }
@@ -118,10 +120,14 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
     // A generation is folded only when whole. One cut short by a run budget is held as results; a
     // resumed campaign runs the rest and folds it all, as an uninterrupted one would. The report
     // folds the held part into a copy.
-    while more_to_do(request, campaign.runs() + pending.len() as u64, started) {
+    // A resumed campaign carries on from the groups it had reached, as an uninterrupted one would.
+    let mut groups =
+        if request.resume.is_some() { Groups::read(&request.findings) } else { Groups::default() };
+    while more_to_do(request, campaign.runs() + pending.len() as u64, started, &groups) {
         let planned = campaign.plan(GENERATION_ITEMS);
         let size = generation_size(request, campaign.runs()).max(pending.len());
-        let results = carry_out(&mut pool, &planned[pending.len()..size])?;
+        let deadline = request.time.map(|budget| (started, budget));
+        let results = carry_out(&mut pool, &planned[pending.len()..size], deadline)?;
         pending.extend(results);
         if pending.len() < GENERATION_ITEMS {
             continue;
@@ -129,7 +135,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         campaign.fold(&planned, std::mem::take(&mut pending));
         // Saved after folding, so a finding reached twice in a generation is written once.
-        saved.extend(save_new_findings(request, &campaign, &known)?);
+        let new = save_new_findings(request, &campaign, &known)?;
+        groups.note(request, &new, campaign.runs(), started)?;
+        saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
         // Saved after every whole generation, so a stopped campaign resumes from the last one.
         if let Some(dir) = &request.resume {
             resume::save(dir, request, &campaign, &pending)?;
@@ -145,7 +153,9 @@ pub(crate) fn explore(request: &Request) -> Result<u8, CliError> {
         let planned = campaign.plan(GENERATION_ITEMS);
         let known: std::collections::BTreeSet<_> = campaign.findings().keys().copied().collect();
         view.fold(&planned[..pending.len()], pending);
-        saved.extend(save_new_findings(request, &view, &known)?);
+        let new = save_new_findings(request, &view, &known)?;
+        groups.note(request, &new, view.runs(), started)?;
+        saved.extend(new.into_iter().filter(|s| s.fresh).map(|s| s.path));
     }
     let campaign = view;
 
@@ -195,7 +205,7 @@ fn save_new_findings(
     request: &Request,
     campaign: &Campaign,
     known: &std::collections::BTreeSet<bohr_types::Digest>,
-) -> Result<Vec<PathBuf>, CliError> {
+) -> Result<Vec<Saved>, CliError> {
     let mut saved = Vec::new();
     for (digest, finding) in campaign.findings() {
         if !known.contains(digest) {
@@ -206,14 +216,82 @@ fn save_new_findings(
 }
 
 /// Whether the budget has anything left, given the runs done so far.
-fn more_to_do(request: &Request, done: u64, started: Instant) -> bool {
-    if let Some(runs) = request.runs {
-        return done < runs;
+///
+/// The budgets that are set all apply, and the first one spent ends the campaign.
+fn more_to_do(request: &Request, done: u64, started: Instant, groups: &Groups) -> bool {
+    if request.runs.is_some_and(|runs| done >= runs) {
+        return false;
     }
-    match request.time {
-        // Checked only between generations, so the clock never cuts one short.
-        Some(budget) => elapsed_since(started) < budget,
-        None => false,
+    if request.time.is_some_and(|budget| elapsed_since(started) >= budget) {
+        return false;
+    }
+    if request.quiet_runs.is_some_and(|quiet| done.saturating_sub(groups.last_new) >= quiet) {
+        return false;
+    }
+    request.runs.is_some() || request.time.is_some() || request.quiet_runs.is_some()
+}
+
+/// The groups of findings a campaign has reached, each with the run and the moment it was first
+/// reached, and the run that last reached a new one.
+#[derive(Default)]
+struct Groups {
+    first: std::collections::BTreeMap<String, (u64, u64)>,
+    last_new: u64,
+}
+
+/// The file in the findings directory that says when each group was first reached.
+pub(crate) const FIRST_SEEN: &str = "first-seen.json";
+
+impl Groups {
+    /// The groups a campaign wrote down in `findings`, and the run that last reached a new one.
+    fn read(findings: &Path) -> Self {
+        let text = std::fs::read_to_string(findings.join(FIRST_SEEN)).unwrap_or_default();
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+        let first: std::collections::BTreeMap<String, (u64, u64)> = listed
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("group")?.as_str()?.to_owned(),
+                    (entry.get("first_run")?.as_u64()?, entry.get("first_after_s")?.as_u64()?),
+                ))
+            })
+            .collect();
+        let last_new = first.values().map(|(run, _)| *run).max().unwrap_or(0);
+        Self { first, last_new }
+    }
+
+    /// Takes note of the findings just saved, at `runs` runs, and writes down any new group.
+    fn note(
+        &mut self,
+        request: &Request,
+        saved: &[Saved],
+        runs: u64,
+        started: Instant,
+    ) -> Result<(), CliError> {
+        let mut grew = false;
+        for Saved { group, .. } in saved {
+            if !self.first.contains_key(group) {
+                self.first.insert(group.clone(), (runs, elapsed_since(started).as_secs()));
+                grew = true;
+            }
+        }
+        if !grew {
+            return Ok(());
+        }
+        self.last_new = runs;
+        let listed: Vec<serde_json::Value> = self
+            .first
+            .iter()
+            .map(|(group, (run, after))| {
+                serde_json::json!({ "group": group, "first_run": run, "first_after_s": after })
+            })
+            .collect();
+        let path = request.findings.join(FIRST_SEEN);
+        let text =
+            serde_json::to_string_pretty(&listed).map_err(|e| CliError::Internal(e.to_string()))?;
+        std::fs::write(&path, text).map_err(|e| {
+            CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display()))
+        })
     }
 }
 
@@ -231,12 +309,25 @@ fn generation_size(request: &Request, folded: u64) -> usize {
 ///
 /// An item whose worker died is reissued once. A second failure is an error, since a campaign
 /// missing a run could not be repeated.
-fn carry_out(pool: &mut Pool, planned: &[WorkItem]) -> Result<Vec<RunResult>, CliError> {
+fn carry_out(
+    pool: &mut Pool,
+    planned: &[WorkItem],
+    deadline: Option<(Instant, Duration)>,
+) -> Result<Vec<RunResult>, CliError> {
     let mut queue: std::collections::VecDeque<WorkItem> = planned.iter().cloned().collect();
     let mut failed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut gathered = Vec::with_capacity(planned.len());
     let mut in_flight = 0usize;
+    let mut cut = false;
     loop {
+        // Past the time budget no item is handed out; those in flight finish, and a generation cut
+        // short is held and folded as one cut by a run budget is.
+        if !queue.is_empty()
+            && deadline.is_some_and(|(started, budget)| elapsed_since(started) >= budget)
+        {
+            queue.clear();
+            cut = true;
+        }
         // Every idle worker is handed the next item, so no worker waits while there is work.
         while let Some(slot) = pool.idle() {
             let Some(item) = queue.pop_front() else { break };
@@ -265,6 +356,17 @@ fn carry_out(pool: &mut Pool, planned: &[WorkItem]) -> Result<Vec<RunResult>, Cl
                 queue.push_front(item);
             }
         }
+    }
+    // A generation cut short is folded as a prefix of its plan. A reissued item dropped at the cut
+    // leaves a gap, and the results after it are dropped too, to be run again on a resume.
+    if cut && let Some(first) = planned.first().map(|item| item.index) {
+        gathered.sort_by_key(|result| result.index);
+        let reach = gathered
+            .iter()
+            .enumerate()
+            .take_while(|(at, result)| result.index == first + *at as u32)
+            .count();
+        gathered.truncate(reach);
     }
     Ok(gathered)
 }
@@ -508,7 +610,8 @@ fn carry_out_one(request: &Request, item: &WorkItem) -> Result<RunResult, CliErr
         coverage: completed.coverage.unwrap_or_default(),
         guest_edges: completed.coverage_edges,
         adversity: completed.report.adversity,
-        journal: completed.report.journal,
+        // Only what the corpus can use; the rest follows from the tape for anyone who replays it.
+        journal: bohr_explorer::corpus_draws(&completed.report.journal, item.prefix.len()),
     })
 }
 
@@ -535,17 +638,35 @@ fn target_for(request: &Request) -> Result<execute::Target, CliError> {
     }
 }
 
-/// Writes a finding's bundle and returns its path. A bundle already under its digest's name is the
-/// same run, written before the campaign was resumed.
+/// A finding's bundle, the group `bohr findings` puts it in, and whether this campaign wrote it.
+struct Saved {
+    path: PathBuf,
+    group: String,
+    fresh: bool,
+}
+
+/// Writes a finding's bundle and returns it with its group. A bundle already under its digest's
+/// name is the same run, written before the campaign was resumed: it is read for its group, so a
+/// campaign run twice into one directory counts its groups the same way.
 fn save_finding(
     request: &Request,
     finding: &bohr_explorer::Finding,
-) -> Result<Option<PathBuf>, CliError> {
+) -> Result<Option<Saved>, CliError> {
     let short = format!("{}", finding.digest);
     let short = short.rsplit(':').next().unwrap_or(&short);
     let path = request.findings.join(format!("finding-{}.bohr", &short[..12.min(short.len())]));
     if path.is_file() {
-        return Ok(None);
+        let Ok(bundle) = std::fs::read(&path).map(|b| bohr_trace::Bundle::parse(&b)) else {
+            return Ok(None);
+        };
+        let Ok(bundle) = bundle else { return Ok(None) };
+        let Ok(manifest) = bundle.manifest() else { return Ok(None) };
+        let events: Vec<bohr_trace::Event> = bundle
+            .section(bohr_trace::SectionId::Events)
+            .map(|raw| bohr_trace::read_events_where(raw, crate::findings::telling).0)
+            .unwrap_or_default();
+        let group = crate::findings::signature(&bundle, &manifest.outcome, &events);
+        return Ok(Some(Saved { path, group, fresh: false }));
     }
     // Re-run with the log kept; the same tape gives the same run.
     let tape = Tape::with_prefix(finding.seed, finding.prefix.clone());
@@ -554,23 +675,39 @@ fn save_finding(
         Some((loaded, text)) => (Some(loaded), text.as_str()),
         None => (None, ""),
     };
-    let completed = execute::once(execute::Execution {
+    let completed = execute::run_with(execute::Execution {
         target: &target,
         tape: &tape,
         config: crate::run_config_for(scenario, None),
         output: execute::Output::Discard,
         policy: SCHEDULER,
-        record: execute::Record::Log,
+        // Spooled: a cluster's log is too large to hold whole, and only the bundle reads it.
+        record: execute::Record::Spool,
         scenario,
         config_toml: config_text,
     })?;
 
-    let bytes = execute::to_bundle(&completed, &tape, None)?;
-    std::fs::write(&path, bytes)
-        .map_err(|e| CliError::Usage(format!("BOHR-1002: cannot write {}: {e}", path.display())))?;
+    execute::write_bundle(&completed, &tape, None, &path)?;
     let verdict = bohr_report::narrate::verdict(&completed.report.outcome);
     eprintln!("  found  {}    {} · {}", verdict.headline, verdict.code, path.display());
-    Ok(Some(path))
+    // The group from the few events it is read from, streamed from the spool.
+    let events = match &completed.spooled {
+        Some(spooled) => {
+            spooled.events_where(crate::findings::telling).map(|(e, _)| e).unwrap_or_default()
+        }
+        None => bohr_trace::read_events_lossy(&completed.log)
+            .0
+            .into_iter()
+            .filter(crate::findings::telling)
+            .collect(),
+    };
+    let group = crate::findings::group_of(
+        &crate::findings::programs_of(&completed.binaries),
+        &completed.report.outcome,
+        &events,
+        &completed.output_tails,
+    );
+    Ok(Some(Saved { path, group, fresh: true }))
 }
 
 /// What the campaign amounted to.
@@ -934,6 +1071,7 @@ mod tests {
             master: Seed(7),
             runs: Some(0),
             time: None,
+            quiet_runs: None,
             jobs: 1,
             findings: PathBuf::from("out/findings"),
             corpus: None,

@@ -19,7 +19,7 @@ mod state;
 
 pub use campaign::{Campaign, Finding, Progress, RunResult, WorkItem};
 pub use choices::Choices;
-pub use corpus::{Corpus, DEFAULT_CAPACITY, Entry, Offer, Origin};
+pub use corpus::{Corpus, DEFAULT_CAPACITY, Entry, Offer, Origin, corpus_draws};
 pub use mutate::{Context, MAX_PREFIX_BYTES, Operator, mutate};
 pub use properties::{MOST_PROPERTIES, Properties, Tally};
 pub use state::StateError;

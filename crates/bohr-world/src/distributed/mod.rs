@@ -185,6 +185,11 @@ pub struct FaultPolicy {
     /// An execution client makes 130 000 calls starting up, so even the finest odds kill it before
     /// it is up. Zero by default.
     pub arm_after: Tick,
+    /// Virtual time from which no drawn fault fires, of any kind: node, disk, memory or network.
+    ///
+    /// Recoveries already armed still happen, so a system is judged on coming back once nothing
+    /// pushes it down. `None` keeps the window open to the end.
+    pub disarm_after: Option<Tick>,
     /// How many drawn faults one run may fire, where a scenario puts a ceiling on it.
     ///
     /// Odds set when; this sets how many. 270 kills in 20 runs of an execution client tested only
@@ -192,6 +197,51 @@ pub struct FaultPolicy {
     pub budget_per_run: Option<u32>,
     /// Which kinds a fire may be, chosen by a draw over this set.
     pub kinds: DrawnFaults,
+    /// Kinds that fire at nought odds, for an ablation: every draw still happens, so the rest of
+    /// the run keeps its schedule, and only these kinds' effects are left out.
+    pub suppressed: Suppressed,
+}
+
+/// A set of fault kinds, as a mask over `FaultKind`'s declaration order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Suppressed(u32);
+
+impl Suppressed {
+    /// No kind suppressed.
+    pub const NONE: Self = Self(0);
+
+    /// The same set, with `kind` in it.
+    #[must_use]
+    pub const fn with(self, kind: FaultKind) -> Self {
+        Self(self.0 | (1 << kind as u32))
+    }
+
+    /// Whether `kind` is in the set.
+    #[must_use]
+    pub const fn contains(self, kind: FaultKind) -> bool {
+        self.0 & (1 << kind as u32) != 0
+    }
+
+    /// `odds`, or nought where `kind` is in the set.
+    pub(crate) const fn odds(self, kind: FaultKind, odds: (u32, u32)) -> (u32, u32) {
+        if self.contains(kind) { (0, 1) } else { odds }
+    }
+}
+
+/// The fault kind a drawn node fault lands as, which ablation names it by.
+const fn landed_as(kind: &NodeFaultKind) -> FaultKind {
+    match kind {
+        NodeFaultKind::Kill => FaultKind::NodeKill,
+        NodeFaultKind::Freeze | NodeFaultKind::Thaw => FaultKind::NodeFreeze,
+        NodeFaultKind::Isolate => FaultKind::NetPartition,
+        NodeFaultKind::Degrade => FaultKind::NetDrop,
+        NodeFaultKind::Restart | NodeFaultKind::RestartFromSnapshot { .. } => {
+            FaultKind::NodeRestart
+        }
+        NodeFaultKind::ChainReorg { .. } => FaultKind::ChainReorg,
+        NodeFaultKind::ClockStep { .. } => FaultKind::ClockStep,
+        NodeFaultKind::ClockDrift { .. } => FaultKind::ClockDrift,
+    }
 }
 
 impl FaultPolicy {
@@ -205,6 +255,9 @@ impl FaultPolicy {
         if now.get() < self.arm_after.get() {
             return (0, 1);
         }
+        if !self.open_at(now) {
+            return (0, 1);
+        }
         if let Some(budget) = self.budget_per_run
             && fired >= budget
         {
@@ -215,6 +268,19 @@ impl FaultPolicy {
             Targeting::Guided if candidate => self.kill,
             Targeting::Guided => (0, 1),
         }
+    }
+
+    /// Whether drawn faults may still fire at `now`.
+    pub(crate) const fn open_at(self, now: Tick) -> bool {
+        match self.disarm_after {
+            Some(closes) => now.get() < closes.get(),
+            None => true,
+        }
+    }
+
+    /// `odds` at `now`, nought once the window has closed. The draw happens either way.
+    pub(crate) const fn windowed(self, now: Tick, odds: (u32, u32)) -> (u32, u32) {
+        if self.open_at(now) { odds } else { (0, 1) }
     }
 
     /// Whether this policy does anything at all.
@@ -471,6 +537,10 @@ pub struct DistributedWorld {
     violated: Option<String>,
     /// One sink for every node's output, in schedule order.
     output: Option<crate::OutputSink>,
+    /// The end of what each incarnation of each node wrote out, for a bundle to keep.
+    ///
+    /// Kept only for a run whose log is kept.
+    tails: Option<bohr_trace::OutputTails>,
     catalog: FaultCatalog,
     /// What every node's world is made of.
     template: NodeTemplate,
@@ -568,7 +638,11 @@ impl DistributedWorld {
     /// The probe's node is outside the fault model and the silence watch.
     #[must_use]
     pub fn with_probes(mut self, probes: Vec<crate::ProbeSpec>, node: u32) -> Self {
-        self.observer = Some(crate::probe::Observer::new(probes));
+        let mut observer = crate::probe::Observer::new(probes);
+        if let Some(closes) = self.fault_policy.disarm_after {
+            observer.judge_stalls_from(closes);
+        }
+        self.observer = Some(observer);
         self.probe_node = Some(NodeId(node));
         self.sdk.probe_node = Some(NodeId(node));
         self
@@ -601,6 +675,7 @@ impl DistributedWorld {
             faults_fired: 0,
             violated: None,
             output: None,
+            tails: None,
             template: NodeTemplate::default(),
             liveness: None,
             durability: None,
@@ -732,11 +807,30 @@ impl DistributedWorld {
         self
     }
 
+    /// The same cluster, keeping the end of what each incarnation of each node writes out.
+    #[must_use]
+    pub fn keeping_tails(mut self) -> Self {
+        self.tails = Some(bohr_trace::OutputTails::new());
+        self
+    }
+
+    /// The end of what each incarnation of each node wrote out, where the cluster kept it.
+    #[must_use]
+    pub fn output_tails(&self) -> Vec<bohr_trace::OutputTail> {
+        self.tails.as_ref().map(bohr_trace::OutputTails::records).unwrap_or_default()
+    }
+
     /// Tells the liveness watch what this world just did to a node.
     ///
     /// Called beside every `NodeState`, which `scripts/lint-rules.sh` checks, so the watch never
     /// blames a node the world stopped. See [`watch::Liveness::node_became`].
     fn node_became(&mut self, node: NodeId, state: NodeState, now: Tick) {
+        // A restart begins a new incarnation, whose output is kept apart from the last one's.
+        if state == NodeState::Restarting
+            && let Some(tails) = self.tails.as_mut()
+        {
+            tails.restarted(node.get(), now.get());
+        }
         // The probe is outside both watches.
         if Some(node) == self.probe_node {
             return;
@@ -911,7 +1005,12 @@ impl DistributedWorld {
                 EventKind::Domain { ns: domain_ns(), kind: DOMAIN_EXPOSED, payload },
             )?;
         }
-        let reorder = self.disk_config.reorder_unsynced;
+        // A torn and a reordered write come from one regime, the per-sector landing, so an
+        // ablation of either takes the regime away; the crash's draw is unchanged.
+        let off = self.fault_policy.suppressed;
+        let reorder = self.disk_config.reorder_unsynced
+            && !off.contains(FaultKind::DiskTear)
+            && !off.contains(FaultKind::DiskReorder);
         let (world, disk) = self.node_parts(node);
         let image = disk.crash_image(node, world, reorder, ctx)?;
         self.nodes.insert(node, restored_node(&self.template, image));
@@ -938,9 +1037,15 @@ impl DistributedWorld {
         match nr {
             sys::FSYNC | sys::FDATASYNC => {
                 // All three draws happen on every sync.
-                let eio = draw_odds(ctx, self.disk_config.eio_probability, DrawSite::DiskError)?;
-                let stall =
-                    draw_odds(ctx, self.disk_config.stall_probability, DrawSite::DiskLatency)?;
+                let now = ctx.world_now();
+                let off = self.fault_policy.suppressed;
+                let eio_odds = self.fault_policy.windowed(now, self.disk_config.eio_probability);
+                let eio_odds = off.odds(FaultKind::DiskError, eio_odds);
+                let stall_odds =
+                    self.fault_policy.windowed(now, self.disk_config.stall_probability);
+                let stall_odds = off.odds(FaultKind::DiskStall, stall_odds);
+                let eio = draw_odds(ctx, eio_odds, DrawSite::DiskError)?;
+                let stall = draw_odds(ctx, stall_odds, DrawSite::DiskLatency)?;
                 let duration =
                     ctx.draw_exponential(self.disk_config.stall_mean_ticks, DrawSite::DiskLatency)?;
 
@@ -1008,8 +1113,12 @@ impl DistributedWorld {
                 Self::finish_disk_op(nr, args, fd, DiskOpKind::Fsync, 0, 0, 0, ctx)
             }
             sys::WRITE | sys::WRITEV | sys::PWRITE64 | sys::PWRITEV => {
-                let enospc =
-                    draw_odds(ctx, self.disk_config.enospc_probability, DrawSite::DiskError)?;
+                let enospc_odds = self
+                    .fault_policy
+                    .windowed(ctx.world_now(), self.disk_config.enospc_probability);
+                let enospc_odds =
+                    self.fault_policy.suppressed.odds(FaultKind::DiskFull, enospc_odds);
+                let enospc = draw_odds(ctx, enospc_odds, DrawSite::DiskError)?;
                 let offset = if matches!(nr, sys::PWRITE64 | sys::PWRITEV) {
                     args[3]
                 } else {
@@ -1165,9 +1274,11 @@ impl DistributedWorld {
             return Ok(None);
         }
         // The probe's allocations pass without a draw. `brk(0)` allocates nothing.
+        let odds = self.fault_policy.windowed(ctx.world_now(), self.fault_policy.enomem);
+        let odds = self.fault_policy.suppressed.odds(FaultKind::MemoryExhausted, odds);
         let refused = Some(node) != self.probe_node
             && !(nr == BRK && args[0] == 0)
-            && draw_odds(ctx, self.fault_policy.enomem, DrawSite::MemoryExhausted)?;
+            && draw_odds(ctx, odds, DrawSite::MemoryExhausted)?;
         if !refused {
             ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: false, data_digest: None })?;
             return Ok(Some(Effects::go(Resume::Continue, SYSCALL_COST)));
@@ -1218,6 +1329,9 @@ impl DistributedWorld {
         // Raised through the network's partition list, like `[[partition]]`. It heals after the
         // recovery delay, or never without one.
         if kind == NodeFaultKind::Isolate {
+            if self.fault_policy.suppressed.contains(landed_as(&kind)) {
+                return Ok(None);
+            }
             let at = ctx.world_now();
             let cut = self.net.links_isolating(node);
             if cut.is_empty() {
@@ -1241,6 +1355,11 @@ impl DistributedWorld {
             let at = ctx.world_now();
             let until = Tick(at.get().saturating_add(self.fault_policy.restart_after.get()));
             let bad = &DEGRADATIONS[ctx.draw_index(DEGRADATIONS.len(), DrawSite::NetPartition)?];
+            // After the severity's draw, so a suppressed degradation leaves the tape where it was.
+            let suppressed = self.fault_policy.suppressed;
+            if suppressed.contains(FaultKind::NetDrop) || suppressed.contains(FaultKind::NetDelay) {
+                return Ok(None);
+            }
             for link in self.net.links_isolating(node) {
                 let index = self.net.add_grey(GreyWindow {
                     link,
@@ -1271,6 +1390,10 @@ impl DistributedWorld {
             }
             other => other,
         };
+        // After every draw the kind makes, so the rest of the run keeps its schedule.
+        if self.fault_policy.suppressed.contains(landed_as(&kind)) {
+            return Ok(None);
+        }
 
         // A freeze goes through the scenario's fault list, so drawn and written faults share code.
         // The kill is immediate, since its exact moment matters.
@@ -1302,6 +1425,15 @@ impl DistributedWorld {
             let at =
                 Tick(ctx.world_now().get().saturating_add(self.fault_policy.restart_after.get()));
             if let Some(back) = self.fault_policy.kinds.recovery(&NodeFaultKind::Kill) {
+                // A suppressed restore still brings the node back, from what its disk kept.
+                let back = match back {
+                    NodeFaultKind::RestartFromSnapshot { .. }
+                        if self.fault_policy.suppressed.contains(FaultKind::NodeRestart) =>
+                    {
+                        NodeFaultKind::Restart
+                    }
+                    other => other,
+                };
                 self.schedule_fault(at, node, back);
             }
         }
@@ -1325,6 +1457,11 @@ impl DistributedWorld {
     #[must_use]
     pub fn with_fault_policy(mut self, policy: FaultPolicy) -> Self {
         self.fault_policy = policy;
+        self.net.follow_policy(policy.disarm_after, policy.suppressed);
+        // Either order of building: probes set before the policy learn the window here.
+        if let (Some(observer), Some(closes)) = (self.observer.as_mut(), policy.disarm_after) {
+            observer.judge_stalls_from(closes);
+        }
         self
     }
 
@@ -2546,6 +2683,9 @@ impl DistributedWorld {
                 }
                 // Kept on the writing node, where projections read.
                 self.node_world(node).keep_written_out(&bytes);
+                if let Some(tails) = self.tails.as_mut() {
+                    tails.wrote(node.get(), &bytes);
+                }
                 let ret = bytes.len() as i64;
                 ctx.emit(EventKind::Syscall {
                     nr,

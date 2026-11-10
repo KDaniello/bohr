@@ -33,7 +33,7 @@ pub use config::{
 pub use distributed::{
     DiskConfig, DistributedWorld, DrawnFaults, DurabilityConfig, FaultPolicy, GreyWindow,
     LivenessConfig, NetworkConfig, NodeFaultKind, ScheduledNodeFault, ScheduledPartition,
-    Targeting, Topology, sdk_violation_code,
+    Suppressed, Targeting, Topology, sdk_violation_code,
 };
 pub use minimal::{MinimalWorld, OutputSink};
 pub use oracle::{

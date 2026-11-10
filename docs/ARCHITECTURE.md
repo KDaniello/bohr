@@ -770,6 +770,15 @@ drawn moments, so a revert undone between two askings is not seen. And a client 
 signed votes cannot be judged for double-signing — reading consensus messages off the wire is
 protocol parsing per client, and none is built in.
 
+**A verdict comes after the oracle, and is not one.** The oracle says a run broke a rule; triage
+says whose the breakage is: the target's, the bench's (a node whose role is not `target`), a mode
+the pack declares non-production, a limit of bohr, a refusal a fault made correct, or the model's.
+It reads only the bundle and the pack of its binary, and, where asked, re-runs the bundle once per
+kind of fault that landed at nought odds (`bohr ablate`). It never changes an outcome, a code or a
+digest: a run that broke a rule still did, and its bundle replays to the same digest. Kept apart
+from the oracle because the oracle is in the run and must be deterministic within it, while a
+verdict depends on the pack a host has and on runs the original never made.
+
 ### 5.18. Handing a run to a debugger is inspection, not resumption
 
 `bohr replay --break-at` stops a reproduced run at a named event and releases the guests for an

@@ -25,27 +25,12 @@ fn write(out: &str, text: &str) -> Result<(), CliError> {
 ///
 /// Matched by digest, since two packs can build programs with the same name.
 fn source_of(model: &RunModel) -> Option<Source> {
-    let digests: Vec<&str> = model.binaries.iter().map(|record| bare(&record.blake3)).collect();
-    let mut names: Vec<String> = std::fs::read_dir("targets")
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("target.toml").is_file())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names.into_iter().find_map(|name| {
-        let pack = crate::targets::resolve(&name).ok()?;
-        digests.contains(&pack.digest.as_str()).then_some(Source {
-            pack: pack.name,
-            repository: pack.repository,
-            commit: pack.commit,
-        })
+    let digests: Vec<&str> = model.binaries.iter().map(|record| record.blake3.as_str()).collect();
+    crate::targets::pack_of(&digests).map(|pack| Source {
+        pack: pack.name,
+        repository: pack.repository,
+        commit: pack.commit,
     })
-}
-
-/// A digest without its `blake3:` prefix, as a pack writes it.
-fn bare(digest: &str) -> &str {
-    digest.strip_prefix("blake3:").unwrap_or(digest)
 }
 
 /// Writes the disclosure draft for one bundle.
@@ -141,16 +126,4 @@ pub(crate) fn sarif(path: &str, out: &str) -> Result<u8, CliError> {
         println!("{out} · {} result{}", findings.len(), if findings.len() == 1 { "" } else { "s" });
     }
     Ok(crate::exit::CLEAN)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The two spellings of one digest name one build.
-    #[test]
-    fn a_bundle_digest_matches_the_pack_that_wrote_it_bare() {
-        assert_eq!(bare("blake3:b1f4"), "b1f4");
-        assert_eq!(bare("b1f4"), "b1f4");
-    }
 }

@@ -64,6 +64,8 @@ fn run(budget_per_run: Option<u32>, seed: u64) -> Judged {
             // Short, so the node is back in time to be killed again.
             restart_after: Tick(Tick::MILLISECOND.get() / 4),
             arm_after: Tick(0),
+            disarm_after: None,
+            suppressed: bohr_world::Suppressed::NONE,
             budget_per_run,
             kinds: DrawnFaults::default(),
         },

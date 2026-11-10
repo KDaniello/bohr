@@ -24,6 +24,16 @@ struct RawPack {
     bench: Option<RawBench>,
     /// The checks `bohr check` holds the pack to, read by [`crate::subjects`].
     check: Option<toml::Table>,
+    scope: Option<RawScope>,
+}
+
+/// Which of the program's modes are not run in production.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScope {
+    /// Words of a command line that put the program in a mode nobody runs in production.
+    #[serde(default)]
+    nonproduction: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +95,9 @@ pub(crate) struct Pack {
     pub(crate) oracle: String,
     /// The pack's `[check]` table, as written.
     pub(crate) checks: Option<toml::Table>,
+    /// Command-line words that put the program in a mode nobody runs in production; a finding of
+    /// a run with one of them is out of scope.
+    pub(crate) nonproduction: Vec<String>,
 }
 
 fn refused(text: String) -> CliError {
@@ -100,12 +113,18 @@ fn installed(name: &str) -> PathBuf {
     if here.is_file() {
         return here;
     }
-    let home = std::env::var_os("BOHR_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bohr")));
-    home.map(|home| home.join("packs/targets").join(name).join("target.toml"))
+    installed_packs()
+        .map(|packs| packs.join(name).join("target.toml"))
         .filter(|file| file.is_file())
         .unwrap_or(here)
+}
+
+/// Where a release's packs are installed: `$BOHR_HOME/packs/targets`, or `~/.bohr/packs/targets`.
+fn installed_packs() -> Option<PathBuf> {
+    std::env::var_os("BOHR_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bohr")))
+        .map(|home| home.join("packs/targets"))
 }
 
 /// Finds a pack by name under `targets/`, or by the path of its directory or its file.
@@ -154,6 +173,7 @@ pub(crate) fn resolve(name: &str) -> Result<Pack, CliError> {
         scenario: root.join(raw.run.scenario),
         oracle: raw.judge.oracle,
         checks: raw.check,
+        nonproduction: raw.scope.unwrap_or_default().nonproduction,
         root,
     })
 }
@@ -216,9 +236,44 @@ fn build(pack: &Pack) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The pack, here or installed, whose binary has one of `digests`, where one has.
+///
+/// Packs are tried in name order, so two packs of one binary resolve the same way every time.
+pub(crate) fn pack_of(digests: &[&str]) -> Option<Pack> {
+    let digests: Vec<String> = digests.iter().map(|d| bare(d).to_owned()).collect();
+    // The packs here and the packs a release installed, as `resolve` finds them.
+    let mut names: Vec<String> = [Some(PathBuf::from("targets")), installed_packs()]
+        .into_iter()
+        .flatten()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("target.toml").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names.into_iter().find_map(|name| {
+        let pack = resolve(&name).ok()?;
+        digests.contains(&pack.digest).then_some(pack)
+    })
+}
+
+/// A digest without its `blake3:` prefix, as a pack writes it.
+fn bare(digest: &str) -> &str {
+    digest.strip_prefix("blake3:").unwrap_or(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two spellings of one digest name one build.
+    #[test]
+    fn a_bundle_digest_matches_the_pack_that_wrote_it_bare() {
+        assert_eq!(bare("blake3:b1f4"), "b1f4");
+        assert_eq!(bare("b1f4"), "b1f4");
+    }
 
     fn pack_in(dir: &Path, text: &str) -> Result<Pack, CliError> {
         let at = dir.join("targets").join("demo");

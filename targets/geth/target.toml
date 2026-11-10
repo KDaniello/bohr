@@ -12,6 +12,11 @@ blake3 = "7db156f6acbb64101c2940935b95f03fc3b85603735ecd23b57a991f4fad3827"
 [run]
 scenario = "targets/geth/scenario.toml"
 
+# The developer mode runs one node that mines on its own, opens its database read-only before it
+# starts, and is used by nobody in production; a finding of a run in it is out of scope.
+[scope]
+nonproduction = ["--dev"]
+
 [judge]
 oracle = "chain"
 

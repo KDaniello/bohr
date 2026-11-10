@@ -115,6 +115,10 @@ bank: build ## Replay every banked finding to its digest (findings/bank, private
 claims: ## Every claim the tool makes, held or failed, with its number (docs/EVIDENCE.md)
 	scripts/claims.sh
 
+.PHONY: brand
+brand: ## The brand's SVG files in docs/assets, drawn from bohr's own tape (examples/brand)
+	$(CARGO) run --quiet --manifest-path examples/brand/Cargo.toml -- docs/assets $(RELEASE)
+
 .PHONY: policy-comparison
 policy-comparison: build guests ## Which scheduler reaches the seeded defects (docs/TESTING.md 8)
 	scripts/policy-comparison.sh

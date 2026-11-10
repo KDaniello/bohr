@@ -26,6 +26,7 @@ pub(crate) struct Hunt {
     pub(crate) pack: String,
     pub(crate) time: Option<Duration>,
     pub(crate) runs: Option<u64>,
+    pub(crate) quiet_runs: Option<u64>,
     pub(crate) jobs: usize,
     pub(crate) seeds: Option<(u64, u64)>,
     pub(crate) no_faults: bool,
@@ -34,6 +35,12 @@ pub(crate) struct Hunt {
     pub(crate) binary: Option<String>,
     pub(crate) master_seed: u64,
 }
+
+/// A hunt with no budget stops after this many runs that added no new group of findings.
+const DEFAULT_QUIET_RUNS: u64 = 1000;
+
+/// A hunt with no budget stops after this long, whatever it is still finding.
+const DEFAULT_TIME: Duration = Duration::from_secs(15 * 60);
 
 fn refused(text: String) -> CliError {
     CliError::Usage(format!("BOHR-1002: {text}"))
@@ -215,16 +222,23 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
                 "--config".into(),
                 absolute(&scenario),
             ];
-            if let Some(time) = request.time {
+            // Without a budget a hunt is a short pass that stops when it has nothing new: most of
+            // what a campaign finds, it finds in its first runs.
+            let unbudgeted =
+                request.time.is_none() && request.runs.is_none() && request.quiet_runs.is_none();
+            let (time, quiet) = if unbudgeted {
+                (Some(DEFAULT_TIME), Some(DEFAULT_QUIET_RUNS))
+            } else {
+                (request.time, request.quiet_runs)
+            };
+            if let Some(time) = time {
                 args.extend(["--time".into(), format!("{}s", time.as_secs().max(1))]);
             }
             if let Some(runs) = request.runs {
                 args.extend(["--runs".into(), runs.to_string()]);
             }
-            if request.time.is_none() && request.runs.is_none() {
-                return Err(CliError::Usage(
-                    "BOHR-1001: a hunt needs a budget: --time, --runs or --seeds".to_owned(),
-                ));
+            if let Some(quiet) = quiet {
+                args.extend(["--quiet-runs".into(), quiet.to_string()]);
             }
             args.extend(["--".into(), absolute(&binary)]);
             let mut campaign = Command::new(&me);
@@ -243,7 +257,8 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
     };
     if !crate::json::on() {
         if findings.is_dir() {
-            crate::findings::findings(&findings.to_string_lossy())?;
+            // Ablated: a campaign's groups are few, and a verdict without it is a guess.
+            crate::findings::findings(&findings.to_string_lossy(), true)?;
         }
         return Ok(code);
     }
@@ -275,7 +290,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
     // The groups `bohr findings` would print, inside this object.
     if findings.is_dir()
         && let (serde_json::Value::Object(fields), serde_json::Value::Object(groups)) =
-            (&mut body, crate::findings::groups_json(&findings.to_string_lossy())?)
+            (&mut body, crate::findings::groups_json(&findings.to_string_lossy(), true)?)
     {
         fields.extend(groups);
     }

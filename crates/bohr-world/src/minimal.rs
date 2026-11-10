@@ -500,6 +500,10 @@ pub struct MinimalWorld {
     ///
     /// Kept only when a projection will read it.
     stdout: Option<Vec<u8>>,
+    /// The end of what the guest wrote to standard output and error, for a bundle to keep.
+    ///
+    /// Kept only for a run whose log is kept; a cluster keeps its own for every node.
+    tails: Option<bohr_trace::OutputTails>,
     /// What `getcwd` answers.
     ///
     /// Part of the filesystem state.
@@ -574,6 +578,7 @@ impl MinimalWorld {
             ended: BTreeSet::new(),
             transfer: Vec::new(),
             stdout: None,
+            tails: None,
             cwd: "/".to_owned(),
             surveying: None,
             timeouts_armed: false,
@@ -594,6 +599,19 @@ impl MinimalWorld {
     pub fn keeping_output(mut self) -> Self {
         self.stdout = Some(Vec::new());
         self
+    }
+
+    /// The same world, keeping the end of what the guest writes out for its bundle.
+    #[must_use]
+    pub fn keeping_tails(mut self) -> Self {
+        self.tails = Some(bohr_trace::OutputTails::new());
+        self
+    }
+
+    /// The end of what the guest wrote out, where the world kept it.
+    #[must_use]
+    pub fn output_tails(&self) -> Vec<bohr_trace::OutputTail> {
+        self.tails.as_ref().map(bohr_trace::OutputTails::records).unwrap_or_default()
     }
 
     /// Adds bytes the guest wrote out to what a projection will read.
@@ -912,6 +930,9 @@ impl MinimalWorld {
             let room = crate::MAX_PROJECTION_BYTES.saturating_sub(kept.len());
             kept.extend_from_slice(&self.transfer[..room.min(self.transfer.len())]);
         }
+        if let Some(tails) = self.tails.as_mut() {
+            tails.wrote(0, &self.transfer);
+        }
         Ok((len as i64, Some(short_digest(&self.transfer))))
     }
 
@@ -971,8 +992,11 @@ impl MinimalWorld {
                 let _ = sink.write_all(bytes);
                 let _ = sink.flush();
             }
-            // The same buffer `write_out` fills.
+            // The same buffers `write_out` fills.
             self.keep_written_out(bytes);
+            if let Some(tails) = self.tails.as_mut() {
+                tails.wrote(0, bytes);
+            }
             return (bytes.len() as i64, Some(short_digest(bytes)));
         }
         let Some(file) = self.open.get(&fd).copied() else {

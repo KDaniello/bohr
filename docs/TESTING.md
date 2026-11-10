@@ -421,12 +421,24 @@ the heuristic choosing its moments is what needs the work — this is where that
 **The bank.** Every finding in another project is kept in `findings/bank/`, private and never
 published: its bundles, the very binaries it was found on — a rebuilt binary is another program,
 and a finding banked by digest alone is one nobody can replay — and the command that found it.
-`make bank` replays each bundle to its digest and fails on one that no longer does, because a
+The probe a network finding ran with is among those binaries: it ships with bohr, so every release
+builds a new one. `make bank` replays each bundle to its digest and fails on one that no longer does, because a
 bundle that stops replaying means the tool changed what a stored run means.
 
 **Claims.** `make claims` prints each claim the tool makes with the figure that decides it, read
 from `benches/baseline.toml`: held, failed, or not measured where no figure was recorded. A claim
 is never reported as held for want of a measurement.
+
+**The clean run.** Every pack is run with `bohr hunt <pack> --no-faults --runs 200`, every drawn and
+written fault removed. A target that fails with no adversity was failing before the tool touched
+it, so any finding here is the bench's or the model's, and the gate allows no target defect. Kept by
+every version, because a pack whose clean run finds something makes every finding of its campaign
+suspect.
+
+**Ablation names what was needed.** On the seeded defects whose injected fault is known, `bohr
+ablate` must name that fault among the necessary kinds. A finding's verdict rests on the kinds
+ablation names, so an ablation that misses the injected one would give a wrong verdict with a
+straight face.
 
 **Reduction on a real client.** A fixture's ratio is not a reducer's ratio: `PingPong` shrinks from
 49,477 events to 18 because nothing in it costs events but the faults, and a real client spends

@@ -1483,6 +1483,25 @@ rss_mb_cometbft = { minutes_1_5 = 415, minutes_26_30 = 461, minutes_56_60 = 634 
 rss_sampling = "the sum over every bohr process once a minute; three adjacent geth samples read 81, 155 and 109 MB"
 runs_per_minute_geth = { minutes_8_12 = 48.0, minutes_26_30 = 55.8 }                 # P9.2 holds; minutes 1-5 not sampled
 
+# v0.9.1 on the 8-core 4 GB VM. What the triage said of each private finding is in
+# findings/baseline.toml; here only what the gates measured.
+[v0_9_1.gates]
+G9_1_1 = "redb and CometBFT re-found and each card names its place; geth's pack runs --dev and its findings are out of scope"
+G9_1_2 = "3 of 3 v0.9 findings given the verdict the gate names, in 7 s with ablation"
+G9_1_3 = "redb, CometBFT, geth, reth: 200 runs each with --no-faults, 0 findings; op-reth not built and not run"
+G9_1_4 = "FAILS: 7 of 10; of the rest, one seeded defect fires with no fault at all, one needs any of net_drop or node_kill, and one was not reached in 1024 runs"
+G9_1_5 = "FAILS: two groups reached at 40 s and 29 s, within 10% of v0.9's campaigns; a group v0.9 first reached at 19% of its campaign is missed by the default quiet pass"
+G9_1_6 = "a four-validator campaign held 143 MB over 28 minutes and 64 runs, where it had grown 250 MB a minute and been killed at 3.3 GB; it found nothing, so a network finding's save is not measured"
+G9_1_7 = "no fault fires at or after the close, in arm_after.rs; the 100-seed run of scenario-faults.toml was not made"
+
+[v0_9_1.perf]                                                                        # P9.1.1-P9.1.3, against v0.8.0's binary: v0.9.0 was not built on this host
+redb_2000_runs_j4_ms = { v0_8 = 31_317, v0_9_1 = 30_675 }                            # P9.1.1: 102% of the runs a minute
+storm_200k_ms = { v0_8 = 836, v0_9_1 = 794 }                                         # P9.1.2
+startup_ms = { v0_8 = 3, v0_9_1 = 3 }
+redb_64_runs_ms = { j1 = { v0_8 = 2_950, v0_9_1 = 2_841 }, j4 = { v0_8 = 809, v0_9_1 = 831 } }
+peak_rss_mb = { v0_8 = 30.3, v0_9_1 = 30.6 }
+ablation = "three findings ablated and triaged in 7 s"                               # P9.1.3
+
 # The walls: what stops each v1.0 target, one `bohr survey` each, written by scripts/walls.sh and
 # by nothing else. A section is one run at one seed and a lower bound twice over (docs/API.md §7);
 # `stopped_by` is the first thing a target cannot get past, and the work v0.3 and v0.5 start from.

@@ -26,12 +26,19 @@ const SECTION_FLAG_ZSTD: u32 = 1;
 const COMPRESS_THRESHOLD: usize = 512;
 
 /// Compression level, fixed so every build writes the same bytes.
-const COMPRESS_LEVEL: i32 = 3;
+pub(crate) const COMPRESS_LEVEL: i32 = 3;
 
 /// The largest a section may unpack to.
 ///
 /// Sections are hashed in memory. Far above any real section; it bounds hostile files.
 const MAX_SECTION_BYTES: u64 = 1 << 30;
+
+/// The largest the event log may unpack to.
+///
+/// Four Go validators write about 400 000 events, 40 MB, per virtual second, so a minute of a
+/// network passes the bound every other section keeps. Still a bound: a file that claims more is
+/// refused before anything is allocated.
+const MAX_EVENTS_BYTES: u64 = 64 << 30;
 
 /// Domain separator for the run identifier.
 const RUN_ID_CONTEXT: &[u8] = b"bohr/bundle/run-id/v1";
@@ -68,6 +75,10 @@ pub enum SectionId {
     ///
     /// Present only where one tape drove more than one implementation. See `docs/API.md` §4.2.
     Executions = 12,
+    /// The end of what each incarnation of each node wrote to standard output and error, as JSON.
+    ///
+    /// Outside the trace digest: the events digest every byte written, this keeps the text.
+    GuestOutput = 13,
 }
 
 /// One implementation's run, within a bundle that holds several.
@@ -396,13 +407,11 @@ fn compress(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// The recorded length is never trusted with an allocation: unpacking is incremental and stops
 /// one byte past it.
-fn decompress(payload: &[u8], original: u64) -> Result<Vec<u8>, String> {
+fn decompress(payload: &[u8], original: u64, bound: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
 
-    if original > MAX_SECTION_BYTES {
-        return Err(format!(
-            "claims {original} bytes, past the {MAX_SECTION_BYTES} a reader holds"
-        ));
+    if original > bound {
+        return Err(format!("claims {original} bytes, past the {bound} a reader holds"));
     }
     let mut out = Vec::new();
     let decoder = zstd::stream::read::Decoder::new(payload).map_err(|e| e.to_string())?;
@@ -432,6 +441,53 @@ pub fn derive_run_id(seed: Seed, trace_digest: Digest) -> [u8; 16] {
 #[derive(Debug, Default)]
 pub struct BundleWriter {
     sections: BTreeMap<u32, Vec<u8>>,
+    /// Sections already compressed into a file, copied into the bundle as they are.
+    spooled: BTreeMap<u32, SpoolEntry>,
+}
+
+/// Where a spooled section is and what its table entry says.
+#[derive(Clone, Debug)]
+struct SpoolEntry {
+    path: std::path::PathBuf,
+    stored: u64,
+    original: u64,
+    hash: Digest,
+}
+
+/// One section as the table and the payload see it.
+enum Payload<'a> {
+    Memory { flags: u32, bytes: Cow<'a, [u8]>, original: u64, hash: Digest },
+    File(&'a SpoolEntry),
+}
+
+impl Payload<'_> {
+    const fn flags(&self) -> u32 {
+        match self {
+            Self::Memory { flags, .. } => *flags,
+            Self::File(_) => SECTION_FLAG_ZSTD,
+        }
+    }
+
+    fn stored(&self) -> u64 {
+        match self {
+            Self::Memory { bytes, .. } => bytes.len() as u64,
+            Self::File(entry) => entry.stored,
+        }
+    }
+
+    const fn original(&self) -> u64 {
+        match self {
+            Self::Memory { original, .. } => *original,
+            Self::File(entry) => entry.original,
+        }
+    }
+
+    const fn hash(&self) -> &Digest {
+        match self {
+            Self::Memory { hash, .. } => hash,
+            Self::File(entry) => &entry.hash,
+        }
+    }
 }
 
 impl BundleWriter {
@@ -443,7 +499,31 @@ impl BundleWriter {
 
     /// Adds or replaces a section.
     pub fn section(&mut self, id: SectionId, bytes: Vec<u8>) -> &mut Self {
+        self.spooled.remove(&(id as u32));
         self.sections.insert(id as u32, bytes);
+        self
+    }
+
+    /// Adds or replaces a section from a finished spool, copied from its file when written.
+    ///
+    /// The spool must outlive the writing: its file goes when it is dropped.
+    pub fn spooled_section(&mut self, id: SectionId, spooled: &crate::Spooled) -> &mut Self {
+        self.sections.remove(&(id as u32));
+        self.spooled.insert(
+            id as u32,
+            SpoolEntry {
+                path: spooled.path().to_owned(),
+                stored: spooled.stored,
+                original: spooled.original,
+                hash: spooled.hash,
+            },
+        );
+        self
+    }
+
+    /// Takes a section out, where it is present.
+    pub fn remove(&mut self, id: SectionId) -> &mut Self {
+        self.sections.remove(&(id as u32));
         self
     }
 
@@ -460,49 +540,94 @@ impl BundleWriter {
     /// Panics on more sections than the header's count can hold.
     #[must_use]
     pub fn finish(&self, run_id: [u8; 16]) -> Vec<u8> {
-        let count = self.sections.len();
+        let mut out = Vec::new();
+        // Writing to memory fails only where a spooled file has gone, which is a caller's bug.
+        self.write_to(&mut out, run_id).expect("a bundle is written to memory");
+        out
+    }
+
+    /// Writes the container to `out`, copying spooled sections from their files.
+    ///
+    /// No section is held twice: an in-memory one is compressed once, a spooled one is streamed.
+    ///
+    /// # Errors
+    ///
+    /// `out` refuses a write, or a spooled section's file cannot be read.
+    ///
+    /// # Panics
+    ///
+    /// Panics on more sections than the header's count can hold.
+    pub fn write_to(&self, out: &mut impl std::io::Write, run_id: [u8; 16]) -> std::io::Result<()> {
+        let mut ids: Vec<u32> = self.sections.keys().chain(self.spooled.keys()).copied().collect();
+        ids.sort_unstable();
+        let count = ids.len();
         assert!(
             u16::try_from(count).is_ok(),
             "a bundle cannot hold more sections than its header can count"
         );
         let table_bytes = count * SECTION_ENTRY_BYTES;
-        let mut out = Vec::with_capacity(BUNDLE_HEADER_BYTES + table_bytes);
+        let mut head = Vec::with_capacity(BUNDLE_HEADER_BYTES + table_bytes);
 
-        out.extend_from_slice(&BUNDLE_MAGIC);
-        out.extend_from_slice(&BUNDLE_FORMAT.to_le_bytes());
-        out.extend_from_slice(&(count as u16).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&run_id);
-        debug_assert_eq!(out.len(), BUNDLE_HEADER_BYTES);
+        head.extend_from_slice(&BUNDLE_MAGIC);
+        head.extend_from_slice(&BUNDLE_FORMAT.to_le_bytes());
+        head.extend_from_slice(&(count as u16).to_le_bytes());
+        head.extend_from_slice(&0u32.to_le_bytes());
+        head.extend_from_slice(&run_id);
+        debug_assert_eq!(head.len(), BUNDLE_HEADER_BYTES);
+
+        let payloads: Vec<(u32, Payload<'_>)> = ids
+            .iter()
+            .map(|id| {
+                let payload = match (self.sections.get(id), self.spooled.get(id)) {
+                    (Some(bytes), _) => {
+                        // Compressed only above the threshold and only if it shrinks; borrowed
+                        // when stored as is, so a large section is not copied.
+                        let (flags, packed) = match compress(bytes) {
+                            Some(packed) => (SECTION_FLAG_ZSTD, Cow::Owned(packed)),
+                            None => (0, Cow::Borrowed(bytes.as_slice())),
+                        };
+                        Payload::Memory {
+                            flags,
+                            bytes: packed,
+                            original: bytes.len() as u64,
+                            hash: Digest::of(bytes),
+                        }
+                    }
+                    (None, Some(entry)) => Payload::File(entry),
+                    (None, None) => unreachable!("every id came from one of the two maps"),
+                };
+                (*id, payload)
+            })
+            .collect();
 
         let mut payload_offset = (BUNDLE_HEADER_BYTES + table_bytes) as u64;
-        // Borrowed when stored as is, so a large trace is not copied.
-        let mut payloads: Vec<Cow<'_, [u8]>> = Vec::with_capacity(count);
-        for (id, bytes) in &self.sections {
-            let original = bytes.len() as u64;
-            let hash = Digest::of(bytes);
-            // Compressed only above the threshold and only if it shrinks.
-            let (flags, payload) = match compress(bytes) {
-                Some(packed) => (SECTION_FLAG_ZSTD, Cow::Owned(packed)),
-                None => (0, Cow::Borrowed(bytes.as_slice())),
-            };
-            let stored = payload.len() as u64;
-            out.extend_from_slice(&id.to_le_bytes());
-            out.extend_from_slice(&flags.to_le_bytes());
-            out.extend_from_slice(&payload_offset.to_le_bytes());
-            out.extend_from_slice(&stored.to_le_bytes());
-            out.extend_from_slice(&original.to_le_bytes());
+        for (id, payload) in &payloads {
+            head.extend_from_slice(&id.to_le_bytes());
+            head.extend_from_slice(&payload.flags().to_le_bytes());
+            head.extend_from_slice(&payload_offset.to_le_bytes());
+            head.extend_from_slice(&payload.stored().to_le_bytes());
+            head.extend_from_slice(&payload.original().to_le_bytes());
             // Hashed over the original bytes.
-            out.extend_from_slice(hash.as_bytes());
-            payload_offset += stored;
-            payloads.push(payload);
+            head.extend_from_slice(payload.hash().as_bytes());
+            payload_offset += payload.stored();
         }
-        // Reserve the known total to avoid regrowth.
-        out.reserve(payload_offset as usize - out.len());
-        for bytes in payloads {
-            out.extend_from_slice(&bytes);
+        out.write_all(&head)?;
+        for (_, payload) in payloads {
+            match payload {
+                Payload::Memory { bytes, .. } => out.write_all(&bytes)?,
+                Payload::File(entry) => {
+                    let copied = std::io::copy(&mut std::fs::File::open(&entry.path)?, out)?;
+                    if copied != entry.stored {
+                        return Err(std::io::Error::other(format!(
+                            "{} holds {copied} bytes, {} recorded",
+                            entry.path.display(),
+                            entry.stored
+                        )));
+                    }
+                }
+            }
         }
-        out
+        Ok(())
     }
 }
 
@@ -571,7 +696,12 @@ impl Bundle {
 
             let raw = &bytes[start..end];
             let payload = if flags & SECTION_FLAG_ZSTD != 0 {
-                decompress(raw, original)
+                let bound = if id == SectionId::Events as u32 {
+                    MAX_EVENTS_BYTES
+                } else {
+                    MAX_SECTION_BYTES
+                };
+                decompress(raw, original, bound)
                     .map_err(|reason| TraceError::SectionUnreadable { id, reason })?
             } else {
                 if stored != original {
@@ -1161,5 +1291,27 @@ mod tests {
     fn created_utc_follows_source_date_epoch() {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn a_spooled_section_reads_back_as_the_bytes_written() {
+        use std::io::Write as _;
+        let events: Vec<u8> = (0..300_000u32).flat_map(|i| (i % 97).to_le_bytes()).collect();
+        let path = std::env::temp_dir().join("bohr-bundle-spool-test.zst");
+        let mut spool = crate::Spool::create(&path).expect("a spool");
+        spool.write_all(&events).expect("written");
+        let spooled = spool.finish().expect("finished");
+
+        let mut writer = BundleWriter::new();
+        writer
+            .section(SectionId::Manifest, b"{}".to_vec())
+            .spooled_section(SectionId::Events, &spooled)
+            .section(SectionId::Notes, b"a note".to_vec());
+        let mut written = Vec::new();
+        writer.write_to(&mut written, [3; 16]).expect("written");
+
+        let bundle = Bundle::parse(&written).expect("a bundle");
+        assert_eq!(bundle.section(SectionId::Events), Some(events.as_slice()));
+        assert_eq!(bundle.section(SectionId::Notes), Some(b"a note".as_slice()));
     }
 }
