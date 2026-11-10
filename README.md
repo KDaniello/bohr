@@ -2,163 +2,192 @@
 
 # bohr
 
-**Deterministic simulation testing for unmodified Linux programs.
-Same seed, same bytes, every time.**
+**Deterministic simulation testing for unmodified Linux programs.**
 
-[![CI](https://github.com/KDaniello/bohr/actions/workflows/test.yml/badge.svg)](https://github.com/KDaniello/bohr/actions/workflows/test.yml)
-[![Lint](https://github.com/KDaniello/bohr/actions/workflows/lint.yml/badge.svg)](https://github.com/KDaniello/bohr/actions/workflows/lint.yml)
-[![Determinism](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml/badge.svg)](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE-APACHE)
+One seed defines one execution: the same bytes, the same schedule, the same faults, on every machine.
+
+[![CI](https://github.com/KDaniello/bohr/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/test.yml)
+[![Determinism](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml)
+[![Nightly](https://github.com/KDaniello/bohr/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/nightly.yml)
+[![SDK conformance](https://github.com/KDaniello/bohr/actions/workflows/sdk.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/sdk.yml)
 
 [Overview](./docs/OVERVIEW.md) ·
 [Architecture](./docs/ARCHITECTURE.md) ·
 [API](./docs/API.md) ·
 [Determinism map](./docs/DETERMINISM.md) ·
 [Testing](./docs/TESTING.md) ·
-[Evidence](./docs/EVIDENCE.md)
+[Evidence](./docs/EVIDENCE.md) ·
+[Changelog](./CHANGELOG.md)
 
 </div>
 
 ---
 
-## What is Bohr
+## Overview
 
-Bohr runs an unmodified Linux program in a deterministic world. Time, randomness, thread
-scheduling, the network and the disk all come from Bohr, and every nondeterministic decision is
-drawn from one string of bytes — the **entropy tape**. One 64-bit seed defines a whole execution.
+bohr runs a Linux program as its project releases it, inside a deterministic world. The world
+supplies time, randomness, thread scheduling, the network and the disk. Every decision the world
+makes is drawn from one string of bytes, the **entropy tape**, and one 64-bit seed defines the tape.
 
-On top of that sit network delays and partitions, process kills, torn writes, stalled disks,
-reordered threads, and a search for the schedule that breaks the program. A finding is a file that
-replays on another machine, reduced to the smallest scenario that still fails.
+On that world, bohr kills and restarts nodes, partitions and degrades the network, tears and
+reorders unsynced writes, fills the disk, fails `fsync`, refuses allocations and moves the clock. A
+campaign searches for the tape that breaks the program. Every finding is a bundle that replays to
+the same digest on another machine, shrinks to the fewest faults that still break the program, and
+stages on a real host without bohr.
 
-## What works today
+## Features
 
-- **A cluster in one world.** Five `raft-rs` nodes driven through a one-way partition and back:
-  100 runs, 16,016 events each, one digest.
-- **Real programs, as released.** `redb` 2.6.3 under a crash campaign; `tokio` 1.53.1 and a TCP
-  service on it, 100 runs agreeing; a 103 MB Ethereum execution client through 333,485 events of
-  its node command.
-- **Runs travel.** 9 of 9 bundles written by a Windows build replay on a Linux one, digest for
-  digest.
-- **Findings shrink.** A fixture's 49,477 events reduce to 18 in 20 replays and reproduce 100 times
-  of 100.
-- **Findings in other projects.** Two, in widely deployed open-source software, are with their
-  maintainers and stay private until fixed.
+- **Unmodified programs.** Linux x86-64 binaries, static or dynamically linked, run under a
+  `ptrace` supervisor with a seccomp pre-filter. No source changes, no rebuild, no hypervisor.
+- **Clusters in one world.** Several programs run as nodes of one network, each with its own
+  address, disk and clock, from a prepared state directory pinned by digest.
+- **Faults.** Process kill and freeze; network partition, drop, delay, duplication, reordering and
+  corruption; torn and reordered writes, disk stalls, `ENOSPC` and `EIO`; `ENOMEM`; clock steps and
+  drift; restore from an older snapshot; chain reorganisation.
+- **Oracles.** Crashes, hangs, SDK assertions, durability of acknowledged writes, liveness, and
+  probes over a node's JSON-RPC: finality, agreement between nodes, a moving head, one signature
+  per height.
+- **Target packs.** `bohr hunt <pack>` builds or checks the pinned binary of a target, runs its
+  campaign and groups its findings.
+- **Findings that explain themselves.** `bohr explain` gives the verdict with its code and the
+  faults, restarts and failed tasks before it. `bohr findings` groups bundles by cause, each group
+  led by its smallest bundle.
+- **Reduction.** `bohr reduce` shrinks the tape and the faults of a finding while it keeps its
+  signature.
+- **Confirmation on a real host.** `bohr confirm` writes a script that stages the recorded faults
+  with real processes, `kill -9` and a dm-flakey device, and reports the reproduction rate.
+- **Reports.** A self-contained HTML page, a disclosure draft in Markdown, SARIF 2.1.0, and the
+  event log as JSON Lines.
+- **Automation.** Every command takes `--json`; `bohr mcp` serves the commands to coding agents
+  over stdio; `action/` fails a pull request on a finding.
 
-Every figure is in [`benches/baseline.toml`](./benches/baseline.toml) with the host it was taken on,
-a Core i5-12600KF. [EVIDENCE.md](./docs/EVIDENCE.md) gives the key and the command behind each.
+## Supported targets
 
-## Goals and where they stand
+| Target | Version | Language | Pack | Judged by |
+|---|---|---|---|---|
+| go-ethereum | v1.17.10 | Go | `targets/geth` | exit status, JSON-RPC probes of the head |
+| CometBFT | v0.38.26 | Go | `targets/cometbft`, `targets/cometbft-net` | exit status, finality, agreement and liveness probes; a transaction driver on four validators |
+| reth | `3641f10` | Rust | `targets/reth` | exit status |
+| op-reth | v2.6.1 | Rust | `targets/op-reth` | exit status |
+| redb | 2.6.3 | Rust | `targets/redb` | acknowledged, lost and resurrected writes through `examples/redb-hunt` |
 
-| Goal | Target | Measured |
-|---|---|---|
-| Total repeatability | 1000 runs of one seed, one byte-identical trace | 100 runs of a five-node cluster, one digest; `make gate` runs 1000 per guest |
-| Zero changes to the code under test | an existing binary, one command | the programs above, as their projects release them |
-| Usable speed | no worse than 5× native | 3.6× on `redb`'s own test suite, measured outside the tree; 6.6× on the same database under the Windows subsystem for Linux; 57 µs per intercepted syscall |
-| Reproduction that travels | 100 of 100 on another machine | 9 of 9, Windows build to Linux build |
-| Minimal reproducers | 40,000 events to fewer than 20 | met on a fixture, 49,477 to 18; not met on a real client within 20 replays, 1,222,888 to 1,189,704 |
-| Stated limits | every hole recorded with its reason | the [determinism map](./docs/DETERMINISM.md) |
+A pack is a directory: the repository and commit, a build script, the binary's blake3 digest, and
+the scenarios. Any other static Linux program runs with `bohr run` and a scenario of its own.
 
-## What it does not do
+## Measured
 
-- **Judge what it was not told to judge.** It finds crashes, hangs, broken SDK assertions and what a
-  scenario's oracle checks. A clean campaign is a statement about those and nothing else.
-- **Run what it does not model.** An unmodelled syscall ends the run with a named error rather than
-  reaching the host. `RDRAND` is a documented hole.
-- **Run the program under test anywhere but Linux x86-64.** The core builds and tests on macOS and
-  Windows; the guest needs Linux.
-- **Place faults better than uniform choice.** Guided targeting loses to uniform on the defect it
-  was measured against, and the claim is withdrawn ([API.md](./docs/API.md) §5.4).
-- **Contain a hostile program.** It is not a sandbox — see [Security](#security).
+Every figure below is recorded in [`benches/baseline.toml`](./benches/baseline.toml) with its host
+and command; [EVIDENCE.md](./docs/EVIDENCE.md) maps each claim to its check.
 
-## Why
+| Property | Result |
+|---|---|
+| Repeatability | 1 000 runs of one seed under every fault kind: one trace digest |
+| Portability | 9 of 9 bundles written by a Windows build replay on a Linux build, digest for digest |
+| Cost of an intercepted syscall | 4.25 µs |
+| Guest startup | 3.07 ms |
+| Campaign throughput | redb: 64 runs in 3.1 s on one worker, in 1.04 s on four; 98 784 runs in 30 minutes on four workers |
+| Worker memory | 14.4 MB peak |
+| Reduction | a fixture from 49 477 events to 18; a finding in a real client from 27 577 events to 5 923 in 200 replays |
+| Release binary | 8.4 MB, static, the same SHA-256 from two build directories |
 
-The most expensive bugs in server software happen once in a million runs: two threads line up, a
-packet arrives out of order, a node dies between the write and the acknowledgement. Ordinary tests
-miss them, and a test that is sometimes red gets a retry annotation with a real bug behind it.
+## Installation
 
-The teams that need deterministic simulation testing — TigerBeetle, FoundationDB, WarpStream,
-SurrealDB, RisingWave, Resonate — have each written their own, because there is nothing to take off
-the shelf. The one commercial product in the category is closed-source.
+Requirements: Linux x86-64, kernel 5.4 or newer (5.15 recommended), an unprivileged user, and the
+Rust toolchain that [`rust-toolchain.toml`](./rust-toolchain.toml) pins. Packs of Go targets build
+with Go. The full matrix is in [PLATFORMS.md](./docs/PLATFORMS.md).
 
-Bohr is an open implementation at the syscall level: no code changes, no rebuild, no hypervisor.
+```bash
+git clone https://github.com/KDaniello/bohr && cd bohr
+make build                     # target/release/bohr
+make probe                     # the JSON-RPC probe, built static where bohr finds it
+target/release/bohr doctor     # kernel features, ptrace scope, user namespaces, seccomp
+```
 
-## Status
+On Ubuntu 23.10 and later, AppArmor restricts unprivileged user namespaces; `bohr doctor` prints the
+one `sudo` command that allows the binary ([PLATFORMS.md](./docs/PLATFORMS.md) §7).
 
-**v0.4.0, blockchain oracles — not published.** What it does and does not do is fixed in the
-[changelog](./CHANGELOG.md). There is one public release, v1.0, and it ships after findings in real
-projects are confirmed by their maintainers. Until then the tape ABI, the bundle format and the
-command line all change.
-
-## For users
-
-Requirements: Linux x86-64, kernel 5.4 or newer, an ordinary unprivileged user.
-Full matrix in [PLATFORMS.md](./docs/PLATFORMS.md).
-
-Install from a release: the installer checks the signature on `SHA256SUMS` and every file against
-it before anything runs, puts `bohr` and the target packs in `~/.bohr`, and runs `bohr doctor`.
+A published release installs with `bohrup`, which checks the signature on `SHA256SUMS` and every
+file against it before anything runs:
 
 ```bash
 curl -sSf https://github.com/KDaniello/bohr/releases/latest/download/bohrup.sh | sh
-bohr doctor
-bohr hunt redb --time 5m
 ```
 
-On Ubuntu 23.10 and later, `bohr doctor` fails on `namespaces` until AppArmor lets the installed
-binary make them, and prints the one `sudo` command that does ([PLATFORMS.md](./docs/PLATFORMS.md) §7).
+## Quick start
+
+Hunt a target from its pack, then read what it found:
 
 ```bash
-# Hunt a target from its pack: build or check the pinned binary, run its campaign, group findings.
-bohr hunt reth --time 1h -j 8 -o hunt-reth
-bohr findings hunt-reth/findings
-
-# A chain judged by its own JSON-RPC: finality, agreement, liveness, double-signing (API.md §5.9).
-make probe example-chain-toy
-bohr run --seed 1 --config examples/chain-toy/scenario-equivocate.toml -- examples/chain-toy/build/chain-toy-node
-
-# Or start from your own program: a first scenario from what a survey of it finds.
-bohr init --nodes 3 -- ./my-service
-bohr explore --time 30m -j 8 --config scenario.toml --resume campaign -- ./my-service
-
-# Check that this machine can run Bohr, and that the target program is supported.
-bohr doctor --target ./my-service
-
-# Run once, deterministically.
-bohr run --seed 42 -- ./my-service --config prod.toml
-
-# Prove it: 1000 runs, one seed, identical traces.
-bohr run --repeat 1000 --seed 42 -- ./my-service
-
-# Hunt for 30 minutes across 8 workers.
-bohr explore --time 30m -j 8 -- ./my-service
-
-# Reproduce, shrink and explain a finding.
-bohr replay findings/finding-9c2d.bohr
-bohr reduce findings/finding-9c2d.bohr -o minimal.bohr
-bohr report minimal.bohr -o report.html
+bohr hunt redb --runs 2000 -j 2 -o hunt-redb
+bohr findings hunt-redb/findings              # groups, each led by its smallest bundle
+bohr explain  hunt-redb/findings/<bundle>     # the verdict and the faults before it
 ```
 
-In Docker, `ptrace` and the namespaces a guest is isolated in are blocked by the default
-profiles; with no command the image runs `bohr doctor`, which names what is still missing:
+Work with one finding:
 
 ```bash
-docker run --cap-add SYS_PTRACE --security-opt seccomp=unconfined   --security-opt apparmor=unconfined -v "$PWD:/work" ghcr.io/kdaniello/bohr:<version> <command>
+bohr replay  finding.bohr                     # the same run, checked against its digest
+bohr reduce  finding.bohr -o minimal.bohr     # the fewest faults that keep the signature
+bohr report  minimal.bohr -o report.html      # one page with the timeline
+bohr confirm minimal.bohr -o confirm.sh       # stage it on a real host, as root
 ```
 
-In CI, a pull request fails on a finding, with the bundle, a report and SARIF attached:
+Start from your own program:
 
-```yaml
-- uses: KDaniello/bohr/action@v1.0.0
-  with: { pack: redb, time: 5m }
+```bash
+bohr doctor --target ./my-service             # can this host run it, and is it supported
+bohr run --seed 42 -- ./my-service            # one deterministic run
+bohr run --seed 42 --repeat 1000 -- ./my-service
+bohr init --nodes 3 -- ./my-service           # a first scenario.toml from a survey of the program
+bohr explore --time 10m -j 8 --config scenario.toml -- ./my-service
 ```
 
-For a coding agent, `bohr mcp` serves the commands as tools over stdio; every tool answers with
-the object `--json` writes ([API.md](./docs/API.md) §7.12–7.13). Every command takes `--json`.
+## Scenarios
 
-### The optional SDK
+A scenario is a TOML file: the nodes, the prepared state, the disk, the faults and the oracles.
 
-Crashes, hangs and data corruption are found with no annotation at all. The SDK is optional, and it
-tells the tool what the program *means*:
+```toml
+[run]
+horizon_ticks = 25_000_000_000           # 25 s of virtual time
+
+[state]
+dir = "targets/cometbft-net/state"       # copied into every node's filesystem, pinned by digest
+
+[cluster]
+nodes = 5
+programs = [
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node0", "--proxy_app", "kvstore"],
+  # … nodes 1–3 …
+  ["examples/comet-driver/build/comet-driver"],
+]
+
+[disk]
+sync_semantics = "strict"                # a crash keeps exactly what was synced
+reorder_unsynced = true
+
+[faults]
+kill_probability = "1/65536"
+restart_after_ticks = 1_000_000_000
+arm_after_ticks = 3_000_000_000
+budget_per_run = 3
+draw = ["node_kill", "node_freeze", "node_isolate", "node_degrade"]
+
+[[probe]]
+name = "finality"
+port = 26657
+rpc = "block"
+params = {}
+every_ticks = 1_000_000_000
+key = "block.header.height"
+value = "block_id.hash"
+property = "never-reverts"
+```
+
+Every key is documented in [API.md](./docs/API.md) §5, and an unknown key is refused by name.
+
+## SDK
+
+bohr finds crashes, hangs and lost writes with no annotation. The SDK adds what a program means:
 
 ```rust
 bohr::always!(log.is_monotonic(), "log index is monotonic");
@@ -166,64 +195,93 @@ bohr::sometimes!(leader_changed && disk_full, "leader change under a full disk")
 bohr::fault_point("before_commit_ack");
 ```
 
-Outside Bohr every call is a no-op. The output format is **compatible with the Antithesis SDKs**, so
-code already annotated for Antithesis runs here unchanged.
+Every call is a no-op outside bohr. The output format is compatible with the Antithesis SDKs.
+SDKs exist for Rust, Go, Python, C and C#, and one conformance suite holds them to one schema.
 
-The two halves differ: `always` finds breakage, `sometimes` finds gaps in the testing — "in ten
-million runs a leader change under a full disk was never reached".
+## Integrations
 
-## For developers
+| Integration | Interface |
+|---|---|
+| Programs | `--json` on every command: one object with its schema name, `bohr.error/1` on failure |
+| Coding agents | `bohr mcp`: the commands as Model Context Protocol tools over stdio ([API.md](./docs/API.md) §7.12) |
+| CI | `action/`: installs a release, hunts a pack, attaches the bundles, a report and SARIF, fails the job on a finding |
+| Containers | run with `--cap-add SYS_PTRACE --security-opt seccomp=unconfined --security-opt apparmor=unconfined` |
+
+## Limitations
+
+- bohr runs guests on Linux x86-64. The core builds and tests on macOS and Windows.
+- A dynamically linked guest runs with the libraries its loader opens placed in the prepared state
+  ([PLATFORMS.md](./docs/PLATFORMS.md)). `bohr confirm` stages static programs.
+- bohr judges crashes, hangs, SDK assertions, acknowledged writes and the probes a scenario
+  declares. A campaign without a finding is a statement about exactly those checks.
+- An unmodelled syscall ends the run with a named error. `RDRAND` executes on the host; the
+  [determinism map](./docs/DETERMINISM.md) lists it with every other source and its treatment.
+- Guided fault targeting performs at the level of uniform choice on the defect it was measured
+  against ([API.md](./docs/API.md) §5.4).
+- One run uses one host. A network of four Go validators reaches about 20 s of virtual time per run.
+- `ptrace` supervision gives reproducibility and no isolation; see [Security](#security).
+
+## Status
+
+Version 0.9.0. The tape ABI, the bundle format, the SDK schema and the command line change between
+versions; every bundle records the four numbers, and [CHANGELOG.md](./CHANGELOG.md) states each
+change with what still replays. Findings in other projects go to their maintainers first and are
+published after a fix or with their agreement.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [OVERVIEW.md](./docs/OVERVIEW.md) | the machine end to end, in one sitting |
+| [ARCHITECTURE.md](./docs/ARCHITECTURE.md) | components, boundaries, the invariants the code follows |
+| [API.md](./docs/API.md) | the tape ABI, the bundle format, the SDK schema, the CLI, every error code |
+| [DETERMINISM.md](./docs/DETERMINISM.md) | every source of nondeterminism and its treatment |
+| [TESTING.md](./docs/TESTING.md) | the test pyramid, the determinism gates, the seeded defects |
+| [EVIDENCE.md](./docs/EVIDENCE.md) | each claim, its measurement and its command |
+| [PLATFORMS.md](./docs/PLATFORMS.md) | host requirements, kernel features, the guest matrix |
+
+## Development
 
 ```bash
-git clone https://github.com/KDaniello/bohr && cd bohr
-make test-fast    # unit, property and integration — no Linux required, under a minute
+make test-fast    # unit, property and integration tests; any OS, under a minute
 make test         # everything this host can run
-make pr           # exactly what CI runs on a pull request
+make pr           # what CI runs on a pull request
 ```
 
-The core is sans-io: the scheduler, the virtual world, the explorer and the reducer are state
-machines with no syscalls, so most of the codebase builds and tests on macOS and Windows too. Only
-the syscall backend needs Linux — and there green elsewhere is not green: the Linux half is skipped,
-not passed.
-
-[AGENTS.md](./AGENTS.md) maps each area to its files and the check that covers it;
-[OVERVIEW.md](./docs/OVERVIEW.md) describes the machine end to end;
-[ARCHITECTURE.md](./docs/ARCHITECTURE.md) states the rules, and its twenty invariants in §5 govern
-the code. [CONTRIBUTING.md](./CONTRIBUTING.md) covers the workflow.
+The scheduler, the world, the explorer and the reducer are sans-io state machines, so they build and
+test on every OS. The syscall backend builds on Linux only, and a run elsewhere skips it.
+[AGENTS.md](./AGENTS.md) maps each area to its files and its check;
+[CONTRIBUTING.md](./CONTRIBUTING.md) covers the workflow.
 
 ## Getting help
 
-Bug reports: an issue with the **seed** or the **bundle**. A bundle is what makes a report
-actionable without further exchange.
-[What a bundle contains](./docs/API.md#46-what-a-bundle-contains-about-the-guest--and-the-redaction-contract)
-describes what travels with it before one is attached to a public issue; `bohr report --redact`
-strips guest data while keeping the run structure.
-
-Questions: GitHub Discussions. Design arguments: an issue labelled `S-needs-decision`, referencing
-the section of `ARCHITECTURE.md` the disagreement is with.
+- **Bugs:** an issue with the seed or the bundle. A bundle reproduces the run on its own;
+  `bohr report --redact` removes guest data and keeps the run's structure
+  ([API.md](./docs/API.md) §4.6).
+- **Questions:** GitHub Discussions.
+- **Design:** an issue labelled `S-needs-decision`, naming the section of
+  [ARCHITECTURE.md](./docs/ARCHITECTURE.md) it concerns.
 
 ## Security
 
-Vulnerability reports: [SECURITY.md](./SECURITY.md).
+Report vulnerabilities as [SECURITY.md](./SECURITY.md) describes.
 
 > [!WARNING]
-> **Bohr is not a security sandbox.** It provides reproducibility, not containment. A malicious
-> program running under Bohr can escape — `ptrace` supervision is not a security boundary. Run
-> untrusted code in a virtual machine, whether or not Bohr is involved.
+> bohr provides reproducibility and no containment. A program under `ptrace` supervision can escape
+> it. Run untrusted code in a virtual machine.
 
-Bohr sends nothing anywhere. No telemetry, no crash reporting, no phone-home. Everything it produces
-is written to the local disk.
+bohr sends no telemetry. Building a pack downloads its target from the source the pack names;
+everything bohr produces is written to the local disk.
 
 ## Acknowledgements
 
-This project stands on published work and on tools we learned from: `rr` for record-and-replay
-engineering and the seccomp pre-filter technique · Hermit for showing both the promise and the
-failure mode of syscall-level determinism · PCT (Microsoft Research, ASPLOS 2010) and AWS Shuttle for
-randomised scheduling with guarantees · loom and turmoil for the in-process side of the field ·
-AFL++ for mutation engineering · Jepsen for the practice of reporting findings privately first and
-publishing them carefully · Antithesis for defining the category and for an SDK format this project
-is compatible with.
+bohr builds on published work and on tools that shaped it: `rr` for record-and-replay engineering
+and the seccomp pre-filter technique; Hermit for syscall-level determinism and its limits; PCT
+(Microsoft Research, ASPLOS 2010) and AWS Shuttle for randomised scheduling with guarantees; loom and
+turmoil for in-process simulation; AFL++ for mutation engineering; Jepsen for the practice of
+reporting findings privately and publishing them carefully; Antithesis for defining the category
+and for the SDK format bohr is compatible with.
 
 ## License
 
-Apache-2.0. See [LICENSE-APACHE](./LICENSE-APACHE).
+Licensed under the [Apache License, Version 2.0](./LICENSE-APACHE).

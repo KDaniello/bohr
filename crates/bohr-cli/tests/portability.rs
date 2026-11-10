@@ -66,11 +66,15 @@ fn produce_bundles_for_cross_machine_replay() {
     }
 
     // A traced bundle carries a real syscall stream, the likeliest to differ across processors.
+    // The guest travels with it: another machine builds its own copy with another compiler, and a
+    // replay refuses a binary whose bytes differ from the recorded ones.
     if let Some(path) = traceable_guest("clock_and_random") {
         let saved = dir.join("traced-clock_and_random.bohr");
         let (code, report) =
             bohr(&["run", "--seed", "42", "--save", &saved.to_string_lossy(), "--", &path]);
         assert!(code == 0 || code == 4, "producing a traced bundle: {report}");
+        std::fs::create_dir_all(dir.join("bin")).expect("binaries directory");
+        std::fs::copy(&path, dir.join("bin/clock_and_random")).expect("the guest travels");
     }
 }
 
@@ -87,10 +91,28 @@ fn verify_bundles_replay_to_what_they_recorded() {
     assert!(!bundles.is_empty(), "no bundles under {}; none were verified", dir.display());
 
     for bundle in &bundles {
-        let (code, report) = bohr(&["replay", "--verify-only", bundle]);
+        let (code, report) = replay_beside_its_binaries(bundle);
         assert_eq!(code, 0, "{bundle} did not replay: {report}");
     }
     eprintln!("{} bundles replayed", bundles.len());
+}
+
+/// Replays a bundle with the binaries that travelled beside it, where there are any.
+///
+/// Run from the bundle's directory with `--binaries bin`, so the moved path is shorter than the
+/// recorded one and the replay can keep the recorded stack (`docs/API.md` §7.3).
+fn replay_beside_its_binaries(bundle: &str) -> (i32, String) {
+    let path = std::path::Path::new(bundle);
+    let Some(home) = path.parent().filter(|dir| dir.join("bin").is_dir()) else {
+        return bohr(&["replay", "--verify-only", bundle]);
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_bohr"))
+        .args(["replay", "--verify-only", "--binaries", "bin"])
+        .arg(path.file_name().expect("a bundle has a file name"))
+        .current_dir(home)
+        .output()
+        .expect("the binary must be runnable");
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 /// Every bundle under a directory, at any depth.
