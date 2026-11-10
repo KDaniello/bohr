@@ -2,8 +2,10 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
-  <img alt="bohr — deterministic simulation testing for unmodified Linux programs" src="docs/assets/banner-light.svg" width="100%">
+  <img alt="bohr — deterministic simulation testing for unmodified Linux programs; seed 1913 places the electrons on its orbits" src="docs/assets/banner-light.svg" width="100%">
 </picture>
+
+<p><br></p>
 
 [![CI](https://github.com/KDaniello/bohr/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/test.yml)
 [![Determinism](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml/badge.svg?branch=main)](https://github.com/KDaniello/bohr/actions/workflows/determinism.yml)

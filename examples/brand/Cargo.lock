@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-tape"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "bohr-types",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "bohr-types"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "serde",
