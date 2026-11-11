@@ -1,0 +1,26 @@
+# retry_applies_twice: a request's id recorded in a write apart from the update it guards, judged by R4.1.
+#
+# S6: a kill in the middle of an operation, a crash keeping all of the unsynced or none.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/retry_applies_twice"]
+
+[disk]
+reorder_unsynced = false
+
+[model]
+kind = "kv"
+
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 1_500_000
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 3_000_000

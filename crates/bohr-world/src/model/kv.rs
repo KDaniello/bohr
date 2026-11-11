@@ -19,6 +19,9 @@ use super::{Ack, Fact, Read};
 /// The facts one `kv.*` record from `node`, in its start `start`, holds.
 pub(super) fn facts(node: u32, start: u64, name: &str, details: &Json) -> Vec<Fact> {
     match name {
+        "kv.begun" | "kv.acked" if counting(details) => {
+            counted(node, details, name == "kv.acked").into_iter().map(Fact::Counted).collect()
+        }
         "kv.begun" => ops(node, start, details).into_iter().map(Fact::Begun).collect(),
         "kv.acked" => ops(node, start, details).into_iter().map(Fact::Acked).collect(),
         "kv.read" => {
@@ -71,6 +74,42 @@ fn ops(node: u32, start: u64, details: &Json) -> Vec<Ack> {
             at: at.clone(),
         })
         .collect()
+}
+
+/// Whether a record is an operation on counters: an `add` or a `move`.
+fn counting(details: &Json) -> bool {
+    matches!(details.get("op").and_then(Json::as_str), Some("add" | "move"))
+}
+
+/// An `add` of a delta to one counter, or a `move` of an amount from the first counter to the
+/// second, by its `id`.
+fn counted(node: u32, details: &Json, acked: bool) -> Option<super::ledger::Counted> {
+    let op = details.get("op").and_then(Json::as_str)?;
+    let id = details.get("id").and_then(text)?;
+    let keys: Vec<&str> = match details.get("keys") {
+        Some(Json::Array(keys)) => keys.iter().filter_map(Json::as_str).collect(),
+        _ => return None,
+    };
+    let amount = match details.get("values") {
+        Some(Json::Array(values)) => values.first().and_then(text)?.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    let effects = match (op, keys.as_slice()) {
+        ("add", [counter]) => vec![(subject(node, counter), amount)],
+        ("move", [from, to]) => vec![(subject(node, from), -amount), (subject(node, to), amount)],
+        _ => return None,
+    };
+    let at = details.get("at").and_then(|at| {
+        Some(format!("{}:{}", at.get("file")?.as_str()?, at.get("line")?.as_int()?))
+    });
+    Some(super::ledger::Counted {
+        node,
+        id: format!("node {node} {id}"),
+        effects,
+        acked,
+        moves: op == "move",
+        at,
+    })
 }
 
 /// A key as a subject: the node's store, then the key.

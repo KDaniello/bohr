@@ -36,6 +36,8 @@ fn each_law_catches_its_defect_and_names_the_file() {
         ("batch_in_two_writes", "BOHR-2058"),
         ("restart_refuses_new_store", "BOHR-2055"),
         ("partition_split_brain", "BOHR-2043"),
+        ("retry_applies_twice", "BOHR-2052"),
+        ("move_not_atomic", "BOHR-2053"),
     ] {
         let Some((exit, report)) = run(defect, "scenario.toml", 1) else { continue };
         assert_eq!(exit, 1, "{defect}: {report}");

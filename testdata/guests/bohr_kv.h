@@ -67,6 +67,34 @@ static void bohr_kv_op(const char *stage, const char *op, const char *const *key
 #define BOHR_KV_BATCH(stage, keys, values, n, seq)                                             \
     bohr_kv_op((stage), "batch", (keys), (values), (n), (seq), __FILE__, __LINE__)
 
+/* An operation on counters by its id, begun or acknowledged: `add` of `amount` to keys[0], or
+ * `move` of `amount` from keys[0] to keys[1]. A retry keeps the id, so it is one operation. */
+static void bohr_kv_counted(const char *stage, const char *op, const char *const *keys, int n,
+                            long amount, const char *id, const char *file, int line) {
+    char keys_text[256] = "", body[768];
+    for (int i = 0; i < n; i++) {
+        size_t k = strlen(keys_text);
+        snprintf(keys_text + k, sizeof keys_text - k, "%s\"%s\"", i ? "," : "", keys[i]);
+    }
+    snprintf(body, sizeof body,
+             "\"op\":\"%s\",\"keys\":[%s],\"values\":[\"%ld\"],\"id\":\"%s\",\"seq\":0,"
+             "\"at\":{\"file\":\"%s\",\"line\":%d}",
+             op, keys_text, amount, id, file, line);
+    bohr_kv_event(stage, body);
+}
+
+#define BOHR_KV_ADD(stage, key, amount, id)                                                    \
+    do {                                                                                       \
+        const char *bohr_k[1] = {(key)};                                                       \
+        bohr_kv_counted((stage), "add", bohr_k, 1, (amount), (id), __FILE__, __LINE__);         \
+    } while (0)
+
+#define BOHR_KV_MOVE(stage, from, to, amount, id)                                              \
+    do {                                                                                       \
+        const char *bohr_k[2] = {(from), (to)};                                                \
+        bohr_kv_counted((stage), "move", bohr_k, 2, (amount), (id), __FILE__, __LINE__);        \
+    } while (0)
+
 /* A key read back: its value, or null where it is absent. */
 static void bohr_kv_read(const char *key, const char *value) {
     char body[512];

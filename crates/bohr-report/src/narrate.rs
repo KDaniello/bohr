@@ -119,6 +119,9 @@ pub fn verdict(outcome: &Outcome) -> Verdict {
                 Some(bohr_trace::RESTARTS_CODE) => "a restarted node never answered",
                 Some(bohr_trace::DELETED_STAYS_CODE) => "a removed value came back",
                 Some(bohr_trace::BATCH_WHOLE_CODE) => "a batch was read back in part",
+                Some(bohr_trace::ONCE_CODE) => "an operation took effect more than once",
+                Some(bohr_trace::CONSERVED_CODE) => "a conserved sum changed",
+                Some(bohr_trace::INCLUDED_CODE) => "a node reported what its state does not hold",
                 _ => "an acknowledged write was lost",
             };
             (format!("{said}: {detail}"), kind)

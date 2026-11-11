@@ -41,6 +41,15 @@ pub const DELETED_STAYS_CODE: &str = "BOHR-2057";
 /// R1.3: a batch was read back in part.
 pub const BATCH_WHOLE_CODE: &str = "BOHR-2058";
 
+/// R4.1: an operation with one identity took effect more than once.
+pub const ONCE_CODE: &str = "BOHR-2052";
+
+/// R5.1: what the workload's operations conserve changed.
+pub const CONSERVED_CODE: &str = "BOHR-2053";
+
+/// R6.1: a node reported something included that its own state does not hold.
+pub const INCLUDED_CODE: &str = "BOHR-2056";
+
 /// R2.2: two replicas past one position hold different states there.
 pub const STATE_AGREES_CODE: &str = "BOHR-2050";
 
@@ -49,11 +58,14 @@ pub const STATE_AGREES_CODE: &str = "BOHR-2050";
 ///
 /// R2.1, R2.3, R2.4 and R3.1 share their codes with v0.4's probe properties, whose questions they
 /// are; R3.2 shares R1.4's, a replica that does not come back.
-pub const LAW_CODES: [&str; 9] = [
+pub const LAW_CODES: [&str; 12] = [
     AGREES_CODE,
     STATE_AGREES_CODE,
     NEVER_REVERTS_CODE,
     UNIQUE_CODE,
+    ONCE_CODE,
+    CONSERVED_CODE,
+    INCLUDED_CODE,
     BATCH_WHOLE_CODE,
     DELETED_STAYS_CODE,
     ACKED_SURVIVES_CODE,

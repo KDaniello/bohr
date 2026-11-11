@@ -1532,7 +1532,16 @@ moves_within_ticks = 10_000_000_000 # R3.1's and R3.2's bound, from the fault wi
 | R3.1 it moves again | a chain decides past its last position within `moves_within_ticks` of the fault window closing | `BOHR-2042` |
 | R3.2 a replica catches up | every replica up then reaches the last position decided before the window closed, within the same bound | `BOHR-2055` |
 
+| R4.1 one effect per operation | a counter is never read above what every operation begun on it makes, each id applied once | `BOHR-2052` |
+| R5.1 the closed set is conserved | within one start, the counters moves touch sum to what they began at | `BOHR-2053` |
+| R6.1 what is reported included is included | a transaction a node reports at a height is in that node's block at that height | `BOHR-2056` |
+
 R2.1, R2.3, R2.4 and R3.1 share v0.4's probe codes, whose questions they are; R3.2 shares R1.4's.
+R4.1 and R5.1 are judged by a ledger of what a store's counters should hold, from the operations
+begun and acknowledged on them, never from what the store says; a counter read below what its
+acknowledged operations make is R1.1. R5.1 is judged only on a start that read every counter of the
+set, and not where an `add` touches it. R6.1 compares a node's `tx` answer with its own block at
+that height, from the load's audit.
 R2.1 and R2.2 compare only replicas that answered one position, so a replica behind is not a
 disagreement. The fault window closes at the latest of the scenario's scheduled faults and heals
 and `faults.disarm_after_ticks`, or at the start where it arms none; drawn faults with no closing
@@ -1730,6 +1739,10 @@ each, and `testdata/guests/bohr_kv.h` writes them from C.
 | `kv.acked` | the same | the store acknowledged it; `at` is `{file, line}` of the acknowledgement |
 | `kv.read` | `key`, `value` or `null` | a key read back |
 | `kv.ready` | — | the store answered its first question since this start |
+
+Two operations act on counters, each with an `id` kept across retries: `add` (`keys` one counter,
+`values` its delta) and `move` (`keys` from and to, `values` the amount). A counter's base is its
+last acknowledged put of a number. `BOHR_KV_ADD` and `BOHR_KV_MOVE` write them from C.
 
 A replica of a consensus log writes `log.committed` (`index`, `entry`, `term`) for each entry it
 commits, `log.leader` (`term`) when it claims a term, and `log.applied` (`index`); C guests have
@@ -2455,6 +2468,9 @@ to do.
 | `BOHR-2044` | a probe saw a number go down on one node; `monotonic` (§5.9) |
 | `BOHR-2045` | a probe holds 65,536 keys and compares no new ones (§5.9) |
 | `BOHR-2051` | R1.1: something acknowledged was read back absent, or as a value it superseded (§5.10) |
+| `BOHR-2052` | R4.1: an operation with one id took effect more than once (§5.10) |
+| `BOHR-2053` | R5.1: the counters moves touch no longer sum to what they began at (§5.10) |
+| `BOHR-2056` | R6.1: a node reported a transaction at a height its own block there does not hold (§5.10) |
 | `BOHR-2055` | R1.4: a node the world restarted did not answer within its bound, or ended without answering (§5.10) |
 | `BOHR-2057` | R1.2: something acknowledged as removed was read back (§5.10) |
 | `BOHR-2058` | R1.3: a batch was read back in part (§5.10) |

@@ -38,6 +38,16 @@ impl Chain {
                 if name == "load.head" {
                     facts.push(Fact::Ready { node });
                 }
+                // An audited block names the transactions it holds, by their index in the plan.
+                if let Some(Json::Array(txs)) = details.get("txs") {
+                    let subjects = txs
+                        .iter()
+                        .filter_map(Json::as_int)
+                        .filter_map(|t| u64::try_from(t).ok())
+                        .map(subject)
+                        .collect();
+                    facts.push(Fact::Holds { node, position: height, subjects });
+                }
                 if let Some(hash) = details.get("block_hash").and_then(Json::as_str) {
                     facts.push(Fact::Decided(Decided {
                         position: height,
@@ -52,10 +62,15 @@ impl Chain {
             ("load.committed", Some(node), Some(tx)) => {
                 let succeeded = details.get("succeeded").and_then(Json::as_bool) == Some(true);
                 let Some(height) = int("height").filter(|_| succeeded) else { return Vec::new() };
+                let reported = Fact::Reported {
+                    node,
+                    subject: subject(tx),
+                    position: u64::try_from(height).unwrap_or(0),
+                };
                 let first = !self.committed_at.contains_key(&tx);
                 let at = self.committed_at.entry(tx).or_insert(height);
                 *at = (*at).min(height);
-                let mut facts = vec![Fact::Ready { node }];
+                let mut facts = vec![Fact::Ready { node }, reported];
                 if first {
                     facts.push(Fact::Acked(Ack {
                         subject: subject(tx),
