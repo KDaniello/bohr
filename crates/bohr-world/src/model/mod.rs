@@ -11,6 +11,7 @@
 mod chain;
 mod kv;
 mod laws;
+mod ledger;
 mod log;
 
 use std::collections::BTreeMap;
@@ -124,6 +125,12 @@ pub(crate) enum Fact {
     Claimed { round: u64, node: u32 },
     /// A replica has come as far as a position: its head, its applied index.
     Reached { node: u32, position: u64 },
+    /// An operation on counters, begun or acknowledged.
+    Counted(ledger::Counted),
+    /// A node reported a subject at a position: a transaction at a height.
+    Reported { node: u32, subject: String, position: u64 },
+    /// A node holds these subjects at a position, and only these.
+    Holds { node: u32, position: u64, subjects: Vec<String> },
 }
 
 /// A law broken: its code, the node it was broken on, and what was seen.
@@ -143,6 +150,8 @@ pub struct Watch {
     config: ModelConfig,
     laws: laws::Laws,
     agreement: laws::Agreement,
+    ledger: ledger::Ledger,
+    api: ledger::Api,
     chain: chain::Chain,
     /// The nodes the records named, which owe catching up once the window closes.
     nodes: std::collections::BTreeSet<u32>,
@@ -167,6 +176,8 @@ impl Watch {
             config,
             laws: laws::Laws::default(),
             agreement: laws::Agreement::default(),
+            ledger: ledger::Ledger::default(),
+            api: ledger::Api::default(),
             chain: chain::Chain::default(),
             nodes: std::collections::BTreeSet::new(),
             down: std::collections::BTreeSet::new(),
@@ -197,9 +208,33 @@ impl Watch {
         let mut broken = Vec::new();
         for fact in facts {
             match fact {
-                Fact::Begun(ack) => self.laws.begun(ack),
-                Fact::Acked(ack) => self.laws.acked(ack),
-                Fact::Read(read) => broken.extend(self.laws.read(&read)),
+                Fact::Begun(ack) => {
+                    // A number put and not yet acknowledged leaves a counter's base unknown.
+                    if ack.value.as_deref().is_some_and(|v| v.parse::<i64>().is_ok()) {
+                        self.ledger.put_begun(&ack.subject);
+                    }
+                    self.laws.begun(ack);
+                }
+                Fact::Acked(ack) => {
+                    // An acknowledged number, alone or in a batch, is a counter's base.
+                    if let Some(n) = ack.value.as_deref().and_then(|v| v.parse::<i64>().ok()) {
+                        self.ledger.base(&ack.subject, n);
+                    }
+                    self.laws.acked(ack);
+                }
+                Fact::Read(read) => {
+                    broken.extend(self.laws.read(&read));
+                    if self.ledger.knows(&read.subject) {
+                        broken.extend(self.ledger.read(&read));
+                    }
+                }
+                Fact::Counted(op) => self.ledger.counted(&op),
+                Fact::Reported { node, subject, position } => {
+                    broken.extend(self.api.reported(node, &subject, position));
+                }
+                Fact::Holds { node, position, subjects } => {
+                    broken.extend(self.api.held(node, position, subjects));
+                }
                 Fact::Ready { node } => {
                     let start = self.start_of(node);
                     self.ready.insert(node, start);

@@ -6,6 +6,40 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.4 — every operation counts once, and the API says what is true
+
+v0.9.2 asks whether what was committed is still held, v0.9.3 whether replicas hold the same. A
+transfer applied twice is held durably and agreed on by every replica, and is still wrong. v0.9.4
+judges the meaning of what a system committed from a ledger of what it should hold, built from the
+operations it began and acknowledged, never from what it says it holds.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.4` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Findings
+
+- **R4.1, one effect per operation** (`BOHR-2052`). A store's counter read above what every
+  operation begun on it makes, each id applied once: a retried operation applied twice. Below what
+  its acknowledged operations make is a loss, R1.1.
+- **R5.1, the closed set is conserved** (`BOHR-2053`). Within one start, the counters a store's
+  moves touch sum to what they began at.
+- **R6.1, what is reported included is included** (`BOHR-2056`). A transaction a chain node
+  reports at a height is in that node's own block there, from the load's end-of-run audit.
+- **Counters in the store records.** `kv.*` gains `add` and `move`, each with an `id` kept across
+  retries; `BOHR_KV_ADD` and `BOHR_KV_MOVE` write them from C.
+
+### Not done
+
+- **Balances, sequences, supply, two chains and the IBC bridge.** R4.2, R5.2 on a chain, R5.3,
+  `[[chain]]`, `[bridge]`, the proto decoders and `cosmos-ibc-env` need `gaiad`, `simd` and Hermes
+  built from source, which the host this release was made on cannot.
+- **R4.1 for a chain** is not judged on `cometbft-net`: its kvstore has no replay protection, so two
+  inclusions of one transaction there are its design.
+
 ## v0.9.3 — replicas agree, and the system comes back
 
 v0.4's probes see a chain fork, revert a final block, sign twice and stall, and v0.9 ran them on

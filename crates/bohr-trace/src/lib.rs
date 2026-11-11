@@ -33,10 +33,10 @@ pub use bundle::{
 };
 pub use event::{
     ACKED_SURVIVES_CODE, ADVANCES_CODE, AGREES_CODE, AssertionKind, BATCH_WHOLE_CODE,
-    DELETED_STAYS_CODE, DURABILITY_CODE, DiskOpKind, Endpoint, Event, EventKind, ExitStatus,
-    FaultGrade, FaultKind, FaultTarget, LAW_CODES, LIVENESS_CODE, MONOTONIC_CODE,
-    NEVER_REVERTS_CODE, NodeState, PROBE_CODES, PacketFate, RESTARTS_CODE, STATE_AGREES_CODE,
-    SwitchReason, UNIQUE_CODE, short_digest,
+    CONSERVED_CODE, DELETED_STAYS_CODE, DURABILITY_CODE, DiskOpKind, Endpoint, Event, EventKind,
+    ExitStatus, FaultGrade, FaultKind, FaultTarget, INCLUDED_CODE, LAW_CODES, LIVENESS_CODE,
+    MONOTONIC_CODE, NEVER_REVERTS_CODE, NodeState, ONCE_CODE, PROBE_CODES, PacketFate,
+    RESTARTS_CODE, STATE_AGREES_CODE, SwitchReason, UNIQUE_CODE, short_digest,
 };
 pub use log::{
     TraceStats, TraceWriter, digest_of, read_events, read_events_lossy, read_events_where,

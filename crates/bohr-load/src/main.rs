@@ -190,6 +190,12 @@ const AUDITED: i64 = 256;
 fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)]) {
     let Some(block) = &plan.block else { return };
     let Some(lowest) = heads.iter().filter_map(|(_, _, head)| *head).min() else { return };
+    // A transaction repeated in the plan is every one of its indexes: the copy refused as a
+    // duplicate is held wherever the first landed.
+    let mut index: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, tx) in plan.txs.iter().enumerate() {
+        index.entry(tx.as_str()).or_default().push(i);
+    }
     for &(node, port, _) in heads {
         for height in (lowest - AUDITED + 1).max(1)..=lowest {
             let at = height.to_string();
@@ -202,6 +208,17 @@ fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)]) {
                 }
             }
             record.push(("final", Json::Bool(plan.final_heads)));
+            // The transactions it holds, by their index in the plan; a block's own are not.
+            if let Some(Json::Array(txs)) = fields.get("txs") {
+                let held = txs
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .filter_map(|tx| index.get(tx))
+                    .flatten()
+                    .map(|i| Json::Int(*i as i64))
+                    .collect();
+                record.push(("txs", Json::Array(held)));
+            }
             send("load.block", &record);
         }
     }
