@@ -57,6 +57,8 @@ struct Plan {
     head: Call,
     /// One block by its height, where the adapter declares it.
     block: Option<Call>,
+    /// Whether a reported block is final, which the load passes on with every head and block.
+    final_heads: bool,
 }
 
 /// What a node said of one committed transaction at the end.
@@ -158,8 +160,10 @@ fn run(plan: &Plan) {
     }
     // Every node is asked for every transaction a node committed: a replica past the height that
     // answers and does not hold one has lost it.
+    let mut heads = Vec::new();
     for &(node, port) in &plan.nodes {
         let head = observe(plan, node, port);
+        heads.push((node, port, head));
         for (tx, (hash, height)) in &committed {
             let mut fields =
                 vec![("tx", Json::Int(*tx as i64)), ("node", Json::Int(i64::from(node)))];
@@ -172,6 +176,33 @@ fn run(plan: &Plan) {
                 fields.push(("head", Json::Int(head)));
             }
             send("load.final", &fields);
+        }
+    }
+    audit(plan, &heads);
+}
+
+/// Most heights the end-of-run audit asks each node about, the latest ones.
+const AUDITED: i64 = 256;
+
+/// Asks every node the blocks every node has, the latest [`AUDITED`] heights up to the lowest head,
+/// so that two replicas' decisions are compared at the same heights rather than wherever a round
+/// of heads happened to land.
+fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)]) {
+    let Some(block) = &plan.block else { return };
+    let Some(lowest) = heads.iter().filter_map(|(_, _, head)| *head).min() else { return };
+    for &(node, port, _) in heads {
+        for height in (lowest - AUDITED + 1).max(1)..=lowest {
+            let at = height.to_string();
+            let Ok(fields) = ask(block, node, port, &[("h", &at)]) else { continue };
+            let mut record =
+                vec![("node", Json::Int(i64::from(node))), ("height", Json::Int(height))];
+            for hash in ["block_hash", "state_hash"] {
+                if let Some(value) = fields.get(hash) {
+                    record.push((hash, value.clone()));
+                }
+            }
+            record.push(("final", Json::Bool(plan.final_heads)));
+            send("load.block", &record);
         }
     }
 }
@@ -244,7 +275,8 @@ fn included(plan: &Plan, node: u32, port: u16, hash: &str) -> Option<(i64, bool)
     Some((height, fields.contains_key("accepted")))
 }
 
-/// Asks a node its head and records it; the height where it answered.
+/// Asks a node its head and records it, with the block and state hashes where the adapter names
+/// them; the height where it answered.
 fn observe(plan: &Plan, node: u32, port: u16) -> Option<i64> {
     match ask(&plan.head, node, port, &[]) {
         Ok(fields) => {
@@ -253,6 +285,12 @@ fn observe(plan: &Plan, node: u32, port: u16) -> Option<i64> {
             if let Some(height) = height {
                 record.push(("height", Json::Int(height)));
             }
+            for hash in ["block_hash", "state_hash"] {
+                if let Some(value) = fields.get(hash) {
+                    record.push((hash, value.clone()));
+                }
+            }
+            record.push(("final", Json::Bool(plan.final_heads)));
             send("load.head", &record);
             height
         }
@@ -394,6 +432,7 @@ fn read_plan(text: &str) -> Result<Plan, String> {
         included: read_call(plan.get("included"))?,
         head: read_call(plan.get("head"))?,
         block: plan.get("block").map(|b| read_call(Some(b))).transpose()?,
+        final_heads: plan.get("final").and_then(Json::as_bool).unwrap_or(false),
     })
 }
 

@@ -62,7 +62,7 @@ fi
 # §5.21: a law is written once over the family layer's vocabulary. A law that names a family's
 # translator or an adapter reads a field of one chain or one store, and stops judging the others.
 laws=crates/bohr-world/src/model/laws.rs
-if [ -f "$laws" ] && hits=$(grep -nE '\b(chain|kv|adapter)::|super::(chain|kv)\b|crate::adapter' "$laws"); then
+if [ -f "$laws" ] && hits=$(grep -nE '\b(chain|kv|log|adapter)::|super::(chain|kv|log)\b|crate::adapter' "$laws"); then
   report 14o §5.21 $'a law names a family or an adapter:\n'"$hits"
 fi
 

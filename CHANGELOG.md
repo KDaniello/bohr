@@ -6,6 +6,48 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.3 — replicas agree, and the system comes back
+
+v0.4's probes see a chain fork, revert a final block, sign twice and stall, and v0.9 ran them on
+single nodes, where none of the four can happen. v0.9.3 judges agreement and liveness as laws over
+a replicated system's decisions, on networks under partitions, one implementation for a chain and
+a consensus log alike.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.3` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Findings
+
+- **The laws of agreement, R2.1–R2.4.** Two replicas deciding one position differently
+  (`BOHR-2041`), leaving different states there (`BOHR-2050`), a replica deciding again a position
+  it reported final (`BOHR-2040`), and a term with two leaders (`BOHR-2043`). The codes are v0.4's
+  where the question is v0.4's.
+- **The laws of moving again, R3.1 and R3.2.** Once the fault window closes, a chain decides past
+  its last position within `[model] moves_within_ticks` (`BOHR-2042`), and every replica that is up
+  reaches what was decided before the window closed (`BOHR-2055`).
+- **The `log` family.** `[model] kind = "log"` reads a consensus library's `log.committed`,
+  `log.leader` and `log.applied` records; `testdata/guests/bohr_log.h` writes them from C.
+- **Every replica's decisions.** The load records each node's block and state hash with its head,
+  and at the end asks every node the latest 256 blocks every node has, so two replicas are compared
+  at the same heights.
+- **Network cells.** `cometbft-net` gains S2 (a minority cut off, then a majority split), S5 (a
+  replica frozen for 10 s while another restarts) and S8 (a replica restored from an older
+  snapshot).
+
+### Not done
+
+- **The seeded defects in CometBFT and `simd`** (`map-order`, `no-redial`, `snapshot-skips-replay`)
+  need their binaries patched and built with a Go toolchain the host this release was made on does
+  not have; so do the Cosmos packs' cells.
+- **`raft-toy` and `split-brain` keep their own checks.** Their move onto `log.*` records needs
+  `protoc` to build `raft-proto`, which that host does not have either.
+- **v0.4's probe judgements are not moved behind the family layer.** The probe judges its
+  properties as before, with the same codes; a scenario may hold both.
+
 ## v0.9.2 — what was acknowledged survives
 
 v0.9 could say a node broke only when a process died. What that misses is the commoner and costlier

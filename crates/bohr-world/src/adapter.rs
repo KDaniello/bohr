@@ -42,6 +42,9 @@ pub struct Adapter {
     /// Ask a node one block, `{h}`: its transactions, compared byte for byte with what was sent
     /// when the node's index of transactions says one is absent.
     pub block: Option<Operation>,
+    /// Whether a block a node reports is final the moment it is reported, as CometBFT's are; a
+    /// chain whose head can be reorganised says no, and its heads are not held to R2.3.
+    pub final_heads: bool,
 }
 
 /// The `[workload]` section: what the load sends, to whom, and for how long.
@@ -95,6 +98,7 @@ impl Workload {
                 ("submit".to_owned(), operation_json(&self.adapter.submit)),
                 ("included".to_owned(), operation_json(&self.adapter.included)),
                 ("head".to_owned(), operation_json(&self.adapter.head)),
+                ("final".to_owned(), Json::Bool(self.adapter.final_heads)),
             ]
             .into_iter()
             .chain(self.adapter.block.as_ref().map(|b| ("block".to_owned(), operation_json(b))))
@@ -130,6 +134,7 @@ fn operation_json(op: &Operation) -> Json {
 /// The declaration `kind = "cometbft-rpc"` starts from: CometBFT and every Cosmos SDK chain.
 const COMETBFT_RPC: &str = r#"
 port = 26657
+final_heads = true
 [submit]
 rpc = "broadcast_tx_sync"
 params = { tx = "{tx_base64}" }
@@ -144,9 +149,14 @@ succeeded = { field = "result.tx_result.code", equals = 0 }
 rpc = "block"
 params = {}
 height = "result.block.header.height"
+block_hash = "result.block_id.hash"
+state_hash = "result.block.header.app_hash"
 [block]
 rpc = "block"
 params = { height = "{h}" }
+height = "result.block.header.height"
+block_hash = "result.block_id.hash"
+state_hash = "result.block.header.app_hash"
 txs = "result.block.data.txs"
 "#;
 
@@ -155,6 +165,7 @@ txs = "result.block.data.txs"
 pub(crate) struct RawAdapter {
     kind: Option<String>,
     port: Option<u16>,
+    final_heads: Option<bool>,
     submit: Option<RawOperation>,
     included: Option<RawOperation>,
     head: Option<RawOperation>,
@@ -269,6 +280,7 @@ fn adapter_of(raw: &RawAdapter) -> Result<Adapter, ConfigError> {
     Ok(Adapter {
         kind: kind.clone(),
         port: raw.port.or(base.port).unwrap_or(26657),
+        final_heads: raw.final_heads.or(base.final_heads).unwrap_or(false),
         submit: operation(&submit, &[("hash", submit.hash.as_ref())], submit.accepted.as_ref()),
         included: operation(
             &included,
@@ -285,11 +297,18 @@ fn adapter_of(raw: &RawAdapter) -> Result<Adapter, ConfigError> {
             ],
             None,
         ),
-        block: raw
-            .block
-            .clone()
-            .or_else(|| base.block.clone())
-            .map(|block| operation(&block, &[("txs", block.txs.as_ref())], None)),
+        block: raw.block.clone().or_else(|| base.block.clone()).map(|block| {
+            operation(
+                &block,
+                &[
+                    ("height", block.height.as_ref()),
+                    ("block_hash", block.block_hash.as_ref()),
+                    ("state_hash", block.state_hash.as_ref()),
+                    ("txs", block.txs.as_ref()),
+                ],
+                None,
+            )
+        }),
     })
 }
 

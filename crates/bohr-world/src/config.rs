@@ -345,6 +345,7 @@ struct RawLiveness {
 struct RawModel {
     kind: String,
     ready_within_ticks: Option<u64>,
+    moves_within_ticks: Option<u64>,
 }
 
 /// The `[durability]` section: what counts as a node answering before it made something durable.
@@ -898,7 +899,7 @@ pub fn parse(text: &str) -> Result<LoadedConfig, ConfigError> {
     let model = model(
         raw.model.as_ref(),
         cluster.is_some(),
-        workload.is_some(),
+        workload.as_ref(),
         &disk,
         &node_faults,
         &fault_policy,
@@ -959,13 +960,14 @@ pub fn parse(text: &str) -> Result<LoadedConfig, ConfigError> {
 fn model(
     raw: Option<&RawModel>,
     clustered: bool,
-    loaded: bool,
+    workload: Option<&crate::adapter::Workload>,
     disk: &crate::DiskConfig,
     node_faults: &[ScheduledNodeFault],
     fault_policy: &FaultPolicy,
     network: &NetworkConfig,
 ) -> Result<Option<crate::model::ModelConfig>, ConfigError> {
     let refused = |m: String| ConfigError::Refused(format!("BOHR-1002: {m}"));
+    let loaded = workload.is_some();
     let Some(raw) = raw else {
         return if loaded {
             Err(refused(
@@ -979,9 +981,10 @@ fn model(
     let family = match raw.kind.as_str() {
         "chain" => crate::model::Family::Chain,
         "kv" => crate::model::Family::Kv,
+        "log" => crate::model::Family::Log,
         other => {
             return Err(refused(format!(
-                "model.kind has no family named {other:?}; this build knows chain and kv"
+                "model.kind has no family named {other:?}; this build knows chain, kv and log"
             )));
         }
     };
@@ -1016,7 +1019,67 @@ fn model(
         family,
         ready_within: Tick(raw.ready_within_ticks.unwrap_or(10_000_000_000)),
         restart_judged,
+        moves_within: Tick(raw.moves_within_ticks.unwrap_or(10_000_000_000)),
+        window_close: judged_close(
+            window_close(node_faults, fault_policy, network, disk),
+            raw.moves_within_ticks.unwrap_or(10_000_000_000),
+            workload,
+        ),
     }))
+}
+
+/// The window's close, or never where R3 would be judged after the load's last observation: a
+/// chain's heads come from the load, and silence after it ends is not a stall.
+fn judged_close(
+    close: Tick,
+    moves_within: u64,
+    workload: Option<&crate::adapter::Workload>,
+) -> Tick {
+    match workload {
+        Some(w) if close.get().saturating_add(moves_within) > w.window_ticks + w.settle_ticks => {
+            Tick(u64::MAX)
+        }
+        _ => close,
+    }
+}
+
+/// When the last fault a scenario arms can land: the latest of its scheduled node faults, its
+/// partitions' and grey windows' ends, and, for drawn faults, the moment no more fire plus the time
+/// a killed node takes to come back. Drawn faults with no closing moment never close it.
+fn window_close(
+    node_faults: &[ScheduledNodeFault],
+    fault_policy: &FaultPolicy,
+    network: &NetworkConfig,
+    disk: &crate::DiskConfig,
+) -> Tick {
+    let drawn = fault_policy.kill.0 > 0
+        || fault_policy.enomem.0 > 0
+        || network.drop_probability.0 > 0
+        || network.duplicate_probability.0 > 0
+        || network.reorder_probability.0 > 0
+        || network.corrupt_probability.0 > 0
+        || disk.stall_probability.0 > 0
+        || disk.eio_probability.0 > 0
+        || disk.enospc_probability.0 > 0;
+    // A drawn node fault with no recovery never heals: the window it opens does not close.
+    if fault_policy.kill.0 > 0 && fault_policy.restart_after.get() == 0 {
+        return Tick(u64::MAX);
+    }
+    let mut close = match (drawn, fault_policy.disarm_after) {
+        (true, None) => return Tick(u64::MAX),
+        (true, Some(closes)) => closes.get().saturating_add(fault_policy.restart_after.get()),
+        (false, _) => 0,
+    };
+    for fault in node_faults {
+        close = close.max(fault.at_tick.get());
+    }
+    for cut in &network.partitions {
+        close = close.max(cut.heal_at_tick.get());
+    }
+    for window in &network.grey {
+        close = close.max(window.until_tick.get());
+    }
+    Tick(close)
 }
 
 /// The port JSON-RPC is answered on where a probe names none: Ethereum's.

@@ -1,0 +1,23 @@
+# partition_split_brain: two leaders under a one-directional partition, judged by R2.4.
+#
+# The cut takes only the 0-to-1 direction, for longer than the follower's election timeout of three
+# 10 ms rounds; the follower's claim crosses the direction that survives.
+
+[run]
+horizon_ticks = 1_000_000_000
+
+[cluster]
+nodes = 2
+argv = ["testdata/guests/build/partition_split_brain", "{node}"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 1_000_000
+
+[model]
+kind = "log"
+
+[[partition]]
+at_tick = 50_000_000
+heal_at_tick = 300_000_000
+cut = { from = [0], to = [1], directional = true }

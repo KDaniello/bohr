@@ -85,10 +85,15 @@ pub fn finding_key(
 /// acknowledged it.
 pub fn place_of(events: &[bohr_trace::Event], tails: &[bohr_trace::OutputTail]) -> Option<String> {
     // The law the oracle tells a finding by is the first of `LAW_CODES` present.
+    // A law's message names its law first, which tells it from a probe's of the same code.
+    let by_law = |code: &str, message: &str| {
+        bohr_trace::LAW_CODES.contains(&code) && message.starts_with('R')
+    };
     let told = bohr_trace::LAW_CODES.iter().find(|law| {
-        events.iter().any(
-            |e| matches!(&e.kind, bohr_trace::EventKind::Diagnostic { code, .. } if code == *law),
-        )
+        events.iter().any(|e| {
+            matches!(&e.kind, bohr_trace::EventKind::Diagnostic { code, message }
+                if code == *law && by_law(code, message))
+        })
     });
     let acknowledged = told.and_then(|law| {
         events.iter().find_map(|event| match &event.kind {

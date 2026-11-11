@@ -8,6 +8,9 @@
  *
  * Depth 3: the cut must be one-directional, must outlast the election timeout, and the
  * claim must cross the surviving direction before the heal.
+ *
+ * Each claim is also a `log.leader` record of term 1, the only term this protocol has, so the law
+ * R2.4 (one decider per round) judges the run from what the nodes said rather than from the exit.
  */
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -16,6 +19,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "../../guests/bohr_log.h"
 
 enum { PORT_BASE = 7000, ROUNDS = 40 };
 
@@ -37,6 +42,8 @@ int main(int argc, char **argv) {
     int self = argc > 1 ? atoi(argv[1]) : 0;
     int peer = 1 - self;
     int leader = self == 0;
+    if (leader)
+        bohr_log_leader(1);
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0)
@@ -66,6 +73,7 @@ int main(int argc, char **argv) {
             /* The election timeout: three missed heartbeats and the follower promotes. */
             if (++silent_rounds == 3) {
                 leader = 1;
+                bohr_log_leader(1);
                 sendto(sock, "CLAIM", 5, 0, (struct sockaddr *)&other, sizeof other);
             }
         }

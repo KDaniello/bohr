@@ -884,11 +884,12 @@ or one chain's RPC fields judges that one and no other, and a defect class share
 then found once per store, if at all.
 
 ```
- LAWS        R1.1 acknowledged survives · R1.2 deleted stays deleted · R1.3 a batch is whole ·
-   │         R1.4 a node restarts                       (bohr-world/src/model/laws.rs)
-   │ read only the vocabulary: Ack, Read
- MODELS      chain: load.* records → Ack, Read          (model/chain.rs)
+ LAWS        R1.1–R1.4 durability · R2.1–R2.4 agreement · R3.1–R3.2 moving again
+   │                                                    (bohr-world/src/model/laws.rs)
+   │ read only the vocabulary: Ack, Read, Decided, claims, reaches
+ MODELS      chain: load.* records → Ack, Read, Decided (model/chain.rs)
    │         kv:    kv.* records   → Ack, Read          (model/kv.rs)
+   │         log:   log.* records  → Decided, claims    (model/log.rs)
    │ read only records
  ADAPTERS    chain: an [adapter] declaration the load performs (adapter.rs, bohr-load)
              kv:    a harness that writes kv.* records

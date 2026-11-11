@@ -348,7 +348,7 @@ recorded difficulty:
 | `raft_toy` | acknowledged write lost when the leader dies before it replicates | 3 | 256 runs |
 | `kv_ack_quiet` | the same as `kv_fsync`, with the self-check removed: the store loses an acknowledged write and exits 0 | 2 | 44 of 60 seeds: a crash lands every unsynced write a quarter of the time, and then nothing is lost |
 | `kv_fsync` | acknowledged write lost after crash, no `fsync` | 2 | < 2 min |
-| `partition_split_brain` | two leaders under a one-directional partition | 3 | < 10 min |
+| `partition_split_brain` | two leaders under a one-directional partition; R2.4 from its `log.leader` records | 3 | < 10 min |
 | `no_checksum` | a datagram protocol with no checksum applies an altered update | 1 | ≥ 20 of 60 seeds with `corrupt_probability`, 0 without |
 | `header_without_record` | a header rewritten to point at an appended record, one `fsync` after both | 2 | ≥ 20 of 60 seeds with reordering, 0 with `reorder_unsynced = false` |
 | `rename_without_dirsync` | a value renamed into place and acknowledged without syncing its directory; R1.1 | 1 | 60 of 60 seeds |

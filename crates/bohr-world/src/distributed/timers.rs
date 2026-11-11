@@ -80,6 +80,12 @@ pub(crate) enum Due {
     ///
     /// A timer, since the finding is an absence.
     LivenessWindow,
+    /// The fault window closes (`judge` false), or the bound after it ends (`judge` true), for
+    /// R3.1 and R3.2.
+    LawWindow {
+        /// Whether this is the moment to judge rather than to note what was decided.
+        judge: bool,
+    },
     /// The moment a restarted node had to have answered by, for R1.4.
     RestartBound {
         /// The node restarted.

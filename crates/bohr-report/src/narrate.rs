@@ -113,6 +113,9 @@ pub fn verdict(outcome: &Outcome) -> Verdict {
         // A law of durability names which one it is by its code; the rest are the boundary's.
         Outcome::DurabilityViolated(detail) => {
             let said = match leading_code(detail) {
+                Some(bohr_trace::RESTARTS_CODE) if detail.contains("R3.2:") => {
+                    "a replica did not catch up"
+                }
                 Some(bohr_trace::RESTARTS_CODE) => "a restarted node never answered",
                 Some(bohr_trace::DELETED_STAYS_CODE) => "a removed value came back",
                 Some(bohr_trace::BATCH_WHOLE_CODE) => "a batch was read back in part",

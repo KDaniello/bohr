@@ -724,7 +724,14 @@ impl DistributedWorld {
     /// `load_node`.
     #[must_use]
     pub fn with_model(mut self, config: crate::model::ModelConfig, load_node: Option<u32>) -> Self {
-        self.model = Some(crate::model::Watch::new(config, load_node));
+        let watch = crate::model::Watch::new(config, load_node);
+        // A window armed to close never has nothing to judge after it.
+        let (close, due) = watch.window();
+        if close.get() < u64::MAX {
+            self.timers.arm(close, NodeId(0), Due::LawWindow { judge: false });
+            self.timers.arm(due, NodeId(0), Due::LawWindow { judge: true });
+        }
+        self.model = Some(watch);
         self.load_node = load_node.map(NodeId);
         self
     }
@@ -2606,6 +2613,28 @@ impl WorldModel for DistributedWorld {
         for entry in self.timers.pop_due(ctx.world_now()) {
             match entry {
                 Due::SleepExpiry { task } => effects.wake.push(Wake { task, ret: 0 }),
+                Due::LawWindow { judge: false } => {
+                    if let Some(watch) = self.model.as_mut() {
+                        watch.window_closed();
+                    }
+                }
+                Due::LawWindow { judge: true } => {
+                    let broken = self
+                        .model
+                        .as_mut()
+                        .map(crate::model::Watch::window_due)
+                        .unwrap_or_default();
+                    for broken in broken {
+                        ctx.emit_for(
+                            NodeId(broken.node),
+                            TaskId::ZERO,
+                            EventKind::Diagnostic {
+                                code: broken.code.to_owned(),
+                                message: broken.message,
+                            },
+                        )?;
+                    }
+                }
                 Due::RestartBound { node, start } => {
                     if let Some(broken) = self.model.as_mut().and_then(|w| w.ready_due(node, start))
                     {

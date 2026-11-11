@@ -1,0 +1,8 @@
+# The seeded defect, and what `bohr check partition_split_brain` holds it to; see docs/TESTING.md §16.
+defect = "a follower promotes itself while the leader still leads, under a one-directional cut"
+
+[check]
+works = { min_events = 20 }
+finds = { seeds = "1..60", code = "BOHR-2043", at_least = 30 }
+repeats = { times = 100 }
+replays = {}
