@@ -6,6 +6,49 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.5 — told no, and judged by what it did with the answer
+
+The faults before v0.9.5 take a node away. A disk that is full, an `fsync` that fails or an
+allocation that is refused leaves the node running and tells it no; v0.9.5 judges what it did with
+the answer. A stop is a correct answer; an acknowledgement after the refusal is not.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.5` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Findings
+
+- **R7.1, a refused write is never acknowledged** (`BOHR-2060`). A loss R1.1 proves, of an
+  operation that saw a write refused with `ENOSPC`, an `fsync` with `EIO` or an allocation with
+  `ENOMEM` between its begin and its acknowledgement, is told with the refused call.
+- **R7.2, the node comes back with the resource** (`BOHR-2061`). A node refused a resource in one
+  start answers in the next; the start that was refused owes no answer.
+- **A stop on a refused resource is an expected refusal.** Triage judges a node that exited or
+  aborted, where only refused resources were needed, an expected refusal; a fault signal stays a
+  defect.
+- **Four seeded defects:** `ack_after_failed_write` and `fsync_retry_after_eio` (R7.1, the second
+  PostgreSQL's fsyncgate), `enospc_count_ahead` (R7.2) and `enomem_half_batch` (R1.3), each
+  caught on 42 to 52 of 60 seeds.
+- **Two cells for `cometbft-net`:** S7, a disk and memory that refuse for the first 12 s, and S4,
+  wall clocks stepped by up to a minute either way and drifting.
+- **A budget stop keeps what was broken before it.** A run stopped by its event or tick budget was a
+  hang whatever it had raised; a law, a property or an assertion broken before the stop is now the
+  finding, judged with no exit, so an earlier crash does not hide it.
+- **One law, one group.** A law's finding is grouped by its code, its law and the words of its
+  message, not the heights, nodes and hashes in it, so one defect met at other heights is one group.
+- **A block a node lacks decides nothing.** A block answered with an empty hash, as CometBFT answers
+  for a height its store does not hold, is no decision and no height reached.
+
+### Not done
+
+- **The bridge and two chains.** R5.3 under a clock step and `cosmos-ibc-env` need `gaiad`, `simd`
+  and Hermes built from source, which the host this release was made on cannot.
+- **R7.1 does not say the refused call was on the operation's file.** A store's records name keys,
+  not descriptors.
+
 ## v0.9.4 — every operation counts once, and the API says what is true
 
 v0.9.2 asks whether what was committed is still held, v0.9.3 whether replicas hold the same. A

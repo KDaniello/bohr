@@ -16,6 +16,19 @@ pub fn signature_of(outcome: &Outcome, events: &[bohr_trace::Event]) -> String {
         let words: String = said.chars().filter(|c| !c.is_ascii_digit()).collect();
         return format!("GuestHung {}", words.split_whitespace().collect::<Vec<_>>().join(" "));
     }
+    // A law is named by its code, its law and the words of its first message: the heights, nodes,
+    // keys and hashes in them differ between runs of one defect.
+    if let Outcome::DurabilityViolated(detail) | Outcome::ProbeViolated(detail) = outcome
+        && let Some((code, rest)) = detail.split_once(": ")
+        && bohr_trace::LAW_CODES.contains(&code)
+        && let Some((law, said)) = rest.split_once(": ")
+        && law.starts_with('R')
+    {
+        let first = said.split("; ").next().unwrap_or(said);
+        let words: Vec<&str> =
+            first.split_whitespace().filter(|w| !w.chars().any(|c| c.is_ascii_digit())).collect();
+        return format!("{code} {law} {}", words.join(" "));
+    }
     Violation::of(outcome, bohr_kernel::StopReason::GuestFinished, events).map_or_else(
         || {
             let verdict = bohr_report::narrate::verdict(outcome);
@@ -222,5 +235,22 @@ mod tests {
         assert_eq!(key(FRAME_A), key(FRAME_A));
         assert_ne!(key(FRAME_A), key(FRAME_B), "two frames read as one finding");
         assert!(key(FRAME_A).contains("log.go"), "the place is missing: {}", key(FRAME_A));
+    }
+
+    #[test]
+    fn one_law_broken_at_other_heights_and_nodes_is_one_group() {
+        let at = |node: u32, from: u32, to: u32| {
+            Outcome::DurabilityViolated(format!(
+                "BOHR-2055: R3.2: node {node} reached position {from} within 10000000000 ticks of                  the fault window closing, where position {to} was decided before it closed"
+            ))
+        };
+        assert_eq!(signature_of(&at(3, 5, 14), &[]), signature_of(&at(1, 12, 17), &[]));
+        assert!(signature_of(&at(3, 5, 14), &[]).starts_with("BOHR-2055 R3.2 node reached"));
+        let hashes = |a: &str| {
+            Outcome::ProbeViolated(format!(
+                "BOHR-2041: R2.1: position 25 decided as {a} by node 0 and as 9F by node 1"
+            ))
+        };
+        assert_eq!(signature_of(&hashes("23AB"), &[]), signature_of(&hashes("77CD"), &[]));
     }
 }

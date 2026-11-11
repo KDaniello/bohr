@@ -122,6 +122,12 @@ pub fn verdict(outcome: &Outcome) -> Verdict {
                 Some(bohr_trace::ONCE_CODE) => "an operation took effect more than once",
                 Some(bohr_trace::CONSERVED_CODE) => "a conserved sum changed",
                 Some(bohr_trace::INCLUDED_CODE) => "a node reported what its state does not hold",
+                Some(bohr_trace::FAILED_ACKED_CODE) => {
+                    "something acknowledged after a refused call was lost"
+                }
+                Some(bohr_trace::RESOURCE_BACK_CODE) => {
+                    "a node did not come back with its resource"
+                }
                 _ => "an acknowledged write was lost",
             };
             (format!("{said}: {detail}"), kind)

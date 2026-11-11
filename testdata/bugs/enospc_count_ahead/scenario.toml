@@ -1,0 +1,27 @@
+# enospc_count_ahead: a record counted before it is written, judged by R7.2.
+#
+# S7: a disk that refuses a third of the writes that need space for 2.5 ms, then a restart once
+# it has room.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/enospc_count_ahead"]
+
+[model]
+kind = "kv"
+ready_within_ticks = 5_000_000
+
+[disk]
+reorder_unsynced = false
+enospc_probability = "1/3"
+
+[faults]
+disarm_after_ticks = 2_500_000
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 4_000_000

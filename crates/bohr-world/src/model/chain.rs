@@ -32,6 +32,13 @@ impl Chain {
         match (name, node, tx) {
             // A head is the node answering, how far it has come, and, where it carries hashes, a
             // decision, final where the adapter says a reported block is, as CometBFT's are.
+            // A block answered with an empty hash is one the node does not hold, as CometBFT
+            // answers for a height its store lacks: no decision, and nothing reached.
+            ("load.block", Some(_), _)
+                if details.get("block_hash").and_then(Json::as_str) == Some("") =>
+            {
+                Vec::new()
+            }
             ("load.head" | "load.block", Some(node), _) if int("height").is_some() => {
                 let height = int("height").and_then(|h| u64::try_from(h).ok()).unwrap_or(0);
                 let mut facts = vec![Fact::Reached { node, position: height }];
@@ -114,6 +121,19 @@ mod tests {
     use bohr_sdk_proto::json;
 
     use super::*;
+
+    #[test]
+    fn a_block_with_an_empty_hash_is_not_held_and_decides_nothing() {
+        let mut chain = Chain::default();
+        let empty =
+            json::parse(r#"{"node":1,"height":25,"block_hash":"","txs":[]}"#).expect("json");
+        assert!(chain.facts("load.block", &empty, |_| 1).is_empty());
+        let held =
+            json::parse(r#"{"node":1,"height":25,"block_hash":"AB","txs":[]}"#).expect("json");
+        assert!(
+            chain.facts("load.block", &held, |_| 1).iter().any(|f| matches!(f, Fact::Decided(_)))
+        );
+    }
 
     #[test]
     fn a_node_past_the_commit_height_owes_the_transaction_and_one_below_does_not() {

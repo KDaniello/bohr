@@ -1,0 +1,52 @@
+# cometbft-net, cell S4.
+#
+# S4: wall clocks stepped by up to a minute either way and drifting within the core's bound, on
+# drawn replicas, between 3 s and 25 s; agreement and moving again must hold through it.
+
+[run]
+horizon_ticks = 50_000_000_000
+ends_with_node = 4                # the load, which ends after its final check
+
+[state]
+dir = "targets/cometbft-net/state"
+cwd = "/"
+
+[cluster]
+nodes = 4
+programs = [
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node0", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node1", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node2", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node3", "--proxy_app", "kvstore"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[model]
+kind = "chain"
+
+[adapter]
+kind = "cometbft-rpc"
+
+[workload]
+txs = "/workload/txs"
+rate = 20
+targets = [0, 1, 2, 3]
+observe_every_ticks = 1_000_000_000
+window_ticks = 30_000_000_000
+settle_ticks = 10_000_000_000
+
+
+[disk]
+sync_semantics = "strict"
+reorder_unsynced = false
+
+[faults]
+kill_probability = "1/32768"
+restart_after_ticks = 1_000_000_000
+arm_after_ticks = 3_000_000_000
+disarm_after_ticks = 25_000_000_000
+budget_per_run = 4
+draw = ["clock_step", "clock_drift"]

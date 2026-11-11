@@ -1293,6 +1293,7 @@ impl DistributedWorld {
                     let (world, disk) = self.node_parts(node);
                     let inode = mapped.or_else(|| world.inode_of(fd));
                     disk.fail_sync(world, inode);
+                    self.refused(node, "an fsync failed with EIO");
                     ctx.emit(EventKind::FaultFired {
                         fault: FaultKind::DiskError,
                         target: FaultTarget::Descriptor(Fd(fd as i32)),
@@ -1364,6 +1365,7 @@ impl DistributedWorld {
                 let needs_space =
                     self.node_world(node).needs_space(fd, offset, u64::from(requested));
                 if needs_space && self.disk_full(ctx)? {
+                    self.refused(node, "a write failed with ENOSPC");
                     ctx.emit(EventKind::FaultFired {
                         fault: FaultKind::DiskFull,
                         target: FaultTarget::Descriptor(Fd(fd as i32)),
@@ -1446,6 +1448,7 @@ impl DistributedWorld {
             // Added space is unsynced, like a write; asking for space can find the disk full.
             sys::FALLOCATE => {
                 if self.node_world(node).needs_space(fd, args[2], args[3]) && self.disk_full(ctx)? {
+                    self.refused(node, "an fallocate failed with ENOSPC");
                     ctx.emit(EventKind::FaultFired {
                         fault: FaultKind::DiskFull,
                         target: FaultTarget::Descriptor(Fd(fd as i32)),
@@ -1501,6 +1504,15 @@ impl DistributedWorld {
         Ok(Effects::go(Resume::Emulate { ret }, SYSCALL_COST))
     }
 
+    /// Tells the model watch, where there is one, that `node` was refused a resource.
+    fn refused(&mut self, node: NodeId, what: &'static str) {
+        if !self.tool_node(node)
+            && let Some(watch) = self.model.as_mut()
+        {
+            watch.refused(node, what);
+        }
+    }
+
     /// Draws whether this allocation is refused, where a scenario says memory can run out.
     ///
     /// These calls stop only when `enomem_probability` is set; unrefused ones run in the kernel.
@@ -1531,6 +1543,13 @@ impl DistributedWorld {
         if !refused {
             ctx.emit(EventKind::Syscall { nr, args, ret: 0, emulated: false, data_digest: None })?;
             return Ok(Some(Effects::go(Resume::Continue, SYSCALL_COST)));
+        }
+        // A refused `brk` is answered by glibc with an `mmap`, and a refused reservation of address
+        // space by a runtime with another hint: neither is a refusal the program sees.
+        /// `PROT_NONE`: address space reserved, nothing allocated in it.
+        const PROT_NONE: u64 = 0;
+        if nr == MREMAP || (nr == MMAP && args[2] != PROT_NONE) {
+            self.refused(node, "an allocation failed with ENOMEM");
         }
         ctx.emit(EventKind::FaultFired {
             fault: FaultKind::MemoryExhausted,

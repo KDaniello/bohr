@@ -1,0 +1,8 @@
+# The seeded defect, and what `bohr check enospc_count_ahead` holds it to; see docs/TESTING.md §16.
+defect = "a record counted before it is written, and the store stopped on ENOSPC with the count ahead"
+
+[check]
+works = { min_events = 20 }
+finds = { seeds = "1..60", code = "BOHR-2061", at_least = 30 }
+repeats = { times = 100 }
+replays = {}

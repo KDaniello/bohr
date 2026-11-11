@@ -1039,25 +1039,35 @@ impl Run<'_, '_> {
 
     /// Turns the oracle's verdict into the outcome recorded in a bundle.
     ///
-    /// A budget stop is a hang whatever the oracle says. A horizon or ending node is judged in
-    /// full.
+    /// A horizon or ending node is judged in full. A budget stop is a hang, unless a law, a
+    /// property or an assertion was already broken: what the run raised before it stopped holds
+    /// whether or not it went on. It is judged with no exit and no signal, so a node's earlier
+    /// crash, which the panel tells first, does not hide what was broken after it.
     fn judge(&mut self, digest: Digest, stop_reason: StopReason) -> Outcome {
         let now = self.clock.now().get();
         let events = self.next_event.get();
-        match stop_reason {
-            StopReason::TickBudget => {
-                return Outcome::GuestHung(format!("no progress by tick {now}"));
-            }
+        let hung = match stop_reason {
+            StopReason::TickBudget => Some(format!("no progress by tick {now}")),
             // Names the horizon, if any, alongside the budget that was reached.
-            StopReason::EventBudget => {
-                return Outcome::GuestHung(match self.config.horizon {
-                    Some(at) => format!(
-                        "event budget reached at {events}, short of the horizon at tick {}",
-                        at.get()
-                    ),
-                    None => format!("event budget reached at {events}"),
-                });
-            }
+            StopReason::EventBudget => Some(match self.config.horizon {
+                Some(at) => format!(
+                    "event budget reached at {events}, short of the horizon at tick {}",
+                    at.get()
+                ),
+                None => format!("event budget reached at {events}"),
+            }),
+            _ => None,
+        };
+        if let Some(hung) = hung {
+            let (exit, killed_by) = (self.last_exit.take(), self.killed_by.take());
+            let judged = self.judged(digest, events);
+            (self.last_exit, self.killed_by) = (exit, killed_by);
+            return match judged {
+                Outcome::Clean => Outcome::GuestHung(hung),
+                found => found,
+            };
+        }
+        match stop_reason {
             // A deadlock is the guest's defect; the oracle never sees it.
             StopReason::Deadlock => {
                 return Outcome::GuestHung(format!("every task is waiting at tick {now}"));
@@ -1066,8 +1076,17 @@ impl Run<'_, '_> {
             StopReason::BreakRequested => {
                 return Outcome::StoppedOnRequest(format!("stopped at event {events}"));
             }
-            StopReason::GuestFinished | StopReason::HorizonReached | StopReason::NodeFinished => {}
+            StopReason::TickBudget
+            | StopReason::EventBudget
+            | StopReason::GuestFinished
+            | StopReason::HorizonReached
+            | StopReason::NodeFinished => {}
         }
+        self.judged(digest, events)
+    }
+
+    /// The oracle's verdict on the run as it stands.
+    fn judged(&mut self, digest: Digest, events: u64) -> Outcome {
         let outcome = RunOutcome {
             digest,
             events,

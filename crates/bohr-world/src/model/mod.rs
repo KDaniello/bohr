@@ -13,6 +13,7 @@ mod kv;
 mod laws;
 mod ledger;
 mod log;
+mod resource;
 
 use std::collections::BTreeMap;
 
@@ -152,6 +153,7 @@ pub struct Watch {
     agreement: laws::Agreement,
     ledger: ledger::Ledger,
     api: ledger::Api,
+    refusals: resource::Refusals,
     chain: chain::Chain,
     /// The nodes the records named, which owe catching up once the window closes.
     nodes: std::collections::BTreeSet<u32>,
@@ -178,6 +180,7 @@ impl Watch {
             agreement: laws::Agreement::default(),
             ledger: ledger::Ledger::default(),
             api: ledger::Api::default(),
+            refusals: resource::Refusals::default(),
             chain: chain::Chain::default(),
             nodes: std::collections::BTreeSet::new(),
             down: std::collections::BTreeSet::new(),
@@ -206,9 +209,12 @@ impl Watch {
             _ => return Vec::new(),
         };
         let mut broken = Vec::new();
+        let node = from.get();
+        let mut acked = false;
         for fact in facts {
             match fact {
                 Fact::Begun(ack) => {
+                    self.refusals.begun(node, &ack.subject, ack.seq);
                     // A number put and not yet acknowledged leaves a counter's base unknown.
                     if ack.value.as_deref().is_some_and(|v| v.parse::<i64>().is_ok()) {
                         self.ledger.put_begun(&ack.subject);
@@ -220,15 +226,25 @@ impl Watch {
                     if let Some(n) = ack.value.as_deref().and_then(|v| v.parse::<i64>().ok()) {
                         self.ledger.base(&ack.subject, n);
                     }
+                    let start = self.start_of(node);
+                    self.refusals.acked(node, start, &ack.subject);
+                    acked = true;
                     self.laws.acked(ack);
                 }
                 Fact::Read(read) => {
-                    broken.extend(self.laws.read(&read));
+                    let seen = self.laws.read(&read);
+                    // R7.1 is told of the subject's latest acknowledgement, which a counter's
+                    // loss, the sum of all of them, is not.
+                    broken.extend(self.refusals.explain(&read.subject, read.start, &seen));
+                    broken.extend(seen);
                     if self.ledger.knows(&read.subject) {
                         broken.extend(self.ledger.read(&read));
                     }
                 }
-                Fact::Counted(op) => self.ledger.counted(&op),
+                Fact::Counted(op) => {
+                    acked |= op.acked;
+                    self.ledger.counted(&op);
+                }
                 Fact::Reported { node, subject, position } => {
                     broken.extend(self.api.reported(node, &subject, position));
                 }
@@ -253,7 +269,19 @@ impl Watch {
                 }
             }
         }
+        if acked {
+            self.refusals.acked_through(node);
+        }
         broken
+    }
+
+    /// The world refused `node` a resource: `what` names the call and its error.
+    pub fn refused(&mut self, node: NodeId, what: &'static str) {
+        if Some(node.get()) == self.load_node {
+            return;
+        }
+        let start = self.start_of(node.get());
+        self.refusals.refused(node.get(), start, what);
     }
 
     /// Tells the watch what the world did to a node; where the world restarted it and R1.4 is
@@ -277,6 +305,7 @@ impl Watch {
         if state != NodeState::Restarting {
             return None;
         }
+        self.refusals.restarted(node.get());
         let start = self.starts.entry(node.get()).or_insert(1);
         *start += 1;
         let start = *start;
@@ -285,12 +314,30 @@ impl Watch {
             .then(|| (Tick(now.get().saturating_add(self.config.ready_within.get())), start))
     }
 
-    /// R1.4 at the moment a restarted node had to have answered by.
+    /// R1.4 at the moment a restarted node had to have answered by; R7.2 where the start before
+    /// it was refused a resource. A start refused a resource itself owes no answer.
     pub fn ready_due(&mut self, node: NodeId, start: u64) -> Option<Broken> {
         let answered = self.ready.get(&node.get()).is_some_and(|seen| *seen >= start);
         let current = self.start_of(node.get()) == start;
-        if answered || !current || !self.late.insert((node.get(), start)) {
+        if answered
+            || !current
+            || self.refusals.refused_in(node.get(), start)
+            || !self.late.insert((node.get(), start))
+        {
             return None;
+        }
+        if self.refusals.refused_in(node.get(), start.saturating_sub(1)) {
+            return Some(Broken {
+                code: bohr_trace::RESOURCE_BACK_CODE,
+                node: node.get(),
+                message: format!(
+                    "R7.2: node {} was refused a resource in start {}, and did not answer within \
+                     {} ticks of the restart after it (start {start})",
+                    node.get(),
+                    start.saturating_sub(1),
+                    self.config.ready_within.get()
+                ),
+            });
         }
         Some(Broken {
             code: bohr_trace::RESTARTS_CODE,

@@ -69,7 +69,7 @@ static void bohr_kv_op(const char *stage, const char *op, const char *const *key
 
 /* An operation on counters by its id, begun or acknowledged: `add` of `amount` to keys[0], or
  * `move` of `amount` from keys[0] to keys[1]. A retry keeps the id, so it is one operation. */
-static void bohr_kv_counted(const char *stage, const char *op, const char *const *keys, int n,
+__attribute__((unused)) static void bohr_kv_counted(const char *stage, const char *op, const char *const *keys, int n,
                             long amount, const char *id, const char *file, int line) {
     char keys_text[256] = "", body[768];
     for (int i = 0; i < n; i++) {

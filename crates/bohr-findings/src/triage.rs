@@ -5,7 +5,7 @@
 //! failure under a model-only fault is a bench failure. Only a target defect counts; every other
 //! verdict keeps the finding and lists it apart.
 
-use bohr_trace::{Bundle, FaultGrade, FaultKind, Outcome};
+use bohr_trace::{Bundle, EventKind, FaultGrade, FaultKind, Outcome};
 
 use crate::ablation::Ablation;
 
@@ -114,6 +114,16 @@ pub fn triage(
     if restored && !failing.is_empty() {
         return Verdict::ExpectedRefusal;
     }
+    let mut needed = necessary.clone();
+    needed.extend(ablation.scheduled.iter().copied());
+    let targets: Vec<u32> = failing
+        .iter()
+        .copied()
+        .filter(|n| role_of(&roles, nodes, *n) == NodeRole::Target)
+        .collect();
+    if stopped_when_refused(&manifest.outcome, &needed, &targets, &refused_nodes(events)) {
+        return Verdict::ExpectedRefusal;
+    }
     // Faults a scenario writes down are needed by its definition, so their grades count too.
     let grade =
         ablation.grade().into_iter().chain(ablation.scheduled.iter().map(|k| k.grade())).max();
@@ -122,6 +132,48 @@ pub fn triage(
         Some(FaultGrade::ModelOnly) => Verdict::ModelArtefact,
         Some(grade) => Verdict::Conditional(grade),
     }
+}
+
+/// The faults that refuse a node a resource rather than take the node away.
+const REFUSALS: [FaultKind; 3] =
+    [FaultKind::DiskFull, FaultKind::DiskError, FaultKind::MemoryExhausted];
+
+/// The nodes a run refused a resource.
+fn refused_nodes(events: &[bohr_trace::Event]) -> Vec<u32> {
+    let mut nodes: Vec<u32> = events
+        .iter()
+        .filter(
+            |e| matches!(&e.kind, EventKind::FaultFired { fault, .. } if REFUSALS.contains(fault)),
+        )
+        .map(|e| e.node.get())
+        .collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
+}
+
+/// Whether the run ended in a stop, an exit or an abort, of only targets refused a resource, where
+/// only refusals were needed or written down: a stop is a correct answer to a full disk, a failed
+/// `fsync` or refused memory, and R7.2 asks whether the node comes back. A fault signal, a
+/// dereference of what was not allocated, is a defect still. A runtime's panic exits with a status,
+/// so a panic on the refused node counts as its stop.
+fn stopped_when_refused(
+    outcome: &Outcome,
+    needed: &[FaultKind],
+    failing: &[u32],
+    refused: &[u32],
+) -> bool {
+    /// `SIGABRT`, which `abort(3)` raises.
+    const ABORT: &str = "killed by signal 6";
+    let stopped = match outcome {
+        Outcome::GuestCrashed(how) => how.starts_with("exit status") || how == ABORT,
+        _ => false,
+    };
+    stopped
+        && !needed.is_empty()
+        && needed.iter().all(|kind| REFUSALS.contains(kind))
+        && !failing.is_empty()
+        && failing.iter().all(|node| refused.contains(node))
 }
 
 /// Why bohr, and not the target, ended a run, where it did.
@@ -221,5 +273,23 @@ mod tests {
         assert!(bohr_limit(&Outcome::UnsupportedSyscall("statx".into())).is_some());
         assert!(bohr_limit(&Outcome::GuestHung("event budget reached at 1000".into())).is_some());
         assert!(bohr_limit(&Outcome::GuestCrashed("exit status 1".into())).is_none());
+    }
+
+    #[test]
+    fn a_stop_on_a_refused_resource_is_expected_and_a_fault_signal_is_not() {
+        let full = [FaultKind::DiskFull];
+        let exited = Outcome::GuestCrashed("exit status 1".into());
+        let stop = |outcome: &Outcome, needed: &[FaultKind], failing: &[u32]| {
+            stopped_when_refused(outcome, needed, failing, &[1])
+        };
+        assert!(stop(&exited, &full, &[1]));
+        assert!(stop(&Outcome::GuestCrashed("killed by signal 6".into()), &full, &[1]));
+        assert!(!stop(&Outcome::GuestCrashed("killed by signal 11".into()), &full, &[1]));
+        // Another node's stop, a kill needed or written down, or no fault needed at all.
+        assert!(!stop(&exited, &full, &[2]));
+        assert!(!stop(&exited, &full, &[1, 2]));
+        assert!(!stop(&exited, &[FaultKind::DiskFull, FaultKind::NodeKill], &[1]));
+        assert!(!stop(&exited, &[], &[1]));
+        assert!(!stop(&Outcome::DurabilityViolated("R7.1".into()), &full, &[1]));
     }
 }
