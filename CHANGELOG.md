@@ -6,6 +6,38 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.7 — the clock without a stop
+
+A Go program reads its clock about 19 000 times a virtual second, and with the host's vDSO withheld
+every read was a system call and a ptrace stop: three quarters of every stop of a CometBFT network.
+v0.9.7 gives a guest a vDSO of bohr's own, whose clock is the world's and costs no stop.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.7` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Findings
+
+- **bohr's vDSO.** At every `execve` the guest maps a clock page and a vDSO built from
+  `crates/bohr-backend-ptrace/vdso/`; `AT_SYSINFO_EHDR` names it. Its `clock_gettime`,
+  `gettimeofday` and `time` read the page the supervisor writes before each resume; the k-th read
+  since returns the node's clock plus k reads' cost, and the reads are charged to the node's time at
+  the next stop, so time moves as it did when each read stopped.
+- **A CometBFT network costs a quarter of the stops.** One `cometbft-net` S0 run: 1 117 335 stops
+  where there were 4 062 821, 1.59 million events where there were 7.52 million, 11.9 s where there
+  were 26.6 s.
+- **`BOHR_CLOCK_PAGE=off`** withholds the vDSO, and every read is a system call again.
+
+### Not done
+
+- **`epoll_pwait`**, the other fifth of a Go program's stops: its answer depends on what arrived,
+  which the world decides at the call.
+- **Old bundles replay unchanged.** A clock read is no longer an event, so a run of this version
+  differs from the same seed's run before it; the bank is recorded again.
+
 ## v0.9.6 — the same laws on Ethereum
 
 v0.9.2–v0.9.5 wrote the laws against CometBFT. What that leaves unproven is the claim they rest on:

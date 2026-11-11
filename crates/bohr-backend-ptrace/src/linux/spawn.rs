@@ -710,6 +710,7 @@ pub(super) fn canonical_stack(
     pid: libc::pid_t,
     rsp: u64,
     execfn: Option<&[u8]>,
+    vdso: Option<u64>,
 ) -> Result<(u64, AuxvReport), BackendError> {
     let bad = || BackendError::BadAddress { addr: GuestAddr(rsp), len: 8 };
     let argc = read_word(pid, rsp)?;
@@ -768,6 +769,8 @@ pub(super) fn canonical_stack(
     words.extend(&envp);
     words.push(0);
     for (key, fixed) in CANONICAL_AUXV {
+        // bohr's own vDSO, where the guest was given one, in place of the host's.
+        let fixed = if key == AT_SYSINFO_EHDR { vdso.or(fixed) } else { fixed };
         match fixed.or_else(|| host.get(&key).copied()) {
             Some(value) => words.extend([key, value]),
             None => words.extend([AT_IGNORE, 0]),
