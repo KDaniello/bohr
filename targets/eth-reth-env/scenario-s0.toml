@@ -1,0 +1,46 @@
+# eth-reth-env, cell S0.
+#
+# S0: reth driven by the engine driver, a block every 2 s from its pool; no fault.
+
+[run]
+horizon_ticks = 50_000_000_000
+ends_with_node = 2                # the load, which ends after its final check
+
+[state]
+dir = "targets/eth-reth-env/state"
+cwd = "/"
+
+[cluster]
+nodes = 2
+programs = [
+  ["targets/reth/build/reth", "node", "--chain", "/genesis.json", "--datadir", "/reth",
+   "--disable-discovery", "--ipcdisable", "--http", "--http.addr", "0.0.0.0", "--http.api", "eth",
+   "--authrpc.addr", "0.0.0.0", "--authrpc.jwtsecret", "/jwt.hex", "--db.max-size", "48MB",
+   "--db.growth-step", "1MB"],
+  ["examples/engine-driver/build/engine-driver", "chain", "--leader", "0", "--blocks", "22", "--every-ms", "2000"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[model]
+kind = "chain"
+# An execution client's start is part of the window: reth opens its engine API ten seconds in.
+moves_within_ticks = 20_000_000_000
+
+[adapter]
+kind = "eth-jsonrpc"
+
+[workload]
+txs = "/workload/txs"
+rate = 20
+targets = [0]
+nodes = [0]
+observe_every_ticks = 1_000_000_000
+window_ticks = 30_000_000_000
+settle_ticks = 10_000_000_000
+
+[disk]
+sync_semantics = "strict"
+reorder_unsynced = false

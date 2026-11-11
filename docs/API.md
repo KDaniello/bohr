@@ -1592,16 +1592,27 @@ height = "result.block.header.height"
 txs = "/workload/txs"     # in the prepared state: one base64 transaction a line
 rate = 20                 # a virtual second
 targets = [0, 1, 2, 3]    # submissions go round these nodes
+nodes = [0, 1, 2, 3]      # the chain's nodes, each asked its head; default: the cluster's
 observe_every_ticks = 1_000_000_000
 window_ticks = 30_000_000_000   # default: faults.disarm_after_ticks
 settle_ticks = 10_000_000_000
 ```
 
 An adapter is a declaration, not code per chain: each of `submit`, `included` and `head` is a method,
-its parameters with `{tx_base64}`, `{hash}` and `{hash_base64}` holes, and the paths of the fields
-recorded, in the probe's path language with `name[n]` for a list's element. A JSON-RPC body carries
-bytes as base64, so `cometbft-rpc` asks `tx` for `{hash_base64}`; its `0x` hex form is refused by the
-server. `kind = "custom"` writes every call out.
+its parameters with holes, and the paths of the fields recorded, in the probe's path language with
+`name[n]` for a list's element. The holes are `{tx_base64}` and `{tx_hex}` for the transaction,
+`{hash}` and `{hash_base64}` for its hash, and `{h}` and `{h_hex}` for a height. CometBFT's body
+carries bytes as base64, so `cometbft-rpc` asks `tx` for `{hash_base64}`; its `0x` hex form is
+refused by the server. A height is read as a number, as decimal text, or as `0x` hex.
+
+`kind = "eth-jsonrpc"` is geth, reth and every EVM execution client, on port 8545: it submits
+`{tx_hex}` with `eth_sendRawTransaction`, asks `eth_getTransactionReceipt` where a transaction
+landed, and asks `eth_getBlockByNumber` for heads and blocks. Its heads are not final when
+reported, so R2.3 does not judge them; a block lists its transactions by hash, which the load knows
+from what each submission answered. `kind = "custom"` writes every call out.
+
+`nodes` names the chain's nodes where the cluster holds more: an Ethereum execution client is
+driven by a consensus client, `examples/engine-driver chain`, which serves no chain API.
 
 `bohr-load` is a guest beside the probe, started as the node after the scenario's own and before
 the probe, so both keep their numbers; it is found as the probe is (§5.9), by `BOHR_LOAD`, beside

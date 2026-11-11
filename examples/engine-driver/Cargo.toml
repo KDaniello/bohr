@@ -8,11 +8,9 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# No dependencies: the token's HMAC-SHA256 is written here, held to RFC 4231's test vectors, so the
+# driver builds wherever the tool does, with nothing fetched.
 [dependencies]
-# What a bearer token is signed with. Pure Rust and pinned: the token this makes has to be the one
-# the node's own library verifies, and a version is part of that claim.
-hmac = "=0.12.1"
-sha2 = "=0.10.9"
 
 [[bin]]
 name = "engine-driver"

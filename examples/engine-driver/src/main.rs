@@ -10,15 +10,16 @@
 //! a projection.
 //!
 //! The scenario runs the client and this driver as separate nodes.
+//!
+//! `engine-driver chain` drives an Ethereum execution client instead, as a beacon node would: a
+//! block every interval, built from the client's own pool of transactions, and, with `--follower`,
+//! every block handed to a second client, which must reach the same state.
 
 use std::{
     io::{ErrorKind, Read, Write},
     net::{SocketAddrV4, TcpStream},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 /// Where the shared secret is, on every node's filesystem.
 ///
@@ -35,8 +36,12 @@ const ATTEMPTS: u32 = 400;
 /// How long to wait between attempts, in virtual time.
 const RETRY: Duration = Duration::from_millis(5);
 
-/// Largest answer read back; the capability list, the longest, fits easily.
-const MAX_ANSWER: usize = 64 * 1024;
+/// Rounds of [`ATTEMPTS`] a client is given to start, about two seconds each: reth opens its
+/// engine API ten seconds in.
+const STARTUP_ROUNDS: u32 = 15;
+
+/// Largest answer read back: a payload of a full block of transfers, hundreds of kilobytes, fits.
+const MAX_ANSWER: usize = 4 * 1024 * 1024;
 
 /// How many blocks the client is asked to build.
 const BLOCKS: u32 = 4;
@@ -58,12 +63,190 @@ const ZERO32: &str = "0x00000000000000000000000000000000000000000000000000000000
 const ZERO20: &str = "0x0000000000000000000000000000000000000000";
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("chain") {
+        std::process::exit(chain_mode(&args[2..]));
+    }
     std::process::exit(drive());
 }
 
-/// The node's address, which is the one the world gave node zero.
-fn node(port: u16) -> SocketAddrV4 {
-    SocketAddrV4::new([10, 66, 0, 1].into(), port)
+/// The address the world gives node `index`.
+fn at(index: u8, port: u16) -> SocketAddrV4 {
+    SocketAddrV4::new([10, 66, 0, index + 1].into(), port)
+}
+
+/// What `chain` was told: the client that builds, the one that follows, how many blocks, and how
+/// far apart.
+struct ChainArgs {
+    leader: u8,
+    follower: Option<u8>,
+    blocks: u32,
+    every: Duration,
+}
+
+fn chain_args(args: &[String]) -> Result<ChainArgs, String> {
+    let mut out =
+        ChainArgs { leader: 0, follower: None, blocks: 20, every: Duration::from_secs(2) };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--leader" => out.leader = value()?.parse().map_err(|e| format!("--leader: {e}"))?,
+            "--follower" => {
+                out.follower = Some(value()?.parse().map_err(|e| format!("--follower: {e}"))?);
+            }
+            "--blocks" => out.blocks = value()?.parse().map_err(|e| format!("--blocks: {e}"))?,
+            "--every-ms" => {
+                out.every = Duration::from_millis(
+                    value()?.parse().map_err(|e| format!("--every-ms: {e}"))?,
+                );
+            }
+            other => return Err(format!("no argument {other:?}")),
+        }
+    }
+    Ok(out)
+}
+
+/// A beacon node's loop over one or two execution clients: build on the leader from its pool,
+/// validate on it, hand the same payload to the follower, and make it head on both.
+///
+/// Every block is final once the next one is built, so a crash has something to contradict. Each
+/// line it prints names the block, the leader's state root, and what the follower answered.
+fn chain_mode(args: &[String]) -> i32 {
+    let args = match chain_args(args) {
+        Ok(args) => args,
+        Err(why) => {
+            eprintln!("engine-driver chain: {why}");
+            return 2;
+        }
+    };
+    let secret = match read_secret() {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("cannot read {SECRET_PATH}: {e}");
+            return 2;
+        }
+    };
+    // Every client is waited for before the first block: one that misses a block has no peer to
+    // fetch it from, and follows nothing after it.
+    let mut genesis_of = Vec::new();
+    for client in std::iter::once(args.leader).chain(args.follower) {
+        let Some(genesis) = (0..STARTUP_ROUNDS).find_map(|_| {
+            call_at(client, PUBLIC_PORT, None, "eth_getBlockByNumber", r#"["0x0",false]"#)
+        }) else {
+            return nothing_asked(&format!("node {client} never answered on its public endpoint"));
+        };
+        let Some(hash) = field(&genesis, "hash") else {
+            return nothing_asked(&format!("no genesis block: {}", body(&genesis, 300)));
+        };
+        println!("node {client} genesis {hash}");
+        genesis_of.push((hash, field(&genesis, "timestamp").unwrap_or_default()));
+    }
+    if genesis_of.iter().any(|(hash, _)| *hash != genesis_of[0].0) {
+        println!("the clients start from different genesis blocks");
+    }
+    let mut built = 0;
+    for number in 1..=args.blocks {
+        // Built on the leader's own head, asked afresh each block, as a beacon node follows its
+        // client: a driver restarted, or a client come back behind, carries on from where the
+        // client is.
+        let Some(latest) =
+            call_at(args.leader, PUBLIC_PORT, None, "eth_getBlockByNumber", r#"["latest",false]"#)
+        else {
+            println!("block {number} not built: the leader does not name its head");
+            std::thread::sleep(args.every);
+            continue;
+        };
+        let (Some(head), Some(stamp)) = (field(&latest, "hash"), field(&latest, "timestamp"))
+        else {
+            println!("block {number} not built: {}", body(&latest, 300));
+            std::thread::sleep(args.every);
+            continue;
+        };
+        let parent = field(&latest, "parentHash").filter(|p| p != ZERO32).unwrap_or(head.clone());
+        let finalized = parent;
+        let stamp = hex_u64(&stamp) + args.every.as_secs().max(1);
+        // A fresh token each block: one is valid for a minute of the node's clock.
+        let token = bearer(&secret);
+        let attributes = format!(
+            r#"{{"timestamp":"{}","prevRandao":"{ZERO32}","suggestedFeeRecipient":"{ZERO20}"}}"#,
+            hex(stamp)
+        );
+        let state = forkchoice_state(&head, &finalized);
+        let Some(started) = call_at(
+            args.leader,
+            ENGINE_PORT,
+            Some(&token),
+            "engine_forkchoiceUpdatedV1",
+            &format!("[{state},{attributes}]"),
+        ) else {
+            println!("block {number} not built: the leader stopped answering");
+            std::thread::sleep(args.every);
+            continue;
+        };
+        let Some(id) = field(&started, "payloadId").filter(|id| id != "null") else {
+            println!("block {number} not built: {}", body(&started, 300));
+            std::thread::sleep(args.every);
+            continue;
+        };
+        // The slot passes before the payload is asked for, as a beacon node waits: a client
+        // starts from an empty block and fills it from its pool while the slot runs.
+        std::thread::sleep(args.every);
+        let Some(got) = call_at(
+            args.leader,
+            ENGINE_PORT,
+            Some(&token),
+            "engine_getPayloadV1",
+            &format!(r#"["{id}"]"#),
+        ) else {
+            println!("block {number} not built: the leader stopped answering at getPayload");
+            continue;
+        };
+        let text = body(&got, MAX_ANSWER);
+        let Some(payload) = object(&text, "result") else {
+            println!("block {number} not built: {}", body(&got, 300));
+            continue;
+        };
+        let Some(hash) = field(&payload, "blockHash") else { continue };
+        let root = field(&payload, "stateRoot").unwrap_or_default();
+        let mut answers = Vec::new();
+        for client in std::iter::once(args.leader).chain(args.follower) {
+            let valid = call_at(
+                client,
+                ENGINE_PORT,
+                Some(&token),
+                "engine_newPayloadV1",
+                &format!("[{payload}]"),
+            )
+            .map_or_else(|| "unanswered".to_owned(), |a| status(&a));
+            let next = forkchoice_state(&hash, &head);
+            let chosen = call_at(
+                client,
+                ENGINE_PORT,
+                Some(&token),
+                "engine_forkchoiceUpdatedV1",
+                &format!("[{next},null]"),
+            )
+            .map_or_else(|| "unanswered".to_owned(), |a| status(&a));
+            answers.push(format!("node {client} {valid}/{chosen}"));
+        }
+        println!("block {number} {hash} root {root} {}", answers.join(" "));
+        built += 1;
+    }
+    println!("built {built} of {}", args.blocks);
+    0
+}
+
+/// A forkchoice state naming `head`, with `finalized` as both safe and final.
+fn forkchoice_state(head: &str, finalized: &str) -> String {
+    format!(
+        r#"{{"headBlockHash":"{head}","safeBlockHash":"{finalized}","finalizedBlockHash":"{finalized}"}}"#
+    )
+}
+
+/// The status an engine answer gives, or the start of the answer where it gives none.
+fn status(answer: &str) -> String {
+    field(answer, "status").unwrap_or_else(|| body(answer, 120))
 }
 
 /// A run in which the client was never reached, and so was never held to anything.
@@ -123,7 +306,10 @@ fn drive() -> i32 {
         return nothing_asked("the node stopped answering at the first forkchoice");
     };
     if !answer.contains("\"VALID\"") {
-        return nothing_asked(&format!("the client refused its own genesis: {}", body(&answer, 300)));
+        return nothing_asked(&format!(
+            "the client refused its own genesis: {}",
+            body(&answer, 300)
+        ));
     }
 
     let mut chain = Chain {
@@ -354,21 +540,98 @@ fn read_secret() -> std::io::Result<Vec<u8>> {
 /// The guest's clock is the world's, so the token matches what the node reads.
 #[allow(clippy::disallowed_methods, reason = "a guest's clock is the world's, and is intercepted")]
 fn bearer(secret: &[u8]) -> String {
-    let issued =
-        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let issued = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
     let header = base64url(br#"{"alg":"HS256","typ":"JWT"}"#);
     let claims = base64url(format!(r#"{{"iat":{issued}}}"#).as_bytes());
     let signed = format!("{header}.{claims}");
 
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("any length of key is accepted");
-    mac.update(signed.as_bytes());
-    format!("{signed}.{}", base64url(&mac.finalize().into_bytes()))
+    format!("{signed}.{}", base64url(&hmac_sha256(secret, signed.as_bytes())))
 }
 
-/// Sends one request and reads the answer, retrying while nobody is listening yet.
-///
-/// Retries until the node listens.
+/// HMAC-SHA256 (RFC 2104), what a JWT's `HS256` names.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&sha256(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.iter().map(|b| b ^ byte).collect::<Vec<u8>>();
+    let mut inner = pad(0x36);
+    inner.extend_from_slice(message);
+    let mut outer = pad(0x5c);
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+}
+
+/// SHA-256 (FIPS 180-4).
+fn sha256(message: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut padded = message.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&((message.len() as u64) * 8).to_be_bytes());
+    for chunk in padded.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(choose).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            (hh, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
+        }
+        for (state, add) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *state = state.wrapping_add(add);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Sends one request to node zero and reads the answer, retrying while nobody is listening yet.
 fn call(port: u16, token: Option<&str>, method: &str, params: &str) -> Option<String> {
+    call_at(0, port, token, method, params)
+}
+
+/// Sends one request to node `index` and reads the answer, retrying until the node listens.
+fn call_at(
+    index: u8,
+    port: u16,
+    token: Option<&str>,
+    method: &str,
+    params: &str,
+) -> Option<String> {
     let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
     let authorization =
         token.map_or_else(String::new, |token| format!("Authorization: Bearer {token}\r\n"));
@@ -379,7 +642,7 @@ fn call(port: u16, token: Option<&str>, method: &str, params: &str) -> Option<St
     );
 
     for _ in 0..ATTEMPTS {
-        let Ok(mut stream) = TcpStream::connect(node(port)) else {
+        let Ok(mut stream) = TcpStream::connect(at(index, port)) else {
             std::thread::sleep(RETRY);
             continue;
         };
@@ -477,4 +740,42 @@ fn base64url(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn sha256_and_hmac_give_the_published_answers() {
+        assert_eq!(
+            hex_of(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex_of(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // RFC 4231, test cases 1 and 2.
+        assert_eq!(
+            hex_of(&hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex_of(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // RFC 4231, test case 6: a key longer than the block.
+        assert_eq!(
+            hex_of(&hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
 }

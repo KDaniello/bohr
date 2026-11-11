@@ -101,6 +101,9 @@ fn run(plan: &Plan) {
     let mut waiting: Vec<(usize, u32, String, Duration)> = Vec::new();
     // Found committed: tx to its hash and the height it was found at.
     let mut committed: BTreeMap<usize, (String, i64)> = BTreeMap::new();
+    // Every hash a node gave for a submission, to its plan index: a chain whose blocks list
+    // transactions by hash is audited by these.
+    let mut hashes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     loop {
         let now = started.elapsed();
         if now >= plan.window {
@@ -108,7 +111,9 @@ fn run(plan: &Plan) {
         }
         if next_tx < plan.txs.len() && now >= tx_due {
             let (node, port) = plan.targets[next_tx % plan.targets.len()];
-            submit(plan, next_tx, node, port, now, &mut waiting);
+            if let Some(hash) = submit(plan, next_tx, node, port, now, &mut waiting) {
+                hashes.entry(hash.to_ascii_lowercase()).or_default().push(next_tx);
+            }
             next_tx += 1;
             tx_due += plan.every_tx;
         }
@@ -178,7 +183,7 @@ fn run(plan: &Plan) {
             send("load.final", &fields);
         }
     }
-    audit(plan, &heads);
+    audit(plan, &heads, &hashes);
 }
 
 /// Most heights the end-of-run audit asks each node about, the latest ones.
@@ -187,7 +192,7 @@ const AUDITED: i64 = 256;
 /// Asks every node the blocks every node has, the latest [`AUDITED`] heights up to the lowest head,
 /// so that two replicas' decisions are compared at the same heights rather than wherever a round
 /// of heads happened to land.
-fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)]) {
+fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)], hashes: &BTreeMap<String, Vec<usize>>) {
     let Some(block) = &plan.block else { return };
     let Some(lowest) = heads.iter().filter_map(|(_, _, head)| *head).min() else { return };
     // A transaction repeated in the plan is every one of its indexes: the copy refused as a
@@ -198,8 +203,10 @@ fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)]) {
     }
     for &(node, port, _) in heads {
         for height in (lowest - AUDITED + 1).max(1)..=lowest {
-            let at = height.to_string();
-            let Ok(fields) = ask(block, node, port, &[("h", &at)]) else { continue };
+            let (at, at_hex) = (height.to_string(), format!("0x{height:x}"));
+            let Ok(fields) = ask(block, node, port, &[("h", &at), ("h_hex", &at_hex)]) else {
+                continue;
+            };
             let mut record =
                 vec![("node", Json::Int(i64::from(node))), ("height", Json::Int(height))];
             for hash in ["block_hash", "state_hash"] {
@@ -213,7 +220,7 @@ fn audit(plan: &Plan, heads: &[(u32, u16, Option<i64>)]) {
                 let held = txs
                     .iter()
                     .filter_map(Json::as_str)
-                    .filter_map(|tx| index.get(tx))
+                    .filter_map(|tx| index.get(tx).or_else(|| hashes.get(&tx.to_ascii_lowercase())))
                     .flatten()
                     .map(|i| Json::Int(*i as i64))
                     .collect();
@@ -236,19 +243,20 @@ fn settle_one(plan: &Plan, node: u32, port: u16, tx: usize, hash: &str, height: 
         Err(why) => return Final::Unanswered(why),
     }
     let Some(block) = &plan.block else { return Final::Absent };
-    let at = height.to_string();
-    match ask(block, node, port, &[("h", &at)]) {
+    let (at, at_hex) = (height.to_string(), format!("0x{height:x}"));
+    // A block lists a transaction by its bytes, as CometBFT's do, or by its hash, as Ethereum's.
+    let named =
+        |t: &Json| t.as_str().is_some_and(|t| t == plan.txs[tx] || t.eq_ignore_ascii_case(hash));
+    match ask(block, node, port, &[("h", &at), ("h_hex", &at_hex)]) {
         Ok(fields) => match fields.get("txs") {
-            Some(Json::Array(txs)) if txs.iter().any(|t| t.as_str() == Some(&plan.txs[tx])) => {
-                Final::Held
-            }
+            Some(Json::Array(txs)) if txs.iter().any(named) => Final::Held,
             _ => Final::Absent,
         },
         Err(why) => Final::Unanswered(why),
     }
 }
 
-/// Submits one transaction and records whether the node accepted it.
+/// Submits one transaction and records whether the node accepted it; the hash it gave.
 fn submit(
     plan: &Plan,
     tx: usize,
@@ -256,8 +264,9 @@ fn submit(
     port: u16,
     now: Duration,
     waiting: &mut Vec<(usize, u32, String, Duration)>,
-) {
-    let holes = [("tx_base64", plan.txs[tx].as_str())];
+) -> Option<String> {
+    let as_hex = format!("0x{}", hex(&unbase64(&plan.txs[tx])));
+    let holes = [("tx_base64", plan.txs[tx].as_str()), ("tx_hex", as_hex.as_str())];
     let answer = ask(&plan.submit, node, port, &holes);
     let (accepted, hash) = match &answer {
         Ok(fields) => (
@@ -278,8 +287,12 @@ fn submit(
         record.push(("error", Json::Str(why.clone())));
     }
     send("load.submitted", &record);
-    if let (true, Some(hash)) = (accepted, hash) {
-        waiting.push((tx, node, hash, now));
+    match (accepted, hash) {
+        (true, Some(hash)) => {
+            waiting.push((tx, node, hash.clone(), now));
+            Some(hash)
+        }
+        _ => None,
     }
 }
 
@@ -369,6 +382,34 @@ fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Bytes as lower-case hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Bytes from standard base64; padding and a stray character end them.
+fn unbase64(text: &str) -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let (mut out, mut acc, mut bits) = (Vec::new(), 0u32, 0);
+    for v in text.bytes().map_while(value) {
+        acc = acc << 6 | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
 /// Bytes as standard base64 with padding, as a JSON-RPC body carries them.
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -386,11 +427,15 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// A number written as a number or as decimal text, as CometBFT writes heights.
+/// A number written as a number, as decimal text, as CometBFT writes heights, or as `0x` hex, as
+/// Ethereum does.
 fn number(value: &Json) -> Option<i64> {
     match value {
         Json::Int(n) => Some(*n),
-        Json::Str(text) => text.parse().ok(),
+        Json::Str(text) => match text.strip_prefix("0x") {
+            Some(digits) => i64::from_str_radix(digits, 16).ok(),
+            None => text.parse().ok(),
+        },
         _ => None,
     }
 }
@@ -509,5 +554,15 @@ mod tests {
         assert_eq!(base64(&unhex("BFFE")), "v/4=");
         assert_eq!(base64(b"k1=v1"), "azE9djE=");
         assert_eq!(base64(&unhex("00ff10")), "AP8Q");
+    }
+
+    #[test]
+    fn base64_reads_back_as_the_hex_an_ethereum_body_carries() {
+        for bytes in [&b""[..], b"k", b"k1", b"k1=", b"k1=v1", &[0, 255, 16, 7]] {
+            assert_eq!(unbase64(&base64(bytes)), bytes);
+        }
+        assert_eq!(hex(&unbase64("AP8Q")), "00ff10");
+        assert_eq!(number(&Json::Str("0x1a".to_owned())), Some(26));
+        assert_eq!(number(&Json::Str("0x0".to_owned())), Some(0));
     }
 }
