@@ -6,6 +6,51 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.2 — what was acknowledged survives
+
+v0.9 could say a node broke only when a process died. What that misses is the commoner and costlier
+failure: a node that lives, answers, and no longer holds what it acknowledged. v0.9.2 judges it with
+four laws of durability and recovery, written once and fed by a chain or a store alike.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.2` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Findings
+
+- **The laws, R1.1–R1.4** (`[model] kind = "kv" | "chain"`). An acknowledged put read back absent or
+  superseded (`BOHR-2051`), a removed value read back (`BOHR-2057`), a batch read back in part,
+  acknowledged or not (`BOHR-2058`), and a node the world restarted that never answers again
+  (`BOHR-2055`). A finding is placed at the line of the acknowledgement that was lost, and a law is
+  told before a crash, since a node that refuses to come back exits non-zero.
+- **A store is judged by what its harness says.** `kv.begun`, `kv.acked`, `kv.read` and `kv.ready`
+  records, with a helper in every SDK and `testdata/guests/bohr_kv.h` for C.
+- **A chain is judged by a load.** `bohr-load`, a guest beside the probe, sends a state's pre-signed
+  transactions through an `[adapter]` declaration and asks every node for every committed one after
+  the fault window; `kind = "cometbft-rpc"` covers CometBFT and every Cosmos SDK chain.
+- **Cells.** `bohr hunt <pack> --cells` hunts each `scenario-s*.toml` of a pack: S0 clean, S1 kills
+  in the commit path, S1f kills in the first start, S3 power loss with torn and reordered writes.
+
+### Fixed
+
+- `rpc`, the probe's JSON-RPC client, is shared with the load; a reply is read one way.
+
+### Determinism
+
+Nothing moved: the laws judge records and the world's own timer, so a finding replays, reduces and
+ablates as any other.
+
+### Not done
+
+- **The Cosmos packs are written and not built.** `cosmos-simd-env`, `cosmos-hub-env` and the
+  candidates (Osmosis, Neutron, dYdX v4, Celestia) are built from source with a Go toolchain and
+  modules fetched from the network, which the host this release was made on does not have. Their
+  hunts, their surveys and the gate that a Cosmos chain is a pack wait for that build.
+- **The redb and mdbx harnesses keep their own summary.** Their move onto `kv.*` records is not done.
+
 ## v0.9.1.1 — the ground under the findings
 
 A review of the whole tool after v0.9.1 found 86 defects: answers the model gave unlike Linux, runs

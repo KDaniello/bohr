@@ -32,10 +32,11 @@ pub use bundle::{
     read_streams,
 };
 pub use event::{
-    ADVANCES_CODE, AGREES_CODE, AssertionKind, DURABILITY_CODE, DiskOpKind, Endpoint, Event,
-    EventKind, ExitStatus, FaultGrade, FaultKind, FaultTarget, LIVENESS_CODE, MONOTONIC_CODE,
-    NEVER_REVERTS_CODE, NodeState, PROBE_CODES, PacketFate, SwitchReason, UNIQUE_CODE,
-    short_digest,
+    ACKED_SURVIVES_CODE, ADVANCES_CODE, AGREES_CODE, AssertionKind, BATCH_WHOLE_CODE,
+    DELETED_STAYS_CODE, DURABILITY_CODE, DiskOpKind, Endpoint, Event, EventKind, ExitStatus,
+    FaultGrade, FaultKind, FaultTarget, LAW_CODES, LIVENESS_CODE, MONOTONIC_CODE,
+    NEVER_REVERTS_CODE, NodeState, PROBE_CODES, PacketFate, RESTARTS_CODE, SwitchReason,
+    UNIQUE_CODE, short_digest,
 };
 pub use log::{
     TraceStats, TraceWriter, digest_of, read_events, read_events_lossy, read_events_where,

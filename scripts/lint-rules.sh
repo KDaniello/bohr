@@ -59,6 +59,13 @@ if hits=$(grep_in_determinism '(Instant::now|SystemTime::now|thread_rng|rand::ra
   report 14c §5.1 $'host clock, ambient RNG or the host file system in a sans-io crate:\n'"$hits"
 fi
 
+# §5.21: a law is written once over the family layer's vocabulary. A law that names a family's
+# translator or an adapter reads a field of one chain or one store, and stops judging the others.
+laws=crates/bohr-world/src/model/laws.rs
+if [ -f "$laws" ] && hits=$(grep -nE '\b(chain|kv|adapter)::|super::(chain|kv)\b|crate::adapter' "$laws"); then
+  report 14o §5.21 $'a law names a family or an adapter:\n'"$hits"
+fi
+
 # Rule 10: hash iteration order is not stable across runs.
 if hits=$(grep_in_determinism '\b(HashMap|HashSet)\b' "${dirs[@]}"); then
   report 14d 'rule 10' $'HashMap/HashSet in a decision path; use BTreeMap or IndexMap:\n'"$hits"

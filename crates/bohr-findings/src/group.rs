@@ -78,8 +78,30 @@ pub fn finding_key(
     }
 }
 
-/// Where a run fell, read from what its failing nodes printed last.
+/// Where a run fell: where a broken law's lost acknowledgement was made, where a law names one,
+/// otherwise read from what its failing nodes printed last.
+///
+/// A law is told by its record, never by a log line, so a lost write is placed at the code that
+/// acknowledged it.
 pub fn place_of(events: &[bohr_trace::Event], tails: &[bohr_trace::OutputTail]) -> Option<String> {
+    // The law the oracle tells a finding by is the first of `LAW_CODES` present.
+    let told = bohr_trace::LAW_CODES.iter().find(|law| {
+        events.iter().any(
+            |e| matches!(&e.kind, bohr_trace::EventKind::Diagnostic { code, .. } if code == *law),
+        )
+    });
+    let acknowledged = told.and_then(|law| {
+        events.iter().find_map(|event| match &event.kind {
+            bohr_trace::EventKind::Diagnostic { code, message } if code == *law => {
+                let at = message.rsplit_once(", acknowledged at ")?.1;
+                Some(format!("acknowledged at {at}"))
+            }
+            _ => None,
+        })
+    });
+    if acknowledged.is_some() {
+        return acknowledged;
+    }
     let failing = bohr_report::narrate::failing_nodes(events);
     bohr_report::locate::locate(tails, &failing).map(|place| place.signature())
 }

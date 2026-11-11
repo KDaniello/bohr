@@ -73,6 +73,39 @@ public static class Sdk
     public static void SendEvent(string name, string detailsJson = "null") =>
         Emit("antithesis_event", "{" + Text(name) + ": " + detailsJson + "}");
 
+    /// <summary>Records an operation a store's harness began: "put", "delete" or "batch"; a null
+    /// value removes its key.</summary>
+    public static void KvBegun(string op, string[] keys, string?[] values, ulong seq,
+        [System.Runtime.CompilerServices.CallerFilePath] string file = "",
+        [System.Runtime.CompilerServices.CallerLineNumber] int line = 0) =>
+        KvOp("kv.begun", op, keys, values, seq, file, line);
+
+    /// <summary>Records an operation the store acknowledged, at the line that calls this.</summary>
+    public static void KvAcked(string op, string[] keys, string?[] values, ulong seq,
+        [System.Runtime.CompilerServices.CallerFilePath] string file = "",
+        [System.Runtime.CompilerServices.CallerLineNumber] int line = 0) =>
+        KvOp("kv.acked", op, keys, values, seq, file, line);
+
+    /// <summary>Records a key read back: its value, or null where it is absent.</summary>
+    public static void KvRead(string key, string? value) =>
+        SendEvent("kv.read", "{" + Text("key") + ": " + Text(key) + ", " + Text("value") + ": " +
+            (value is null ? "null" : Text(value)) + "}");
+
+    /// <summary>Records that the store answered its first question since this start.</summary>
+    public static void KvReady() => SendEvent("kv.ready", "{}");
+
+    private static void KvOp(string stage, string op, string[] keys, string?[] values, ulong seq,
+        string file, int line)
+    {
+        var keyList = string.Join(", ", System.Linq.Enumerable.Select(keys, Text));
+        var valueList = string.Join(", ",
+            System.Linq.Enumerable.Select(values, v => v is null ? "null" : Text(v)));
+        SendEvent(stage, "{" + Text("op") + ": " + Text(op) + ", " + Text("keys") + ": [" + keyList +
+            "], " + Text("values") + ": [" + valueList + "], " + Text("seq") + ": " + seq + ", " +
+            Text("at") + ": {" + Text("file") + ": " + Text(file) + ", " + Text("line") + ": " +
+            line + "}}");
+    }
+
     /// <summary>Random bytes that belong to the run rather than to the machine.</summary>
     /// <remarks>
     /// Under Bohr these come from the entropy tape by way of the world model, so a seed reproduces

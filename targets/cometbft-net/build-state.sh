@@ -31,4 +31,7 @@ genesis["genesis_time"] = "2025-01-01T00:00:00Z"
 json.dump(genesis, open(path, "w"), indent=2)
 EOF
 done
+# The workload: 600 kvstore transactions, `k<i>=v<i>`, one base64 line each, for bohr-load.
+mkdir -p "$out/workload"
+for i in $(seq 0 599); do printf 'k%d=v%d' "$i" "$i" | base64; done > "$out/workload/txs"
 echo "built $out"

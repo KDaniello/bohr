@@ -351,6 +351,16 @@ recorded difficulty:
 | `partition_split_brain` | two leaders under a one-directional partition | 3 | < 10 min |
 | `no_checksum` | a datagram protocol with no checksum applies an altered update | 1 | ≥ 20 of 60 seeds with `corrupt_probability`, 0 without |
 | `header_without_record` | a header rewritten to point at an appended record, one `fsync` after both | 2 | ≥ 20 of 60 seeds with reordering, 0 with `reorder_unsynced = false` |
+| `rename_without_dirsync` | a value renamed into place and acknowledged without syncing its directory; R1.1 | 1 | 60 of 60 seeds |
+| `delete_unsynced` | a delete acknowledged before its tombstone is durable; R1.2 | 1 | 45 of 60 seeds |
+| `batch_in_two_writes` | a batch written as two durable records with no commit marker; R1.3 | 1 | 60 of 60 seeds |
+| `restart_refuses_new_store` | an interrupted creation refused forever; R1.4 | 1 | 60 of 60 seeds |
+
+**The four laws' defects are judged by what the guest wrote, not by how it ended.** Each writes the
+`kv.*` records of `API.md` §6.4 through `testdata/guests/bohr_kv.h` and reads every key back at
+every start; the law's finding is placed at the line of the lost acknowledgement, so the place names
+the changed file. `kv_ack_quiet` writes the records too, and its `scenario-law.toml` judges the
+same run by R1.1 instead of by `[durability]`: over seeds 1–60 the two find the same 36 seeds.
 
 **Some of these catch themselves, and one deliberately does not.** `kv_fsync` compares what it
 acknowledged against what survived and exits 1, so the crash oracle finds it — which makes it a

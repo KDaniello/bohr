@@ -11,6 +11,10 @@
  * datagram sent while the node's disk is dirty, and a print is not one.
  *
  * Depth 2: a kill must land between one record's answer and the sync that would have kept it.
+ *
+ * It also writes the `kv.*` records (`docs/API.md` §6.5), so the same run is judged by the boundary
+ * (`scenario.toml`) and by the law R1.1 (`scenario-law.toml`). A restarted node reads every record
+ * back and stops; a record not wholly written reads as absent, as a store with a checksum reads it.
  */
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -19,6 +23,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "../../guests/bohr_kv.h"
 
 enum { RECORD = 64, PUTS = 16, PORT = 7000 };
 
@@ -40,14 +46,34 @@ static void pause_a_moment(void) {
     nanosleep(&how_long, 0);
 }
 
+/* Every record read back: whole, or absent. */
+static void read_back(int data) {
+    char record[RECORD], whole[RECORD], key[8];
+    memset(whole, 'k', sizeof whole);
+    for (int i = 0; i < PUTS; i++) {
+        snprintf(key, sizeof key, "r%d", i);
+        ssize_t got = pread(data, record, sizeof record, (off_t)i * RECORD);
+        int held = got == (ssize_t)sizeof record && memcmp(record, whole, sizeof record) == 0;
+        bohr_kv_read(key, held ? "k" : 0);
+    }
+    bohr_kv_ready();
+}
+
 int main(void) {
+    int again = access("store.db", F_OK) == 0;
     int data = open("store.db", O_CREAT | O_RDWR, 0644);
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (data < 0 || sock < 0)
         return 2;
+    if (again) {
+        read_back(data);
+        return 0;
+    }
 
-    char record[RECORD];
+    char record[RECORD], key[8];
     for (int i = 0; i < PUTS; i++) {
+        snprintf(key, sizeof key, "r%d", i);
+        BOHR_KV_PUT("kv.begun", key, "k", (unsigned long)i + 1);
         memset(record, 'k', sizeof record);
         if (pwrite(data, record, sizeof record, (off_t)i * RECORD) != (ssize_t)sizeof record)
             return 2;
@@ -55,6 +81,7 @@ int main(void) {
         /* The defect: the answer goes out here, and the sync that would have made it true
          * happens afterwards. Whatever a kill takes in between was acknowledged and is gone. */
         answer(sock, i + 1);
+        BOHR_KV_PUT("kv.acked", key, "k", (unsigned long)i + 1);
         pause_a_moment();
         if (fsync(data) != 0)
             return 2;

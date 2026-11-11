@@ -1,0 +1,9 @@
+# The seeded defect, and what `bohr check delete_unsynced` holds it to; see docs/TESTING.md §16.
+defect = "a delete acknowledged before its tombstone is durable"
+
+[check]
+works = { min_events = 20 }
+# The kill is written down inside the window, so every seed meets it.
+finds = { seeds = "1..60", code = "BOHR-2057", at_least = 30 }
+repeats = { times = 100 }
+replays = {}

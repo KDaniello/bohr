@@ -110,8 +110,15 @@ pub fn verdict(outcome: &Outcome) -> Verdict {
         Outcome::LivenessViolated(detail) => {
             (format!("the cluster stopped committing: {detail}"), kind)
         }
+        // A law of durability names which one it is by its code; the rest are the boundary's.
         Outcome::DurabilityViolated(detail) => {
-            (format!("an acknowledged write was lost: {detail}"), kind)
+            let said = match leading_code(detail) {
+                Some(bohr_trace::RESTARTS_CODE) => "a restarted node never answered",
+                Some(bohr_trace::DELETED_STAYS_CODE) => "a removed value came back",
+                Some(bohr_trace::BATCH_WHOLE_CODE) => "a batch was read back in part",
+                _ => "an acknowledged write was lost",
+            };
+            (format!("{said}: {detail}"), kind)
         }
         Outcome::ProbeViolated(detail) => {
             let code = leading_code(detail).map_or_else(|| kind.clone(), str::to_owned);

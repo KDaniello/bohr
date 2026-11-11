@@ -1506,6 +1506,76 @@ What the probes do not do:
 - **Judge a value it could not parse.** Results are JSON with integer numbers; a reply with a float
   or a body over 1 MiB is an unanswered request, not a finding.
 
+### 5.10 The laws of durability: `[model]`, `[adapter]`, `[workload]`
+
+A law is not a test of one project but a rule over the model of a family of systems. `[model]`
+names the family whose records the laws read; one implementation of each law judges every family
+(`ARCHITECTURE.md` §5.21).
+
+```toml
+[model]
+kind = "kv"                         # or "chain"
+ready_within_ticks = 10_000_000_000 # R1.4's bound, from the restart; default 10 s
+```
+
+| Law | Holds when | Code |
+|---|---|---|
+| R1.1 acknowledged survives | a subject whose last acknowledged operation is a put is never read back absent, nor as a value acknowledged before it and since superseded, by a reader that owes it | `BOHR-2051` |
+| R1.2 deleted stays deleted | a subject whose last acknowledged operation removed it is never read back as a value acknowledged before the removal | `BOHR-2057` |
+| R1.3 a batch is whole | within one start, a batch's subjects are read back all with its values or all with older ones, acknowledged or not | `BOHR-2058` |
+| R1.4 a node restarts | a node the world restarted answers within `ready_within_ticks`, and does not end without answering | `BOHR-2055` |
+
+What each law refuses to claim: a value never acknowledged may be a write in flight at a crash, and
+an operation begun (`kv.begun`) and not acknowledged excuses what it could have done, so neither is
+a loss; a chain node whose head is below the height a transaction was committed at does not owe
+it. R1.4 is judged only where nothing the scenario arms is graded below `real`: with
+`[disk] reorder_unsynced = false`, no restart from a snapshot and no corrupted packets. Each law
+raises one diagnostic per law, node and subject, naming where the lost acknowledgement was made, and
+a finding is placed there (§7.7). A law's finding is told before a crash: a node that refuses to
+come back exits non-zero, and the crash would hide the law it broke.
+
+A store is judged from what its harness writes (§6.5); a store is its node's own, so two nodes
+running one harness keep two stores. A chain is judged from what `bohr-load` records, which needs
+an adapter and a workload:
+
+```toml
+[adapter]
+kind = "cometbft-rpc"     # a built-in declaration: CometBFT and every Cosmos SDK chain
+port = 26657
+[adapter.head]            # any call may be written out, replacing the declaration's
+rpc = "block"
+params = {}
+height = "result.block.header.height"
+
+[workload]
+txs = "/workload/txs"     # in the prepared state: one base64 transaction a line
+rate = 20                 # a virtual second
+targets = [0, 1, 2, 3]    # submissions go round these nodes
+observe_every_ticks = 1_000_000_000
+window_ticks = 30_000_000_000   # default: faults.disarm_after_ticks
+settle_ticks = 10_000_000_000
+```
+
+An adapter is a declaration, not code per chain: each of `submit`, `included` and `head` is a method,
+its parameters with `{tx_base64}`, `{hash}` and `{hash_base64}` holes, and the paths of the fields
+recorded, in the probe's path language with `name[n]` for a list's element. A JSON-RPC body carries
+bytes as base64, so `cometbft-rpc` asks `tx` for `{hash_base64}`; its `0x` hex form is refused by the
+server. `kind = "custom"` writes every call out.
+
+`bohr-load` is a guest beside the probe, started as the node after the scenario's own and before
+the probe, so both keep their numbers; it is found as the probe is (§5.9), by `BOHR_LOAD`, beside
+`bohr`, or where `make probe` builds it. It submits the transactions at the rate, asks where each
+landed, asks each node its head, and after the window and the settle time asks every node for every
+transaction a node committed. It judges nothing: each answer is a `load.*` record, and only the load
+node's are read. `run.ends_with_node` may name it, and a run then ends after its final check.
+
+What the laws do not do:
+
+- **Read a log line.** A law reads records; where a run fell is localisation's (§7.7).
+- **Judge agreement, liveness or catching up.** A node that restarts but never catches up is v0.9.3's.
+- **Judge balances.** A transaction applied twice or with the wrong amount is v0.9.4's; R1.1 asks
+  only that a committed transaction is held.
+
 ---
 
 ## 6. SDK
@@ -1629,7 +1699,25 @@ Rules:
   generated from the Rust types — a CI job regenerates it and fails on a diff, so the schema and the
   code cannot drift.
 
-### 6.4 Antithesis compatibility matrix
+### 6.4 The store records: `kv.*`
+
+A store's harness writes what it began, what the store acknowledged, what it read back and when it
+first answered after a start, as events (`SendEvent`) of these names; every SDK has a helper for
+each, and `testdata/guests/bohr_kv.h` writes them from C.
+
+| Event | Details | Means |
+|---|---|---|
+| `kv.begun` | `op` (`put`, `delete`, `batch`), `keys`, `values` (`null` removes), `seq`, `at` | an operation started, which may land or not |
+| `kv.acked` | the same | the store acknowledged it; `at` is `{file, line}` of the acknowledgement |
+| `kv.read` | `key`, `value` or `null` | a key read back |
+| `kv.ready` | — | the store answered its first question since this start |
+
+`seq` orders a store's operations; a batch's keys share its `seq`. A harness reads every key back at
+the start of every start, before anything else, since a read is what a law judges. The helpers:
+`kv::begun`, `kv::acked`, `kv::read`, `kv::ready` in Rust; `KvBegun`, `KvAcked`, `KvRead`,
+`KvReady` in Go and C#; `kv_begun`, `kv_acked`, `kv_read`, `kv_ready` in Python.
+
+### 6.5 Antithesis compatibility matrix
 
 | Antithesis | Bohr | Note |
 |---|---|---|
@@ -1961,6 +2049,12 @@ scenario with every drawn and scheduled fault taken out, which is how an oracle 
 runs nothing was done to. `--binary <path>` replaces the pack's binary in the scenario's
 `argv`, so the file whose digest is checked is the file that runs. A hunt ends by grouping what it
 found (§7.7).
+
+`--cells` hunts every cell of the pack: each `scenario-s*.toml` beside its scenario, one after
+another, each under `-o/<cell>`, and prints one line a cell with its exit; the worst is the hunt's.
+A cell is a scenario of its own: S0 the load with no faults, S1 kills in the commit path, S1f kills
+inside the first start, S3 power loss with torn and reordered writes. `--json` is refused with it,
+since a hunt writes one object. A pack judged by the laws (§5.10) names `oracle = "laws"`.
 
 The packs in this repository: `redb`, `reth`, `op-reth`. `op-reth` is built from `rust/op-reth` in
 `ethereum-optimism/optimism`; the `ethereum-optimism/op-reth` repository is archived.
@@ -2336,6 +2430,10 @@ to do.
 | `BOHR-2043` | a probe saw one key carry two values anywhere; `double-sign` (§5.9) |
 | `BOHR-2044` | a probe saw a number go down on one node; `monotonic` (§5.9) |
 | `BOHR-2045` | a probe holds 65,536 keys and compares no new ones (§5.9) |
+| `BOHR-2051` | R1.1: something acknowledged was read back absent, or as a value it superseded (§5.10) |
+| `BOHR-2055` | R1.4: a node the world restarted did not answer within its bound, or ended without answering (§5.10) |
+| `BOHR-2057` | R1.2: something acknowledged as removed was read back (§5.10) |
+| `BOHR-2058` | R1.3: a batch was read back in part (§5.10) |
 | `BOHR-3001` | `ptrace` denied; `kernel.yama.ptrace_scope` |
 | `BOHR-3006` | the backend cannot hand a guest to a debugger |
 | `BOHR-3002` | unprivileged user namespaces disabled |

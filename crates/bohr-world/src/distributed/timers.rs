@@ -80,6 +80,13 @@ pub(crate) enum Due {
     ///
     /// A timer, since the finding is an absence.
     LivenessWindow,
+    /// The moment a restarted node had to have answered by, for R1.4.
+    RestartBound {
+        /// The node restarted.
+        node: NodeId,
+        /// The start it had to answer in.
+        start: u64,
+    },
     /// Time to ask which nodes have stopped making calls.
     ///
     /// Re-armed each time it fires.

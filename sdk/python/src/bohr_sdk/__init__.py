@@ -31,6 +31,10 @@ __all__ = [
     "always",
     "always_or_unreachable",
     "fault_point",
+    "kv_acked",
+    "kv_begun",
+    "kv_read",
+    "kv_ready",
     "random_bytes",
     "random_choice",
     "reachable",
@@ -207,6 +211,33 @@ def setup_complete(details: Any = None) -> None:
 def send_event(name: str, details: Any = None) -> None:
     """Puts a named event on the timeline."""
     _emit("antithesis_event", {name: details})
+
+
+def _kv_op(stage: str, op: str, keys: list[str], values: list[str | None], seq: int) -> None:
+    frame = inspect.currentframe()
+    caller = frame.f_back.f_back if frame and frame.f_back else None
+    at = {"file": caller.f_code.co_filename, "line": caller.f_lineno} if caller else None
+    send_event(stage, {"op": op, "keys": keys, "values": values, "seq": seq, "at": at})
+
+
+def kv_begun(op: str, keys: list[str], values: list[str | None], seq: int) -> None:
+    """Records an operation a store's harness began: put, delete or batch; None removes a key."""
+    _kv_op("kv.begun", op, keys, values, seq)
+
+
+def kv_acked(op: str, keys: list[str], values: list[str | None], seq: int) -> None:
+    """Records an operation the store acknowledged, at the line that calls this."""
+    _kv_op("kv.acked", op, keys, values, seq)
+
+
+def kv_read(key: str, value: str | None) -> None:
+    """Records a key read back: its value, or None where it is absent."""
+    send_event("kv.read", {"key": key, "value": value})
+
+
+def kv_ready() -> None:
+    """Records that the store answered its first question since this start."""
+    send_event("kv.ready", {})
 
 
 def random_bytes(n: int) -> bytes:

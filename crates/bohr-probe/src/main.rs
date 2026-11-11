@@ -16,18 +16,18 @@
 use std::{
     collections::BTreeMap,
     io::{Read as _, Write as _},
-    net::{Ipv4Addr, SocketAddrV4, TcpStream},
+    net::TcpStream,
     process::ExitCode,
     time::Duration,
 };
 
-use bohr_sdk_proto::json::{self, Json};
+use bohr_sdk_proto::{
+    json::{self, Json},
+    rpc::{MOST_BODY, address, answer_for, at, parse_reply, request_bytes},
+};
 
 /// Longest a node may take to answer: three beats, and never more than a second.
 const MOST_WAIT: Duration = Duration::from_secs(1);
-
-/// Largest reply read; a larger one is reported as too large.
-const MOST_BODY: usize = 1 << 20;
 
 /// One call, as the plan names it.
 struct Request {
@@ -249,7 +249,9 @@ impl Endpoint {
                     self.stream = None;
                 }
                 match json::parse(&reply) {
-                    Ok(reply) => answered.extend(owed.iter().map(|i| (*i, answer_for(&reply, *i)))),
+                    Ok(reply) => {
+                        answered.extend(owed.iter().map(|i| (*i, answer_for(&reply, *i as i64))))
+                    }
                     Err(e) => fail(answered, owed, &format!("unreadable: {e}")),
                 }
             }
@@ -288,37 +290,11 @@ fn batch_body(requests: &[Request], members: &[usize]) -> String {
     }
 }
 
-/// One call's result in a reply, found by its id where the reply is a batch.
-fn answer_for(reply: &Json, index: usize) -> Result<Json, String> {
-    let item = match reply {
-        Json::Array(items) => items
-            .iter()
-            .find(|item| item.get("id").and_then(Json::as_int) == Some(index as i64))
-            .ok_or_else(|| "missing from the batch".to_owned())?,
-        single => single,
-    };
-    if let Some(error) = item.get("error") {
-        let message = error.get("message").and_then(Json::as_str).unwrap_or("error");
-        return Err(format!("error: {message}"));
-    }
-    Ok(item.get("result").cloned().unwrap_or(Json::Null))
-}
-
-/// The address the world gives node `index`.
-fn address(index: u32, port: u16) -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::from(0x0A42_0000 | (index + 1)), port)
-}
-
 /// Writes one HTTP request.
 fn send(stream: &mut TcpStream, key: (u32, u16), body: &str) -> Result<(), String> {
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        address(key.0, key.1),
-        body.len()
-    );
-    let mut bytes = head.into_bytes();
-    bytes.extend_from_slice(body.as_bytes());
-    stream.write_all(&bytes).map_err(|e| format!("send: {}", e.kind()))
+    stream
+        .write_all(&request_bytes(address(key.0, key.1), body))
+        .map_err(|e| format!("send: {}", e.kind()))
 }
 
 /// Reads whatever has arrived, without waiting.
@@ -343,64 +319,6 @@ fn read_available(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(), Strin
     }
 }
 
-/// One HTTP reply from what has arrived, with whether the connection may be used again; `None`
-/// while some of it has still to come.
-fn parse_reply(buf: &[u8]) -> Result<Option<(String, bool)>, String> {
-    let Some(header_end) = find(buf, b"\r\n\r\n").map(|at| at + 4) else { return Ok(None) };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
-    let status = head.split_whitespace().nth(1).unwrap_or("").to_owned();
-    let keep = !head.contains("\r\nconnection: close");
-    let length = head
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length:"))
-        .and_then(|n| n.trim().parse::<usize>().ok());
-    let chunked =
-        head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"));
-    let raw = &buf[header_end..];
-    let body = if chunked {
-        match dechunk(raw)? {
-            Some(body) => body,
-            None => return Ok(None),
-        }
-    } else {
-        let Some(length) = length else {
-            return Err("reply has neither a length nor chunks".to_owned());
-        };
-        if raw.len() < length {
-            return Ok(None);
-        }
-        raw[..length].to_vec()
-    };
-    if status != "200" {
-        return Err(format!("http {status}"));
-    }
-    let text = String::from_utf8(body).map_err(|_| "reply is not text".to_owned())?;
-    Ok(Some((text, keep)))
-}
-
-/// A chunked body, where every chunk to the last has arrived.
-fn dechunk(mut raw: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let mut body = Vec::new();
-    loop {
-        let Some(line_end) = find(raw, b"\r\n") else { return Ok(None) };
-        let size_text = String::from_utf8_lossy(&raw[..line_end]).to_string();
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| "a chunk size does not read".to_owned())?;
-        if raw.len() < line_end + 2 + size + 2 {
-            return Ok(None);
-        }
-        body.extend_from_slice(&raw[line_end + 2..line_end + 2 + size]);
-        raw = &raw[line_end + 2 + size + 2..];
-        if size == 0 {
-            return Ok(Some(body));
-        }
-    }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 /// A result with only the named fields kept: per element for an array, as it is otherwise.
 ///
 /// A dotted field keeps its nesting, so the world reads it back by the same path. `.` keeps the
@@ -419,10 +337,6 @@ fn reduced(result: &Json, fields: &[String]) -> Json {
         }
         other => other.clone(),
     }
-}
-
-fn at<'a>(item: &'a Json, path: &str) -> Option<&'a Json> {
-    path.split('.').try_fold(item, |at, part| at.get(part))
 }
 
 fn put(into: &mut Json, path: &str, value: Json) {
@@ -465,28 +379,6 @@ mod tests {
         let body = batch_body(&requests, &[0, 1]);
         assert!(body.starts_with('[') && body.contains(r#""id":1"#), "{body}");
         assert!(!batch_body(&requests, &[1]).starts_with('['));
-    }
-
-    #[test]
-    fn a_reply_is_taken_only_once_whole() {
-        let whole = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnull";
-        assert_eq!(parse_reply(&whole[..20]), Ok(None));
-        assert_eq!(parse_reply(&whole[..whole.len() - 1]), Ok(None));
-        assert_eq!(parse_reply(whole), Ok(Some(("null".to_owned(), true))));
-        let chunked =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nnu\r\n2\r\nll\r\n0\r\n\r\n";
-        assert_eq!(parse_reply(&chunked[..chunked.len() - 3]), Ok(None));
-        assert_eq!(parse_reply(chunked), Ok(Some(("null".to_owned(), true))));
-    }
-
-    #[test]
-    fn a_batch_reply_is_read_by_id_in_any_order() {
-        let reply =
-            json::parse(r#"[{"id":1,"result":[]},{"id":0,"error":{"code":-1,"message":"no"}}]"#)
-                .expect("json");
-        assert_eq!(answer_for(&reply, 1), Ok(Json::Array(Vec::new())));
-        assert_eq!(answer_for(&reply, 0), Err("error: no".to_owned()));
-        assert!(answer_for(&reply, 7).is_err());
     }
 
     #[test]

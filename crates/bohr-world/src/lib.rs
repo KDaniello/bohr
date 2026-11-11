@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapter;
 mod bytes;
 #[cfg(any(
     feature = "chaos-syscall-passthru",
@@ -20,6 +21,7 @@ pub mod config;
 pub mod cpu;
 mod distributed;
 mod minimal;
+pub mod model;
 mod nums;
 mod oracle;
 pub mod probe;
@@ -38,8 +40,8 @@ pub use distributed::{
 };
 pub use minimal::{MinimalWorld, OutputSink};
 pub use oracle::{
-    AgreementOracle, DurabilityOracle, GroupOracle, LivenessOracle, Panel, ProbeOracle, Probed,
-    PropertiesAndCrashOracle, Watching, panel,
+    AgreementOracle, DurabilityOracle, GroupOracle, LawOracle, LivenessOracle, Panel, ProbeOracle,
+    Probed, PropertiesAndCrashOracle, Watching, panel,
 };
 pub use probe::{ProbeSpec, Property};
 pub use projection::{MAX_PROJECTION_BYTES, Projected, ProjectionSpec, Source, Value};

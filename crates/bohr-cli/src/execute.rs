@@ -381,11 +381,12 @@ fn drive(
             if loaded.linux.io_uring == bohr_world::IoUring::Ring {
                 cluster = cluster.with_io_uring();
             }
-            // The probe is the node after the last one the scenario numbers, as `specs_for`
-            // appends it.
+            // The load and the probe follow the scenario's own nodes, as `specs_for` appends them.
             if !loaded.probes.is_empty() {
-                let probe_node = loaded.cluster.as_ref().map_or(1, |c| c.nodes.max(1));
-                cluster = cluster.with_probes(loaded.probes.clone(), probe_node);
+                cluster = cluster.with_probes(loaded.probes.clone(), loaded.probe_node());
+            }
+            if let Some(model) = loaded.model {
+                cluster = cluster.with_model(model, loaded.load_node());
             }
             if let Some(state) = loaded.state.clone() {
                 cluster = cluster.from_state(state, loaded.cwd.clone());
@@ -605,7 +606,8 @@ fn fingerprints(specs: &[GuestSpec]) -> Vec<BinaryRecord> {
         };
         // The probe is known by its name inside the run: a replay with `--binaries` also runs
         // the scenario's programs from a file other than `argv[0]`.
-        let role = match (blake3.is_empty(), path == crate::PROBE_ARGV0) {
+        let supplied = path == crate::PROBE_ARGV0 || path == crate::LOAD_ARGV0;
+        let role = match (blake3.is_empty(), supplied) {
             (true, _) => bohr_trace::BinaryRole::Builtin,
             (false, true) => bohr_trace::BinaryRole::Probe,
             (false, false) => bohr_trace::BinaryRole::Executable,

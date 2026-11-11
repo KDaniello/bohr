@@ -611,6 +611,12 @@ pub struct DistributedWorld {
     observer: Option<crate::probe::Observer>,
     /// The node the probe runs on, which this world never faults and never counts as silent.
     probe_node: Option<NodeId>,
+    /// The laws' watch, where the scenario names a `[model]`.
+    model: Option<crate::model::Watch>,
+    /// The node the load runs on, which like the probe is outside the fault model and the watches.
+    load_node: Option<NodeId>,
+    /// Each node's first task since its last start: its own process, whose `exit_group` ends it.
+    main_task: BTreeMap<NodeId, TaskId>,
 }
 
 /// A node's world as this cluster configures one.
@@ -714,6 +720,21 @@ impl DistributedWorld {
         self
     }
 
+    /// The same world, judged by the laws of `config`'s family; `load.*` records are read only from
+    /// `load_node`.
+    #[must_use]
+    pub fn with_model(mut self, config: crate::model::ModelConfig, load_node: Option<u32>) -> Self {
+        self.model = Some(crate::model::Watch::new(config, load_node));
+        self.load_node = load_node.map(NodeId);
+        self
+    }
+
+    /// Whether `node` runs one of the tool's own guests, the probe or the load: outside the fault
+    /// model and the watches, so a fault never lands on what judges.
+    fn tool_node(&self, node: NodeId) -> bool {
+        Some(node) == self.probe_node || Some(node) == self.load_node
+    }
+
     /// The same world, told which program each node runs.
     #[must_use]
     pub fn with_programs(mut self, programs: Vec<String>) -> Self {
@@ -749,6 +770,9 @@ impl DistributedWorld {
             epolls: Epolls::default(),
             observer: None,
             probe_node: None,
+            model: None,
+            load_node: None,
+            main_task: BTreeMap::new(),
         }
     }
 
@@ -905,9 +929,18 @@ impl DistributedWorld {
         {
             tails.restarted(node.get(), now.get());
         }
-        // The probe is outside both watches.
-        if Some(node) == self.probe_node {
+        // A start ends; its first task is no longer the node's process.
+        if matches!(state, NodeState::Dead | NodeState::Restarting) {
+            self.main_task.remove(&node);
+        }
+        // The tool's nodes are outside every watch.
+        if self.tool_node(node) {
             return;
+        }
+        if let Some(watch) = self.model.as_mut()
+            && let Some((due, start)) = watch.node_became(node, state, now)
+        {
+            self.timers.arm(due, node, Due::RestartBound { node, start });
         }
         if let Some(watch) = self.liveness.as_mut() {
             watch.node_became(node, state, now);
@@ -1176,9 +1209,11 @@ impl DistributedWorld {
     }
 
     fn node_world(&mut self, node: NodeId) -> &mut MinimalWorld {
-        // Registered at birth, so a node that never syncs is noticed. The probe is excluded.
+        // Registered at birth, so a node that never syncs is noticed. The tool's nodes are
+        // excluded.
+        let tool = self.tool_node(node);
         if let Some(watch) = self.liveness.as_mut()
-            && Some(node) != self.probe_node
+            && !tool
         {
             watch.knows(node);
         }
@@ -1483,7 +1518,7 @@ impl DistributedWorld {
         // The probe's allocations pass without a draw. `brk(0)` allocates nothing.
         let odds = self.fault_policy.windowed(ctx.world_now(), self.fault_policy.enomem);
         let odds = self.fault_policy.suppressed.odds(FaultKind::MemoryExhausted, odds);
-        let refused = Some(node) != self.probe_node
+        let refused = !self.tool_node(node)
             && !(nr == BRK && args[0] == 0)
             && draw_odds(ctx, odds, DrawSite::MemoryExhausted)?;
         if !refused {
@@ -1513,7 +1548,7 @@ impl DistributedWorld {
         node: NodeId,
         ctx: &mut StopCtx<'_, '_>,
     ) -> Result<Option<Effects>, KernelError> {
-        if !self.fault_policy.is_armed() || Some(node) == self.probe_node {
+        if !self.fault_policy.is_armed() || self.tool_node(node) {
             return Ok(None);
         }
         // Guided targeting aims at unsynced writes.
@@ -1696,6 +1731,20 @@ impl DistributedWorld {
         }
         if let Some(violation) = digested.violated {
             self.violated.get_or_insert(violation);
+        }
+        if let Some(watch) = self.model.as_mut() {
+            for (name, details) in &digested.family_records {
+                for broken in watch.record(node, name, details) {
+                    ctx.emit_for(
+                        NodeId(broken.node),
+                        TaskId::ZERO,
+                        EventKind::Diagnostic {
+                            code: broken.code.to_owned(),
+                            message: broken.message,
+                        },
+                    )?;
+                }
+            }
         }
         if let Some(observer) = self.observer.as_mut() {
             let now = ctx.world_now();
@@ -2500,6 +2549,25 @@ impl WorldModel for DistributedWorld {
     fn handle(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         let effects = self.answer(stop, ctx)?;
         self.audit_answer(stop, &effects, ctx)?;
+        if let Some(watch) = self.model.as_mut() {
+            for op in &effects.node_ops {
+                // Only the node's own process ending ends the node: a child it forked, such as a
+                // helper a shell started, may exit while the node goes on.
+                if let NodeOp::Ended { node, by } = op
+                    && self.main_task.get(node) == Some(by)
+                    && let Some(broken) = watch.node_ended(*node)
+                {
+                    ctx.emit_for(
+                        NodeId(broken.node),
+                        TaskId::ZERO,
+                        EventKind::Diagnostic {
+                            code: broken.code.to_owned(),
+                            message: broken.message,
+                        },
+                    )?;
+                }
+            }
+        }
         // A finished node is silent by design; read off the effects.
         if let Some(watch) = self.liveness.as_mut() {
             for op in &effects.node_ops {
@@ -2538,6 +2606,19 @@ impl WorldModel for DistributedWorld {
         for entry in self.timers.pop_due(ctx.world_now()) {
             match entry {
                 Due::SleepExpiry { task } => effects.wake.push(Wake { task, ret: 0 }),
+                Due::RestartBound { node, start } => {
+                    if let Some(broken) = self.model.as_mut().and_then(|w| w.ready_due(node, start))
+                    {
+                        ctx.emit_for(
+                            node,
+                            TaskId::ZERO,
+                            EventKind::Diagnostic {
+                                code: broken.code.to_owned(),
+                                message: broken.message,
+                            },
+                        )?;
+                    }
+                }
                 Due::FutexTimeout { node, task, word, seq } => {
                     // A timeout fires only into the wait that armed it, checked at firing.
                     if self.futex_seq.get(&task) == Some(&seq)
@@ -2765,7 +2846,7 @@ impl WorldModel for DistributedWorld {
                                     .nodes
                                     .keys()
                                     .copied()
-                                    .filter(|n| Some(*n) != self.probe_node)
+                                    .filter(|n| !self.tool_node(*n))
                                     .collect();
                                 every.sort_unstable();
                                 every
@@ -2869,12 +2950,14 @@ impl DistributedWorld {
     fn answer(&mut self, stop: &Stop, ctx: &mut StopCtx<'_, '_>) -> Result<Effects, KernelError> {
         let node = ctx.node();
         self.node_of_task.insert(stop.task, node);
+        self.main_task.entry(node).or_insert(stop.task);
         // The node's world exists before anything is answered, since every descriptor number,
         // a socket's too, is taken from its table.
         self.node_parts(node);
         // Any stop shows the node is alive; recorded before answering.
+        let tool = self.tool_node(node);
         if let Some(watch) = self.liveness.as_mut()
-            && Some(node) != self.probe_node
+            && !tool
         {
             watch.stirred(node, ctx.world_now());
         }

@@ -1,0 +1,39 @@
+# The quiet acknowledgement defect, judged by the law R1.1 from the guest's own records.
+#
+# The same run as scenario.toml, judged by what the guest acknowledged and read back instead of by
+# what it sent: G9.2.5 holds the two to the same seeds.
+#
+# What follows is scenario.toml's own account of the boundary judgement.
+#
+# Nothing here knows what the guest promises. `[durability]` says only that a node answering
+# somebody with unsynced writes behind it, and coming back without them, is a finding — which is
+# true of every store ever written and needs no knowledge of this one.
+#
+# Two nodes because an answer is an outbound datagram, and a datagram needs somewhere to go.
+
+[run]
+horizon_ticks = 60_000_000        # 60 ms: long enough for the kill, the restart and what follows
+
+[cluster]
+nodes = 2
+argv = ["testdata/guests/build/kv_ack_quiet"]
+
+[network]
+topology = "full"
+latency_mean_ticks = 200_000
+
+[disk]
+sync_semantics = "strict"
+
+[model]
+kind = "kv"
+
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 8_000_000               # 8 ms, inside the window between an answer and its sync
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 12_000_000

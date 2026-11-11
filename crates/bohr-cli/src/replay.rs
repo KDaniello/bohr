@@ -275,10 +275,9 @@ pub(crate) fn verify_binaries(
         }
         // The probe is found as a run finds it and checked against the recorded build.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        let path = if record.role == bohr_trace::BinaryRole::Probe {
-            crate::probe::program()?
-        } else {
-            relocated(&record.path, dir)
+        let path = match crate::probe::supplied(&record.path) {
+            Some(found) if record.role == bohr_trace::BinaryRole::Probe => found?,
+            _ => relocated(&record.path, dir),
         };
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let path = relocated(&record.path, dir);

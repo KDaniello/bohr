@@ -1,0 +1,24 @@
+[package]
+name = "bohr-load"
+description = "The guest that sends a chain its workload and writes down what the chain acknowledged."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# A guest, like bohr-probe: it runs inside a world, on that world's clock and network, so every
+# call it makes is modelled. Built static by scripts/build-probe.sh, because a world holds no
+# dynamic loader.
+[[bin]]
+name = "bohr-load"
+path = "src/main.rs"
+
+[dependencies]
+bohr-sdk = { path = "../../sdk/rust", version = "0.0.0" }
+bohr-sdk-proto.workspace = true
+
+[lints]
+workspace = true

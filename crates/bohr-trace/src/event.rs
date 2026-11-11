@@ -29,6 +29,22 @@ pub const LIVENESS_CODE: &str = "BOHR-2030";
 /// A node answered while what it had written was not durable, and came back without it.
 pub const DURABILITY_CODE: &str = "BOHR-2031";
 
+/// R1.1: something a system acknowledged was read back absent, or as a value it had superseded.
+pub const ACKED_SURVIVES_CODE: &str = "BOHR-2051";
+
+/// R1.4: a node restarted after real faults did not answer within its bound.
+pub const RESTARTS_CODE: &str = "BOHR-2055";
+
+/// R1.2: something acknowledged as removed was read back.
+pub const DELETED_STAYS_CODE: &str = "BOHR-2057";
+
+/// R1.3: a batch was read back in part.
+pub const BATCH_WHOLE_CODE: &str = "BOHR-2058";
+
+/// The codes the laws of durability and recovery raise, in the order a finding is told by them.
+pub const LAW_CODES: [&str; 4] =
+    [BATCH_WHOLE_CODE, DELETED_STAYS_CODE, ACKED_SURVIVES_CODE, RESTARTS_CODE];
+
 /// A probe saw a value at a key change after it was seen, on one node.
 pub const NEVER_REVERTS_CODE: &str = "BOHR-2040";
 /// A probe saw two nodes answer differently for one key.

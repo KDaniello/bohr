@@ -215,10 +215,11 @@ and a dependency in one and not the other fails `make pr`.
 | `bohr-findings` | `bohr-kernel` `bohr-reducer` `bohr-report` `bohr-sdk-proto` `bohr-trace` `bohr-types` `bohr-world` |
 | `bohr-testkit` | `bohr-backend` `bohr-backend-null` `bohr-explorer` `bohr-kernel` `bohr-reducer` `bohr-tape` `bohr-trace` `bohr-types` `bohr-world` |
 | `bohr-probe` | `bohr-sdk-proto` |
+| `bohr-load` | `bohr-sdk-proto` |
 | `bohr-cli` | `bohr-backend` `bohr-backend-null` `bohr-backend-ptrace` `bohr-explorer` `bohr-findings` `bohr-kernel` `bohr-reducer` `bohr-report` `bohr-sdk-proto` `bohr-tape` `bohr-testkit` `bohr-trace` `bohr-types` `bohr-world` `bohr-x86` |
 <!-- /crate-graph -->
 
-`bohr-probe` also depends on the Rust SDK (`sdk/rust`), which is outside `crates/` and depends on
+`bohr-probe` and `bohr-load` also depend on the Rust SDK (`sdk/rust`), which is outside `crates/` and depends on
 `bohr-sdk-proto` alone (`scripts/check-sdk-deps.sh`).
 
 The direction around `bohr-kernel` is the one to note: **the kernel is depended upon by the world,
@@ -874,6 +875,42 @@ Two consequences follow, and both are enforced rather than documented:
 another on the rest — are outside the model, and so is a projection read off a request on the
 virtual network, which is protocol parsing. A differential run is N homogeneous clusters, never one
 mixed one.
+
+### 5.21. A law is written once, over the family layer
+
+A class of error is not a test of one project but a rule over the model of a family of systems.
+What a per-project oracle misses is the second project: a check that reads one store's file format
+or one chain's RPC fields judges that one and no other, and a defect class shared by every store is
+then found once per store, if at all.
+
+```
+ LAWS        R1.1 acknowledged survives · R1.2 deleted stays deleted · R1.3 a batch is whole ·
+   │         R1.4 a node restarts                       (bohr-world/src/model/laws.rs)
+   │ read only the vocabulary: Ack, Read
+ MODELS      chain: load.* records → Ack, Read          (model/chain.rs)
+   │         kv:    kv.* records   → Ack, Read          (model/kv.rs)
+   │ read only records
+ ADAPTERS    chain: an [adapter] declaration the load performs (adapter.rs, bohr-load)
+             kv:    a harness that writes kv.* records
+```
+
+Each layer knows only the layer directly below it. A law that names a translator or an adapter
+reads a field of one family, and is an architectural error: `scripts/lint-rules.sh` (14o) refuses
+`laws.rs` naming either. A third chain is a new adapter declaration and a state; a third store is a
+harness that writes the records. Neither adds a line under `model/`.
+
+Every judgement is a function of the records so far and of the world's own timer (R1.4's bound,
+armed at a restart), so a law's finding replays, reduces and ablates like any other. Records are
+read only from the node that owes them: `load.*` from the load, and a store's `kv.*` from its own
+node, whose keys are its own. The watch lives in the distributed world beside the probe's observer,
+fed by the same SDK record stream; its diagnostics are read by `LawOracle`, asked before the crash
+oracle, since a node that refuses to come back exits non-zero and the crash would hide the law.
+
+The load is a guest, like the probe: the world's network, clock and randomness are its, so one seed
+sends the same transactions at the same virtual moments. It judges nothing.
+
+Thus a durability law is a rule over a family's acknowledgements and reads, written once and fed by
+any family that can say what it acknowledged and what it read back.
 
 ---
 

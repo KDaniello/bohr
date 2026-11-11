@@ -1,0 +1,27 @@
+# delete_unsynced: a delete acknowledged before its tombstone is durable, judged by R1.2.
+#
+# S1: a kill in the commit path, a crash keeping all of the unsynced or none of it.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/delete_unsynced"]
+
+[disk]
+reorder_unsynced = false          # all of the unsynced survives a crash or none: R1.4 is judged
+
+[model]
+kind = "kv"
+ready_within_ticks = 5_000_000
+
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 1_500_000
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 3_000_000
