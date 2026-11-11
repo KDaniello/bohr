@@ -6,6 +6,49 @@ Written for someone deciding whether to upgrade. Format and section order in
 Four numbers version independently and are recorded in every bundle: `tool_version`,
 `tape_abi`, `bundle_format`, `sdk_schema` ([`docs/API.md`](./docs/API.md) §9).
 
+## v0.9.6 — the same laws on Ethereum
+
+v0.9.2–v0.9.5 wrote the laws against CometBFT. What that leaves unproven is the claim they rest on:
+that a law is written over a family's model, and so holds for a chain it was not written against.
+v0.9.6 runs every law on two Ethereum execution clients without changing one: no file under
+`bohr-world/src/model/` changed in this version.
+
+| Number | Value |
+|---|---|
+| `tool_version` | `0.9.6` |
+| `tape_abi` | `2` |
+| `bundle_format` | `3` |
+| `sdk_schema` | `1` |
+
+### Findings
+
+- **The `eth-jsonrpc` adapter.** geth, reth and every EVM execution client: `{tx_hex}` submitted
+  with `eth_sendRawTransaction`, receipts and blocks asked by `{hash}` and `{h_hex}`, `0x`
+  heights read, a block's transactions matched by the hashes submissions returned.
+- **`[workload] nodes`** names the chain's nodes where the cluster holds more, such as the consensus
+  client that drives an execution client.
+- **`engine-driver chain`** drives an execution client as a beacon node does: a block every
+  interval from the client's own pool, and with `--follower` every block handed to a second client.
+  Its token's HMAC-SHA256 is written in the driver, held to RFC 4231's vectors.
+- **`scripts/eth-txs.py`** signs transfers offline with no library: Keccak-256, secp256k1 with
+  RFC 6979, EIP-155, held to known answers.
+- **Two environments:** `eth-geth-env` and `eth-reth-env`, cells S0 and S1, and S9, where geth
+  builds and reth follows, two clients as two replicas of one chain.
+- **A split between clients is caught.** S9-split runs reth under another chain id; it refuses the
+  first block that holds a transfer, and R3.2 catches it.
+
+### Not done
+
+- **A split as two state roots.** Behind one engine API the follower checks the builder's state
+  root and refuses a block it computes otherwise; a split is a follower that stops, caught by R3.2,
+  not R2.2.
+- **A patched client.** The seeded split is a configuration, not a client changed by one gas unit:
+  rebuilding reth takes hours on the host this release was made on.
+- **A real consensus client**, and mainnet's state.
+- **R6.1 on a head that can be replaced.** R6.1 compares a reported inclusion with the block at its
+  height, final or not; a chain reorganised after a receipt would break it falsely. The driver
+  never reorganises, and the model is not changed in this version.
+
 ## v0.9.5 — told no, and judged by what it did with the answer
 
 The faults before v0.9.5 take a node away. A disk that is full, an `fsync` that fails or an

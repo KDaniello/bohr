@@ -1,0 +1,23 @@
+# reth, an Ethereum execution client, driven by the engine driver as a beacon node drives one,
+# loaded by bohr-load through the eth-jsonrpc adapter and judged by the laws over the chain model.
+
+[source]
+repository = "https://github.com/paradigmxyz/reth"
+commit = "3641f10830f44f71c2469fdf7e818ccd4a4b0e76"
+
+[build]
+command = ["targets/reth/build.sh"]
+binary = "targets/reth/build/reth"
+blake3 = "47d8e0ee44991aaaa51baf129f86f0e950492979f5924382bf08c6bd452b7c3c"
+
+[run]
+scenario = "targets/eth-reth-env/scenario-s0.toml"
+
+[judge]
+oracle = "laws"
+
+# What `bohr check` holds the pack to; see docs/TESTING.md §16.
+[check]
+works = { min_events = 100_000, min_virtual_s = 39 }
+repeats = { times = 3 }
+clean = { seeds = "1..4" }

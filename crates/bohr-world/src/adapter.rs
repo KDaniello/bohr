@@ -17,8 +17,10 @@ use crate::ConfigError;
 pub struct Operation {
     /// The JSON-RPC method.
     pub method: String,
-    /// The parameters, with `{tx_base64}`, `{hash}` and `{hash_base64}` holes the load fills: a
-    /// JSON-RPC body carries bytes as base64, where the submit answer gives the hash in hex.
+    /// The parameters, with holes the load fills: `{tx_base64}` and `{tx_hex}` the transaction,
+    /// `{hash}` and `{hash_base64}` its hash as the submit answer gave it and as base64, `{h}` and
+    /// `{h_hex}` a height in decimal and as `0x` hex. CometBFT's body carries bytes as base64,
+    /// Ethereum's as hex.
     pub params: Json,
     /// Field name to its path in the reply, `result.…`.
     pub fields: BTreeMap<String, String>,
@@ -56,7 +58,8 @@ pub struct Workload {
     pub rate: u64,
     /// The nodes that receive submissions, in rotation.
     pub targets: Vec<u32>,
-    /// Every node of the chain, each asked its head and, at the end, every committed transaction.
+    /// Every node of the chain, each asked its head and, at the end, every committed transaction:
+    /// the cluster's nodes, or those `nodes` names.
     pub nodes: Vec<u32>,
     /// Virtual time between two rounds of `head`.
     pub observe_every_ticks: u64,
@@ -160,6 +163,37 @@ state_hash = "result.block.header.app_hash"
 txs = "result.block.data.txs"
 "#;
 
+/// The declaration `kind = "eth-jsonrpc"` starts from: geth, reth and every EVM execution client.
+///
+/// A head is not final when reported, since a fork choice can replace it; a block lists its
+/// transactions by hash, which the load knows from what each submission answered.
+const ETH_JSONRPC: &str = r#"
+port = 8545
+final_heads = false
+[submit]
+rpc = "eth_sendRawTransaction"
+params = ["{tx_hex}"]
+hash = "result"
+[included]
+rpc = "eth_getTransactionReceipt"
+params = ["{hash}"]
+height = "result.blockNumber"
+succeeded = { field = "result.status", equals = "0x1" }
+[head]
+rpc = "eth_getBlockByNumber"
+params = ["latest", false]
+height = "result.number"
+block_hash = "result.hash"
+state_hash = "result.stateRoot"
+[block]
+rpc = "eth_getBlockByNumber"
+params = ["{h_hex}", false]
+height = "result.number"
+block_hash = "result.hash"
+state_hash = "result.stateRoot"
+txs = "result.transactions"
+"#;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawAdapter {
@@ -199,6 +233,7 @@ pub(crate) struct RawWorkload {
     txs: String,
     rate: Option<u64>,
     targets: Vec<u32>,
+    nodes: Option<Vec<u32>>,
     observe_every_ticks: Option<u64>,
     window_ticks: Option<u64>,
     settle_ticks: Option<u64>,
@@ -237,6 +272,14 @@ pub(crate) fn workload(
             nodes.saturating_sub(1)
         )));
     }
+    // A cluster may hold more than the chain: a consensus client driving it serves no chain API.
+    let chain: Vec<u32> = raw.nodes.clone().unwrap_or_else(|| (0..nodes).collect());
+    if chain.is_empty() || chain.iter().any(|n| *n >= nodes) {
+        return Err(refused(format!(
+            "workload.nodes must name nodes of the cluster, 0 to {}",
+            nodes.saturating_sub(1)
+        )));
+    }
     let window_ticks = raw.window_ticks.or(window_default).ok_or_else(|| {
         refused(
             "workload.window_ticks is needed where no faults.disarm_after_ticks closes a window"
@@ -247,7 +290,7 @@ pub(crate) fn workload(
         txs: raw.txs.clone(),
         rate: raw.rate.unwrap_or(20).max(1),
         targets: raw.targets.clone(),
-        nodes: (0..nodes).collect(),
+        nodes: chain,
         observe_every_ticks: raw.observe_every_ticks.unwrap_or(1_000_000_000),
         window_ticks,
         settle_ticks: raw.settle_ticks.unwrap_or(10_000_000_000),
@@ -261,11 +304,13 @@ fn adapter_of(raw: &RawAdapter) -> Result<Adapter, ConfigError> {
     let base: RawAdapter = match kind.as_str() {
         "cometbft-rpc" => toml::from_str(COMETBFT_RPC)
             .map_err(|e| refused(format!("the built-in cometbft-rpc declaration: {e}")))?,
+        "eth-jsonrpc" => toml::from_str(ETH_JSONRPC)
+            .map_err(|e| refused(format!("the built-in eth-jsonrpc declaration: {e}")))?,
         "custom" => RawAdapter::default(),
         other => {
             return Err(refused(format!(
                 "adapter.kind has no declaration named {other:?}; this build knows cometbft-rpc, \
-                 or custom with every call written out"
+                 eth-jsonrpc, or custom with every call written out"
             )));
         }
     };
@@ -380,6 +425,24 @@ mod tests {
         assert!(super::workload(Some(&workload), None, 4, Some(1)).is_err());
         let adapter = RawAdapter::default();
         assert!(super::workload(Some(&workload), Some(&adapter), 4, Some(1)).is_err());
+    }
+
+    #[test]
+    fn the_ethereum_declaration_sends_hex_and_reads_hex_heights() {
+        let adapter: RawAdapter = toml::from_str(r#"kind = "eth-jsonrpc""#).expect("toml");
+        let workload: RawWorkload = toml::from_str(
+            r#"txs = "/workload/txs"
+                              targets = [0]"#,
+        )
+        .expect("toml");
+        let built = workload_of(&workload, &adapter);
+        assert_eq!(built.adapter.port, 8545);
+        assert!(!built.adapter.final_heads);
+        assert_eq!(built.adapter.submit.params.to_json(), r#"["{tx_hex}"]"#);
+        assert_eq!(built.adapter.included.method, "eth_getTransactionReceipt");
+        let block = built.adapter.block.as_ref().expect("a block call");
+        assert_eq!(block.params.to_json(), r#"["{h_hex}",false]"#);
+        assert_eq!(block.fields.get("txs").map(String::as_str), Some("result.transactions"));
     }
 
     fn workload_of(workload: &RawWorkload, adapter: &RawAdapter) -> Workload {

@@ -1,0 +1,23 @@
+# geth, an Ethereum execution client, driven by the engine driver as a beacon node drives one,
+# loaded by bohr-load through the eth-jsonrpc adapter and judged by the laws over the chain model.
+
+[source]
+repository = "https://github.com/ethereum/go-ethereum"
+commit = "v1.17.10"
+
+[build]
+command = ["targets/geth/build.sh"]
+binary = "targets/geth/build/geth"
+blake3 = "7db156f6acbb64101c2940935b95f03fc3b85603735ecd23b57a991f4fad3827"
+
+[run]
+scenario = "targets/eth-geth-env/scenario-s0.toml"
+
+[judge]
+oracle = "laws"
+
+# What `bohr check` holds the pack to; see docs/TESTING.md §16.
+[check]
+works = { min_events = 100_000, min_virtual_s = 39 }
+repeats = { times = 3 }
+clean = { seeds = "1..4" }

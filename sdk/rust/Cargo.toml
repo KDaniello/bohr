@@ -12,4 +12,4 @@ publish = false
 # The record format, and nothing else. An SDK is linked into somebody else's build, so a
 # dependency here becomes their problem to resolve. See docs/ARCHITECTURE.md 9, rule S3.
 [dependencies]
-bohr-sdk-proto = { path = "../../crates/bohr-sdk-proto", version = "0.9.5" }
+bohr-sdk-proto = { path = "../../crates/bohr-sdk-proto", version = "0.9.6" }
