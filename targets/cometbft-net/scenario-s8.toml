@@ -1,0 +1,54 @@
+# cometbft-net, cell S8.
+#
+# S8: a replica restored from an older snapshot, the operator's restore from a backup; it must catch up without deciding anything again. Graded plausible, so R1.4 is not judged.
+
+[run]
+horizon_ticks = 50_000_000_000
+ends_with_node = 4                # the load, which ends after its final check
+
+[state]
+dir = "targets/cometbft-net/state"
+cwd = "/"
+
+[cluster]
+nodes = 4
+programs = [
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node0", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node1", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node2", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node3", "--proxy_app", "kvstore"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[model]
+kind = "chain"
+
+[adapter]
+kind = "cometbft-rpc"
+
+[workload]
+txs = "/workload/txs"
+rate = 20
+targets = [0, 1, 2, 3]
+observe_every_ticks = 1_000_000_000
+window_ticks = 30_000_000_000
+settle_ticks = 10_000_000_000
+
+
+[disk]
+sync_semantics = "strict"
+snapshot_depth = 4
+
+[[fault]]
+kind = "node_kill"
+node = 2
+at_tick = 12_000_000_000
+
+[[fault]]
+kind = "node_restart_from_snapshot"
+node = 2
+at_tick = 13_000_000_000
+snapshot_back = 2

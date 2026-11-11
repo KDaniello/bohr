@@ -1,14 +1,17 @@
 //! The family layer: what the laws of a class read, and the watch that feeds them.
 //!
 //! A law is not a test of one project but a rule over the model of a family of systems. Each
-//! family's records are turned into one vocabulary, `Ack` and `Read`, by a translator of its
-//! own (`chain`, `kv`); the laws (`laws`) read only that vocabulary, so one law judges a chain and
-//! a store alike. Every judgement is a function of the records so far and of the world's own timer,
-//! so a finding replays, reduces and ablates like any other. See `docs/ARCHITECTURE.md` §5.21.
+//! family's records are turned into one vocabulary — `Ack` and `Read` for durability, `Decided`
+//! and the claims and reaches of `Fact` for agreement — by a translator of its own (`chain`, `kv`,
+//! `log`); the laws (`laws`) read only that vocabulary, so one law judges a chain, a store and a
+//! consensus log alike. Every judgement is a function of the records so far and of the world's own
+//! timer, so a finding replays, reduces and ablates like any other. See `docs/ARCHITECTURE.md`
+//! §5.21.
 
 mod chain;
 mod kv;
 mod laws;
+mod log;
 
 use std::collections::BTreeMap;
 
@@ -23,6 +26,8 @@ pub enum Family {
     Chain,
     /// A store that acknowledges puts, deletes and batches, fed by its harness's records.
     Kv,
+    /// A consensus log that commits entries by index under terms, fed by its replicas' records.
+    Log,
 }
 
 impl Family {
@@ -32,6 +37,7 @@ impl Family {
         match self {
             Self::Chain => "chain",
             Self::Kv => "kv",
+            Self::Log => "log",
         }
     }
 }
@@ -46,6 +52,12 @@ pub struct ModelConfig {
     /// Whether R1.4 is judged at all: only where every fault the scenario arms is graded `real`,
     /// so that whatever landed was real too.
     pub restart_judged: bool,
+    /// How long after the fault window closes the system has to move again and every replica to
+    /// catch up, for R3.1 and R3.2.
+    pub moves_within: Tick,
+    /// When the last fault the scenario arms can land: the latest of its scheduled faults and
+    /// heals and of `faults.disarm_after_ticks`, or the start where it arms none.
+    pub window_close: Tick,
 }
 
 /// An acknowledgement, in the vocabulary every law reads.
@@ -79,6 +91,22 @@ pub(crate) struct Read {
     pub(crate) owes: bool,
 }
 
+/// A position decided by a replica, in the vocabulary every law of agreement reads: a block at a
+/// height, an entry at an index.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Decided {
+    /// The height or the index.
+    pub(crate) position: u64,
+    /// What was decided there: a block hash, an entry.
+    pub(crate) value: String,
+    /// The state deciding it left behind, where the family reports one.
+    pub(crate) state: Option<String>,
+    /// The replica that decided it.
+    pub(crate) node: u32,
+    /// Whether the replica reported it final.
+    pub(crate) final_: bool,
+}
+
 /// What a translator makes of one record.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Fact {
@@ -90,6 +118,12 @@ pub(crate) enum Fact {
     Read(Read),
     /// The node answered its first question since its last start.
     Ready { node: u32 },
+    /// A replica decided a position.
+    Decided(Decided),
+    /// A node claimed a round: led a term, proposed at a height.
+    Claimed { round: u64, node: u32 },
+    /// A replica has come as far as a position: its head, its applied index.
+    Reached { node: u32, position: u64 },
 }
 
 /// A law broken: its code, the node it was broken on, and what was seen.
@@ -108,7 +142,12 @@ pub struct Broken {
 pub struct Watch {
     config: ModelConfig,
     laws: laws::Laws,
+    agreement: laws::Agreement,
     chain: chain::Chain,
+    /// The nodes the records named, which owe catching up once the window closes.
+    nodes: std::collections::BTreeSet<u32>,
+    /// The nodes the world has down now, which owe nothing until they are up again.
+    down: std::collections::BTreeSet<u32>,
     /// The node the load runs on, the one node whose `load.*` records are read.
     load_node: Option<u32>,
     /// Each node's starts so far; the first is 1.
@@ -127,7 +166,10 @@ impl Watch {
         Self {
             config,
             laws: laws::Laws::default(),
+            agreement: laws::Agreement::default(),
             chain: chain::Chain::default(),
+            nodes: std::collections::BTreeSet::new(),
+            down: std::collections::BTreeSet::new(),
             load_node,
             starts: BTreeMap::new(),
             ready: BTreeMap::new(),
@@ -149,6 +191,7 @@ impl Watch {
                 let starts = &self.starts;
                 self.chain.facts(name, details, |node| starts.get(&node).copied().unwrap_or(1))
             }
+            Family::Log if name.starts_with("log.") => log::facts(from.get(), name, details),
             _ => return Vec::new(),
         };
         let mut broken = Vec::new();
@@ -160,6 +203,18 @@ impl Watch {
                 Fact::Ready { node } => {
                     let start = self.start_of(node);
                     self.ready.insert(node, start);
+                }
+                Fact::Decided(decided) => {
+                    self.nodes.insert(decided.node);
+                    broken.extend(self.agreement.decided(&decided));
+                }
+                Fact::Claimed { round, node } => {
+                    self.nodes.insert(node);
+                    broken.extend(self.agreement.claimed(round, node));
+                }
+                Fact::Reached { node, position } => {
+                    self.nodes.insert(node);
+                    self.agreement.reached(node, position);
                 }
             }
         }
@@ -178,10 +233,12 @@ impl Watch {
             return None;
         }
         if matches!(state, NodeState::Dead | NodeState::Frozen) {
-            // Put down again by the world: the start owes no answer.
+            // Put down again by the world: the start owes no answer, and the node no catching up.
             self.late.insert((node.get(), self.start_of(node.get())));
+            self.down.insert(node.get());
             return None;
         }
+        self.down.remove(&node.get());
         if state != NodeState::Restarting {
             return None;
         }
@@ -214,11 +271,46 @@ impl Watch {
     /// R1.4 for a node whose process ended on its own: one the world restarted that ends without
     /// having answered in this start never will.
     pub fn node_ended(&mut self, node: NodeId) -> Option<Broken> {
+        // Its process gone, the node owes no catching up either.
+        self.down.insert(node.get());
         let start = self.start_of(node.get());
         if !self.config.restart_judged || start < 2 || Some(node.get()) == self.load_node {
             return None;
         }
         self.ready_due(node, start)
+    }
+
+    /// When the fault window closes and when R3.1 and R3.2 are judged after it.
+    #[must_use]
+    pub const fn window(&self) -> (Tick, Tick) {
+        let close = self.config.window_close;
+        (close, Tick(close.get().saturating_add(self.config.moves_within.get())))
+    }
+
+    /// The fault window closed: what was decided by now is what the system must move past.
+    pub fn window_closed(&mut self) {
+        self.agreement.window_closed();
+    }
+
+    /// R3.1 and R3.2, the bound after the window closed. A chain decides a block every interval,
+    /// so it must have moved; a log with nothing to commit need not, and is judged for catching up
+    /// alone. A node the world has down owes nothing.
+    pub fn window_due(&mut self) -> Vec<Broken> {
+        // A torn crash, a restore from an older snapshot or a corrupted packet can leave a node
+        // rightly unable to start, and the system rightly stopped with it.
+        if !self.config.restart_judged {
+            return Vec::new();
+        }
+        let owing: Vec<u32> = self
+            .nodes
+            .iter()
+            .copied()
+            .filter(|n| !self.down.contains(n) && Some(*n) != self.load_node)
+            .collect();
+        // A chain moves only with more than two thirds of its replicas up.
+        let quorum = owing.len() * 3 > self.nodes.len() * 2;
+        let moves = self.config.family == Family::Chain && quorum && !owing.is_empty();
+        self.agreement.window_due(&owing, self.config.moves_within.get(), moves)
     }
 
     fn start_of(&self, node: u32) -> u64 {

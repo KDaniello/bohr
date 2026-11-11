@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use bohr_sdk_proto::json::Json;
 
-use super::{Ack, Fact, Read};
+use super::{Ack, Decided, Fact, Read};
 
 /// What the chain's records said so far: the lowest height each transaction was committed at.
 #[derive(Debug, Default)]
@@ -30,7 +30,25 @@ impl Chain {
         let node = int("node").and_then(|n| u32::try_from(n).ok());
         let tx = int("tx").and_then(|n| u64::try_from(n).ok());
         match (name, node, tx) {
-            ("load.head", Some(node), _) if int("height").is_some() => vec![Fact::Ready { node }],
+            // A head is the node answering, how far it has come, and, where it carries hashes, a
+            // decision, final where the adapter says a reported block is, as CometBFT's are.
+            ("load.head" | "load.block", Some(node), _) if int("height").is_some() => {
+                let height = int("height").and_then(|h| u64::try_from(h).ok()).unwrap_or(0);
+                let mut facts = vec![Fact::Reached { node, position: height }];
+                if name == "load.head" {
+                    facts.push(Fact::Ready { node });
+                }
+                if let Some(hash) = details.get("block_hash").and_then(Json::as_str) {
+                    facts.push(Fact::Decided(Decided {
+                        position: height,
+                        value: hash.to_owned(),
+                        state: details.get("state_hash").and_then(Json::as_str).map(str::to_owned),
+                        node,
+                        final_: details.get("final").and_then(Json::as_bool) == Some(true),
+                    }));
+                }
+                facts
+            }
             ("load.committed", Some(node), Some(tx)) => {
                 let succeeded = details.get("succeeded").and_then(Json::as_bool) == Some(true);
                 let Some(height) = int("height").filter(|_| succeeded) else { return Vec::new() };

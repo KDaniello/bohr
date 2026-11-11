@@ -1514,8 +1514,9 @@ names the family whose records the laws read; one implementation of each law jud
 
 ```toml
 [model]
-kind = "kv"                         # or "chain"
+kind = "kv"                         # or "chain", or "log"
 ready_within_ticks = 10_000_000_000 # R1.4's bound, from the restart; default 10 s
+moves_within_ticks = 10_000_000_000 # R3.1's and R3.2's bound, from the fault window's close
 ```
 
 | Law | Holds when | Code |
@@ -1524,6 +1525,24 @@ ready_within_ticks = 10_000_000_000 # R1.4's bound, from the restart; default 10
 | R1.2 deleted stays deleted | a subject whose last acknowledged operation removed it is never read back as a value acknowledged before the removal | `BOHR-2057` |
 | R1.3 a batch is whole | within one start, a batch's subjects are read back all with its values or all with older ones, acknowledged or not | `BOHR-2058` |
 | R1.4 a node restarts | a node the world restarted answers within `ready_within_ticks`, and does not end without answering | `BOHR-2055` |
+| R2.1 decisions agree | every two replicas that decided one position decided the same: one block hash at a height, one entry at an index | `BOHR-2041` |
+| R2.2 state agrees | every two replicas that decided one position left the same state: one state hash at a height | `BOHR-2050` |
+| R2.3 a final decision stays | a position a replica reported final is never decided otherwise by it, a restart included | `BOHR-2040` |
+| R2.4 one decider per round | no term has two leaders | `BOHR-2043` |
+| R3.1 it moves again | a chain decides past its last position within `moves_within_ticks` of the fault window closing | `BOHR-2042` |
+| R3.2 a replica catches up | every replica up then reaches the last position decided before the window closed, within the same bound | `BOHR-2055` |
+
+R2.1, R2.3, R2.4 and R3.1 share v0.4's probe codes, whose questions they are; R3.2 shares R1.4's.
+R2.1 and R2.2 compare only replicas that answered one position, so a replica behind is not a
+disagreement. The fault window closes at the latest of the scenario's scheduled faults and heals
+and `faults.disarm_after_ticks`, or at the start where it arms none; drawn faults with no closing
+moment never close it, and R3 is then not judged; so are drawn kills with no restart, and a close
+whose bound falls after the load's last observation. R3 is judged only where R1.4 is, since a torn
+crash, a restore from an older snapshot or a corrupted packet can leave a node rightly unable to
+start. A log with nothing to commit need not move, so R3.1 judges a chain alone, and only with more
+than two thirds of its replicas up. A block is a final decision, held to R2.3, where the adapter
+says so: `cometbft-rpc` has `final_heads = true`, `custom` has it false unless it says otherwise. A chain's decisions are the heads the load asks every node and, at the
+end, the latest 256 blocks every node has, asked of each.
 
 What each law refuses to claim: a value never acknowledged may be a write in flight at a crash, and
 an operation begun (`kv.begun`) and not acknowledged excuses what it could have done, so neither is
@@ -1572,7 +1591,7 @@ node's are read. `run.ends_with_node` may name it, and a run then ends after its
 What the laws do not do:
 
 - **Read a log line.** A law reads records; where a run fell is localisation's (§7.7).
-- **Judge agreement, liveness or catching up.** A node that restarts but never catches up is v0.9.3's.
+- **Verify a signature or read consensus messages.** R2.4 reads what replicas said they led.
 - **Judge balances.** A transaction applied twice or with the wrong amount is v0.9.4's; R1.1 asks
   only that a committed transaction is held.
 
@@ -1712,7 +1731,12 @@ each, and `testdata/guests/bohr_kv.h` writes them from C.
 | `kv.read` | `key`, `value` or `null` | a key read back |
 | `kv.ready` | — | the store answered its first question since this start |
 
-`seq` orders a store's operations; a batch's keys share its `seq`. A harness reads every key back at
+A replica of a consensus log writes `log.committed` (`index`, `entry`, `term`) for each entry it
+commits, `log.leader` (`term`) when it claims a term, and `log.applied` (`index`); C guests have
+`testdata/guests/bohr_log.h`.
+
+`seq` orders a store's operations within one start; a later start's are later whatever their
+numbers, and a batch's keys share its `seq`. A harness reads every key back at
 the start of every start, before anything else, since a read is what a law judges. The helpers:
 `kv::begun`, `kv::acked`, `kv::read`, `kv::ready` in Rust; `KvBegun`, `KvAcked`, `KvRead`,
 `KvReady` in Go and C#; `kv_begun`, `kv_acked`, `kv_read`, `kv_ready` in Python.

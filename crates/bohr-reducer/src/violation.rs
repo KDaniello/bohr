@@ -250,6 +250,13 @@ fn lost_writes(events: &[Event]) -> BTreeSet<(NodeId, String)> {
                 let (file, _) = rest.split_once(" and came back")?;
                 Some((event.node, file.to_owned()))
             }
+            // A law's loss is told by the law and its subject: the message up to what was seen.
+            EventKind::Diagnostic { code, message }
+                if bohr_trace::LAW_CODES.contains(&code.as_str()) && message.starts_with('R') =>
+            {
+                let told = message.split(" read back").next().unwrap_or(message);
+                Some((event.node, format!("{code} {told}")))
+            }
             _ => None,
         })
         .collect()

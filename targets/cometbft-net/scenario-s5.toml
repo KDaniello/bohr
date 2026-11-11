@@ -1,0 +1,63 @@
+# cometbft-net, cell S5.
+#
+# S5: one replica frozen for 10 s while another is killed and restarted: both must catch up once the window closes.
+
+[run]
+horizon_ticks = 50_000_000_000
+ends_with_node = 4                # the load, which ends after its final check
+
+[state]
+dir = "targets/cometbft-net/state"
+cwd = "/"
+
+[cluster]
+nodes = 4
+programs = [
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node0", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node1", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node2", "--proxy_app", "kvstore"],
+  ["targets/cometbft/build/cometbft", "start", "--home", "/net/node3", "--proxy_app", "kvstore"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[model]
+kind = "chain"
+
+[adapter]
+kind = "cometbft-rpc"
+
+[workload]
+txs = "/workload/txs"
+rate = 20
+targets = [0, 1, 2, 3]
+observe_every_ticks = 1_000_000_000
+window_ticks = 30_000_000_000
+settle_ticks = 10_000_000_000
+
+
+[disk]
+sync_semantics = "strict"
+reorder_unsynced = false
+
+[[fault]]
+kind = "node_freeze"
+node = 3
+at_tick = 6_000_000_000
+
+[[fault]]
+kind = "node_thaw"
+node = 3
+at_tick = 16_000_000_000
+
+[[fault]]
+kind = "node_kill"
+node = 1
+at_tick = 9_000_000_000
+
+[[fault]]
+kind = "node_restart"
+node = 1
+at_tick = 10_000_000_000

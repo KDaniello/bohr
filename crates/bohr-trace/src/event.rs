@@ -41,9 +41,25 @@ pub const DELETED_STAYS_CODE: &str = "BOHR-2057";
 /// R1.3: a batch was read back in part.
 pub const BATCH_WHOLE_CODE: &str = "BOHR-2058";
 
-/// The codes the laws of durability and recovery raise, in the order a finding is told by them.
-pub const LAW_CODES: [&str; 4] =
-    [BATCH_WHOLE_CODE, DELETED_STAYS_CODE, ACKED_SURVIVES_CODE, RESTARTS_CODE];
+/// R2.2: two replicas past one position hold different states there.
+pub const STATE_AGREES_CODE: &str = "BOHR-2050";
+
+/// The codes the laws raise, in the order a finding is told by them: a split before a loss, a loss
+/// before a stall.
+///
+/// R2.1, R2.3, R2.4 and R3.1 share their codes with v0.4's probe properties, whose questions they
+/// are; R3.2 shares R1.4's, a replica that does not come back.
+pub const LAW_CODES: [&str; 9] = [
+    AGREES_CODE,
+    STATE_AGREES_CODE,
+    NEVER_REVERTS_CODE,
+    UNIQUE_CODE,
+    BATCH_WHOLE_CODE,
+    DELETED_STAYS_CODE,
+    ACKED_SURVIVES_CODE,
+    ADVANCES_CODE,
+    RESTARTS_CODE,
+];
 
 /// A probe saw a value at a key change after it was seen, on one node.
 pub const NEVER_REVERTS_CODE: &str = "BOHR-2040";
@@ -57,8 +73,14 @@ pub const UNIQUE_CODE: &str = "BOHR-2043";
 pub const MONOTONIC_CODE: &str = "BOHR-2044";
 
 /// Every code a probe raises as a finding, which is what a reduction identifies such a run by.
-pub const PROBE_CODES: [&str; 5] =
-    [NEVER_REVERTS_CODE, AGREES_CODE, ADVANCES_CODE, UNIQUE_CODE, MONOTONIC_CODE];
+pub const PROBE_CODES: [&str; 6] = [
+    NEVER_REVERTS_CODE,
+    AGREES_CODE,
+    ADVANCES_CODE,
+    UNIQUE_CODE,
+    MONOTONIC_CODE,
+    STATE_AGREES_CODE,
+];
 
 /// What happened. Closed apart from [`EventKind::Domain`], which world models extend through.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

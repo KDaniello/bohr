@@ -26,8 +26,8 @@ fn run(defect: &str, scenario: &str, seed: u64) -> Option<(i32, String)> {
     Some((out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned()))
 }
 
-/// Each law catches the defect seeded for it, and its finding names the changed file (G9.2.1,
-/// G9.2.4).
+/// Each law catches the defect seeded for it, and a store's finding names the changed file
+/// (G9.2.1, G9.2.4, G9.3.1).
 #[test]
 fn each_law_catches_its_defect_and_names_the_file() {
     for (defect, code) in [
@@ -35,11 +35,13 @@ fn each_law_catches_its_defect_and_names_the_file() {
         ("delete_unsynced", "BOHR-2057"),
         ("batch_in_two_writes", "BOHR-2058"),
         ("restart_refuses_new_store", "BOHR-2055"),
+        ("partition_split_brain", "BOHR-2043"),
     ] {
         let Some((exit, report)) = run(defect, "scenario.toml", 1) else { continue };
         assert_eq!(exit, 1, "{defect}: {report}");
         assert!(report.contains(code), "{defect} was not caught by {code}: {report}");
-        if code != "BOHR-2055" {
+        // A store's acknowledgement has a line to be placed at; a restart and a claim have none.
+        if !["BOHR-2055", "BOHR-2043"].contains(&code) {
             assert!(report.contains(&format!("{defect}.c:")), "{defect} is not placed: {report}");
         }
     }
