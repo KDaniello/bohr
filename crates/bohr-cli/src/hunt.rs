@@ -34,6 +34,70 @@ pub(crate) struct Hunt {
     pub(crate) resume: bool,
     pub(crate) binary: Option<String>,
     pub(crate) master_seed: u64,
+    /// The scenario to hunt under, where not the pack's own: one of its cells.
+    pub(crate) scenario: Option<PathBuf>,
+}
+
+/// Hunts every cell of a pack: each `scenario-s*.toml` beside the pack's scenario, one after
+/// another, each into a directory of its own under the output, and says what each came to.
+///
+/// The worst exit of the cells is the hunt's.
+pub(crate) fn hunt_cells(request: &Hunt) -> Result<u8, CliError> {
+    if crate::json::on() {
+        return Err(CliError::usage(
+            "BOHR-1001: --cells runs one hunt a cell, and --json writes one object; run a cell at a \
+             time for its object"
+                .to_owned(),
+        ));
+    }
+    let pack = targets::resolve(&request.pack)?;
+    let dir = pack.scenario.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut cells: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| CliError::refused(format!("cannot list {}: {e}", dir.display())))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with("scenario-s") && name.ends_with(".toml"))
+        })
+        .collect();
+    cells.sort();
+    if cells.is_empty() {
+        return Err(CliError::refused(format!(
+            "pack {} has no cells: no scenario-s*.toml beside {}",
+            pack.name,
+            pack.scenario.display()
+        )));
+    }
+    let mut worst = crate::exit::CLEAN;
+    let mut said = Vec::new();
+    for cell in &cells {
+        let name = cell
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cell")
+            .trim_start_matches("scenario-");
+        eprintln!("\ncell {name}: {}", cell.display());
+        let code = hunt(&Hunt {
+            out: request.out.join(name),
+            scenario: Some(cell.clone()),
+            pack: request.pack.clone(),
+            binary: request.binary.clone(),
+            ..*request
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("cell {name}: {e}");
+            e.exit()
+        });
+        worst = worst.max(code);
+        said.push(format!("  {name:<8} exit {code} · {}", request.out.join(name).display()));
+    }
+    eprintln!("\ncells of {}", pack.name);
+    for line in said {
+        eprintln!("{line}");
+    }
+    Ok(worst)
 }
 
 /// A hunt with no budget stops after this many runs that added no new group of findings.
@@ -142,13 +206,15 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
     }
 
     // The scenario must arm the pack's oracle, or every run would be clean for lack of checking.
-    let text = std::fs::read_to_string(&pack.scenario)
-        .map_err(|e| CliError::refused(format!("cannot read {}: {e}", pack.scenario.display())))?;
+    let scenario_path = request.scenario.clone().unwrap_or_else(|| pack.scenario.clone());
+    let text = std::fs::read_to_string(&scenario_path)
+        .map_err(|e| CliError::refused(format!("cannot read {}: {e}", scenario_path.display())))?;
     let loaded = crate::state_dir::load(&text)?;
     let armed = match pack.oracle.as_str() {
         "durability" => loaded.durability.is_some(),
         "liveness" => loaded.liveness.is_some(),
         "chain" => !loaded.probes.is_empty(),
+        "laws" => loaded.model.is_some(),
         _ => true,
     };
     if !armed {
@@ -158,6 +224,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
             pack.oracle,
             match pack.oracle.as_str() {
                 "chain" => "no [chain] and no [[probe]]",
+                "laws" => "no [model]",
                 "durability" => "no [durability]",
                 _ => "no [liveness]",
             }
@@ -189,7 +256,7 @@ pub(crate) fn hunt(request: &Hunt) -> Result<u8, CliError> {
             .map_err(|e| CliError::refused(format!("cannot write {}: {e}", written.display())))?;
         written
     } else {
-        pack.scenario.clone()
+        scenario_path.clone()
     };
     eprintln!(
         "hunting {} ({} at {}) · blake3 {} · judged by {} · {}",

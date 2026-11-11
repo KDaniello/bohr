@@ -1,0 +1,23 @@
+# Four CometBFT validators with the kvstore application, driven by bohr-load through the
+# cometbft-rpc adapter and judged by the laws of durability (R1.1, R1.4) over the chain model.
+
+[source]
+repository = "https://github.com/cometbft/cometbft"
+commit = "v0.38.26"
+
+[build]
+command = ["targets/cometbft/build.sh"]
+binary = "targets/cometbft/build/cometbft"
+blake3 = "c9a7172c1d01f28dff5fa70f876c53aac7b691fc03b8df7c59a08c4b78fcf769"
+
+[run]
+scenario = "targets/cometbft-net/scenario-s0.toml"
+
+[judge]
+oracle = "laws"
+
+# What `bohr check` holds the pack to; see docs/TESTING.md §16.
+[check]
+works = { min_events = 100_000, min_virtual_s = 39 }
+repeats = { times = 3 }
+clean = { seeds = "1..4" }

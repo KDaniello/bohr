@@ -8,5 +8,5 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 RUSTFLAGS="-C target-feature=+crt-static" \
-  cargo build --release -p bohr-probe --target x86_64-unknown-linux-gnu
-echo "built ${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release/bohr-probe"
+  cargo build --release -p bohr-probe -p bohr-load --target x86_64-unknown-linux-gnu
+echo "built ${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release/bohr-probe and bohr-load"

@@ -6,6 +6,8 @@ extend-exclude = [
   "fuzz/seeds/**",
   "*.tape",
   "*.bohr",
+  # Pre-signed transactions, one base64 line each: data, not words.
+  "targets/*/state/workload/txs",
 ]
 
 [default.extend-words]

@@ -155,6 +155,90 @@ pub fn send_event(name: &str, details: Json) {
     emit(move |meta| Record::Event(name.to_owned(), details, meta));
 }
 
+/// The records a store's harness writes for the laws of durability: what it began, what the store
+/// acknowledged, what it read back, and when it first answered after a start (`docs/API.md` §6.5).
+///
+/// The harness judges nothing; the world compares. Each acknowledgement names the line it was made
+/// on, so a finding is placed at it.
+pub mod kv {
+    use std::collections::BTreeMap;
+
+    use bohr_sdk_proto::json::Json;
+
+    /// What a store was asked to do.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Op {
+        /// One key, one value.
+        Put,
+        /// One key removed.
+        Delete,
+        /// Several keys at once; a value of `None` removes its key.
+        Batch,
+    }
+
+    fn op(
+        stage: &str,
+        op: Op,
+        keys: &[&str],
+        values: &[Option<&str>],
+        seq: u64,
+        at: &std::panic::Location<'_>,
+    ) {
+        let name = match op {
+            Op::Put => "put",
+            Op::Delete => "delete",
+            Op::Batch => "batch",
+        };
+        let mut details = BTreeMap::new();
+        details.insert("op".to_owned(), Json::Str(name.to_owned()));
+        details.insert(
+            "keys".to_owned(),
+            Json::Array(keys.iter().map(|k| Json::Str((*k).to_owned())).collect()),
+        );
+        details.insert(
+            "values".to_owned(),
+            Json::Array(
+                values.iter().map(|v| v.map_or(Json::Null, |v| Json::Str(v.to_owned()))).collect(),
+            ),
+        );
+        details.insert("seq".to_owned(), Json::Int(i64::try_from(seq).unwrap_or(i64::MAX)));
+        details.insert(
+            "at".to_owned(),
+            Json::Object(BTreeMap::from([
+                ("file".to_owned(), Json::Str(at.file().to_owned())),
+                ("line".to_owned(), Json::Int(i64::from(at.line()))),
+            ])),
+        );
+        super::send_event(stage, Json::Object(details));
+    }
+
+    /// An operation begun, which may land or not.
+    #[track_caller]
+    pub fn begun(kind: Op, keys: &[&str], values: &[Option<&str>], seq: u64) {
+        op("kv.begun", kind, keys, values, seq, std::panic::Location::caller());
+    }
+
+    /// An operation the store acknowledged.
+    #[track_caller]
+    pub fn acked(kind: Op, keys: &[&str], values: &[Option<&str>], seq: u64) {
+        op("kv.acked", kind, keys, values, seq, std::panic::Location::caller());
+    }
+
+    /// A key read back: its value, or `None` where it is absent.
+    pub fn read(key: &str, value: Option<&str>) {
+        let details = BTreeMap::from([
+            ("key".to_owned(), Json::Str(key.to_owned())),
+            ("value".to_owned(), value.map_or(Json::Null, |v| Json::Str(v.to_owned()))),
+        ]);
+        super::send_event("kv.read", Json::Object(details));
+    }
+
+    /// The store answered its first question since this start.
+    pub fn ready() {
+        super::send_event("kv.ready", Json::Object(BTreeMap::new()));
+    }
+}
+
 /// Random bytes that belong to the run.
 ///
 /// Under Bohr from the tape; otherwise from the platform, which the supervisor reports as

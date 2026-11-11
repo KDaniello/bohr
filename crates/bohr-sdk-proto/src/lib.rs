@@ -10,6 +10,7 @@
 
 pub mod json;
 pub mod probe;
+pub mod rpc;
 
 use std::collections::BTreeMap;
 
@@ -31,7 +32,7 @@ pub enum AssertType {
     Reachable,
     /// Must never be reached.
     Unreachable,
-    /// A numeric guard from the Antithesis surface, read but never written (`docs/API.md` §6.4).
+    /// A numeric guard from the Antithesis surface, read but never written (`docs/API.md` §6.5).
     NumericGuard(&'static str),
 }
 

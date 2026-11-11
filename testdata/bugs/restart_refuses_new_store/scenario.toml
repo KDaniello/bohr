@@ -1,0 +1,27 @@
+# restart_refuses_new_store: a store whose interrupted creation is refused forever, judged by R1.4.
+#
+# S1f: a kill inside the first start, between the manifest and the entry point.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/restart_refuses_new_store"]
+
+[disk]
+reorder_unsynced = false          # all of the unsynced survives a crash or none: R1.4 is judged
+
+[model]
+kind = "kv"
+ready_within_ticks = 5_000_000
+
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 500_000
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 2_000_000

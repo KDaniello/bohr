@@ -77,6 +77,10 @@ pub struct LoadedConfig {
     pub fault_points: Vec<String>,
     /// The odds each listed fault point is armed on a node, drawn once per run.
     pub fault_point_odds: (u32, u32),
+    /// The family whose laws judge the run, where the scenario names one.
+    pub model: Option<crate::model::ModelConfig>,
+    /// What the load sends the chain, where the scenario starts one.
+    pub workload: Option<crate::adapter::Workload>,
 }
 
 /// The `[linux]` section: which kernel facilities the guest is told exist.
@@ -131,6 +135,7 @@ impl LoadedConfig {
         crate::Watching {
             liveness: self.liveness.is_some(),
             durability: self.durability.is_some(),
+            laws: self.model.is_some(),
             probed: crate::Probed {
                 never_reverts: has(Property::NeverReverts),
                 monotonic: has(Property::Monotonic),
@@ -139,6 +144,22 @@ impl LoadedConfig {
                 unique: has(Property::Unique),
             },
         }
+    }
+
+    /// The node the load runs on: the one after the scenario's own, where a workload starts one.
+    #[must_use]
+    pub fn load_node(&self) -> Option<u32> {
+        self.workload.as_ref().map(|_| self.scenario_nodes())
+    }
+
+    /// The node the probe runs on: after the scenario's own nodes and the load.
+    #[must_use]
+    pub fn probe_node(&self) -> u32 {
+        self.scenario_nodes() + u32::from(self.workload.is_some())
+    }
+
+    fn scenario_nodes(&self) -> u32 {
+        self.cluster.as_ref().map_or(1, |c| c.nodes.max(1))
     }
 
     /// Whether this scenario asks for anything to go wrong.
@@ -245,6 +266,9 @@ struct RawConfig {
     coverage: Option<RawCoverage>,
     linux: Option<RawLinux>,
     chain: Option<RawChain>,
+    model: Option<RawModel>,
+    adapter: Option<crate::adapter::RawAdapter>,
+    workload: Option<crate::adapter::RawWorkload>,
     #[serde(default)]
     probe: Vec<RawProbe>,
     #[serde(default)]
@@ -313,6 +337,14 @@ struct RawLiveness {
     after_heal_ticks: Option<u64>,
     quiet_ticks: Option<u64>,
     progress: Option<String>,
+}
+
+/// The `[model]` section: which family's laws judge the run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModel {
+    kind: String,
+    ready_within_ticks: Option<u64>,
 }
 
 /// The `[durability]` section: what counts as a node answering before it made something durable.
@@ -848,13 +880,30 @@ pub fn parse(text: &str) -> Result<LoadedConfig, ConfigError> {
         }
     };
 
-    let run = run_limits(raw.run.as_ref(), cluster.as_ref().map(|c| c.nodes))?;
+    // The load is a node of the run too, numbered after the scenario's own: a run may end with it.
+    let loading = u32::from(raw.workload.is_some());
+    let run = run_limits(raw.run.as_ref(), cluster.as_ref().map(|c| c.nodes + loading))?;
     let (state_source, cwd) = state(raw.state.as_ref());
     let differential =
         differential(raw.differential.as_ref(), raw.faults.as_ref(), cluster.as_ref())?;
     let liveness = liveness(raw.liveness.as_ref(), &raw.partition)?;
     let durability = durability(raw.durability.as_ref(), raw.faults.as_ref(), &raw.fault)?;
     let probes = probes(raw.chain.as_ref(), &raw.probe, cluster.as_ref())?;
+    let workload = crate::adapter::workload(
+        raw.workload.as_ref(),
+        raw.adapter.as_ref(),
+        cluster.as_ref().map_or(1, |c| c.nodes.max(1)),
+        fault_policy.disarm_after.map(Tick::get),
+    )?;
+    let model = model(
+        raw.model.as_ref(),
+        cluster.is_some(),
+        workload.is_some(),
+        &disk,
+        &node_faults,
+        &fault_policy,
+        &network,
+    )?;
 
     // A policy armed after the run ends never fires, so it is refused with both numbers.
     if let Some(horizon) = run.horizon
@@ -897,7 +946,77 @@ pub fn parse(text: &str) -> Result<LoadedConfig, ConfigError> {
         probes,
         fault_points,
         fault_point_odds,
+        model,
+        workload,
     })
+}
+
+/// Reads `[model]`, refusing a family nothing could feed.
+///
+/// R1.4 is judged only where nothing the scenario arms is graded below `real`: a torn or reordered
+/// crash, a restart from an older snapshot or a corrupted packet can each leave a node rightly
+/// unable to start.
+fn model(
+    raw: Option<&RawModel>,
+    clustered: bool,
+    loaded: bool,
+    disk: &crate::DiskConfig,
+    node_faults: &[ScheduledNodeFault],
+    fault_policy: &FaultPolicy,
+    network: &NetworkConfig,
+) -> Result<Option<crate::model::ModelConfig>, ConfigError> {
+    let refused = |m: String| ConfigError::Refused(format!("BOHR-1002: {m}"));
+    let Some(raw) = raw else {
+        return if loaded {
+            Err(refused(
+                "[workload] feeds the chain model, and no [model] kind = \"chain\" reads it"
+                    .to_owned(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let family = match raw.kind.as_str() {
+        "chain" => crate::model::Family::Chain,
+        "kv" => crate::model::Family::Kv,
+        other => {
+            return Err(refused(format!(
+                "model.kind has no family named {other:?}; this build knows chain and kv"
+            )));
+        }
+    };
+    if !clustered {
+        return Err(refused(
+            "[model] reads the records a cluster's nodes write, and the scenario has no [cluster]"
+                .to_owned(),
+        ));
+    }
+    if (family == crate::model::Family::Chain) != loaded {
+        return Err(refused(
+            "a chain is judged from what the load records: model.kind = \"chain\" and [workload] \
+             go together"
+                .to_owned(),
+        ));
+    }
+    if node_faults.iter().any(|f| matches!(f.kind, crate::NodeFaultKind::ChainReorg { .. })) {
+        return Err(refused(
+            "chain_reorg rewinds every node below what it committed, by design; the laws of \
+             [model] are not judged under it"
+                .to_owned(),
+        ));
+    }
+    let snapshot = node_faults
+        .iter()
+        .any(|f| matches!(f.kind, crate::NodeFaultKind::RestartFromSnapshot { .. }));
+    let restart_judged = !disk.reorder_unsynced
+        && !snapshot
+        && !fault_policy.kinds.recover_from_snapshot
+        && network.corrupt_probability.0 == 0;
+    Ok(Some(crate::model::ModelConfig {
+        family,
+        ready_within: Tick(raw.ready_within_ticks.unwrap_or(10_000_000_000)),
+        restart_judged,
+    }))
 }
 
 /// The port JSON-RPC is answered on where a probe names none: Ethereum's.

@@ -175,6 +175,13 @@ A guest built without any of this is still searched — by the schedule and by f
 neither of which needs coverage — and is reported as searched without it. That is a different
 statement from a guest that covered nothing, and the two are never merged.
 
+**The Cosmos candidates are not surveyed.** Osmosis and Neutron (CosmWasm, `libwasmvm` a dynamic
+library to place in `[state]`), dYdX v4 (forks of `cometbft` and `cosmos-sdk`) and Celestia
+(`celestia-core`) are each a pack to build from source with a Go toolchain and the chain's modules
+fetched from the network, which the host the v0.9.2 packs were written on does not have; the same
+holds for `cosmos-simd-env` and `cosmos-hub-env`, whose packs are written and not built. Until each
+is built and run under `bohr survey`, none has a row under `[walls.*]`, and none is hunted.
+
 ### 4.2 Syscall support
 
 The table lives in code, in `crates/bohr-backend-ptrace/src/linux/syscalls.rs`, and generates both

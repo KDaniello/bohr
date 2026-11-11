@@ -1,0 +1,24 @@
+# rename_without_dirsync: a value renamed into place and acknowledged without syncing its directory, judged by R1.1.
+#
+# S3: a crash may keep or lose any unsynced write, and the rename is unsynced until something syncs the namespace.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/rename_without_dirsync"]
+
+[model]
+kind = "kv"
+ready_within_ticks = 5_000_000
+
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 2_500_000
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 4_000_000

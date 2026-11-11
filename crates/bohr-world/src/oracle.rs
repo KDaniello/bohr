@@ -102,6 +102,37 @@ impl Oracle for DurabilityOracle {
     }
 }
 
+/// Reports a law of durability or recovery a family's records broke (R1.1–R1.4).
+///
+/// Reads the codes the world's model watch raised; the sharpest law first, so a torn batch is told
+/// as one and not as each of its keys lost.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LawOracle;
+
+impl Oracle for LawOracle {
+    fn identity(&self) -> OracleId {
+        OracleId::new("laws", 1)
+    }
+
+    fn judge(&mut self, run: &RunOutcome) -> Verdict {
+        for code in bohr_trace::LAW_CODES {
+            let broken: Vec<&str> = run
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == code)
+                .map(|d| d.message.as_str())
+                .collect();
+            if !broken.is_empty() {
+                return Verdict::Finding(Outcome::DurabilityViolated(format!(
+                    "{code}: {}",
+                    broken.join("; ")
+                )));
+            }
+        }
+        Verdict::Clean
+    }
+}
+
 /// Reports a property a probe's answers broke.
 ///
 /// One per property, reading the code the world raised.
@@ -225,6 +256,8 @@ pub struct Watching {
     pub liveness: bool,
     /// Whether an answer given before a sync and lost to a crash is a finding.
     pub durability: bool,
+    /// Whether the laws of durability and recovery judge the scenario's `[model]`.
+    pub laws: bool,
     /// Which properties the scenario's probes hold the answers to.
     pub probed: Probed,
 }
@@ -270,6 +303,12 @@ pub fn panel(watching: Watching) -> Panel {
     }
     if watching.liveness {
         rest.push(Box::new(LivenessOracle));
+    }
+    // A law is told before a crash: a node that refuses to come back exits non-zero, and the crash
+    // would hide the law it broke.
+    if watching.laws {
+        rest.insert(0, Box::new(PropertiesAndCrashOracle));
+        return Panel::of(Box::new(LawOracle), rest);
     }
     Panel::of(Box::new(PropertiesAndCrashOracle), rest)
 }

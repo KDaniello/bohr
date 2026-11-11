@@ -1,0 +1,51 @@
+# cosmos-hub-env, cell S1.
+#
+# S1: a node killed in the commit path, restarted after 1 s; a crash keeps all of the unsynced or none, so R1.4 is judged.
+
+[run]
+horizon_ticks = 50_000_000_000
+ends_with_node = 4                # the load, which ends after its final check
+
+[state]
+dir = "targets/cosmos-hub-env/state"
+cwd = "/"
+
+[cluster]
+nodes = 4
+programs = [
+  ["targets/cosmos-hub-env/build/gaiad", "start", "--home", "/net/node0"],
+  ["targets/cosmos-hub-env/build/gaiad", "start", "--home", "/net/node1"],
+  ["targets/cosmos-hub-env/build/gaiad", "start", "--home", "/net/node2"],
+  ["targets/cosmos-hub-env/build/gaiad", "start", "--home", "/net/node3"],
+]
+
+[cluster.env]
+HOME = "/root"
+PATH = "/usr/bin:/bin"
+
+[model]
+kind = "chain"
+
+[adapter]
+kind = "cometbft-rpc"
+
+[workload]
+txs = "/workload/txs"
+rate = 20
+targets = [0, 1, 2, 3]
+observe_every_ticks = 1_000_000_000
+window_ticks = 30_000_000_000
+settle_ticks = 10_000_000_000
+
+[disk]
+sync_semantics = "strict"
+reorder_unsynced = false
+
+[faults]
+kill_probability = "1/65536"
+targeting = "guided"
+restart_after_ticks = 1_000_000_000
+arm_after_ticks = 5_000_000_000
+disarm_after_ticks = 30_000_000_000
+budget_per_run = 3
+draw = ["node_kill"]

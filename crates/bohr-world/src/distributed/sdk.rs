@@ -48,6 +48,8 @@ pub(crate) struct Digested {
     pub(crate) violated: Option<String>,
     /// Rounds of answers the probe reported, each as the event's details.
     pub(crate) probe_rounds: Vec<bohr_sdk_proto::json::Json>,
+    /// Records a family's model reads, `kv.*` and `load.*`, as their names and details.
+    pub(crate) family_records: Vec<(String, bohr_sdk_proto::json::Json)>,
 }
 
 impl SdkRecords {
@@ -132,6 +134,12 @@ impl SdkRecords {
             && self.probe_node == Some(node)
         {
             digested.probe_rounds.push(details.clone());
+        }
+
+        if let Record::Event(name, details, _) = &record
+            && (name.starts_with("kv.") || name.starts_with("load."))
+        {
+            digested.family_records.push((name.clone(), details.clone()));
         }
 
         if let Record::Assert(assertion, _) = &record {

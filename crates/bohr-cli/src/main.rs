@@ -121,7 +121,7 @@ impl CliError {
     }
 
     /// The exit code this error ends the process with.
-    const fn exit(&self) -> u8 {
+    pub(crate) const fn exit(&self) -> u8 {
         if self.internal { exit::INTERNAL } else { exit::USAGE }
     }
 }
@@ -195,6 +195,10 @@ enum Command {
         /// Reproduces the whole campaign.
         #[arg(long, value_name = "U64", default_value_t = 0)]
         master_seed: u64,
+        /// Hunt every cell of the pack, each `scenario-s*.toml` beside its scenario, one after
+        /// another, each under `-o/<cell>`.
+        #[arg(long)]
+        cells: bool,
     },
 
     /// Hold subjects to the checks they declare: a pack's `[check]`, a seeded defect's `bug.toml`.
@@ -738,11 +742,38 @@ pub(crate) fn specs_for(
             spec
         })
         .collect();
-    with_probe(specs, loaded)
+    with_probe(with_load(specs, loaded)?, loaded)
 }
 
 /// The probe's name inside a run, the same on every host so bundles replay anywhere.
 pub(crate) const PROBE_ARGV0: &str = "/bohr/probe";
+
+/// The load's name inside a run.
+pub(crate) const LOAD_ARGV0: &str = "/bohr/load";
+
+/// The specs with the load appended after the scenario's nodes, where the scenario has a workload.
+///
+/// After the scenario's own nodes and before the probe, so both keep their numbers; the load gets
+/// only the SDK's environment.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn with_load(
+    mut specs: Vec<bohr_backend::GuestSpec>,
+    loaded: Option<&bohr_world::LoadedConfig>,
+) -> Result<Vec<bohr_backend::GuestSpec>, CliError> {
+    let Some(workload) = loaded.and_then(|l| l.workload.as_ref()) else {
+        return Ok(specs);
+    };
+    let index = specs.len();
+    specs.push(bohr_backend::GuestSpec {
+        argv: vec![LOAD_ARGV0.to_owned(), workload.plan()],
+        executable: Some(probe::load_program()?),
+        env: vec![
+            ("BOHR_SDK_OUTPUT".to_owned(), execute::SDK_RECORD_PATH.to_owned()),
+            ("BOHR_SDK_NODE".to_owned(), index.to_string()),
+        ],
+    });
+    Ok(specs)
+}
 
 /// The specs with the probe appended as the last node, where the scenario has probes.
 ///
@@ -901,19 +932,24 @@ fn dispatch(command: Command) -> Result<u8, CliError> {
             resume,
             binary,
             master_seed,
-        } => hunt::hunt(&hunt::Hunt {
-            pack,
-            time,
-            runs,
-            quiet_runs,
-            jobs,
-            seeds,
-            no_faults,
-            out: out.into(),
-            resume,
-            binary,
-            master_seed,
-        }),
+            cells,
+        } => {
+            let request = hunt::Hunt {
+                pack,
+                time,
+                runs,
+                quiet_runs,
+                jobs,
+                seeds,
+                no_faults,
+                out: out.into(),
+                resume,
+                binary,
+                master_seed,
+                scenario: None,
+            };
+            if cells { hunt::hunt_cells(&request) } else { hunt::hunt(&request) }
+        }
         Command::Check(args) => check_command(args),
         Command::Sweep(args) => sweep_command(args),
         Command::Findings { dir, ablate } => findings::findings(&dir, ablate),

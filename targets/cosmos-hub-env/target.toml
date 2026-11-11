@@ -1,0 +1,24 @@
+# the Cosmos Hub's gaiad: the first production target, four validators driven by bohr-load through cometbft-rpc and judged by the laws
+# of durability over the chain model. Not built here yet: see README.md.
+
+[source]
+repository = "https://github.com/cosmos/gaia"
+commit = "v25.1.0"
+
+[build]
+command = ["targets/cosmos-hub-env/build.sh"]
+binary = "targets/cosmos-hub-env/build/gaiad"
+# Pinned when the pack is first built on a host; until then a hunt refuses the binary by digest.
+blake3 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[run]
+scenario = "targets/cosmos-hub-env/scenario-s0.toml"
+
+[judge]
+oracle = "laws"
+
+# What `bohr check` holds the pack to; see docs/TESTING.md §16.
+[check]
+works = { min_events = 100_000, min_virtual_s = 39 }
+repeats = { times = 3 }
+clean = { seeds = "1..4" }

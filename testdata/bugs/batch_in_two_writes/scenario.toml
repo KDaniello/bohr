@@ -1,0 +1,27 @@
+# batch_in_two_writes: a batch written as two durable records with no commit marker, judged by R1.3.
+#
+# S1: a kill between the two records of the second batch.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/batch_in_two_writes"]
+
+[disk]
+reorder_unsynced = false          # all of the unsynced survives a crash or none: R1.4 is judged
+
+[model]
+kind = "kv"
+ready_within_ticks = 5_000_000
+
+[[fault]]
+kind = "node_kill"
+node = 0
+at_tick = 1_500_000
+
+[[fault]]
+kind = "node_restart"
+node = 0
+at_tick = 3_000_000
