@@ -57,6 +57,11 @@ pub struct RunConfig {
     /// All by default, as a bundle records them. A run that keeps no log may keep only what its
     /// caller reads back.
     pub draws: bohr_tape::Keep,
+    /// Whether a guest reads its clock without a stop, where the backend can give it a clock page.
+    ///
+    /// On by default. A stored run is run again as it was recorded: one from before the page, or
+    /// recorded without it, runs without it.
+    pub clock_page: bool,
 }
 
 /// The SDK fault points a run may arm, by name, and the odds each is armed on a node.
@@ -94,6 +99,7 @@ impl Default for RunConfig {
             ends_with: None,
             ticks_per_progress_unit: None,
             draws: bohr_tape::Keep::All,
+            clock_page: true,
         }
     }
 }
@@ -770,6 +776,18 @@ impl Run<'_, '_> {
         }
         self.last_reason = SwitchReason::SyscallBoundary;
 
+        // What a read of the clock without a stop returns until the next stop: the node's clock
+        // now, as a `clock_gettime` answered here would have been.
+        let node = self
+            .tasks
+            .node_for(chosen)
+            .ok_or(KernelError::Invariant("resumed a task with no node"))?;
+        self.backend.present_clock(
+            chosen,
+            self.clock.now_on(node).get(),
+            self.clock.wall_on(node).get(),
+            CLOCK_READ_COST.get(),
+        )?;
         self.backend.resume(chosen, action)?;
         Ok(self.backend.next_stop()?)
     }
@@ -789,6 +807,15 @@ impl Run<'_, '_> {
             .tasks
             .node_for(stop.task)
             .ok_or(KernelError::Invariant("a stop arrived for a task with no node"))?;
+        // The clock reads made without a stop since the resume are charged before the stop is
+        // answered, as each would have been had it stopped: the world moves until the node's own
+        // clock reads what the last of them returned and one cost more, so a drifting clock never
+        // reads less after the stop than it did before it.
+        let reads = self.backend.clock_reads();
+        if reads > 0 {
+            let at = self.clock.deadline_on(node, reads.saturating_mul(CLOCK_READ_COST.get()));
+            self.clock.advance(Tick(at.get().saturating_sub(self.clock.now().get())));
+        }
         let effects = {
             let at = DeadlineCtx::new(
                 &mut self.clock,
@@ -1121,6 +1148,10 @@ impl Run<'_, '_> {
 /// Draws the offset and drift one node's clock runs at.
 ///
 /// Both come from the tape, so mutating them moves no other decision.
+/// What a clock read without a stop costs the node's time: what the world charges a
+/// `clock_gettime` it answers, so a read costs the same either way.
+const CLOCK_READ_COST: Tick = Tick(1_000);
+
 fn draw_node_clock(cursor: &mut TapeCursor<'_>, max_skew: Tick) -> Result<NodeClock, KernelError> {
     let offset = cursor.draw_range(max_skew.get().saturating_add(1), DrawSite::ClockSkew)?;
 

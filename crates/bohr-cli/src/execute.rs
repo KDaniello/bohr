@@ -269,7 +269,8 @@ pub(crate) fn hand_over_at(exec: Execution<'_>) -> Result<(), CliError> {
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         Target::Program(specs) => {
-            let mut backend = bohr_backend_ptrace::PtraceBackend::new();
+            let mut backend =
+                bohr_backend_ptrace::PtraceBackend::new().with_clock_page(exec.config.clock_page);
             if !backend.capabilities().hands_over_to_debugger {
                 return Err(CliError::internal(
                     "BOHR-3006: this backend cannot hand a guest to a debugger".to_owned(),
@@ -326,6 +327,7 @@ fn run_against(exec: Execution<'_>, worlds: Worlds) -> Result<Completed, CliErro
             if exec.scenario.is_some_and(|s| s.fault_policy.enomem.0 > 0) {
                 backend = backend.watching_allocations();
             }
+            backend = backend.with_clock_page(exec.config.clock_page);
             let completed = drive(&mut backend, "ptrace", specs, exec, worlds)?;
             // Known only once the guest has started, so folded in afterwards.
             Ok(Completed { degradations: backend.degradations().to_vec(), ..completed })

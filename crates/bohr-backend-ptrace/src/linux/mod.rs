@@ -10,6 +10,7 @@ mod spawn;
 
 pub use spawn::CORE_VARIABLE;
 mod syscalls;
+mod vdso;
 
 use std::collections::BTreeMap;
 
@@ -144,6 +145,14 @@ pub struct PtraceBackend {
     reaped: std::collections::BTreeSet<TaskId>,
     /// The signal the world ended a thread group with, by group, for the threads the kill takes.
     ended_by: BTreeMap<libc::pid_t, u32>,
+    /// Each thread group's clock page, where its program was given bohr's vDSO.
+    clock_pages: BTreeMap<libc::pid_t, u64>,
+    /// Whether guests are given bohr's vDSO, as the run asks.
+    clock_page: bool,
+    /// The page of the task last resumed, whose reads the next stop is charged for.
+    presented: Option<(libc::pid_t, u64)>,
+    /// Reads counted on a page an `execve` has since replaced, charged with the next stop's.
+    carried_reads: u64,
     /// Reports collected while a dead group was reaped, for tasks outside it, in arrival order.
     held: std::collections::VecDeque<(libc::pid_t, libc::c_int)>,
 }
@@ -185,8 +194,38 @@ impl PtraceBackend {
             exits: std::collections::VecDeque::new(),
             reaped: std::collections::BTreeSet::new(),
             ended_by: BTreeMap::new(),
+            clock_pages: BTreeMap::new(),
+            clock_page: true,
+            presented: None,
+            carried_reads: 0,
             held: std::collections::VecDeque::new(),
         }
+    }
+
+    /// The same backend, giving guests bohr's vDSO or not; without it every clock read is a stop,
+    /// and the run is recorded as degraded by `clock_page_withheld`, so it is run again the same
+    /// way.
+    #[must_use]
+    pub fn with_clock_page(mut self, on: bool) -> Self {
+        self.clock_page = on;
+        if !on {
+            self.notes.push("clock_page_withheld".to_owned());
+        }
+        self
+    }
+
+    /// Gives the guest stopped at its `execve` bohr's vDSO, where the run asks for it; where the
+    /// host refuses the mapping, the guest runs without one and the run is recorded as degraded
+    /// by `clock_page_withheld`, so it is run again without it.
+    fn install_clock_page(&mut self, pid: libc::pid_t) -> Option<u64> {
+        if !self.clock_page {
+            return None;
+        }
+        let image = vdso::install(pid).ok().flatten();
+        if image.is_none() && !self.notes.iter().any(|n| n == "clock_page_withheld") {
+            self.notes.push("clock_page_withheld".to_owned());
+        }
+        image
     }
 
     /// The same backend, stopping every allocation call so a world can refuse one.
@@ -523,9 +562,10 @@ impl DeterminismBackend for PtraceBackend {
 
         // The guest reads the name it was started by in `AT_EXECFN`, not the path this host
         // executed it from.
+        let vdso = self.install_clock_page(pid);
         let mut regs = get_regs(pid)?;
         let label = spawn::execfn_label(spec.argv.first().map_or("", String::as_str));
-        let (rsp, report) = spawn::canonical_stack(pid, regs.rsp, Some(&label))?;
+        let (rsp, report) = spawn::canonical_stack(pid, regs.rsp, Some(&label), vdso)?;
         regs.rsp = rsp;
         set_regs(pid, &regs)?;
         if !report.vdso_disabled {
@@ -548,6 +588,9 @@ impl DeterminismBackend for PtraceBackend {
 
         let id = self.register(pid, pid, node, spec.argv.first().cloned().unwrap_or_default());
         self.task_mut(id)?.attached = true;
+        if let Some(image) = vdso {
+            self.clock_pages.insert(pid, vdso::page_of(image));
+        }
         Ok(id)
     }
 
@@ -638,6 +681,11 @@ impl DeterminismBackend for PtraceBackend {
                     child_pid
                 });
                 let thread = group == self.task(id)?.group;
+                // A fork's copy of memory holds the page where the parent's did; a thread or a
+                // process sharing memory holds the same page.
+                if let Some(page) = self.clock_pages.get(&self.task(id)?.group).copied() {
+                    self.clock_pages.insert(group, page);
+                }
 
                 let parent = self.task(id)?;
                 let (node, program) = (parent.node, parent.program.clone());
@@ -669,8 +717,14 @@ impl DeterminismBackend for PtraceBackend {
             // The exec is not reported above the boundary: the task keeps its identity, and the
             // filter admits `execve` without asking the world.
             if is_event(status, libc::PTRACE_EVENT_EXEC) {
+                let vdso = self.install_clock_page(pid);
+                let group = self.task(id)?.group;
+                match vdso {
+                    Some(image) => self.clock_pages.insert(group, vdso::page_of(image)),
+                    None => self.clock_pages.remove(&group),
+                };
                 let mut regs = get_regs(pid)?;
-                let (rsp, report) = spawn::canonical_stack(pid, regs.rsp, None)?;
+                let (rsp, report) = spawn::canonical_stack(pid, regs.rsp, None, vdso)?;
                 regs.rsp = rsp;
                 set_regs(pid, &regs)?;
                 if !report.vdso_disabled {
@@ -692,6 +746,15 @@ impl DeterminismBackend for PtraceBackend {
                     return Err(BackendError::Lost(format!(
                         "a syscall arrived through the {abi} ABI, which this build does not read"
                     )));
+                }
+                // An `execve` replaces the address space and its clock page with it: what that page
+                // counted is carried to the next stop, and the call goes on to the host.
+                if regs.orig_rax == EXECVE {
+                    if let Some((pid, page)) = self.presented.take() {
+                        self.carried_reads += vdso::reads(pid, page).unwrap_or(0);
+                    }
+                    self.release(id, libc::PTRACE_CONT, 0)?;
+                    continue;
                 }
                 self.current = None;
                 return Ok(Some(Stop {
@@ -867,6 +930,32 @@ impl DeterminismBackend for PtraceBackend {
         self.dying.push((pid, group));
         self.forget(task);
         Ok(())
+    }
+
+    fn present_clock(
+        &mut self,
+        task: TaskId,
+        monotonic_ns: u64,
+        wall_ns: u64,
+        step_ns: u64,
+    ) -> Result<(), BackendError> {
+        self.presented = None;
+        let Ok(known) = self.task(task) else { return Ok(()) };
+        let (pid, group) = (known.pid, known.group);
+        let Some(page) = self.clock_pages.get(&group).copied() else { return Ok(()) };
+        // A process a fatal signal is taking down has no memory left to write, and runs no code
+        // that could read the page.
+        if vdso::present(pid, page, monotonic_ns, wall_ns, step_ns).is_ok() {
+            self.presented = Some((pid, page));
+        }
+        Ok(())
+    }
+
+    fn clock_reads(&mut self) -> u64 {
+        // A task that ended since its resume took its reads with it: they cost nothing more.
+        let now =
+            self.presented.take().map_or(0, |(pid, page)| vdso::reads(pid, page).unwrap_or(0));
+        now + std::mem::take(&mut self.carried_reads)
     }
 
     fn hand_over(&mut self) -> Result<Vec<DebuggerTarget>, BackendError> {
@@ -1181,6 +1270,9 @@ fn set_regs(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Result<(), Backe
     }
     Ok(())
 }
+
+/// `execve`.
+const EXECVE: u64 = 59;
 
 fn is_event(status: libc::c_int, event: libc::c_int) -> bool {
     libc::WIFSTOPPED(status)

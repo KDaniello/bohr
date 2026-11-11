@@ -653,7 +653,11 @@ pub(crate) fn run_config_for(
     loaded: Option<&bohr_world::LoadedConfig>,
     max_events: Option<u64>,
 ) -> RunConfig {
-    let mut config = RunConfig::default();
+    // `BOHR_CLOCK_PAGE=off` runs every clock read as a stop, to measure against.
+    let mut config = RunConfig {
+        clock_page: std::env::var("BOHR_CLOCK_PAGE").map_or(true, |v| v != "off"),
+        ..RunConfig::default()
+    };
     if let Some(limits) = loaded.map(|l| l.run) {
         config.horizon = limits.horizon;
         config.ends_with = limits.ends_with_node.map(bohr_types::NodeId);

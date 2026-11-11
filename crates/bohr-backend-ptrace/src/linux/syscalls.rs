@@ -108,7 +108,9 @@ pub(crate) const TABLE: &[Entry] = &[
     admit(14, "rt_sigprocmask"),
     admit(131, "sigaltstack"),
     admit(15, "rt_sigreturn"),
-    admit(59, "execve"),
+    // Traced for the backend alone, which carries the clock page's reads past the new image and
+    // lets the call go on; the world never sees it.
+    trace(59, "execve"),
     admit(158, "arch_prctl"),
     admit(218, "set_tid_address"),
     admit(273, "set_robust_list"),
@@ -349,7 +351,6 @@ mod tests {
             [
                 "arch_prctl",
                 "brk",
-                "execve",
                 "mprotect",
                 "mremap",
                 "rt_sigaction",

@@ -1020,7 +1020,9 @@ asserted ([`TESTING.md`](./TESTING.md) §11).
 
 ```
  1. Guest executes  clock_gettime(CLOCK_MONOTONIC, &ts)
-        │  no VDSO: AT_SYSINFO_EHDR was zeroed at exec, so this is a real syscall
+        │  where the guest has bohr's VDSO, the read is answered from its clock page and never
+        │  reaches here; with BOHR_CLOCK_PAGE=off, or before the page is first written, it is a
+        │  real syscall
  2. Kernel evaluates the seccomp-BPF filter → SECCOMP_RET_TRACE
         ▼  bohr-backend-ptrace                          budget: ≤ 12 µs per traced syscall
  3. Supervisor wakes on the stop, reads registers, builds Stop::SyscallEntry { nr, args }

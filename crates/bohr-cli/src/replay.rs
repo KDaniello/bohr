@@ -62,6 +62,7 @@ pub(crate) fn record_again(
         config: {
             let mut config = crate::run_config_for(loaded.as_ref(), None);
             config.max_events = budget_for(&manifest, config.max_events);
+            config.clock_page = clock_page_for(&manifest);
             config
         },
         output: execute::Output::Discard,
@@ -125,6 +126,7 @@ pub(crate) fn replay_to(
     // The bundle's configuration sets the bounds, as it sets the world and the oracle.
     let mut run_config = crate::run_config_for(loaded.as_ref(), None);
     run_config.max_events = budget_for(&manifest, run_config.max_events);
+    run_config.clock_page = clock_page_for(&manifest);
     run_config.break_at = break_at.map(bohr_types::EventId);
     // Only digested: a replay that matches needs no log, and one that diverges is run again
     // with its log kept, to the same events, to name where.
@@ -227,6 +229,15 @@ pub(crate) fn verify_state(
         )));
     }
     Ok(())
+}
+
+/// Whether a stored run is run again with the clock page: only where it was recorded with it, by
+/// a version that had it and without `clock_page_withheld`.
+pub(crate) fn clock_page_for(manifest: &Manifest) -> bool {
+    let version: Vec<u64> =
+        manifest.tool_version.split('.').map(|part| part.parse().unwrap_or(0)).collect();
+    version >= vec![0, 9, 7]
+        && !manifest.determinism.reasons.iter().any(|r| r == "clock_page_withheld")
 }
 
 /// The event budget a stored run is run again under: the one it recorded.

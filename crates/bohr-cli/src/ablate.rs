@@ -43,6 +43,7 @@ fn trial(
     let target = replay::target_from(bundle, manifest, Some(&loaded), binaries)?;
     let mut run_config = crate::run_config_for(Some(&loaded), None);
     run_config.max_events = replay::budget_for(manifest, run_config.max_events);
+    run_config.clock_page = replay::clock_page_for(manifest);
     let completed = execute::run_with(execute::Execution {
         target: &target,
         tape,

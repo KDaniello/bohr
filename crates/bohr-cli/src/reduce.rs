@@ -85,6 +85,7 @@ pub(crate) fn reduce(
             config: {
                 let mut config = crate::run_config_for(loaded.as_ref(), None);
                 config.max_events = replay::budget_for(&manifest, config.max_events);
+                config.clock_page = replay::clock_page_for(&manifest);
                 config
             },
             output: execute::Output::Discard,
@@ -175,6 +176,7 @@ pub(crate) fn reduce(
         config: {
             let mut config = crate::run_config_for(reduced.as_ref(), None);
             config.max_events = replay::budget_for(&manifest, config.max_events);
+            config.clock_page = replay::clock_page_for(&manifest);
             config
         },
         output: execute::Output::Discard,

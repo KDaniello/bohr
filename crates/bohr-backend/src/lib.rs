@@ -95,6 +95,31 @@ pub trait DeterminismBackend {
         0
     }
 
+    /// Tells the task about to resume what its node's clock reads, in nanoseconds: the monotonic
+    /// clock, the wall clock, and the step each read without a stop adds.
+    ///
+    /// For an implementation that lets a guest read its clock without a stop. The default does
+    /// nothing: every read is then a system call, answered by the world.
+    ///
+    /// # Errors
+    ///
+    /// The clock could not be written into the guest.
+    fn present_clock(
+        &mut self,
+        _task: TaskId,
+        _monotonic_ns: u64,
+        _wall_ns: u64,
+        _step_ns: u64,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// How many times the task last resumed read its clock without a stop, since
+    /// [`Self::present_clock`]; zero once asked, until the next resume.
+    fn clock_reads(&mut self) -> u64 {
+        0
+    }
+
     /// Releases every stopped guest to an external debugger, and says how to reach each one.
     ///
     /// Guarded by [`BackendCapabilities::hands_over_to_debugger`]. The default returns an empty
