@@ -355,8 +355,12 @@ recorded difficulty:
 | `delete_unsynced` | a delete acknowledged before its tombstone is durable; R1.2 | 1 | 45 of 60 seeds |
 | `batch_in_two_writes` | a batch written as two durable records with no commit marker; R1.3 | 1 | 60 of 60 seeds |
 | `restart_refuses_new_store` | an interrupted creation refused forever; R1.4 | 1 | 60 of 60 seeds |
-| `retry_applies_twice` | a request's id recorded apart from the update it guards; R4.1 | 1 | see `bug.toml` |
-| `move_not_atomic` | a move written as a debit and a credit apart; R5.1 | 1 | see `bug.toml` |
+| `retry_applies_twice` | a request's id recorded apart from the update it guards; R4.1 | 1 | 60 of 60 seeds |
+| `move_not_atomic` | a move written as a debit and a credit apart; R5.1 | 1 | 60 of 60 seeds |
+| `ack_after_failed_write` | a write's `ENOSPC` ignored and the record acknowledged; R7.1 | 1 | 52 of 60 seeds |
+| `fsync_retry_after_eio` | a failed `fsync` retried and the retry's success believed (fsyncgate); R7.1 | 1 | 42 of 60 seeds |
+| `enospc_count_ahead` | a record counted before it is written, the store stopped on `ENOSPC`; R7.2 | 1 | RESULT_COUNT |
+| `enomem_half_batch` | a batch applied key by key into buffers allocated as it goes; R1.3 | 1 | 51 of 60 seeds |
 
 **The four laws' defects are judged by what the guest wrote, not by how it ended.** Each writes the
 `kv.*` records of `API.md` §6.4 through `testdata/guests/bohr_kv.h` and reads every key back at

@@ -1531,10 +1531,11 @@ moves_within_ticks = 10_000_000_000 # R3.1's and R3.2's bound, from the fault wi
 | R2.4 one decider per round | no term has two leaders | `BOHR-2043` |
 | R3.1 it moves again | a chain decides past its last position within `moves_within_ticks` of the fault window closing | `BOHR-2042` |
 | R3.2 a replica catches up | every replica up then reaches the last position decided before the window closed, within the same bound | `BOHR-2055` |
-
 | R4.1 one effect per operation | a counter is never read above what every operation begun on it makes, each id applied once | `BOHR-2052` |
 | R5.1 the closed set is conserved | within one start, the counters moves touch sum to what they began at | `BOHR-2053` |
 | R6.1 what is reported included is included | a transaction a node reports at a height is in that node's block at that height | `BOHR-2056` |
+| R7.1 a refused write is never acknowledged | nothing acknowledged after a write, `fsync` or allocation refused between its operation's begin and its acknowledgement is read back lost in the same start | `BOHR-2060` |
+| R7.2 the node comes back with the resource | a node refused a resource in one start answers in the next, within `ready_within_ticks` | `BOHR-2061` |
 
 R2.1, R2.3, R2.4 and R3.1 share v0.4's probe codes, whose questions they are; R3.2 shares R1.4's.
 R4.1 and R5.1 are judged by a ledger of what a store's counters should hold, from the operations
@@ -1542,6 +1543,18 @@ begun and acknowledged on them, never from what the store says; a counter read b
 acknowledged operations make is R1.1. R5.1 is judged only on a start that read every counter of the
 set, and not where an `add` touches it. R6.1 compares a node's `tx` answer with its own block at
 that height, from the load's audit.
+R7.1 is told of a loss R1.1 proves, read in the start that acknowledged it, where the world refused
+the node a write with `ENOSPC`, an `fsync` with `EIO` or an allocation with `ENOMEM` between the
+operation's first begin and its acknowledgement: with no crash between, the refused call is what
+took the data. A loss across a crash stays R1.1's, and so does a counter's. R7.1 does not claim the
+refused call was on the file the operation wrote, since a store's records name keys and not
+descriptors, and it is not judged on a chain, whose acknowledgement is the network's and not one
+node's. A refused `brk` and a refused `PROT_NONE` reservation are not told: glibc and a runtime
+answer them with another call. A start refused a resource owes no answer, since stopping is a
+correct answer to a full disk; R7.2 asks the start after it, and needs a restart to ask, which a
+scenario writes down. Triage judges a run that ended in an exit or an abort, only of nodes refused
+a resource and with only refusals needed, an expected refusal; a runtime's panic exits with a
+status, so a panic on the refused node counts as its stop.
 R2.1 and R2.2 compare only replicas that answered one position, so a replica behind is not a
 disagreement. The fault window closes at the latest of the scenario's scheduled faults and heals
 and `faults.disarm_after_ticks`, or at the start where it arms none; drawn faults with no closing
@@ -2471,6 +2484,8 @@ to do.
 | `BOHR-2052` | R4.1: an operation with one id took effect more than once (§5.10) |
 | `BOHR-2053` | R5.1: the counters moves touch no longer sum to what they began at (§5.10) |
 | `BOHR-2056` | R6.1: a node reported a transaction at a height its own block there does not hold (§5.10) |
+| `BOHR-2060` | R7.1: something acknowledged after a refused write, `fsync` or allocation in its operation was lost (§5.10) |
+| `BOHR-2061` | R7.2: a node refused a resource in one start did not answer in the next (§5.10) |
 | `BOHR-2055` | R1.4: a node the world restarted did not answer within its bound, or ended without answering (§5.10) |
 | `BOHR-2057` | R1.2: something acknowledged as removed was read back (§5.10) |
 | `BOHR-2058` | R1.3: a batch was read back in part (§5.10) |

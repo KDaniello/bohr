@@ -50,6 +50,13 @@ pub const CONSERVED_CODE: &str = "BOHR-2053";
 /// R6.1: a node reported something included that its own state does not hold.
 pub const INCLUDED_CODE: &str = "BOHR-2056";
 
+/// R7.1: something acknowledged after a refused write, `fsync` or allocation in its operation was
+/// lost.
+pub const FAILED_ACKED_CODE: &str = "BOHR-2060";
+
+/// R7.2: a node refused a resource did not come back once the resource did.
+pub const RESOURCE_BACK_CODE: &str = "BOHR-2061";
+
 /// R2.2: two replicas past one position hold different states there.
 pub const STATE_AGREES_CODE: &str = "BOHR-2050";
 
@@ -58,7 +65,7 @@ pub const STATE_AGREES_CODE: &str = "BOHR-2050";
 ///
 /// R2.1, R2.3, R2.4 and R3.1 share their codes with v0.4's probe properties, whose questions they
 /// are; R3.2 shares R1.4's, a replica that does not come back.
-pub const LAW_CODES: [&str; 12] = [
+pub const LAW_CODES: [&str; 14] = [
     AGREES_CODE,
     STATE_AGREES_CODE,
     NEVER_REVERTS_CODE,
@@ -67,9 +74,11 @@ pub const LAW_CODES: [&str; 12] = [
     CONSERVED_CODE,
     INCLUDED_CODE,
     BATCH_WHOLE_CODE,
+    FAILED_ACKED_CODE,
     DELETED_STAYS_CODE,
     ACKED_SURVIVES_CODE,
     ADVANCES_CODE,
+    RESOURCE_BACK_CODE,
     RESTARTS_CODE,
 ];
 

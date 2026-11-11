@@ -1,0 +1,20 @@
+# enomem_half_batch: a batch applied key by key, each into a buffer allocated as it goes, judged by R1.3.
+#
+# S7: memory that refuses an eighth of the allocations.
+
+[run]
+horizon_ticks = 30_000_000
+
+[cluster]
+nodes = 1
+argv = ["testdata/guests/build/enomem_half_batch"]
+
+[model]
+kind = "kv"
+ready_within_ticks = 5_000_000
+
+[disk]
+reorder_unsynced = false
+
+[faults]
+enomem_probability = "1/8"

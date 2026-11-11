@@ -111,7 +111,7 @@ pub struct LawOracle;
 
 impl Oracle for LawOracle {
     fn identity(&self) -> OracleId {
-        OracleId::new("laws", 3)
+        OracleId::new("laws", 4)
     }
 
     fn judge(&mut self, run: &RunOutcome) -> Verdict {
@@ -127,9 +127,9 @@ impl Oracle for LawOracle {
                 continue;
             }
             let detail = format!("{code}: {}", broken.join("; "));
-            // Durability, recovery and the ledger, R1, R3.2 and R4 to R6, are a durability
-            // outcome; agreement and moving again, R2 and R3.1, a property the replicas' answers
-            // broke.
+            // Durability, recovery, the ledger and resources, R1, R3.2 and R4 to R7, are a
+            // durability outcome; agreement and moving again, R2 and R3.1, a property the replicas'
+            // answers broke.
             let durability = [
                 bohr_trace::ACKED_SURVIVES_CODE,
                 bohr_trace::DELETED_STAYS_CODE,
@@ -138,6 +138,8 @@ impl Oracle for LawOracle {
                 bohr_trace::ONCE_CODE,
                 bohr_trace::CONSERVED_CODE,
                 bohr_trace::INCLUDED_CODE,
+                bohr_trace::FAILED_ACKED_CODE,
+                bohr_trace::RESOURCE_BACK_CODE,
             ];
             return Verdict::Finding(if durability.contains(&code) {
                 Outcome::DurabilityViolated(detail)
@@ -151,7 +153,7 @@ impl Oracle for LawOracle {
 
 /// Whether a diagnostic was raised by a law of the family layer, which names its law first.
 fn is_law(message: &str) -> bool {
-    ["R1.", "R2.", "R3.", "R4.", "R5.", "R6."].iter().any(|law| message.starts_with(law))
+    ["R1.", "R2.", "R3.", "R4.", "R5.", "R6.", "R7."].iter().any(|law| message.starts_with(law))
 }
 
 /// Reports a property a probe's answers broke.

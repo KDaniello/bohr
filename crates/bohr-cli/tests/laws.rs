@@ -30,20 +30,26 @@ fn run(defect: &str, scenario: &str, seed: u64) -> Option<(i32, String)> {
 /// (G9.2.1, G9.2.4, G9.3.1).
 #[test]
 fn each_law_catches_its_defect_and_names_the_file() {
-    for (defect, code) in [
-        ("rename_without_dirsync", "BOHR-2051"),
-        ("delete_unsynced", "BOHR-2057"),
-        ("batch_in_two_writes", "BOHR-2058"),
-        ("restart_refuses_new_store", "BOHR-2055"),
-        ("partition_split_brain", "BOHR-2043"),
-        ("retry_applies_twice", "BOHR-2052"),
-        ("move_not_atomic", "BOHR-2053"),
+    // A seed each: a refused resource is drawn, and the first seed need not draw it.
+    for (defect, code, seed) in [
+        ("rename_without_dirsync", "BOHR-2051", 1),
+        ("delete_unsynced", "BOHR-2057", 1),
+        ("batch_in_two_writes", "BOHR-2058", 1),
+        ("restart_refuses_new_store", "BOHR-2055", 1),
+        ("partition_split_brain", "BOHR-2043", 1),
+        ("retry_applies_twice", "BOHR-2052", 1),
+        ("move_not_atomic", "BOHR-2053", 1),
+        ("ack_after_failed_write", "BOHR-2060", 1),
+        ("fsync_retry_after_eio", "BOHR-2060", 3),
+        ("enospc_count_ahead", "BOHR-2061", 1),
+        ("enomem_half_batch", "BOHR-2058", 2),
     ] {
-        let Some((exit, report)) = run(defect, "scenario.toml", 1) else { continue };
+        let Some((exit, report)) = run(defect, "scenario.toml", seed) else { continue };
         assert_eq!(exit, 1, "{defect}: {report}");
         assert!(report.contains(code), "{defect} was not caught by {code}: {report}");
-        // A store's acknowledgement has a line to be placed at; a restart and a claim have none.
-        if !["BOHR-2055", "BOHR-2043"].contains(&code) {
+        // A store's acknowledgement has a line to be placed at; a restart, a coming back and a
+        // claim have none.
+        if !["BOHR-2055", "BOHR-2061", "BOHR-2043"].contains(&code) {
             assert!(report.contains(&format!("{defect}.c:")), "{defect} is not placed: {report}");
         }
     }

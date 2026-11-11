@@ -1,0 +1,8 @@
+# The seeded defect, and what `bohr check enomem_half_batch` holds it to; see docs/TESTING.md §16.
+defect = "a batch applied key by key, each into a buffer allocated as it goes"
+
+[check]
+works = { min_events = 20 }
+finds = { seeds = "1..60", code = "BOHR-2058", at_least = 30 }
+repeats = { times = 100 }
+replays = {}
